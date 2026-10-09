@@ -1,0 +1,27 @@
+# Go
+/bin/
+/dist/
+*.test
+*.out
+coverage.*
+
+# runtime data
+/data/
+*.db
+
+# embedded UI build output (placeholder index.html is committed)
+/internal/webui/dist/*
+!/internal/webui/dist/.keep
+!/internal/webui/dist/index.html
+
+# web
+node_modules/
+web/.nuxt/
+web/.output/
+web/.data/
+web/dist/
+web/test-results/
+web/playwright-report/
+.DS_Store
+*.log
+.env
