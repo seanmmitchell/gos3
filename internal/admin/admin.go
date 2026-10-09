@@ -42,9 +42,18 @@ type Deps struct {
 }
 
 // NewHandler returns the admin API handler. It expects full request paths
-// (starting with Prefix). CONTRACT STUB — replaced by the admin work item.
+// (starting with Prefix).
+//
+// The handler answers CORS preflights (OPTIONS) from the global CORS
+// settings without authentication, authenticates every other request with
+// d.Verifier (SigV4 header or presigned URL; anonymous requests get 401),
+// authorizes it with d.IAM ("admin:<Action>", see docs/admin-api.md) and
+// renders JSON responses; errors use the envelope
+// {"error":{"code":"…","message":"…"}}.
+//
+// Backend, Verifier, IAM and Settings are required; NewHandler panics if one
+// of them is nil (a wiring bug). Metrics, Discovery, Info and Logger are
+// optional.
 func NewHandler(d Deps) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		http.Error(w, `{"error":{"code":"NotImplemented","message":"admin API not implemented"}}`, http.StatusNotImplemented)
-	})
+	return newAPI(d)
 }

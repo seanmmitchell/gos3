@@ -230,7 +230,7 @@ func TestMultipartReaderStableAcrossPartReplace(t *testing.T) {
 	oi, err := b.CompleteMultipartUpload(ctx, bkt, "k", up.UploadID, []int{1}, storage.ObjectMeta{}, storage.CommitOptions{})
 	<-done
 	if err != nil {
-		if !errors.Is(err, storage.ErrPartNotFound) {
+		if !errors.Is(err, errPartsChanged) {
 			t.Fatalf("complete: %v", err)
 		}
 		return
@@ -247,4 +247,55 @@ func TestMultipartReaderStableAcrossPartReplace(t *testing.T) {
 	b2 := openTest(t, b.Root())
 	waitRecovery(t, b2)
 	eq(t, "part files", len(partFiles(t, b2)), 0)
+}
+
+func TestCompleteRetriesWhenPartReplaced(t *testing.T) {
+	b, bkt := newBucket(t, "")
+	up, _ := b.CreateMultipartUpload(ctx, bkt, "k", storage.ObjectMeta{}, "")
+	uploadPart(t, b, bkt, "k", up.UploadID, 1, "old-1|")
+	uploadPart(t, b, bkt, "k", up.UploadID, 2, "old-2")
+
+	var calls int
+	afterPartsCopied = func(id string) {
+		calls++
+		if calls == 1 {
+			// Replace part 2 after its old content was copied.
+			uploadPart(t, b, bkt, "k", id, 2, "new-2")
+		}
+	}
+	t.Cleanup(func() { afterPartsCopied = nil })
+
+	oi, err := b.CompleteMultipartUpload(ctx, bkt, "k", up.UploadID, []int{1, 2}, storage.ObjectMeta{ETag: "x-2"}, storage.CommitOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	eq(t, "attempts", calls, 2)
+	eq(t, "size", oi.Size, int64(len("old-1|new-2")))
+	eq(t, "content", read(t, b, bkt, "k", ""), "old-1|new-2")
+	// The data file of the discarded first attempt was removed.
+	eq(t, "data files", len(dataFiles(t, b)), 1)
+	eq(t, "part files", len(partFiles(t, b)), 0)
+
+	// Constant replacement gives up after a bounded number of attempts and
+	// leaves the upload intact.
+	up2, _ := b.CreateMultipartUpload(ctx, bkt, "k2", storage.ObjectMeta{}, "")
+	uploadPart(t, b, bkt, "k2", up2.UploadID, 1, "p")
+	calls = 0
+	afterPartsCopied = func(id string) {
+		calls++
+		uploadPart(t, b, bkt, "k2", id, 1, "q")
+	}
+	_, err = b.CompleteMultipartUpload(ctx, bkt, "k2", up2.UploadID, []int{1}, storage.ObjectMeta{}, storage.CommitOptions{})
+	if !errors.Is(err, errPartsChanged) {
+		t.Fatalf("constant replacement: %v", err)
+	}
+	eq(t, "attempts", calls, completeRetries)
+	afterPartsCopied = nil
+	if _, err := b.GetMultipartUpload(ctx, bkt, "k2", up2.UploadID); err != nil {
+		t.Fatalf("upload removed after failed completion: %v", err)
+	}
+	if _, err := b.GetObjectInfo(ctx, bkt, "k2", ""); !errors.Is(err, storage.ErrObjectNotFound) {
+		t.Fatalf("object created by failed completion: %v", err)
+	}
+	eq(t, "data files", len(dataFiles(t, b)), 1)
 }

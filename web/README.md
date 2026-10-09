@@ -98,7 +98,8 @@ app/
   components/common/      shared building blocks (prefix `Common`)
   components/layout/      AppLogo, ServerSwitcher, IdentityMenu (prefix `Layout`)
 server/                   Nitro routes for standalone local discovery (servers & discovery agent)
-test/unit/                Vitest (node env + DOMParser/Storage from test/setup.ts)
+test/unit/                Vitest "unit" project (node env + DOMParser/Storage from test/setup.ts)
+test/nuxt/                Vitest "nuxt" project (@nuxt/test-utils, components & composables)
 test/e2e/                 Playwright smoke tests + static server
 ```
 
@@ -122,8 +123,8 @@ import { useConnectionsStore } from '~/stores/connections'
 | **admin** | `app/pages/servers/[id]/index.vue`, `app/pages/servers/[id]/users/index.vue`, `app/pages/servers/[id]/users/[name].vue`, `app/pages/servers/[id]/policies/index.vue`, `app/pages/servers/[id]/policies/[name].vue`, `app/pages/servers/[id]/settings.vue`, `app/pages/servers/[id]/buckets/[bucket]/settings.vue`, `app/components/admin/`, `app/components/bucket-settings/` |
 
 The pages listed above currently are placeholders (`// PLACEHOLDER`) — replace
-them wholesale. Feature agents may add tests under `test/unit/<area>-*.test.ts`
-and `test/e2e/<area>.spec.ts`. If you need a change in a scaffold file, keep it
+them wholesale. Feature agents may add tests under `test/unit/<area>-*.test.ts`,
+`test/nuxt/<area>-*.test.ts` and `test/e2e/<area>.spec.ts`. If you need a change in a scaffold file, keep it
 minimal and mention it in your report.
 
 ## Conventions
@@ -223,9 +224,23 @@ layout derives breadcrumbs from these routes; override with
 
 ### Testing
 
-Unit tests run in Node (native `fetch`/`Headers`/WebCrypto, which behave like
-browsers) with `DOMParser` and Web Storage installed by `test/setup.ts` —
-happy-dom's own `Headers` keeps header-name case and breaks SigV4. Inject a
-`fetch` into `S3Client`/`AdminClient` (`{ fetch }` option) or `vi.stubGlobal('fetch', …)`.
-Code using Nuxt auto-imports (components, composables) is not covered by the
-unit setup; prefer keeping logic in plain TS modules with explicit imports.
+`pnpm test` runs two Vitest projects (`vitest.config.ts`):
+
+| Project | Files | Environment | Use for |
+|---|---|---|---|
+| `unit` | `test/unit/**/*.test.ts` | Node + `test/setup.ts` (DOMParser from happy-dom, in-memory Web Storage) | plain TS modules: clients, parsers, store, utils — fast |
+| `nuxt` | `test/nuxt/**/*.test.ts` | `@nuxt/test-utils` (`environment: 'nuxt'`, happy-dom) | components & composables that need auto-imports / Nuxt UI / Pinia |
+
+- Unit tests use Node's native `fetch`/`Headers`/WebCrypto (browser-like);
+  happy-dom's own `Headers` keeps header-name case and breaks SigV4. Inject a
+  `fetch` into `S3Client`/`AdminClient` (`{ fetch }` option) or
+  `vi.stubGlobal('fetch', …)`. Unit tests import modules explicitly (no auto-imports).
+- Nuxt tests mount components with `mountSuspended(Component, { props, slots })`
+  from `@nuxt/test-utils/runtime` and may call composables directly (see
+  `test/nuxt/common-components.test.ts`, `test/nuxt/composables.test.ts`).
+  Overlays/modals are teleported; prefer testing their logic in plain modules.
+- Run one project: `pnpm vitest run --project unit` (or `nuxt`).
+- E2E: `pnpm test:e2e` (Playwright, `test/e2e/*.spec.ts`) builds the embedded
+  bundle and serves it via `test/e2e/serve.mjs`, which mocks `GET /_gos3/info`.
+  Extend the mock server there if your feature needs canned API responses.
+- All test files are type-checked by `pnpm typecheck` (`test/tsconfig.json`).

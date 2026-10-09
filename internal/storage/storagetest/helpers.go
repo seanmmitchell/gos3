@@ -101,14 +101,6 @@ func (e *env) wantErr(what string, err error, targets ...error) bool {
 	return true
 }
 
-// mustErr is wantErr but stops the test on mismatch.
-func (e *env) mustErr(what string, err error, targets ...error) {
-	e.t.Helper()
-	if !e.wantErr(what, err, targets...) {
-		e.t.FailNow()
-	}
-}
-
 // --- buckets ---
 
 func (e *env) mkBucket(name string) {

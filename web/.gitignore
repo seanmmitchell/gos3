@@ -1,0 +1,9 @@
+# Build output / caches (see also the repository root .gitignore)
+node_modules/
+.nuxt/
+.output/
+.data/
+dist
+*.tsbuildinfo
+test-results/
+playwright-report/

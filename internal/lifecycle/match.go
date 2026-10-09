@@ -7,14 +7,14 @@ import (
 	"time"
 )
 
-// ExpiryTime returns when an action configured with a number of days
+// Expiry returns when an action configured with a number of days
 // becomes due for something created (or made noncurrent, or initiated) at t:
 // S3 adds the days to t and rounds the result up to the following midnight
 // UTC. For example an object created 2014-01-15 10:30 UTC with a 3-day
 // expiration expires at 2014-01-19 00:00 UTC. Like S3 (and MinIO) the result
 // is always the midnight strictly after t+days, even when t+days is itself a
 // midnight. Negative days are treated as 0.
-func ExpiryTime(t time.Time, days int) time.Time {
+func Expiry(t time.Time, days int) time.Time {
 	if days < 0 {
 		days = 0
 	}
@@ -124,7 +124,7 @@ func (c *Configuration) CurrentExpiration(key string, tags map[string]string, si
 		}
 		var t time.Time
 		if e.Days != nil {
-			t = ExpiryTime(lastModified, *e.Days)
+			t = Expiry(lastModified, *e.Days)
 		} else {
 			t = e.Date.UTC()
 		}
@@ -152,7 +152,7 @@ func (c *Configuration) AbortDate(key string, initiated time.Time) (abort time.T
 			!strings.HasPrefix(key, r.KeyPrefix()) {
 			continue
 		}
-		t := ExpiryTime(initiated, *a.DaysAfterInitiation)
+		t := Expiry(initiated, *a.DaysAfterInitiation)
 		if !ok || t.Before(abort) {
 			abort, ruleID, ok = t, r.ID, true
 		}

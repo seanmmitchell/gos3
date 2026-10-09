@@ -1,0 +1,486 @@
+package admin
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"log/slog"
+	"net"
+	"net/http"
+	"path"
+	"strconv"
+	"strings"
+	"time"
+
+	"github.com/seanmmitchell/gos3/internal/auth"
+	"github.com/seanmmitchell/gos3/internal/discovery"
+	"github.com/seanmmitchell/gos3/internal/iam"
+	"github.com/seanmmitchell/gos3/internal/s3err"
+	"github.com/seanmmitchell/gos3/internal/storage"
+)
+
+// maxBodySize bounds JSON request bodies.
+const maxBodySize = 1 << 20
+
+// Error codes of the admin API (docs/admin-api.md "Errors").
+const (
+	codeInvalidRequest   = "InvalidRequest"
+	codeInvalidName      = "InvalidName"
+	codeInvalidPolicy    = "InvalidPolicy"
+	codeInvalidSettings  = "InvalidSettings"
+	codeUnauthenticated  = "Unauthenticated"
+	codeAccessDenied     = "AccessDenied"
+	codeNotFound         = "NotFound"
+	codeMethodNotAllowed = "MethodNotAllowed"
+	codeConflict         = "Conflict"
+	codeInternalError    = "InternalError"
+	codeProbeFailed      = "ProbeFailed"
+)
+
+// apiError is an error rendered as the admin JSON error envelope.
+type apiError struct {
+	Status  int
+	Code    string
+	Message string
+}
+
+func (e *apiError) Error() string { return e.Code + ": " + e.Message }
+
+func errorf(status int, code, format string, args ...any) *apiError {
+	msg := format
+	if len(args) > 0 {
+		msg = fmt.Sprintf(format, args...)
+	}
+	return &apiError{Status: status, Code: code, Message: msg}
+}
+
+func badRequest(format string, args ...any) *apiError {
+	return errorf(http.StatusBadRequest, codeInvalidRequest, format, args...)
+}
+
+func notFound(format string, args ...any) *apiError {
+	return errorf(http.StatusNotFound, codeNotFound, format, args...)
+}
+
+// reqCtx is the per-request state passed to endpoint handlers.
+type reqCtx struct {
+	r      *http.Request
+	ctx    context.Context
+	auth   *auth.Result
+	id     auth.Identity
+	action string // admin action, "" for endpoints open to any identity
+}
+
+// handlerFunc is an authenticated endpoint. It returns the HTTP status and
+// a value to encode as JSON (nil with 204), or an error.
+type handlerFunc func(rc *reqCtx) (status int, body any, err error)
+
+// route is one endpoint of the API.
+type route struct {
+	method string
+	path   string // relative to Prefix, Go ServeMux pattern syntax
+	action string // IAM action without the "admin:" prefix; "" = any identity
+	h      handlerFunc
+}
+
+// api is the admin API handler.
+type api struct {
+	d       Deps
+	log     *slog.Logger
+	mux     *http.ServeMux
+	started time.Time
+	now     func() time.Time
+
+	usage  *ttlCache[storage.BucketUsage] // per bucket
+	totals *ttlCache[storageTotals]       // key ""
+}
+
+// usageTTL is how long computed storage usage is cached.
+const usageTTL = 30 * time.Second
+
+// usageComputeTimeout bounds one (detached) usage computation.
+const usageComputeTimeout = 2 * time.Minute
+
+func newAPI(d Deps) *api {
+	if d.Backend == nil || d.Verifier == nil || d.IAM == nil || d.Settings == nil {
+		panic("admin: Deps.Backend, Verifier, IAM and Settings are required")
+	}
+	a := &api{d: d, log: d.Logger, now: time.Now}
+	if a.log == nil {
+		a.log = slog.Default()
+	}
+	a.started = a.now()
+	clock := func() time.Time { return a.now() }
+	a.usage = newTTLCache[storage.BucketUsage](usageTTL, usageComputeTimeout, clock)
+	a.totals = newTTLCache[storageTotals](usageTTL, usageComputeTimeout, clock)
+	a.mux = http.NewServeMux()
+	a.register(a.routes())
+	return a
+}
+
+// routes lists every endpoint (docs/admin-api.md).
+func (a *api) routes() []route {
+	return []route{
+		// Identity
+		{"GET", "/whoami", "", a.whoami},
+		{"GET", "/whoami/keys", "", a.listOwnKeys},
+		{"POST", "/whoami/keys", "", a.createOwnKey},
+		{"DELETE", "/whoami/keys/{accessKey}", "", a.deleteOwnKey},
+		// Server
+		{"GET", "/info", "ServerInfo", a.serverInfo},
+		{"GET", "/stats", "GetStats", a.stats},
+		{"GET", "/config", "GetConfig", a.getConfig},
+		{"PUT", "/config", "UpdateConfig", a.putConfig},
+		// Users & access keys
+		{"GET", "/users", "ListUsers", a.listUsers},
+		{"POST", "/users", "CreateUser", a.createUser},
+		{"GET", "/users/{name}", "GetUser", a.getUser},
+		{"PATCH", "/users/{name}", "UpdateUser", a.updateUser},
+		{"DELETE", "/users/{name}", "DeleteUser", a.deleteUser},
+		{"POST", "/users/{name}/keys", "CreateAccessKey", a.createAccessKey},
+		{"PATCH", "/keys/{accessKey}", "UpdateAccessKey", a.updateAccessKey},
+		{"DELETE", "/keys/{accessKey}", "DeleteAccessKey", a.deleteAccessKey},
+		// Policies
+		{"GET", "/policies", "ListPolicies", a.listPolicies},
+		{"GET", "/policies/{name}", "GetPolicy", a.getPolicy},
+		{"PUT", "/policies/{name}", "PutPolicy", a.putPolicy},
+		{"DELETE", "/policies/{name}", "DeletePolicy", a.deletePolicy},
+		{"POST", "/authz/simulate", "SimulatePolicy", a.simulate},
+		// Buckets
+		{"GET", "/buckets", "ListBuckets", a.listBuckets},
+		{"GET", "/buckets/{name}", "GetBucket", a.getBucket},
+		{"DELETE", "/buckets/{name}", "ForceDeleteBucket", a.deleteBucket},
+		// Discovery
+		{"GET", "/discovery", "GetDiscovery", a.getDiscovery},
+		{"POST", "/discovery/probe", "GetDiscovery", a.probe},
+		{"POST", "/discovery/scan", "ScanNetwork", a.scan},
+	}
+}
+
+// register installs the routes on the mux. Every path additionally gets a
+// method-less pattern answering 405 with the Allow header (more specific
+// method patterns win), and Prefix+"/" catches unknown paths with a JSON 404.
+func (a *api) register(routes []route) {
+	allowed := map[string][]string{}
+	var order []string
+	for _, rt := range routes {
+		a.mux.Handle(rt.method+" "+Prefix+rt.path, a.endpoint(rt))
+		if _, ok := allowed[rt.path]; !ok {
+			order = append(order, rt.path)
+		}
+		allowed[rt.path] = append(allowed[rt.path], rt.method)
+	}
+	for _, p := range order {
+		methods := allowed[p]
+		for _, m := range methods {
+			if m == http.MethodGet {
+				methods = append(methods, http.MethodHead)
+				break
+			}
+		}
+		allow := strings.Join(append(methods, http.MethodOptions), ", ")
+		a.mux.HandleFunc(Prefix+p, func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Allow", allow)
+			writeError(w, errorf(http.StatusMethodNotAllowed, codeMethodNotAllowed,
+				"method %s is not allowed on %s (allowed: %s)", r.Method, r.URL.Path, allow))
+		})
+	}
+	a.mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		writeError(w, notFound("unknown admin API path %s", r.URL.Path))
+	})
+}
+
+// ServeHTTP implements http.Handler.
+func (a *api) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	defer func() {
+		if v := recover(); v != nil {
+			if v == http.ErrAbortHandler {
+				panic(v)
+			}
+			a.log.Error("admin: panic serving request", "method", r.Method, "path", r.URL.Path, "panic", v)
+			writeError(w, errorf(http.StatusInternalServerError, codeInternalError, "internal server error"))
+		}
+	}()
+	w.Header().Set("Cache-Control", "no-store")
+	w.Header().Set("X-Content-Type-Options", "nosniff")
+
+	cors := a.d.Settings.Get().CORS
+	if r.Method == http.MethodOptions {
+		a.preflight(w, r, cors)
+		return
+	}
+	applyCORS(w, r, cors)
+
+	p := r.URL.Path
+	if p != Prefix && !strings.HasPrefix(p, Prefix+"/") {
+		writeError(w, notFound("unknown admin API path %s", p))
+		return
+	}
+	// Reject non-canonical paths ourselves: the mux would answer them with a
+	// (non-JSON) redirect.
+	if cleaned := path.Clean(p); cleaned != p && cleaned+"/" != p {
+		writeError(w, notFound("unknown admin API path %s", p))
+		return
+	}
+	a.mux.ServeHTTP(w, r)
+}
+
+// endpoint wraps a route with authentication, authorization and response
+// rendering.
+func (a *api) endpoint(rt route) http.Handler {
+	action := ""
+	if rt.action != "" {
+		action = "admin:" + rt.action
+	}
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		res, err := a.d.Verifier.Authenticate(r)
+		if err != nil {
+			e := s3err.As(err)
+			writeError(w, errorf(http.StatusUnauthorized, codeUnauthenticated, "%s: %s", e.Code, e.Message))
+			return
+		}
+		if res.Body != nil {
+			defer res.Body.Close()
+		}
+		if res.Identity.IsAnonymous {
+			writeError(w, errorf(http.StatusUnauthorized, codeUnauthenticated,
+				"AccessDenied: anonymous requests are not allowed; sign the request with AWS Signature Version 4"))
+			return
+		}
+		rc := &reqCtx{r: r, ctx: r.Context(), auth: res, id: res.Identity, action: action}
+		if action != "" {
+			dec := a.authorize(rc, action)
+			if !dec.Allowed {
+				writeError(w, errorf(http.StatusForbidden, codeAccessDenied,
+					"%s is not allowed to perform %s", describeIdentity(rc.id), action))
+				return
+			}
+		}
+		status, body, err := rt.h(rc)
+		if err != nil {
+			ae := a.toAPIError(err)
+			if ae.Status >= 500 {
+				a.log.Error("admin: request failed", "method", r.Method, "path", r.URL.Path,
+					"user", rc.id.User, "err", err)
+			}
+			writeError(w, ae)
+			return
+		}
+		if status == http.StatusNoContent || body == nil {
+			if status == 0 {
+				status = http.StatusNoContent
+			}
+			w.WriteHeader(status)
+			return
+		}
+		writeJSON(w, status, body)
+	})
+}
+
+// authorize evaluates an admin action for the request's identity.
+func (a *api) authorize(rc *reqCtx, action string) iam.Decision {
+	return a.d.IAM.Authorize(rc.ctx, iam.AuthzRequest{
+		Identity:   rc.id,
+		Action:     action,
+		Conditions: requestConditions(rc.r),
+	})
+}
+
+// requestConditions builds the IAM condition context of a request.
+func requestConditions(r *http.Request) map[string][]string {
+	c := map[string][]string{
+		"aws:SecureTransport": {strconv.FormatBool(r.TLS != nil)},
+	}
+	if host, _, err := net.SplitHostPort(r.RemoteAddr); err == nil {
+		c["aws:SourceIp"] = []string{host}
+	} else if r.RemoteAddr != "" {
+		c["aws:SourceIp"] = []string{r.RemoteAddr}
+	}
+	if ua := r.UserAgent(); ua != "" {
+		c["aws:UserAgent"] = []string{ua}
+	}
+	if ref := r.Referer(); ref != "" {
+		c["aws:Referer"] = []string{ref}
+	}
+	return c
+}
+
+func describeIdentity(id auth.Identity) string {
+	switch {
+	case id.IsAnonymous:
+		return "anonymous"
+	case id.IsRoot:
+		return "root"
+	case id.User != "":
+		return "user " + strconv.Quote(id.User)
+	}
+	return "access key " + strconv.Quote(id.AccessKey)
+}
+
+// toAPIError maps handler errors (iam, storage, s3err, context) to the
+// admin error envelope.
+func (a *api) toAPIError(err error) *apiError {
+	var ae *apiError
+	if errors.As(err, &ae) {
+		return ae
+	}
+	msg := strings.TrimPrefix(err.Error(), "iam: ")
+	msg = strings.TrimPrefix(msg, "storage: ")
+	switch {
+	// iam (order matters: some errors wrap others)
+	case errors.Is(err, iam.ErrUserNotFound), errors.Is(err, iam.ErrKeyNotFound), errors.Is(err, iam.ErrPolicyNotFound):
+		return errorf(http.StatusNotFound, codeNotFound, "%s", msg)
+	case errors.Is(err, iam.ErrUserExists), errors.Is(err, iam.ErrPolicyInUse):
+		return errorf(http.StatusConflict, codeConflict, "%s", msg)
+	case errors.Is(err, iam.ErrInvalidName):
+		return errorf(http.StatusBadRequest, codeInvalidName, "%s", msg)
+	case errors.Is(err, iam.ErrInvalidPolicy):
+		return errorf(http.StatusBadRequest, codeInvalidPolicy, "%s", msg)
+	case errors.Is(err, iam.ErrTooManyKeys), errors.Is(err, iam.ErrPolicyBuiltin), errors.Is(err, iam.ErrRootImmutable):
+		return errorf(http.StatusBadRequest, codeInvalidRequest, "%s", msg)
+	// storage
+	case errors.Is(err, storage.ErrBucketNotFound):
+		return errorf(http.StatusNotFound, codeNotFound, "%s", msg)
+	case errors.Is(err, storage.ErrBucketNotEmpty):
+		return errorf(http.StatusConflict, codeConflict, "%s", msg)
+	case errors.Is(err, storage.ErrInvalidName):
+		return errorf(http.StatusBadRequest, codeInvalidName, "%s", msg)
+	case errors.Is(err, context.Canceled), errors.Is(err, context.DeadlineExceeded):
+		return errorf(http.StatusServiceUnavailable, codeInternalError, "request canceled or timed out: %s", msg)
+	}
+	var se *s3err.Error
+	if errors.As(err, &se) && se.HTTPStatus >= 400 && se.HTTPStatus < 500 {
+		return errorf(http.StatusBadRequest, codeInvalidRequest, "%s: %s", se.Code, se.Message)
+	}
+	return errorf(http.StatusInternalServerError, codeInternalError, "%s", msg)
+}
+
+// errorBody is the JSON error envelope.
+type errorBody struct {
+	Error errorDetail `json:"error"`
+}
+
+type errorDetail struct {
+	Code    string `json:"code"`
+	Message string `json:"message"`
+}
+
+func writeError(w http.ResponseWriter, e *apiError) {
+	writeJSON(w, e.Status, errorBody{Error: errorDetail{Code: e.Code, Message: e.Message}})
+}
+
+// writeJSON encodes v (fully, before writing headers) and sends it.
+func writeJSON(w http.ResponseWriter, status int, v any) {
+	var buf bytes.Buffer
+	enc := json.NewEncoder(&buf)
+	enc.SetEscapeHTML(false)
+	if err := enc.Encode(v); err != nil {
+		buf.Reset()
+		status = http.StatusInternalServerError
+		_ = json.NewEncoder(&buf).Encode(errorBody{Error: errorDetail{
+			Code: codeInternalError, Message: "encoding response: " + err.Error(),
+		}})
+	}
+	h := w.Header()
+	h.Set("Content-Type", "application/json; charset=utf-8")
+	h.Set("Content-Length", strconv.Itoa(buf.Len()))
+	w.WriteHeader(status)
+	_, _ = w.Write(buf.Bytes())
+}
+
+// readBody reads the (verified) request body, bounded by maxBodySize.
+// Signature / payload hash failures surface here (auth verifies at EOF).
+func (rc *reqCtx) readBody() ([]byte, error) {
+	if rc.auth == nil || rc.auth.Body == nil {
+		return nil, nil
+	}
+	data, err := io.ReadAll(io.LimitReader(rc.auth.Body, maxBodySize+1))
+	if err != nil {
+		var se *s3err.Error
+		if errors.As(err, &se) {
+			if se.Code == s3err.ErrSignatureDoesNotMatch.Code {
+				return nil, errorf(http.StatusUnauthorized, codeUnauthenticated, "%s: %s", se.Code, se.Message)
+			}
+			return nil, badRequest("%s: %s", se.Code, se.Message)
+		}
+		return nil, badRequest("reading request body: %v", err)
+	}
+	if len(data) > maxBodySize {
+		return nil, badRequest("request body exceeds %d bytes", maxBodySize)
+	}
+	return data, nil
+}
+
+// decodeBody strictly decodes a JSON body into v (unknown fields and
+// trailing data are rejected). An empty body is an error unless optional.
+func (rc *reqCtx) decodeBody(v any, optional bool) error {
+	data, err := rc.readBody()
+	if err != nil {
+		return err
+	}
+	if len(bytes.TrimSpace(data)) == 0 {
+		if optional {
+			return nil
+		}
+		return badRequest("request body is required")
+	}
+	return decodeStrict(data, v)
+}
+
+func decodeStrict(data []byte, v any) error {
+	dec := json.NewDecoder(bytes.NewReader(data))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(v); err != nil {
+		return badRequest("invalid JSON body: %s", jsonErrorMessage(err))
+	}
+	if _, err := dec.Token(); err != io.EOF {
+		return badRequest("invalid JSON body: unexpected data after the JSON value")
+	}
+	return nil
+}
+
+func jsonErrorMessage(err error) string {
+	var te *json.UnmarshalTypeError
+	if errors.As(err, &te) {
+		if te.Field != "" {
+			return fmt.Sprintf("field %q must be of type %s", te.Field, te.Type)
+		}
+		return fmt.Sprintf("value must be of type %s", te.Type)
+	}
+	var se *json.SyntaxError
+	if errors.As(err, &se) {
+		return fmt.Sprintf("%v (at offset %d)", se, se.Offset)
+	}
+	if errors.Is(err, io.ErrUnexpectedEOF) {
+		return "unexpected end of JSON input"
+	}
+	return strings.TrimPrefix(err.Error(), "json: ")
+}
+
+// queryBool parses an optional boolean query parameter.
+func queryBool(r *http.Request, name string) (bool, error) {
+	v := r.URL.Query().Get(name)
+	if v == "" {
+		return false, nil
+	}
+	b, err := strconv.ParseBool(v)
+	if err != nil {
+		return false, badRequest("query parameter %q must be a boolean, got %q", name, v)
+	}
+	return b, nil
+}
+
+// info returns this server's identity document (zero value when unset).
+func (a *api) info() discovery.Info {
+	if a.d.Info == nil {
+		return discovery.Info{Service: discovery.ServiceName, APIVersion: "v1", Features: []string{}}
+	}
+	inf := a.d.Info()
+	if inf.Features == nil {
+		inf.Features = []string{}
+	}
+	return inf
+}

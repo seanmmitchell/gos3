@@ -374,16 +374,48 @@ func (b *Backend) removeUploadDir(uploadID string) {
 	}
 }
 
+// completeRetries bounds how often CompleteMultipartUpload starts over
+// when a listed part is re-uploaded while its data is being copied.
+const completeRetries = 4
+
+// afterPartsCopied, when non-nil, runs after CompleteMultipartUpload copied
+// the parts and before it commits (tests use it to inject races).
+var afterPartsCopied func(uploadID string)
+
+// errPartsChanged reports that a part was replaced during completion.
+var errPartsChanged = errors.New("fs: multipart upload parts changed during completion")
+
 // CompleteMultipartUpload concatenates the listed parts into a new object
 // version (committed like ObjectWriter.Commit) and removes the upload with
 // all its parts. If the commit fails (e.g. preconditions) the upload is
 // kept, so the client may retry.
+//
+// The commit transaction verifies that every listed part still refers to the
+// file that was copied; if a part was re-uploaded concurrently the
+// completion starts over (a bounded number of times), so the committed
+// object always consists of the parts current at commit time.
 func (b *Backend) CompleteMultipartUpload(ctx context.Context, bucket, key, uploadID string, partNumbers []int, meta storage.ObjectMeta, opts storage.CommitOptions) (storage.ObjectInfo, error) {
-	if err := b.begin(ctx); err != nil {
-		return storage.ObjectInfo{}, err
-	}
 	if ctx == nil {
 		ctx = context.Background()
+	}
+	for attempt := 1; ; attempt++ {
+		info, err := b.completeOnce(ctx, bucket, key, uploadID, partNumbers, meta, opts)
+		if errors.Is(err, errPartsChanged) && attempt < completeRetries {
+			continue
+		}
+		if errors.Is(err, errPartsChanged) {
+			return storage.ObjectInfo{}, fmt.Errorf("fs: complete upload %q: %w (too much contention)", uploadID, err)
+		}
+		return info, err
+	}
+}
+
+// completeOnce is one attempt of CompleteMultipartUpload. It returns
+// errPartsChanged when a listed part was replaced or vanished while the
+// upload still exists.
+func (b *Backend) completeOnce(ctx context.Context, bucket, key, uploadID string, partNumbers []int, meta storage.ObjectMeta, opts storage.CommitOptions) (storage.ObjectInfo, error) {
+	if err := b.begin(ctx); err != nil {
+		return storage.ObjectInfo{}, err
 	}
 	// Resolve the parts and fail fast on preconditions before copying data.
 	var (
@@ -392,6 +424,7 @@ func (b *Backend) CompleteMultipartUpload(ctx context.Context, bucket, key, uplo
 		sizes    []int64
 	)
 	err := b.view(func(tx *bbolt.Tx) error {
+		files, sizes = files[:0], sizes[:0]
 		br, bb, err := loadBucket(tx, bucket)
 		if err != nil {
 			return err
@@ -429,9 +462,10 @@ func (b *Backend) CompleteMultipartUpload(ctx context.Context, bucket, key, uplo
 	for i, file := range files {
 		if err := b.appendPart(ctx, t, uploadID, file, sizes[i], partNumbers[i]); err != nil {
 			t.discard()
-			if errors.Is(err, storage.ErrPartNotFound) {
-				// The part file vanished: report a concurrent abort or
-				// completion as such.
+			if errors.Is(err, errPartsChanged) {
+				// The part file vanished: the part was replaced (retry) or
+				// the upload was aborted or completed concurrently (report
+				// that instead).
 				if _, gerr := b.GetMultipartUpload(ctx, bucket, key, uploadID); gerr != nil {
 					return storage.ObjectInfo{}, gerr
 				}
@@ -446,6 +480,9 @@ func (b *Backend) CompleteMultipartUpload(ctx context.Context, bucket, key, uplo
 	if path != "" {
 		defer b.pending.done(path)
 	}
+	if afterPartsCopied != nil {
+		afterPartsCopied(uploadID)
+	}
 	info, err := b.commitObject(commitReq{
 		bucket:   bucket,
 		bucketID: bucketID,
@@ -457,6 +494,20 @@ func (b *Backend) CompleteMultipartUpload(ctx context.Context, bucket, key, uplo
 		pre: func(tx *bbolt.Tx, bb *bbolt.Bucket) error {
 			if _, err := loadUpload(bb, key, uploadID); err != nil {
 				return err
+			}
+			parts := bb.Bucket(subParts)
+			for i, n := range partNumbers {
+				v := parts.Get(partKey(uploadID, n))
+				if v == nil {
+					return fmt.Errorf("%w: part %d of upload %q", storage.ErrPartNotFound, n, uploadID)
+				}
+				var rec partRecord
+				if err := decodeRecord(v, &rec); err != nil {
+					return err
+				}
+				if rec.File != files[i] {
+					return errPartsChanged
+				}
 			}
 			return deleteUploadTx(tx, bb, uploadID)
 		},
@@ -478,8 +529,8 @@ func (b *Backend) appendPart(ctx context.Context, t *tmpFile, uploadID, file str
 	f, err := os.Open(b.partPath(uploadID, file))
 	if err != nil {
 		if errors.Is(err, iofs.ErrNotExist) {
-			// Replaced or aborted concurrently.
-			return fmt.Errorf("%w: part %d of upload %q changed during completion", storage.ErrPartNotFound, n, uploadID)
+			// Replaced, aborted or completed concurrently.
+			return fmt.Errorf("%w: part %d vanished", errPartsChanged, n)
 		}
 		return fmt.Errorf("fs: open part %d: %w", n, err)
 	}

@@ -116,24 +116,24 @@ watch(() => connection.value?.id, (id) => {
       <template #default="{ collapsed: isCollapsed }">
         <LayoutServerSwitcher :collapsed="isCollapsed" />
 
-        <nav aria-label="Server navigation">
-          <UNavigationMenu
-            v-if="serverItems.length"
-            :collapsed="isCollapsed"
-            :items="serverItems"
-            orientation="vertical"
-            tooltip
-          />
-        </nav>
+        <!-- UNavigationMenu renders its own <nav>; aria-label falls through to it. -->
+        <UNavigationMenu
+          v-if="serverItems.length"
+          aria-label="Server navigation"
+          :collapsed="isCollapsed"
+          :items="serverItems"
+          orientation="vertical"
+          tooltip
+        />
 
-        <nav aria-label="Global navigation" class="mt-auto">
-          <UNavigationMenu
-            :collapsed="isCollapsed"
-            :items="globalItems"
-            orientation="vertical"
-            tooltip
-          />
-        </nav>
+        <UNavigationMenu
+          aria-label="Global navigation"
+          class="mt-auto"
+          :collapsed="isCollapsed"
+          :items="globalItems"
+          orientation="vertical"
+          tooltip
+        />
       </template>
 
       <template #footer="{ collapsed: isCollapsed }">

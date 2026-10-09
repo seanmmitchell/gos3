@@ -11,6 +11,9 @@ package discovery
 import (
 	"context"
 	"log/slog"
+	"net"
+	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -138,52 +141,177 @@ type ScanResult struct {
 	Elapsed string `json:"elapsed"`
 }
 
-// Service runs discovery.
+// Service runs discovery. It is safe for concurrent use.
 type Service struct {
-	cfg    Config
 	self   func() Info
 	logger *slog.Logger
+
+	// Replaceable in tests.
+	now        func() time.Time
+	lookupSRV  func(ctx context.Context, service, proto, name string) (string, []*net.SRV, error)
+	openBeacon func(group *net.UDPAddr, o beaconOptions) (*beacon, error)
+
+	prober   *prober
+	table    *peerTable
+	probeQ   chan candidate
+	throttle *throttle
+
+	multicastWarned atomic.Bool
+	mdnsWarned      atomic.Bool
+
+	mu  sync.RWMutex // guards cfg
+	cfg Config
+
+	life       sync.Mutex // serialises Start/Stop/Reconfigure
+	running    bool
+	rootCtx    context.Context
+	rootCancel context.CancelFunc
+	mechs      map[string]*mechanism
 }
 
 // New creates a discovery service. self returns this server's current Info
-// (used for advertising and to recognise/ignore our own announcements).
+// (used for advertising and to recognise/ignore our own announcements); it
+// may be nil for a pure browser. A nil logger means slog.Default().
 //
-// CONTRACT STUB.
+// The configuration is validated by Start and Reconfigure (see
+// Config.Validate); zero values select defaults.
 func New(cfg Config, self func() Info, logger *slog.Logger) *Service {
 	if logger == nil {
 		logger = slog.Default()
 	}
-	return &Service{cfg: cfg, self: self, logger: logger}
+	e := resolve(cfg)
+	s := &Service{
+		self:     self,
+		logger:   logger.With("component", "discovery"),
+		now:      time.Now,
+		prober:   newProber(),
+		table:    newPeerTable(e.ttl),
+		probeQ:   make(chan candidate, probeQueueSize),
+		throttle: newThrottle(candidateThrottle),
+		cfg:      cloneConfig(cfg),
+	}
+	s.lookupSRV = net.DefaultResolver.LookupSRV
+	s.openBeacon = func(group *net.UDPAddr, o beaconOptions) (*beacon, error) {
+		return openBeacon(group, o, s.multicastFailed)
+	}
+	s.table.configure(e.ttl, e.seeds)
+	return s
 }
 
 // Start begins advertising/browsing according to the config. It returns once
 // listeners are set up; background work stops when ctx is done or Stop is
 // called. Failures of individual mechanisms (e.g. multicast unavailable) are
-// logged, not fatal. CONTRACT STUB.
-func (s *Service) Start(ctx context.Context) error { return nil }
+// logged, not fatal; an invalid configuration is returned as an error.
+// Start is idempotent while running.
+func (s *Service) Start(ctx context.Context) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	s.life.Lock()
+	defer s.life.Unlock()
+	if s.running {
+		if s.rootCtx.Err() == nil {
+			return nil
+		}
+		s.stopLocked() // previous context ended; start afresh
+	}
+	cfg := s.Config()
+	if err := cfg.Validate(); err != nil {
+		return err
+	}
+	s.rootCtx, s.rootCancel = context.WithCancel(ctx)
+	s.running = true
+	s.mechs = make(map[string]*mechanism)
+	s.applyLocked(resolve(cfg))
+	return nil
+}
 
-// Stop stops all background work and withdraws mDNS advertisements.
-func (s *Service) Stop() {}
+// Stop stops all background work, sends a beacon bye, withdraws mDNS
+// advertisements and waits for every goroutine to exit. It is idempotent.
+// The peer table is kept.
+func (s *Service) Stop() {
+	s.life.Lock()
+	defer s.life.Unlock()
+	s.stopLocked()
+}
 
-// Reconfigure applies a new configuration (restarting mechanisms as needed).
-// CONTRACT STUB.
-func (s *Service) Reconfigure(cfg Config) error { s.cfg = cfg; return nil }
+// Reconfigure validates and applies a new configuration, restarting only the
+// mechanisms whose settings changed. When the service is not running the
+// configuration is stored for the next Start.
+func (s *Service) Reconfigure(cfg Config) error {
+	if err := cfg.Validate(); err != nil {
+		return err
+	}
+	s.life.Lock()
+	defer s.life.Unlock()
+	s.mu.Lock()
+	s.cfg = cloneConfig(cfg)
+	s.mu.Unlock()
+	e := resolve(cfg)
+	s.table.configure(e.ttl, e.seeds)
+	if s.running && s.rootCtx.Err() == nil {
+		s.applyLocked(e)
+	}
+	return nil
+}
 
 // Config returns the active configuration.
-func (s *Service) Config() Config { return s.cfg }
+func (s *Service) Config() Config {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return cloneConfig(s.cfg)
+}
 
-// Peers returns currently known peers (excluding this server), sorted by Name then ID.
-// CONTRACT STUB.
-func (s *Service) Peers() []Peer { return nil }
+// Peers returns currently known peers (excluding this server), sorted by Name
+// then ID. Expired peers are dropped first.
+func (s *Service) Peers() []Peer {
+	s.table.expire(s.now())
+	return s.table.snapshot(s.selfID())
+}
 
 // Probe fetches GET <baseURL>/_gos3/info and returns the peer it describes,
-// adding it to the peer table with SourceProbe. CONTRACT STUB.
+// adding it to the peer table with SourceProbe. baseURL is normalised with
+// NormalizeBaseURL ("nas:9000" → "http://nas:9000"). Without a deadline on
+// ctx the probe times out after 5 s. Probing this server itself returns its
+// peer view without adding it to the table. Errors wrap ErrInvalidURL,
+// ErrNotGos3 or the transport error.
 func (s *Service) Probe(ctx context.Context, baseURL string) (Peer, error) {
-	return Peer{}, context.Canceled
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	u, err := NormalizeBaseURL(baseURL)
+	if err != nil {
+		return Peer{}, err
+	}
+	pctx, cancel := withDefaultTimeout(ctx, defaultProbeTimeout)
+	defer cancel()
+	info, err := s.prober.fetch(pctx, u)
+	now := s.now()
+	if err != nil {
+		for _, id := range s.table.findByAddr(u) {
+			s.table.probeFailed(id, err.Error(), now)
+		}
+		return Peer{}, err
+	}
+	selfID := s.selfID()
+	if info.ID != selfID {
+		if p, ok := s.table.observeInfo(info, u, SourceProbe, now, selfID); ok {
+			return p, nil
+		}
+	}
+	return peerFromInfo(info, u, SourceProbe, now), nil
 }
 
 // Scan actively probes targets and adds found servers with SourceScan.
-// CONTRACT STUB.
+//
+// Targets are expanded as described on ScanRequest (CIDRs skip network and
+// broadcast addresses for IPv4 prefixes up to /30; base URLs are probed as
+// given) × Ports × Schemes. The number of hosts is bounded by
+// Config.MaxScanHosts (ErrTooManyHosts); malformed requests yield
+// ErrInvalidScan and a disabled scan (Config.AllowScan false) ErrScanDisabled.
+// Found peers are de-duplicated by ID, exclude this server, and are sorted by
+// Name then ID. When ctx is cancelled the partial result is returned with
+// ctx.Err().
 func (s *Service) Scan(ctx context.Context, req ScanRequest) (ScanResult, error) {
-	return ScanResult{}, nil
+	return s.scan(ctx, req)
 }

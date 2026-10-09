@@ -75,8 +75,8 @@ type Configuration struct {
 }
 
 // Rule is one lifecycle rule. Exactly one of Filter and the deprecated
-// top-level Prefix may be set; when both are nil the rule applies to every
-// object in the bucket.
+// top-level Prefix must be set (Validate enforces it); an empty Filter or an
+// empty Prefix applies the rule to every object in the bucket.
 type Rule struct {
 	ID     string  `xml:"ID,omitempty"`
 	Filter *Filter `xml:"Filter"`
@@ -339,7 +339,9 @@ func (r *Rule) validate() error {
 	if r.Status != StatusEnabled && r.Status != StatusDisabled {
 		return s3err.ErrMalformedXML
 	}
-	if r.Filter != nil && r.Prefix != nil {
+	// Exactly one of Filter and the legacy Prefix is required (an empty
+	// <Filter/> or <Prefix/> selects every object).
+	if (r.Filter == nil) == (r.Prefix == nil) {
 		return s3err.ErrMalformedXML
 	}
 	if r.Filter != nil {

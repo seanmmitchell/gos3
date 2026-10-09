@@ -158,4 +158,8 @@ var (
 	ErrNoSuchPublicAccessBlockConfiguration = def("NoSuchPublicAccessBlockConfiguration", http.StatusNotFound, "The public access block configuration was not found.")
 	ErrInvalidToken                         = def("InvalidToken", http.StatusBadRequest, "The provided token is malformed or otherwise invalid.")
 	ErrMalformedTrailer                     = def("MalformedTrailerError", http.StatusBadRequest, "The request contained trailing data that was not well-formed or did not conform to our published schema.")
+	// ErrCORSForbidden is returned for CORS preflight requests that match no rule.
+	ErrCORSForbidden = def("AccessForbidden", http.StatusForbidden, "CORSResponse: This CORS request is not allowed. This is usually because the evalution of Origin, request method / Access-Control-Request-Method or Access-Control-Request-Headers are not whitelisted by the resource's CORS spec.")
+	// ErrBadRequest is a generic 400 (e.g. CORS preflight without Origin).
+	ErrBadRequest = def("BadRequest", http.StatusBadRequest, "Bad Request")
 )
