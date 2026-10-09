@@ -11,6 +11,7 @@ package iam
 import (
 	"context"
 	"errors"
+	"sync"
 	"time"
 
 	"github.com/seanmmitchell/gos3/internal/auth"
@@ -124,20 +125,30 @@ type NamedPolicy struct {
 
 // ParsePolicy parses and validates an identity policy document.
 // Errors wrap ErrInvalidPolicy with a human readable reason.
-//
-// CONTRACT STUB.
 func ParsePolicy(data []byte) (*PolicyDocument, error) {
-	return nil, ErrInvalidPolicy
+	doc, reason := decodePolicy(data)
+	if reason == "" {
+		reason = validateIdentityPolicy(doc)
+	}
+	if reason != "" {
+		return nil, wrapf(ErrInvalidPolicy, reason)
+	}
+	return doc, nil
 }
 
 // ParseBucketPolicy parses and validates a bucket policy for bucket: every
 // statement needs a Principal, and resources must refer to the bucket
 // (arn:aws:s3:::bucket or arn:aws:s3:::bucket/...). Returns
 // s3err.ErrMalformedPolicy (with a descriptive message) on failure.
-//
-// CONTRACT STUB.
 func ParseBucketPolicy(data []byte, bucket string) (*PolicyDocument, error) {
-	return nil, s3err.ErrMalformedPolicy
+	doc, reason := decodePolicy(data)
+	if reason == "" {
+		reason = validateBucketPolicy(doc, bucket)
+	}
+	if reason != "" {
+		return nil, s3err.ErrMalformedPolicy.WithMessage("%s", reason)
+	}
+	return doc, nil
 }
 
 // AuthzRequest is an authorization question.
@@ -189,71 +200,110 @@ type Options struct {
 }
 
 // Manager is the IAM service. It implements auth.CredentialProvider.
+//
+// All methods are safe for concurrent use. State is kept in memory and, when
+// Options.Dir is set, written synchronously to <Dir>/iam.json on every
+// mutation. iam.json contains secret access keys (they are needed to verify
+// SigV4 signatures) and must be treated as sensitive: it is created with mode
+// 0600 and should be backed up and stored accordingly.
 type Manager struct {
 	opts Options
+	path string // iam.json path; "" when in-memory
+
+	mu sync.RWMutex
+	st *state // copy-on-write: replaced wholesale by mutations
 }
 
 var _ auth.CredentialProvider = (*Manager)(nil)
 
 // Open loads (or initializes) IAM state.
-//
-// CONTRACT STUB.
-func Open(opts Options) (*Manager, error) { return &Manager{opts: opts}, nil }
+func Open(opts Options) (*Manager, error) { return open(opts) }
 
-// Close flushes state.
+// Close flushes state. Writes are synchronous, so Close only exists for
+// symmetry; it is idempotent and always returns nil.
 func (m *Manager) Close() error { return nil }
 
-// LookupCredentials implements auth.CredentialProvider. CONTRACT STUB.
+// LookupCredentials implements auth.CredentialProvider.
 func (m *Manager) LookupCredentials(accessKey string) (string, auth.Identity, error) {
-	return "", auth.Identity{}, s3err.ErrInvalidAccessKeyID
+	return m.lookupCredentials(accessKey)
 }
 
 // Authorize evaluates req following AWS semantics: root is always allowed;
 // an explicit Deny in the identity's policies or the bucket policy denies;
 // otherwise an Allow from any identity policy, the bucket policy (principal
 // match, incl. "*" for anonymous) or a canned ACL allows; default deny.
-//
-// CONTRACT STUB.
 func (m *Manager) Authorize(ctx context.Context, req AuthzRequest) Decision {
-	return Decision{Reason: "not implemented"}
+	return m.authorize(req)
 }
 
-// Users. CONTRACT STUBS.
-func (m *Manager) ListUsers(ctx context.Context) ([]User, error) { return nil, nil }
+// ListUsers returns all users sorted by name (secrets are never included).
+func (m *Manager) ListUsers(ctx context.Context) ([]User, error) { return m.listUsers(ctx) }
+
+// GetUser returns one user (secrets are never included).
 func (m *Manager) GetUser(ctx context.Context, name string) (User, error) {
-	return User{}, ErrUserNotFound
+	return m.getUser(ctx, name)
 }
+
+// CreateUser creates a user. Names must match [A-Za-z0-9+=,.@_-]{1,64};
+// "root" and "anonymous" are reserved. All policies must exist.
 func (m *Manager) CreateUser(ctx context.Context, spec UserSpec) (User, error) {
-	return User{}, ErrInvalidName
+	return m.createUser(ctx, spec)
 }
+
+// UpdateUser updates a user; nil fields of u are left unchanged.
 func (m *Manager) UpdateUser(ctx context.Context, name string, u UserUpdate) (User, error) {
-	return User{}, ErrUserNotFound
+	return m.updateUser(ctx, name, u)
 }
-func (m *Manager) DeleteUser(ctx context.Context, name string) error { return ErrUserNotFound }
 
-// Access keys. CreateAccessKey returns the secret (only time it is exposed).
-// accessKey/secretKey may be supplied by the caller (empty = generate:
-// 20-char uppercase alnum access key, 40-char base64url-ish secret). CONTRACT STUBS.
+// DeleteUser deletes a user and all of its access keys.
+func (m *Manager) DeleteUser(ctx context.Context, name string) error { return m.deleteUser(ctx, name) }
+
+// CreateAccessKey creates an access key for user and returns it including
+// the secret (the only time it is exposed). accessKey/secretKey may be
+// supplied by the caller (empty = generate: 20-char uppercase alnum access
+// key, 40-char URL-safe secret). Caller supplied access keys must be 3..128
+// characters of [A-Za-z0-9._-] and secrets 8..128 printable ASCII
+// characters. A user may have at most 10 keys.
 func (m *Manager) CreateAccessKey(ctx context.Context, user, description, accessKey, secretKey string) (AccessKey, error) {
-	return AccessKey{}, ErrUserNotFound
+	return m.createAccessKey(ctx, user, description, accessKey, secretKey)
 }
-func (m *Manager) UpdateAccessKey(ctx context.Context, accessKey, status string) error {
-	return ErrKeyNotFound
-}
-func (m *Manager) DeleteAccessKey(ctx context.Context, accessKey string) error { return ErrKeyNotFound }
 
-// Policies. Built-ins are listed with Builtin=true and are read-only. CONTRACT STUBS.
-func (m *Manager) ListPolicies(ctx context.Context) ([]NamedPolicy, error) { return nil, nil }
+// UpdateAccessKey sets the status (KeyActive or KeyInactive) of a key.
+func (m *Manager) UpdateAccessKey(ctx context.Context, accessKey, status string) error {
+	return m.updateAccessKey(ctx, accessKey, status)
+}
+
+// DeleteAccessKey deletes an access key.
+func (m *Manager) DeleteAccessKey(ctx context.Context, accessKey string) error {
+	return m.deleteAccessKey(ctx, accessKey)
+}
+
+// ListPolicies returns the built-in policies (Builtin=true, read-only)
+// followed by the custom policies sorted by name.
+func (m *Manager) ListPolicies(ctx context.Context) ([]NamedPolicy, error) {
+	return m.listPolicies(ctx)
+}
+
+// GetPolicy returns a built-in or custom policy.
 func (m *Manager) GetPolicy(ctx context.Context, name string) (NamedPolicy, error) {
-	return NamedPolicy{}, ErrPolicyNotFound
+	return m.getPolicy(ctx, name)
 }
+
+// PutPolicy creates or replaces a custom identity policy. The document is
+// validated like ParsePolicy (errors wrap ErrInvalidPolicy); built-in names
+// yield ErrPolicyBuiltin.
 func (m *Manager) PutPolicy(ctx context.Context, name, description string, doc PolicyDocument) (NamedPolicy, error) {
-	return NamedPolicy{}, ErrInvalidPolicy
+	return m.putPolicy(ctx, name, description, doc)
 }
-func (m *Manager) DeletePolicy(ctx context.Context, name string) error { return ErrPolicyNotFound }
+
+// DeletePolicy deletes a custom policy (ErrPolicyInUse if attached to a
+// user, ErrPolicyBuiltin for built-ins).
+func (m *Manager) DeletePolicy(ctx context.Context, name string) error {
+	return m.deletePolicy(ctx, name)
+}
 
 // EffectivePolicies returns the identity policies that apply to id (root:
-// [admin]; anonymous: none). CONTRACT STUB.
+// [admin]; anonymous: none).
 func (m *Manager) EffectivePolicies(ctx context.Context, id auth.Identity) ([]NamedPolicy, error) {
-	return nil, nil
+	return m.effectivePolicies(ctx, id)
 }

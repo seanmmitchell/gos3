@@ -108,7 +108,7 @@ type Verifier struct {
 
 // NewVerifier returns a Verifier backed by creds.
 func NewVerifier(creds CredentialProvider, opts Options) *Verifier {
-	if opts.MaxClockSkew == 0 {
+	if opts.MaxClockSkew <= 0 {
 		opts.MaxClockSkew = 15 * time.Minute
 	}
 	if opts.Now == nil {
@@ -121,9 +121,17 @@ func NewVerifier(creds CredentialProvider, opts Options) *Verifier {
 // information yield Result{Identity: Anonymous, Method: MethodAnonymous}.
 // Errors are *s3err.Error values.
 //
-// CONTRACT STUB — replaced by the auth work item.
+// Supported: SigV4 Authorization header, SigV4 presigned query strings,
+// and payloads signed with a hex SHA-256, UNSIGNED-PAYLOAD,
+// STREAMING-AWS4-HMAC-SHA256-PAYLOAD(-TRAILER) and
+// STREAMING-UNSIGNED-PAYLOAD-TRAILER (aws-chunked). SigV2 is rejected with
+// AccessDenied. Anonymous requests still get a verifying Body when they
+// declare x-amz-content-sha256 or use unsigned aws-chunked encoding.
 func (v *Verifier) Authenticate(r *http.Request) (*Result, error) {
-	return nil, s3err.ErrNotImplemented
+	if r == nil {
+		return nil, s3err.ErrInvalidRequest
+	}
+	return v.authenticate(r)
 }
 
 // PostPolicyForm is the parsed multipart/form-data fields of a browser POST
@@ -141,11 +149,10 @@ type PostPolicyConditions struct {
 // VerifyPostPolicy verifies the signature of a browser POST upload form
 // (x-amz-algorithm=AWS4-HMAC-SHA256, x-amz-credential, x-amz-date, policy,
 // x-amz-signature). It returns the identity and decoded policy; forms with no
-// policy/signature yield Anonymous and a nil policy.
-//
-// CONTRACT STUB — replaced by the auth work item.
+// policy/signature yield Anonymous and a nil policy. An expired policy is
+// rejected with AccessDenied ("Policy expired").
 func (v *Verifier) VerifyPostPolicy(form PostPolicyForm) (Identity, *PostPolicyConditions, error) {
-	return Identity{}, nil, s3err.ErrNotImplemented
+	return v.verifyPostPolicy(form)
 }
 
 // CheckPostPolicy validates that the uploaded form fields and file size
@@ -153,9 +160,14 @@ func (v *Verifier) VerifyPostPolicy(form PostPolicyForm) (Identity, *PostPolicyC
 // content-length-range, bucket, key, ...). Returns
 // s3err.ErrAccessDenied/ErrInvalidPolicyDocument/ErrEntityTooLarge/...
 //
-// CONTRACT STUB — replaced by the auth work item.
+// form must include every submitted field except the file (lowercased
+// names) plus "bucket" set to the target bucket. Every field other than
+// x-amz-signature, file, policy, bucket and x-ignore-* must be covered by a
+// condition. A nil p (anonymous upload) always passes. fileSize < 0 skips
+// content-length-range checks, so the handler may check the fields before
+// streaming the file and the size afterwards.
 func CheckPostPolicy(p *PostPolicyConditions, form PostPolicyForm, fileSize int64) error {
-	return s3err.ErrNotImplemented
+	return checkPostPolicy(p, form, fileSize)
 }
 
 // Credentials is an access/secret key pair (client side).
@@ -166,16 +178,20 @@ type Credentials struct {
 
 // SignRequest signs r in place with SigV4 (Authorization header) — a client
 // helper for tests, discovery probes and peer calls. payloadHash is the hex
-// SHA-256 of the body or PayloadUnsigned.
-//
-// CONTRACT STUB — replaced by the auth work item.
+// SHA-256 of the body or PayloadUnsigned ("" picks the empty-body hash for
+// bodiless requests, else PayloadUnsigned). It sets X-Amz-Date,
+// X-Amz-Content-Sha256 and Authorization, signs host, every x-amz-* header,
+// content-type and content-md5, and pins r.URL.RawPath to the AWS-encoded
+// path so the path on the wire is exactly the signed one. Empty region and
+// service default to DefaultRegion and "s3".
 func SignRequest(r *http.Request, c Credentials, region, service, payloadHash string, t time.Time) error {
-	return s3err.ErrNotImplemented
+	return signRequest(r, c, region, service, payloadHash, t)
 }
 
 // PresignURL returns a SigV4 presigned URL for method + rawURL valid for expires.
-//
-// CONTRACT STUB — replaced by the auth work item.
+// Only host is signed (payload UNSIGNED-PAYLOAD, service "s3"); expires must
+// be within 1s..7d. Existing query parameters are kept (re-encoded and
+// sorted canonically) and stale X-Amz-* auth parameters are replaced.
 func PresignURL(method, rawURL string, c Credentials, region string, expires time.Duration, t time.Time) (string, error) {
-	return "", s3err.ErrNotImplemented
+	return presignURL(method, rawURL, c, region, expires, t)
 }

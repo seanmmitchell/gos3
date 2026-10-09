@@ -156,4 +156,6 @@ var (
 	ErrInvalidStorageClassTransition        = def("InvalidRequest", http.StatusBadRequest, "Storage class transitions are not supported.")
 	ErrReplicationConfigurationNotFound     = def("ReplicationConfigurationNotFoundError", http.StatusNotFound, "The replication configuration was not found.")
 	ErrNoSuchPublicAccessBlockConfiguration = def("NoSuchPublicAccessBlockConfiguration", http.StatusNotFound, "The public access block configuration was not found.")
+	ErrInvalidToken                         = def("InvalidToken", http.StatusBadRequest, "The provided token is malformed or otherwise invalid.")
+	ErrMalformedTrailer                     = def("MalformedTrailerError", http.StatusBadRequest, "The request contained trailing data that was not well-formed or did not conform to our published schema.")
 )
