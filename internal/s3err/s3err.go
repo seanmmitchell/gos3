@@ -162,4 +162,14 @@ var (
 	ErrCORSForbidden = def("AccessForbidden", http.StatusForbidden, "CORSResponse: This CORS request is not allowed. This is usually because the evalution of Origin, request method / Access-Control-Request-Method or Access-Control-Request-Headers are not whitelisted by the resource's CORS spec.")
 	// ErrBadRequest is a generic 400 (e.g. CORS preflight without Origin).
 	ErrBadRequest = def("BadRequest", http.StatusBadRequest, "Bad Request")
+	// ErrInvalidBucketAclWithObjectOwnership is returned when a canned ACL
+	// other than private is requested together with ObjectOwnership
+	// BucketOwnerEnforced (ACLs disabled).
+	ErrInvalidBucketAclWithObjectOwnership = def("InvalidBucketAclWithObjectOwnership", http.StatusBadRequest, "Bucket cannot have ACLs set with ObjectOwnership's BucketOwnerEnforced setting")
+	// ErrAccessControlListNotSupported is returned when setting an ACL on a
+	// bucket (or object) whose ObjectOwnership is BucketOwnerEnforced.
+	ErrAccessControlListNotSupported = def("AccessControlListNotSupported", http.StatusBadRequest, "The bucket does not allow ACLs")
+	// ErrInvalidTargetBucketForLogging is returned by PutBucketLogging when
+	// the target bucket does not exist.
+	ErrInvalidTargetBucketForLogging = def("InvalidTargetBucketForLogging", http.StatusBadRequest, "The target bucket for logging does not exist")
 )

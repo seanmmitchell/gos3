@@ -58,7 +58,7 @@ const versioningLabel = computed(() => (props.versioning === 'Enabled' ? 'Enable
 
 <template>
   <div class="space-y-6">
-    <div class="grid gap-3 sm:grid-cols-2 xl:grid-cols-4">
+    <div class="grid grid-cols-2 gap-3 xl:grid-cols-4">
       <template v-if="usage">
         <AdminStatCard label="Objects" :value="formatNumber(usage.objects)" icon="i-lucide-files" :hint="`${formatNumber(usage.versions)} versions`" />
         <AdminStatCard label="Size" :value="formatBytes(usage.bytes)" icon="i-lucide-hard-drive" :hint="`${formatBytes(usage.versionBytes)} incl. versions`" />

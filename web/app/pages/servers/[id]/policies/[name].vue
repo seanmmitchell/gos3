@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import type { NamedPolicy } from '~/types/admin'
 import { AdminError } from '~/utils/admin/client'
-import { canSimulate, policiesPageMode } from '~/components/admin/-capabilities'
+import { canSimulate, identityPending, policiesPageMode } from '~/components/admin/-capabilities'
 
 /**
  * Policy detail: built-in policies are read-only; custom policies are
@@ -13,13 +13,14 @@ const router = useRouter()
 const id = computed(() => routeParam(route.params.id))
 const name = computed(() => routeParam(route.params.name))
 const { connection, requireAdmin } = useConnection()
-const { capabilities } = useWhoAmI()
+const { capabilities, status } = useWhoAmI()
 const confirm = useConfirm()
 const toast = useToast()
 
 useHead({ title: () => `Policy ${name.value}` })
 
 const mode = computed(() => policiesPageMode(connection.value?.kind, capabilities.value))
+const pending = computed(() => identityPending(connection.value?.kind, status.value))
 const simulate = computed(() => canSimulate(connection.value?.kind, capabilities.value))
 
 const policy = useLoader(() => requireAdmin().getPolicy(name.value), { immediate: false })
@@ -108,8 +109,12 @@ onBeforeRouteLeave(async () => {
       </template>
     </CommonPageHeader>
 
+    <div v-if="pending" class="space-y-3" aria-busy="true">
+      <USkeleton class="h-10 w-full" />
+      <USkeleton class="h-40 w-full" />
+    </div>
     <CommonEmptyState
-      v-if="mode === 'unavailable'"
+      v-else-if="mode === 'unavailable'"
       icon="i-lucide-lock"
       title="Not available"
       description="IAM policies are only available on gos3 servers to identities with admin permissions."

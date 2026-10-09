@@ -1,0 +1,28 @@
+{
+  "_comment": "Preset connections for the gos3 web UI. Copy this file to servers.json (served at <baseURL>servers.json) or pass the array as NUXT_PUBLIC_SERVERS. Accepted keys per entry: id, name, endpoint|url (required), region, kind ('gos3' | 's3'), forcePathStyle|pathStyle, color (hex or a Nuxt UI color name), accessKeyId|accessKey, secretAccessKey|secretKey. Entries without id get 'preset-<endpoint-slug>'. Presets are read-only in the UI (only credentials can be entered there); users may hide a preset by removing it. Avoid shipping secret keys: anyone who can load the UI can read this file.",
+  "servers": [
+    {
+      "id": "nas",
+      "name": "NAS",
+      "endpoint": "http://10.0.0.5:9000",
+      "region": "us-east-1",
+      "kind": "gos3",
+      "forcePathStyle": true,
+      "color": "#14b8a6"
+    },
+    {
+      "name": "Backup gos3",
+      "endpoint": "https://backup.example.internal:9443",
+      "kind": "gos3"
+    },
+    {
+      "id": "aws-eu",
+      "name": "AWS eu-west-1",
+      "endpoint": "https://s3.eu-west-1.amazonaws.com",
+      "region": "eu-west-1",
+      "kind": "s3",
+      "forcePathStyle": false,
+      "color": "#f59e0b"
+    }
+  ]
+}

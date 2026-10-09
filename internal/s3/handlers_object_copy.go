@@ -1,0 +1,363 @@
+package s3
+
+// CopyObject and DeleteObjects. Owned by the s3-object work item.
+
+import (
+	"crypto/md5"
+	"encoding/base64"
+	"encoding/hex"
+	"encoding/xml"
+	"errors"
+	"hash"
+	"io"
+	"log/slog"
+	"maps"
+	"net/http"
+	"strings"
+
+	"github.com/seanmmitchell/gos3/internal/s3err"
+	"github.com/seanmmitchell/gos3/internal/storage"
+)
+
+// --- CopyObject ---
+
+// copyObjectResult is the CopyObject response body.
+type copyObjectResult struct {
+	XMLName           xml.Name `xml:"http://s3.amazonaws.com/doc/2006-03-01/ CopyObjectResult"`
+	ETag              string   `xml:"ETag"`
+	LastModified      string   `xml:"LastModified"`
+	ChecksumType      string   `xml:"ChecksumType,omitempty"`
+	ChecksumCRC32     string   `xml:"ChecksumCRC32,omitempty"`
+	ChecksumCRC32C    string   `xml:"ChecksumCRC32C,omitempty"`
+	ChecksumCRC64NVME string   `xml:"ChecksumCRC64NVME,omitempty"`
+	ChecksumSHA1      string   `xml:"ChecksumSHA1,omitempty"`
+	ChecksumSHA256    string   `xml:"ChecksumSHA256,omitempty"`
+}
+
+// Directive values of x-amz-metadata-directive / x-amz-tagging-directive.
+const (
+	directiveCopy    = "COPY"
+	directiveReplace = "REPLACE"
+)
+
+// parseDirective validates a COPY|REPLACE directive header (default COPY).
+func parseDirective(h http.Header, name string) (string, error) {
+	v := strings.TrimSpace(h.Get(name))
+	switch strings.ToUpper(v) {
+	case "", directiveCopy:
+		return directiveCopy, nil
+	case directiveReplace:
+		return directiveReplace, nil
+	}
+	what := "metadata"
+	if strings.Contains(strings.ToLower(name), "tagging") {
+		what = "tagging"
+	}
+	return "", s3err.ErrInvalidArgument.WithMessage("Unknown %s directive.", what).
+		With("ArgumentName", strings.ToLower(name)).With("ArgumentValue", truncateValue(v))
+}
+
+// sourceChecksumAlgorithm returns the algorithm of a source object's
+// stored checksum (canonical order), or "".
+func sourceChecksumAlgorithm(sums map[string]string) string {
+	for _, a := range checksumAlgorithms {
+		if sums[a] != "" {
+			return a
+		}
+	}
+	return ""
+}
+
+// copyHasher computes the MD5 and one checksum of copied data.
+type copyHasher struct {
+	md5  hash.Hash
+	sum  hash.Hash
+	algo string
+	n    int64
+}
+
+func (c *copyHasher) Write(p []byte) (int, error) {
+	c.md5.Write(p)
+	c.sum.Write(p)
+	c.n += int64(len(p))
+	return len(p), nil
+}
+
+// handleCopyObject implements CopyObject: the source (authorized with
+// s3:GetObject / s3:GetObjectVersion) is streamed into a new version of the
+// destination while its MD5 and checksum are recomputed. Metadata and tags
+// follow x-amz-metadata-directive / x-amz-tagging-directive; storage class,
+// ACL, encryption, object lock and website redirect always come from the
+// request (and bucket defaults), as in S3.
+func (s *Server) handleCopyObject(w http.ResponseWriter, r *http.Request, rc *reqContext) error {
+	ctx := r.Context()
+	h := r.Header
+	if err := checkSSECHeaders(h); err != nil {
+		return err
+	}
+	src, err := parseCopySource(h.Get("X-Amz-Copy-Source"))
+	if err != nil {
+		return err
+	}
+	if h.Get("X-Amz-Copy-Source-Range") != "" {
+		return s3err.ErrInvalidArgument.WithMessage("The x-amz-copy-source-range header is only supported for UploadPartCopy.").
+			With("ArgumentName", "x-amz-copy-source-range")
+	}
+	metaDir, err := parseDirective(h, "X-Amz-Metadata-Directive")
+	if err != nil {
+		return err
+	}
+	tagDir, err := parseDirective(h, "X-Amz-Tagging-Directive")
+	if err != nil {
+		return err
+	}
+	algo := ""
+	if v := h.Get("X-Amz-Checksum-Algorithm"); v != "" {
+		var ok bool
+		if algo, ok = normalizeChecksumAlgorithm(v); !ok {
+			return invalidChecksumValue("x-amz-checksum-algorithm")
+		}
+	}
+	hdrMeta, err := s.objectMetaFromHeaders(h)
+	if err != nil {
+		return err
+	}
+	cond, err := parseWriteConditions(h)
+	if err != nil {
+		return err
+	}
+	bi, err := s.bucketInfo(ctx, rc)
+	if err != nil {
+		return err
+	}
+	srcBucket, info, rd, err := s.openCopySource(r, rc, src)
+	if err != nil {
+		return err
+	}
+	defer rd.Close()
+	if info.Size > s.maxObjectSize {
+		return s3err.ErrInvalidRequest.WithMessage("The specified copy source is larger than the maximum allowable size for a copy source: %d", s.maxObjectSize)
+	}
+	if src.Bucket == rc.bucket && src.Key == rc.key && (src.VersionID == "" || info.IsLatest) &&
+		metaDir != directiveReplace && tagDir != directiveReplace && algo == "" &&
+		h.Get("X-Amz-Storage-Class") == "" && h.Get("X-Amz-Server-Side-Encryption") == "" &&
+		h.Get("X-Amz-Website-Redirect-Location") == "" {
+		return s3err.ErrInvalidRequest.WithMessage("This copy request is illegal because it is trying to copy an object to itself without changing the object's metadata, storage class, website redirect location or encryption attributes.")
+	}
+
+	meta := hdrMeta
+	if metaDir == directiveCopy {
+		meta.ContentType = info.ContentType
+		meta.ContentEncoding = info.ContentEncoding
+		meta.ContentDisposition = info.ContentDisposition
+		meta.ContentLanguage = info.ContentLanguage
+		meta.CacheControl = info.CacheControl
+		meta.Expires = info.Expires
+		meta.UserMeta = maps.Clone(info.UserMeta)
+	}
+	if tagDir == directiveCopy {
+		meta.Tags = maps.Clone(info.Tags)
+	}
+	if err := s.prepareNewObject(ctx, r, rc, bi, rc.key, &meta,
+		h.Get("X-Amz-Object-Lock-Legal-Hold") != "", h.Get("X-Amz-Acl"), h.Get("X-Amz-Acl") != ""); err != nil {
+		return err
+	}
+	if algo == "" {
+		algo = sourceChecksumAlgorithm(info.Checksums)
+	}
+	if algo == "" {
+		algo = ChecksumCRC64NVME
+	}
+	hasher := &copyHasher{md5: md5.New(), sum: newChecksumHash(algo), algo: algo}
+	data := io.TeeReader(io.LimitReader(rd, info.Size), hasher)
+	out, err := s.storeObject(ctx, rc.bucket, rc.key, data, meta, cond, func(m *storage.ObjectMeta) error {
+		if hasher.n != info.Size {
+			return io.ErrUnexpectedEOF
+		}
+		m.ETag = hex.EncodeToString(hasher.md5.Sum(nil))
+		m.Checksums = map[string]string{algo: base64.StdEncoding.EncodeToString(hasher.sum.Sum(nil))}
+		m.ChecksumType = ChecksumTypeFullObject
+		return nil
+	})
+	if err != nil {
+		return err
+	}
+
+	hdr := w.Header()
+	if bi.Versioning != storage.VersioningUnversioned {
+		hdr.Set("X-Amz-Version-Id", out.VersionID)
+	}
+	if srcBucket.Versioning != storage.VersioningUnversioned {
+		hdr.Set("X-Amz-Copy-Source-Version-Id", info.VersionID)
+	}
+	setSSEHeaders(hdr, out.ObjectMeta)
+	res := copyObjectResult{
+		ETag:         quoteETag(out.ETag),
+		LastModified: formatXMLTime(out.LastModified),
+		ChecksumType: out.ChecksumType,
+	}
+	res.ChecksumCRC32 = out.Checksums[ChecksumCRC32]
+	res.ChecksumCRC32C = out.Checksums[ChecksumCRC32C]
+	res.ChecksumCRC64NVME = out.Checksums[ChecksumCRC64NVME]
+	res.ChecksumSHA1 = out.Checksums[ChecksumSHA1]
+	res.ChecksumSHA256 = out.Checksums[ChecksumSHA256]
+	return writeXML(w, http.StatusOK, res)
+}
+
+// openCopySource opens the source of a copy (CopyObject, and usable by
+// UploadPartCopy): it validates the source version ID, authorizes
+// s3:GetObject / s3:GetObjectVersion on it, applies the S3 delete marker
+// rules (NoSuchKey for a latest delete marker, InvalidRequest for one
+// addressed by version ID) and the x-amz-copy-source-if-* preconditions
+// (412). It returns the source bucket, the version's info and a reader
+// over its content, which the caller must close.
+func (s *Server) openCopySource(r *http.Request, rc *reqContext, src copySource) (storage.BucketInfo, storage.ObjectInfo, io.ReadSeekCloser, error) {
+	ctx := r.Context()
+	if src.VersionID != "" && !validVersionID(src.VersionID) {
+		return storage.BucketInfo{}, storage.ObjectInfo{}, nil, s3err.ErrInvalidArgument.WithMessage("Invalid version id specified").
+			With("ArgumentName", "x-amz-copy-source").With("ArgumentValue", truncateValue(r.Header.Get("X-Amz-Copy-Source")))
+	}
+	if err := s.authorize(r, rc, objectReadAction(src.VersionID), src.Bucket, src.Key, src.VersionID); err != nil {
+		return storage.BucketInfo{}, storage.ObjectInfo{}, nil, err
+	}
+	bi, err := s.lookupBucket(ctx, src.Bucket)
+	if err != nil {
+		return storage.BucketInfo{}, storage.ObjectInfo{}, nil, err
+	}
+	info, rd, err := s.backend.OpenObject(ctx, src.Bucket, src.Key, src.VersionID)
+	if err != nil {
+		return bi, info, nil, objectLookupError(err, src.Bucket, src.Key, src.VersionID)
+	}
+	fail := func(err error) (storage.BucketInfo, storage.ObjectInfo, io.ReadSeekCloser, error) {
+		if rd != nil {
+			_ = rd.Close()
+		}
+		return bi, info, nil, err
+	}
+	switch {
+	case info.DeleteMarker && src.VersionID != "":
+		return fail(s3err.ErrInvalidRequest.WithMessage("The source of a copy request may not specifically refer to a delete marker by version id."))
+	case info.DeleteMarker:
+		return fail(s3err.ErrNoSuchKey.With("Key", src.Key))
+	case rd == nil:
+		return fail(errors.New("s3: backend returned no reader for an object"))
+	}
+	if err := checkCopySourceConditions(r.Header, info.ETag, info.LastModified); err != nil {
+		return fail(err)
+	}
+	return bi, info, rd, nil
+}
+
+// --- DeleteObjects ---
+
+// deleteRequest is the DeleteObjects request body.
+type deleteRequest struct {
+	XMLName xml.Name           `xml:"Delete"`
+	Quiet   bool               `xml:"Quiet"`
+	Objects []deleteIdentifier `xml:"Object"`
+}
+
+// deleteIdentifier is one <Object> of a DeleteObjects request.
+type deleteIdentifier struct {
+	Key       string `xml:"Key"`
+	VersionID string `xml:"VersionId"`
+	// ETag makes the deletion conditional on the current ETag.
+	ETag string `xml:"ETag"`
+}
+
+// deleteResult is the DeleteObjects response body.
+type deleteResult struct {
+	XMLName xml.Name       `xml:"http://s3.amazonaws.com/doc/2006-03-01/ DeleteResult"`
+	Deleted []deletedEntry `xml:"Deleted"`
+	Errors  []deleteError  `xml:"Error"`
+}
+
+// deletedEntry reports one successful deletion.
+type deletedEntry struct {
+	Key                   string `xml:"Key"`
+	VersionID             string `xml:"VersionId,omitempty"`
+	DeleteMarker          bool   `xml:"DeleteMarker,omitempty"`
+	DeleteMarkerVersionID string `xml:"DeleteMarkerVersionId,omitempty"`
+}
+
+// deleteError reports one failed deletion.
+type deleteError struct {
+	Key       string `xml:"Key"`
+	VersionID string `xml:"VersionId,omitempty"`
+	Code      string `xml:"Code"`
+	Message   string `xml:"Message"`
+}
+
+// maxDeleteObjectsBody bounds the DeleteObjects request body (1000 keys of
+// up to 1024 bytes, XML-escaped, plus version IDs and markup).
+const maxDeleteObjectsBody = 8 << 20
+
+// handleDeleteObjects implements DeleteObjects: up to 1000 keys, each
+// authorized (s3:DeleteObject / s3:DeleteObjectVersion) and deleted on its
+// own; failures are reported per key in the DeleteResult. Quiet mode
+// omits successful deletions.
+func (s *Server) handleDeleteObjects(w http.ResponseWriter, r *http.Request, rc *reqContext) error {
+	ctx := r.Context()
+	bi, err := s.bucketInfo(ctx, rc)
+	if err != nil {
+		return err
+	}
+	var req deleteRequest
+	if err := s.decodeValidatedXML(r, rc, maxDeleteObjectsBody, &req); err != nil {
+		return err
+	}
+	if len(req.Objects) == 0 || len(req.Objects) > maxDeleteObjects {
+		return s3err.ErrMalformedXML
+	}
+	for _, o := range req.Objects {
+		if o.Key == "" {
+			return s3err.ErrMalformedXML
+		}
+	}
+	res := deleteResult{}
+	for _, o := range req.Objects {
+		d, err := s.deleteObjectsEntry(r, rc, bi, o)
+		if err != nil {
+			e := s.toS3Error(ctx, rc, err)
+			res.Errors = append(res.Errors, deleteError{Key: o.Key, VersionID: o.VersionID, Code: e.Code, Message: e.Message})
+			continue
+		}
+		if !req.Quiet {
+			res.Deleted = append(res.Deleted, d)
+		}
+	}
+	rc.addLog(slog.Int("delete_keys", len(req.Objects)))
+	return writeXML(w, http.StatusOK, res)
+}
+
+// deleteObjectsEntry deletes one key of a DeleteObjects request.
+func (s *Server) deleteObjectsEntry(r *http.Request, rc *reqContext, bi storage.BucketInfo, o deleteIdentifier) (deletedEntry, error) {
+	if err := validateObjectKey(o.Key); err != nil {
+		return deletedEntry{}, err
+	}
+	if o.VersionID != "" && !validVersionID(o.VersionID) {
+		return deletedEntry{}, s3err.ErrInvalidArgument.WithMessage("Invalid version id specified")
+	}
+	action := "s3:DeleteObject"
+	if o.VersionID != "" {
+		action = "s3:DeleteObjectVersion"
+	}
+	if err := s.authorize(r, rc, action, bi.Name, o.Key, o.VersionID); err != nil {
+		return deletedEntry{}, err
+	}
+	res, err := s.deleteObjectVersion(r.Context(), r, rc, bi, o.Key, o.VersionID, strings.TrimSpace(o.ETag))
+	if err != nil {
+		return deletedEntry{}, err
+	}
+	d := deletedEntry{Key: o.Key}
+	switch {
+	case o.VersionID != "":
+		d.VersionID = o.VersionID
+		if res.DeleteMarker {
+			d.DeleteMarker, d.DeleteMarkerVersionID = true, o.VersionID
+		}
+	case res.DeleteMarker:
+		d.DeleteMarker, d.DeleteMarkerVersionID = true, res.VersionID
+	}
+	return d, nil
+}

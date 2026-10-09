@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { buildCors } from '~/utils/s3/builders'
-import { CORS_METHODS, corsRuleToForm, formToCorsRule, hasErrors, MAX_CORS_RULES, newCorsRule, validateCorsRule, type CorsRuleForm } from './-cors'
+import { corsRuleToForm, formToCorsRule, hasErrors, MAX_CORS_RULES, newCorsRule, validateCorsRule, type CorsRuleForm } from './-cors'
 
 /**
  * Bucket CORS rules (?cors): one editor row per rule (origins, methods,
@@ -46,8 +46,8 @@ function removeRule(i: number) {
   rules.value = rules.value.filter((_, j) => j !== i)
 }
 
-function toggleMethod(rule: CorsRuleForm, m: string, on: boolean | 'indeterminate') {
-  rule.allowedMethods = on === true ? [...new Set([...rule.allowedMethods, m])] : rule.allowedMethods.filter(x => x !== m)
+function setRule(i: number, rule: CorsRuleForm) {
+  rules.value = rules.value.map((r, j) => (j === i ? rule : r))
 }
 
 const save = useAsyncAction(async () => {
@@ -81,8 +81,6 @@ async function reset() {
   submitted.value = false
 }
 
-const baseId = useId()
-const fieldError = (i: number, k: keyof ReturnType<typeof validateCorsRule>) => (submitted.value ? errors.value[i]?.[k] : undefined)
 </script>
 
 <template>
@@ -111,49 +109,15 @@ const fieldError = (i: number, k: keyof ReturnType<typeof validateCorsRule>) => 
         <CommonEmptyState v-if="!rules.length" compact icon="i-lucide-globe" title="No CORS rules" description="Browsers on other origins cannot read from or write to this bucket.">
           <UButton size="sm" icon="i-lucide-plus" label="Add rule" @click="addRule" />
         </CommonEmptyState>
-        <div
+        <BucketSettingsCorsRuleEditor
           v-for="(rule, i) in rules"
           :key="i"
-          role="group"
-          :aria-labelledby="`${baseId}-rule-${i}`"
-          class="space-y-3 rounded-md border border-default p-3"
-          :class="submitted && hasErrors(errors[i] ?? {}) ? 'border-error/60' : ''"
-        >
-          <p :id="`${baseId}-rule-${i}`" class="text-sm font-medium text-highlighted">
-            Rule {{ i + 1 }}<span v-if="rule.id" class="font-normal text-muted"> · {{ rule.id }}</span>
-          </p>
-          <div class="grid gap-3 md:grid-cols-2">
-            <UFormField label="Allowed origins" :name="`cors-${i}-origins`" required help="“*” or e.g. https://app.example.com (one * allowed)" :error="fieldError(i, 'allowedOrigins')">
-              <AdminListInput v-model="rule.allowedOrigins" placeholder="https://app.example.com" />
-            </UFormField>
-            <UFormField label="Allowed methods" :name="`cors-${i}-methods`" required :error="fieldError(i, 'allowedMethods')">
-              <div class="flex flex-wrap gap-x-4 gap-y-2 pt-1" role="group" :aria-label="`Allowed methods of rule ${i + 1}`">
-                <UCheckbox
-                  v-for="m in CORS_METHODS"
-                  :key="m"
-                  :model-value="rule.allowedMethods.includes(m)"
-                  :label="m"
-                  @update:model-value="toggleMethod(rule, m, $event)"
-                />
-              </div>
-            </UFormField>
-            <UFormField label="Allowed headers" :name="`cors-${i}-headers`" help="Request headers (“*” = any)" :error="fieldError(i, 'allowedHeaders')">
-              <AdminListInput v-model="rule.allowedHeaders" placeholder="*" />
-            </UFormField>
-            <UFormField label="Exposed headers" :name="`cors-${i}-expose`" help="Response headers scripts may read (e.g. ETag)" :error="fieldError(i, 'exposeHeaders')">
-              <AdminListInput v-model="rule.exposeHeaders" placeholder="ETag" />
-            </UFormField>
-            <UFormField label="Max age (seconds)" :name="`cors-${i}-maxage`" :error="fieldError(i, 'maxAgeSeconds')">
-              <UInputNumber v-model="rule.maxAgeSeconds" :min="0" :step="60" class="w-full" placeholder="none" />
-            </UFormField>
-            <UFormField label="Rule ID" :name="`cors-${i}-id`" help="Optional" :error="fieldError(i, 'id')">
-              <UInput v-model="rule.id" class="w-full" placeholder="optional" />
-            </UFormField>
-          </div>
-          <div class="flex justify-end">
-            <UButton size="xs" color="error" variant="ghost" icon="i-lucide-trash-2" :label="`Remove rule ${i + 1}`" @click="removeRule(i)" />
-          </div>
-        </div>
+          :model-value="rule"
+          :index="i"
+          :errors="submitted ? errors[i] : undefined"
+          @update:model-value="setRule(i, $event)"
+          @remove="removeRule(i)"
+        />
         <UButton
           v-if="rules.length"
           size="sm"

@@ -68,9 +68,15 @@ function submit() {
               <UInputNumber v-model="form.sizeLessThan" :min="1" class="w-full" placeholder="any" />
             </UFormField>
           </div>
-          <UFormField label="Object tags" name="tags" :error="show('tags')">
+          <div class="space-y-2">
+            <p class="text-sm font-medium text-default">
+              Object tags
+            </p>
             <CommonKeyValueEditor v-model="form.tags" key-label="Tag key" value-label="Tag value" add-label="Add tag" :max-items="10" />
-          </UFormField>
+            <p v-if="show('tags')" class="text-sm text-error">
+              {{ show('tags') }}
+            </p>
+          </div>
         </fieldset>
 
         <fieldset class="space-y-3">

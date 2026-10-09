@@ -203,7 +203,7 @@ const storageCards = computed(() => {
         description="The public /_gos3/info document could not be read (the server may require authentication for it or be offline)."
       />
       <div v-else class="grid gap-6 lg:grid-cols-2">
-        <dl class="grid grid-cols-[auto_1fr] gap-x-4 gap-y-2 text-sm">
+        <dl class="grid min-w-0 grid-cols-[auto_minmax(0,1fr)] gap-x-4 gap-y-2 text-sm">
           <template v-for="r in identityRows" :key="r.label">
             <dt class="text-muted">
               {{ r.label }}
@@ -214,7 +214,7 @@ const storageCards = computed(() => {
             </dd>
           </template>
         </dl>
-        <div class="space-y-4">
+        <div class="min-w-0 space-y-4">
           <div>
             <h3 class="mb-2 text-xs font-medium uppercase tracking-wide text-muted">
               Endpoints
@@ -222,7 +222,7 @@ const storageCards = computed(() => {
             <ul class="space-y-1 text-sm">
               <li v-for="e in endpoints" :key="`${e.label}-${e.url}`" class="flex min-w-0 items-center gap-2">
                 <span class="w-20 shrink-0 text-muted">{{ e.label }}</span>
-                <code class="truncate font-mono text-xs">{{ e.url }}</code>
+                <code class="min-w-0 truncate font-mono text-xs" :title="e.url">{{ e.url }}</code>
                 <CommonCopyButton :value="e.url" :aria-label="`Copy ${e.label} endpoint`" />
               </li>
             </ul>
@@ -250,7 +250,7 @@ const storageCards = computed(() => {
             computed <CommonRelativeTime :value="stats.storage.computedAt" />
           </span>
         </h2>
-        <div class="grid gap-3 sm:grid-cols-2 xl:grid-cols-4">
+        <div class="grid grid-cols-2 gap-3 xl:grid-cols-4">
           <template v-if="stats">
             <AdminStatCard v-for="c in storageCards" :key="c.label" v-bind="c" />
           </template>
@@ -265,7 +265,7 @@ const storageCards = computed(() => {
           Requests
           <span v-if="metrics" class="ml-2 text-xs font-normal text-muted">since <CommonRelativeTime :value="metrics.startedAt" /></span>
         </h2>
-        <div class="grid gap-3 sm:grid-cols-2 xl:grid-cols-5">
+        <div class="grid grid-cols-2 gap-3 sm:grid-cols-3 xl:grid-cols-5">
           <AdminStatCard label="Requests" :value="formatNumber(metrics?.requests)" icon="i-lucide-activity" :hint="`${formatNumber(lastHour.requests)} in the last hour`" :loading="!metrics" />
           <AdminStatCard
             label="Errors"

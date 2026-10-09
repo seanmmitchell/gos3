@@ -167,3 +167,16 @@ describe('per-operation table', () => {
     expect(diskUsedPercent(1, 0)).toBe(0)
   })
 })
+
+describe('identityPending', () => {
+  it('is pending only for gos3 connections whose identity is not resolved yet', async () => {
+    const { identityPending } = await import('~/components/admin/-capabilities')
+    expect(identityPending('gos3', undefined)).toBe(true)
+    expect(identityPending('gos3', { state: 'unknown', whoami: null })).toBe(true)
+    expect(identityPending('gos3', { state: 'checking', whoami: null })).toBe(true)
+    expect(identityPending('gos3', { state: 'checking', whoami: {} })).toBe(false)
+    expect(identityPending('gos3', { state: 'unauthorized', whoami: null })).toBe(false)
+    expect(identityPending('gos3', { state: 'online', whoami: null })).toBe(false)
+    expect(identityPending('s3', undefined)).toBe(false)
+  })
+})

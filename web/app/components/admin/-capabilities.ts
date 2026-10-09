@@ -146,3 +146,14 @@ export function resolveBucketTab(v: unknown): BucketSettingsTab {
   const s = Array.isArray(v) ? v[0] : v
   return BUCKET_TABS.find(t => t.value === s)?.value ?? 'overview'
 }
+
+/**
+ * True while the identity of a gos3 connection is not known yet (status not
+ * checked or being checked). Pages show a skeleton instead of a premature
+ * "not allowed" state during that time.
+ */
+export function identityPending(kind: ConnectionKind | undefined, status: { state: string, whoami: unknown } | null | undefined): boolean {
+  if (kind !== 'gos3') return false
+  if (status?.whoami) return false
+  return !status || status.state === 'unknown' || status.state === 'checking'
+}

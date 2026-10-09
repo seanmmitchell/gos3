@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import type { DropdownMenuItem, TableColumn } from '@nuxt/ui'
 import type { User } from '~/types/admin'
-import { canManageOwnKeys, canSimulate, usersPageMode } from '~/components/admin/-capabilities'
+import { canManageOwnKeys, canSimulate, identityPending, usersPageMode } from '~/components/admin/-capabilities'
 import CreateUserModal from '~/components/admin/CreateUserModal.vue'
 import NewAccessKeyModal from '~/components/admin/NewAccessKeyModal.vue'
 
@@ -15,11 +15,12 @@ useHead({ title: 'Users' })
 const route = useRoute()
 const id = computed(() => routeParam(route.params.id))
 const { connection, requireAdmin } = useConnection()
-const { capabilities, whoami, isRoot, loading: whoamiLoading } = useWhoAmI()
+const { capabilities, whoami, isRoot, status, loading: whoamiLoading } = useWhoAmI()
 const overlay = useOverlay()
 const confirm = useConfirm()
 
 const mode = computed(() => usersPageMode(connection.value?.kind, capabilities.value))
+const pending = computed(() => identityPending(connection.value?.kind, status.value))
 const showMyKeys = computed(() => canManageOwnKeys(connection.value?.kind, isRoot.value, !!whoami.value))
 const simulate = computed(() => canSimulate(connection.value?.kind, capabilities.value))
 
@@ -148,14 +149,18 @@ function activeKeys(u: User): number {
       icon="i-lucide-users"
       :description="mode === 'self' ? 'Manage the access keys of your own IAM user.' : 'IAM users, their policies and access keys.'"
     >
-      <template v-if="mode === 'manage'" #actions>
+      <template v-if="mode === 'manage' && !pending" #actions>
         <UButton color="neutral" variant="outline" icon="i-lucide-refresh-cw" aria-label="Refresh users" :loading="users.loading.value" @click="users.refresh" />
         <UButton icon="i-lucide-user-plus" label="Create user" @click="openCreate" />
       </template>
     </CommonPageHeader>
 
+    <div v-if="pending" class="space-y-3" aria-busy="true">
+      <USkeleton class="h-10 w-full" />
+      <USkeleton class="h-40 w-full" />
+    </div>
     <CommonEmptyState
-      v-if="mode === 'unavailable'"
+      v-else-if="mode === 'unavailable'"
       icon="i-lucide-server-cog"
       title="Not available for this server"
       description="IAM users are managed through the gos3 admin API. Generic S3 services manage identities in their own console."

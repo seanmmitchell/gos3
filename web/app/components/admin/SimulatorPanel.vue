@@ -39,11 +39,15 @@ const errorMsg = ref<string>()
 watch(() => props.fixedUser, (v) => {
   if (v) user.value = v
 })
+// Users usually arrive after mount: preselect the first one until the user picks.
+const userTouched = ref(false)
+watch(() => props.users, (list) => {
+  if (!props.fixedUser && !userTouched.value && list.length && user.value === ANONYMOUS) user.value = list[0]!
+})
 
 const userItems = computed(() => [ANONYMOUS, ...props.users.filter(u => u !== ANONYMOUS)])
 const actionItems = computed(() => [...SIMULATOR_ACTIONS])
 const conditions = computed(() => parseConditionLines(conditionsText.value))
-const ids = { action: useId(), bucket: useId(), key: useId(), cond: useId() }
 
 const sim = useAsyncAction(async () => {
   const u = props.fixedUser ?? (user.value === ANONYMOUS ? '' : user.value)
@@ -96,11 +100,10 @@ function onCreateAction(item: string) {
     <form class="space-y-3" novalidate @submit.prevent="run">
       <div class="grid gap-3 sm:grid-cols-2">
         <UFormField v-if="!fixedUser" label="User" name="user">
-          <USelectMenu v-model="user" :items="userItems" class="w-full" :search-input="{ placeholder: 'Filter users…' }" />
+          <USelectMenu v-model="user" :items="userItems" class="w-full" :search-input="{ placeholder: 'Filter users…' }" @update:model-value="userTouched = true" />
         </UFormField>
         <UFormField label="Action" name="action" :error="errorMsg === 'Choose an action' ? errorMsg : undefined" :class="fixedUser ? 'sm:col-span-2' : ''">
           <USelectMenu
-            :id="ids.action"
             v-model="action"
             :items="actionItems"
             class="w-full"
@@ -110,10 +113,10 @@ function onCreateAction(item: string) {
           />
         </UFormField>
         <UFormField label="Bucket" name="bucket" help="Empty = no specific bucket.">
-          <UInput :id="ids.bucket" v-model="bucket" class="w-full" placeholder="photos" autocomplete="off" />
+          <UInput v-model="bucket" class="w-full" placeholder="photos" autocomplete="off" />
         </UFormField>
         <UFormField label="Object key" name="key">
-          <UInput :id="ids.key" v-model="key" class="w-full" placeholder="2024/cat.jpg" autocomplete="off" />
+          <UInput v-model="key" class="w-full" placeholder="2024/cat.jpg" autocomplete="off" />
         </UFormField>
       </div>
       <UCollapsible v-model:open="showConditions">
@@ -133,7 +136,7 @@ function onCreateAction(item: string) {
             help="One key=value per line, multiple values comma separated, e.g. aws:SourceIp=10.0.0.7"
             :error="conditions.error"
           >
-            <UTextarea :id="ids.cond" v-model="conditionsText" :rows="3" class="w-full font-mono" placeholder="aws:SecureTransport=true" />
+            <UTextarea v-model="conditionsText" :rows="3" class="w-full font-mono" placeholder="aws:SecureTransport=true" />
           </UFormField>
         </template>
       </UCollapsible>

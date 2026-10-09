@@ -2,7 +2,7 @@
 import type { DropdownMenuItem, TableColumn } from '@nuxt/ui'
 import type { NamedPolicy } from '~/types/admin'
 import { AdminError } from '~/utils/admin/client'
-import { canSimulate, policiesPageMode } from '~/components/admin/-capabilities'
+import { canSimulate, identityPending, policiesPageMode } from '~/components/admin/-capabilities'
 import CreatePolicyModal from '~/components/admin/CreatePolicyModal.vue'
 
 /**
@@ -15,12 +15,13 @@ const route = useRoute()
 const router = useRouter()
 const id = computed(() => routeParam(route.params.id))
 const { connection, requireAdmin } = useConnection()
-const { capabilities } = useWhoAmI()
+const { capabilities, status } = useWhoAmI()
 const overlay = useOverlay()
 const confirm = useConfirm()
 const toast = useToast()
 
 const mode = computed(() => policiesPageMode(connection.value?.kind, capabilities.value))
+const pending = computed(() => identityPending(connection.value?.kind, status.value))
 const canManage = computed(() => mode.value === 'manage')
 const simulate = computed(() => canSimulate(connection.value?.kind, capabilities.value))
 
@@ -130,8 +131,12 @@ function rowActions(p: NamedPolicy): DropdownMenuItem[][] {
       </template>
     </CommonPageHeader>
 
+    <div v-if="pending" class="space-y-3" aria-busy="true">
+      <USkeleton class="h-10 w-full" />
+      <USkeleton class="h-40 w-full" />
+    </div>
     <CommonEmptyState
-      v-if="mode === 'unavailable'"
+      v-else-if="mode === 'unavailable'"
       icon="i-lucide-lock"
       title="Not available"
       :description="connection?.kind === 'gos3' ? 'Your identity has no admin permissions on this server.' : 'IAM policies are managed through the gos3 admin API.'"

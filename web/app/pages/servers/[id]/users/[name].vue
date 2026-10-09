@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import type { AccessKey, User } from '~/types/admin'
 import { AdminError } from '~/utils/admin/client'
-import { canSimulate, usersPageMode } from '~/components/admin/-capabilities'
+import { canSimulate, identityPending, usersPageMode } from '~/components/admin/-capabilities'
 import CreateKeyModal from '~/components/admin/CreateKeyModal.vue'
 import NewAccessKeyModal from '~/components/admin/NewAccessKeyModal.vue'
 
@@ -15,13 +15,14 @@ const router = useRouter()
 const id = computed(() => routeParam(route.params.id))
 const name = computed(() => routeParam(route.params.name))
 const { connection, requireAdmin } = useConnection()
-const { capabilities, whoami } = useWhoAmI()
+const { capabilities, whoami, status } = useWhoAmI()
 const overlay = useOverlay()
 const confirm = useConfirm()
 
 useHead({ title: () => `User ${name.value}` })
 
 const mode = computed(() => usersPageMode(connection.value?.kind, capabilities.value))
+const pending = computed(() => identityPending(connection.value?.kind, status.value))
 const simulate = computed(() => canSimulate(connection.value?.kind, capabilities.value))
 
 const user = useLoader(() => requireAdmin().getUser(name.value), { immediate: false })
@@ -183,7 +184,6 @@ async function onDeleteKey(k: AccessKey) {
   if (ok) await deleteKey.run(k)
 }
 
-const descriptionId = useId()
 </script>
 
 <template>
@@ -211,8 +211,12 @@ const descriptionId = useId()
       </template>
     </CommonPageHeader>
 
+    <div v-if="pending" class="space-y-3" aria-busy="true">
+      <USkeleton class="h-10 w-full" />
+      <USkeleton class="h-40 w-full" />
+    </div>
     <CommonEmptyState
-      v-if="mode !== 'manage'"
+      v-else-if="mode !== 'manage'"
       icon="i-lucide-lock"
       title="Not allowed"
       :description="mode === 'unavailable' ? 'IAM users are only available on gos3 servers.' : 'Managing users requires the admin:CreateUser permission.'"
@@ -241,7 +245,7 @@ const descriptionId = useId()
           </template>
           <form class="space-y-4" novalidate @submit.prevent="onSaveDetails">
             <UFormField label="Description" name="description" :error="descriptionError">
-              <UInput :id="descriptionId" v-model="description" class="w-full" placeholder="Optional" />
+              <UInput v-model="description" class="w-full" placeholder="Optional" />
             </UFormField>
             <UFormField label="Policies" name="policies" help="Identity policies attached to this user.">
               <USelectMenu

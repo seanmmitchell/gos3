@@ -18,7 +18,6 @@ const props = defineProps<{
 const emit = defineEmits<{ close: [] }>()
 
 const saved = ref(false)
-const confirmId = useId()
 const secret = computed(() => props.accessKey.secretKey ?? '')
 const input = computed(() => ({
   accessKey: props.accessKey.accessKey,
@@ -113,7 +112,7 @@ const baseName = computed(() => profileName(props.user || props.accessKey.access
           </div>
         </div>
         <div class="flex items-center gap-2">
-          <UCheckbox :id="confirmId" v-model="saved" label="I have stored the secret key" />
+          <UCheckbox v-model="saved" label="I have stored the secret key" />
         </div>
       </div>
     </template>

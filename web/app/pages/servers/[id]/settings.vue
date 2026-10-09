@@ -2,7 +2,7 @@
 import type { Settings } from '~/types/admin'
 import { AdminError } from '~/utils/admin/client'
 import { useConnectionsStore } from '~/stores/connections'
-import { settingsPageMode } from '~/components/admin/-capabilities'
+import { identityPending, settingsPageMode } from '~/components/admin/-capabilities'
 import {
   emptySettingsForm,
   formToSettings,
@@ -27,11 +27,12 @@ const route = useRoute()
 const id = computed(() => routeParam(route.params.id))
 const store = useConnectionsStore()
 const { connection, requireAdmin } = useConnection()
-const { capabilities } = useWhoAmI()
+const { capabilities, status } = useWhoAmI()
 const confirm = useConfirm()
 const toast = useToast()
 
 const mode = computed(() => settingsPageMode(connection.value?.kind, capabilities.value))
+const pending = computed(() => identityPending(connection.value?.kind, status.value))
 const readonly = computed(() => mode.value !== 'manage')
 
 const loaded = ref<Settings | null>(null)
@@ -143,8 +144,12 @@ const formatItems: { label: string, value: string }[] = LOG_FORMATS.map(f => ({ 
       </template>
     </CommonPageHeader>
 
+    <div v-if="pending" class="space-y-3" aria-busy="true">
+      <USkeleton class="h-10 w-full" />
+      <USkeleton class="h-40 w-full" />
+    </div>
     <CommonEmptyState
-      v-if="mode === 'unavailable'"
+      v-else-if="mode === 'unavailable'"
       icon="i-lucide-lock"
       title="Not available"
       :description="connection?.kind === 'gos3' ? 'Your identity has no admin permissions on this server.' : 'Server settings are only available on gos3 servers.'"
@@ -173,7 +178,7 @@ const formatItems: { label: string, value: string }[] = LOG_FORMATS.map(f => ({ 
         role="alert"
       />
 
-      <fieldset :disabled="readonly" class="contents">
+      <fieldset :disabled="readonly" class="min-w-0 space-y-6">
         <!-- General -->
         <UCard>
           <template #header>

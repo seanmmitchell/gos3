@@ -103,7 +103,6 @@ async function reset() {
   load()
 }
 
-const ids = { name: useId(), description: useId() }
 </script>
 
 <template>
@@ -126,10 +125,10 @@ const ids = { name: useId(), description: useId() }
         help="1–128 characters: letters, digits and + = , . @ _ -"
         :error="(submitted || !!nameServerError) && nameError"
       >
-        <UInput :id="ids.name" v-model="name" class="w-full" autocomplete="off" spellcheck="false" placeholder="photos-readwrite" autofocus />
+        <UInput v-model="name" class="w-full" autocomplete="off" spellcheck="false" placeholder="photos-readwrite" autofocus />
       </UFormField>
       <UFormField label="Description" name="description" :error="descriptionError" :class="mode === 'create' ? '' : 'md:col-span-2'">
-        <UInput :id="ids.description" v-model="description" class="w-full" :readonly="readonly" placeholder="Optional" />
+        <UInput v-model="description" class="w-full" :readonly="readonly" placeholder="Optional" />
       </UFormField>
     </div>
     <AdminPolicyTemplatePicker v-if="!readonly" @apply="applyTemplate" />
