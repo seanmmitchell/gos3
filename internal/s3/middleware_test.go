@@ -34,10 +34,10 @@ func checkCommonHeaders(t *testing.T, h http.Header) {
 
 func TestCommonHeadersAndErrorBody(t *testing.T) {
 	e := newTestEnv(t)
-	// Stub handler => NotImplemented with a full XML error body.
+	// Missing bucket => NoSuchBucket with a full XML error body.
 	resp := e.signed("GET", "/nosuchbucket?list-type=2", nil, nil)
 	checkCommonHeaders(t, resp.Header)
-	if resp.StatusCode != 501 || resp.code() != "NotImplemented" {
+	if resp.StatusCode != 404 || resp.code() != "NoSuchBucket" {
 		t.Fatalf("%d %s", resp.StatusCode, resp.Data)
 	}
 	if !strings.HasPrefix(string(resp.Data), `<?xml version="1.0" encoding="UTF-8"?>`) || resp.Header.Get("Content-Type") != "application/xml" {
@@ -62,7 +62,7 @@ func TestCommonHeadersAndErrorBody(t *testing.T) {
 	}
 	// HEAD errors have no body.
 	resp = e.signed("HEAD", "/bkt/key", nil, nil)
-	if resp.StatusCode != 501 || len(resp.Data) != 0 {
+	if resp.StatusCode != 404 || len(resp.Data) != 0 {
 		t.Fatalf("HEAD: %d %q", resp.StatusCode, resp.Data)
 	}
 	checkCommonHeaders(t, resp.Header)
