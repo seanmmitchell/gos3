@@ -28,7 +28,8 @@ async function enable() {
       description: 'Every overwrite and delete will keep the previous version (which uses storage until it expires or is deleted). Once enabled, versioning can be suspended but never fully turned off.',
       confirmLabel: 'Enable versioning',
       color: 'primary',
-      icon: 'i-lucide-history'
+      icon: 'i-lucide-history',
+      irreversible: true
     })
     if (!ok) return
   }

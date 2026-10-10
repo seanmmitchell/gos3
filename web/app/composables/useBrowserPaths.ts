@@ -95,6 +95,17 @@ export interface BrowserObjectEntry {
 
 export type BrowserEntry = BrowserFolderEntry | BrowserObjectEntry
 
+/**
+ * Version to address when opening a listed object: none for the latest
+ * version (the plain object URL), but always the delete marker's own version
+ * ID — the plain key of a deleted object answers 404, which would show
+ * "Object not found" instead of the delete marker.
+ */
+export function entryVersionParam(e: Pick<BrowserObjectEntry, 'versionId' | 'isLatest' | 'isDeleteMarker'>): string | undefined {
+  if (!e.versionId) return undefined
+  return !e.isLatest || e.isDeleteMarker ? e.versionId : undefined
+}
+
 /** Separator between key and version id in selection ids (cannot occur in keys we create). */
 export const VERSION_ID_SEP = '\u0000'
 

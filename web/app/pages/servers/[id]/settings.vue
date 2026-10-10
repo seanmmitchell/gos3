@@ -8,6 +8,7 @@ import {
   formToSettings,
   isFormDirty,
   LOG_FORMATS,
+  SETTINGS_LIMITS,
   LOG_LEVELS,
   sectionOf,
   settingsToForm,
@@ -232,7 +233,7 @@ const formatItems: { label: string, value: string }[] = LOG_FORMATS.map(f => ({ 
             <UFormField label="Allowed headers" name="cors.allowedHeaders" help="Request headers browsers may send (“*” = any)." :error="err('cors.allowedHeaders')">
               <AdminListInput v-model="form.cors.allowedHeaders" placeholder="*" :disabled="readonly" />
             </UFormField>
-            <UFormField label="Exposed headers" name="cors.exposeHeaders" help="Response headers scripts may read. Uploads need ETag." :error="err('cors.exposeHeaders')">
+            <UFormField label="Exposed headers" name="cors.exposeHeaders" help="Response headers scripts may read (“*” = all). Uploads need ETag." :error="err('cors.exposeHeaders')">
               <AdminListInput v-model="form.cors.exposeHeaders" placeholder="ETag" :disabled="readonly" />
             </UFormField>
             <UFormField label="Max age (seconds)" name="cors.maxAgeSeconds" help="How long browsers cache preflight responses." :error="err('cors.maxAgeSeconds')">
@@ -240,7 +241,7 @@ const formatItems: { label: string, value: string }[] = LOG_FORMATS.map(f => ({ 
             </UFormField>
           </div>
           <UAlert
-            v-if="form.cors.allowedOrigins.length && !form.cors.exposeHeaders.some(h => h.toLowerCase() === 'etag')"
+            v-if="form.cors.allowedOrigins.length && !form.cors.exposeHeaders.some(h => h === '*' || h.toLowerCase() === 'etag')"
             class="mt-4"
             color="warning"
             variant="subtle"
@@ -276,7 +277,7 @@ const formatItems: { label: string, value: string }[] = LOG_FORMATS.map(f => ({ 
               <UInput v-model="form.discovery.beaconGroup" class="w-full font-mono" placeholder="239.255.73.83:7373" :disabled="readonly || !form.discovery.beacon" />
             </UFormField>
             <UFormField label="Beacon interval (seconds)" name="discovery.beaconIntervalSeconds" :error="err('discovery.beaconIntervalSeconds')" :help="`= ${formatDuration(secondsToNs(form.discovery.beaconIntervalSeconds || 0))}`">
-              <UInputNumber v-model="form.discovery.beaconIntervalSeconds" :min="1" :step="1" :format-options="{ maximumFractionDigits: 3 }" class="w-full" :disabled="readonly || !form.discovery.beacon" />
+              <UInputNumber v-model="form.discovery.beaconIntervalSeconds" :min="SETTINGS_LIMITS.minBeaconIntervalSeconds" :max="SETTINGS_LIMITS.maxBeaconIntervalSeconds" :step="1" :format-options="{ maximumFractionDigits: 3 }" class="w-full" :disabled="readonly || !form.discovery.beacon" />
             </UFormField>
             <UFormField label="Peer TTL (seconds)" name="discovery.peerTtlSeconds" help="Peers not seen for this long are dropped." :error="err('discovery.peerTtlSeconds')">
               <UInputNumber v-model="form.discovery.peerTtlSeconds" :min="1" :step="10" :format-options="{ maximumFractionDigits: 3 }" class="w-full" :disabled="readonly" />
@@ -284,12 +285,12 @@ const formatItems: { label: string, value: string }[] = LOG_FORMATS.map(f => ({ 
             <UFormField label="Static seeds" name="discovery.seeds" help="Servers to probe directly: http://host:9000 or host:9000" :error="err('discovery.seeds')" class="md:col-span-3">
               <AdminListInput v-model="form.discovery.seeds" placeholder="http://10.0.0.5:9000" :disabled="readonly" />
             </UFormField>
-            <UFormField label="DNS SRV names" name="discovery.dnsSrv" help="e.g. _gos3._tcp.example.com" :error="err('discovery.dnsSrv')" class="md:col-span-3">
-              <AdminListInput v-model="form.discovery.dnsSrv" placeholder="_gos3._tcp.example.com" :disabled="readonly" />
+            <UFormField label="DNS SRV domains" name="discovery.dnsSrv" help="Domains whose _gos3._tcp.<domain> SRV records list servers, e.g. example.com" :error="err('discovery.dnsSrv')" class="md:col-span-3">
+              <AdminListInput v-model="form.discovery.dnsSrv" placeholder="example.com" :disabled="readonly" />
             </UFormField>
             <USwitch v-model="form.discovery.allowScan" label="Allow network scans" description="Let admins scan address ranges from this server." :disabled="readonly" />
             <UFormField label="Max hosts per scan" name="discovery.maxScanHosts" :error="err('discovery.maxScanHosts')">
-              <UInputNumber v-model="form.discovery.maxScanHosts" :min="1" :step="256" class="w-full" :disabled="readonly || !form.discovery.allowScan" />
+              <UInputNumber v-model="form.discovery.maxScanHosts" :min="1" :max="SETTINGS_LIMITS.maxScanHosts" :step="256" class="w-full" :disabled="readonly || !form.discovery.allowScan" />
             </UFormField>
           </div>
         </UCard>
@@ -329,7 +330,7 @@ const formatItems: { label: string, value: string }[] = LOG_FORMATS.map(f => ({ 
             <div class="grid gap-4 sm:grid-cols-2">
               <USwitch v-model="form.lifecycle.enabled" label="Enabled" description="Apply bucket lifecycle rules (expiration, clean-up)." class="sm:col-span-2" :disabled="readonly" />
               <UFormField label="Interval (seconds)" name="lifecycle.intervalSeconds" :help="`Runs every ${formatSeconds(form.lifecycle.intervalSeconds || 0)}`" :error="err('lifecycle.intervalSeconds')">
-                <UInputNumber v-model="form.lifecycle.intervalSeconds" :min="1" :step="60" class="w-full" :disabled="readonly || !form.lifecycle.enabled" />
+                <UInputNumber v-model="form.lifecycle.intervalSeconds" :min="SETTINGS_LIMITS.minLifecycleSeconds" :max="SETTINGS_LIMITS.maxLifecycleSeconds" :step="60" class="w-full" :disabled="readonly || !form.lifecycle.enabled" />
               </UFormField>
             </div>
           </UCard>

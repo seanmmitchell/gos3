@@ -525,6 +525,7 @@ func (s *Server) handlePutObject(w http.ResponseWriter, r *http.Request, rc *req
 	}
 	setChecksumHeaders(hdr, info.Checksums, info.ChecksumType)
 	setSSEHeaders(hdr, info.ObjectMeta)
+	s.setExpirationHeader(ctx, hdr, info)
 	writeEmpty(w, http.StatusOK)
 	return nil
 }
@@ -663,6 +664,7 @@ func (s *Server) serveObject(w http.ResponseWriter, r *http.Request, rc *reqCont
 	whole := rng == nil && (partNumber == 0 || !multipart)
 	writeObjectHeaders(w, info, versioned, checksumMode && whole)
 	hdr := w.Header()
+	s.setExpirationHeader(r.Context(), hdr, info)
 	if checksumMode && partNumber > 0 && multipart {
 		setChecksumHeaders(hdr, partSums, "")
 	}

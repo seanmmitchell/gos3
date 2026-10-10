@@ -62,10 +62,14 @@ const sim = useAsyncAction(async () => {
   const target = req.bucket ? `${req.bucket}${req.key ? `/${req.key}` : ''}` : '*'
   result.value = { decision, request: `${u || 'anonymous'} → ${req.action} on ${target}` }
   return decision
-}, { errorTitle: 'Simulation failed' })
+  // Errors are shown inline (next to the inputs that caused them) rather than
+  // as a toast that disappears, e.g. "bucket does not exist".
+}, { toastErrors: false })
 
 async function run() {
   errorMsg.value = undefined
+  // Never leave the previous verdict next to inputs it was not computed for.
+  result.value = null
   if (!action.value.trim()) {
     errorMsg.value = 'Choose an action'
     return
@@ -144,6 +148,7 @@ function onCreateAction(item: string) {
         <UButton type="submit" icon="i-lucide-play" label="Simulate" :loading="sim.loading.value" />
       </div>
     </form>
+    <CommonErrorAlert v-if="sim.error.value" class="mt-4" :error="sim.error.value" title="Simulation failed" />
     <div v-if="result" class="mt-4" aria-live="polite">
       <UAlert
         :color="result.decision.allowed ? 'success' : 'error'"

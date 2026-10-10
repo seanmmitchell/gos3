@@ -501,3 +501,8 @@ func TestConditionalPut(t *testing.T) {
 		})
 	}
 }
+
+func rawMD5(b []byte) []byte {
+	s := md5.Sum(b)
+	return s[:]
+}

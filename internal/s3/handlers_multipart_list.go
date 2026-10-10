@@ -105,6 +105,7 @@ func (s *Server) handleListParts(w http.ResponseWriter, r *http.Request, rc *req
 		res.Parts = append(res.Parts, lp)
 		res.NextPartNumberMarker = p.PartNumber
 	}
+	s.setAbortHeaders(ctx, w.Header(), up)
 	return writeXML(w, http.StatusOK, res)
 }
 

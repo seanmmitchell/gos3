@@ -253,6 +253,12 @@ type rawRequest struct {
 // do sends a raw (optionally SigV4-signed) request.
 func (e *env) do(t testing.TB, rr rawRequest) response {
 	t.Helper()
+	return e.doAt(t, rr, time.Now())
+}
+
+// doAt is do with the signing time given.
+func (e *env) doAt(t testing.TB, rr rawRequest, at time.Time) response {
+	t.Helper()
 	u := rr.path
 	if !strings.HasPrefix(u, "http://") && !strings.HasPrefix(u, "https://") {
 		u = e.base + rr.path
@@ -277,7 +283,7 @@ func (e *env) do(t testing.TB, rr rawRequest) response {
 			sum := sha256.Sum256(rr.body)
 			ph = hex.EncodeToString(sum[:])
 		}
-		if err := auth.SignRequest(req, *rr.creds, region, "s3", ph, time.Now()); err != nil {
+		if err := auth.SignRequest(req, *rr.creds, region, "s3", ph, at); err != nil {
 			t.Fatalf("SignRequest: %v", err)
 		}
 	}

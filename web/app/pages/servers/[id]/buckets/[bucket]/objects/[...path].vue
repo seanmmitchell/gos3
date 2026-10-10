@@ -243,7 +243,7 @@ function targetOf(e: BrowserEntry): OpTarget {
 
 function linkFor(e: BrowserEntry): string {
   if (e.type === 'folder') return browserRoute(serverId.value, bucket.value, e.key)
-  return browserObjectRoute(serverId.value, bucket.value, e.key, e.versionId && !e.isLatest ? e.versionId : undefined)
+  return browserObjectRoute(serverId.value, bucket.value, e.key, entryVersionParam(e))
 }
 
 const parentLink = computed(() => (prefix.value ? browserRoute(serverId.value, bucket.value, parentPrefix(prefix.value)) : appRoutes.buckets(serverId.value)))
@@ -509,7 +509,7 @@ async function onAction(action: BrowserRowAction, e: BrowserEntry) {
       await router.push(linkFor(e))
       break
     case 'details':
-      await router.push(browserObjectRoute(serverId.value, bucket.value, e.key, e.type === 'object' && e.versionId && !e.isLatest ? e.versionId : undefined))
+      await router.push(browserObjectRoute(serverId.value, bucket.value, e.key, e.type === 'object' ? entryVersionParam(e) : undefined))
       break
     case 'download':
       await downloadFlow([t])

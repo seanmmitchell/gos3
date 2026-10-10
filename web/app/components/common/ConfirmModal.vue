@@ -11,13 +11,20 @@ const props = withDefaults(defineProps<{
   color?: 'error' | 'primary' | 'warning' | 'neutral'
   icon?: string
   requireText?: string
+  /**
+   * Adds "This action cannot be undone." Defaults to true for destructive
+   * (color 'error') confirmations only: enabling or suspending a setting can
+   * be reverted, and saying otherwise misleads.
+   */
+  irreversible?: boolean
 }>(), {
   description: undefined,
   confirmLabel: 'Confirm',
   cancelLabel: 'Cancel',
   color: 'error',
   icon: undefined,
-  requireText: undefined
+  requireText: undefined,
+  irreversible: undefined
 })
 
 const emit = defineEmits<{ close: [value: boolean] }>()
@@ -25,6 +32,7 @@ const emit = defineEmits<{ close: [value: boolean] }>()
 const typed = ref('')
 const canConfirm = computed(() => !props.requireText || typed.value === props.requireText)
 const inputId = useId()
+const showIrreversible = computed(() => props.irreversible ?? props.color === 'error')
 
 function confirm() {
   if (canConfirm.value) emit('close', true)
@@ -38,7 +46,7 @@ function confirm() {
     :close="false"
     :ui="{ footer: 'justify-end' }"
   >
-    <template v-if="icon || requireText" #body>
+    <template v-if="requireText || (icon && showIrreversible)" #body>
       <div class="flex items-start gap-3">
         <UIcon
           v-if="icon"
@@ -53,7 +61,7 @@ function confirm() {
           </label>
           <UInput :id="inputId" v-model="typed" class="w-full" autocomplete="off" autofocus />
         </form>
-        <p v-else class="text-sm text-muted">
+        <p v-else-if="showIrreversible" class="text-sm text-muted">
           This action cannot be undone.
         </p>
       </div>

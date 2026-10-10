@@ -280,6 +280,24 @@ func TestStreamingRoundTrip(t *testing.T) {
 	}
 }
 
+// TestStreamingUnsignedSingleLargeChunk: the AWS SDK for Go v2 sends a
+// STREAMING-UNSIGNED-PAYLOAD-TRAILER body of known length as one chunk, so
+// unsigned chunks larger than MaxChunkSize must be accepted (regression:
+// every SDK upload over 64 MiB via HTTPS failed with InvalidRequest).
+func TestStreamingUnsignedSingleLargeChunk(t *testing.T) {
+	v := liveVerifier()
+	data := pattern(MaxChunkSize + 4096)
+	crc := [][2]string{{"x-amz-checksum-crc32", "AAAAAA=="}}
+	r := streamingRequest(t, streamCase{mode: PayloadStreamingUnsignedTrailer, data: data, chunkSize: len(data), trailers: crc})
+	o := runAuth(v, r)
+	if o.Code != "" {
+		t.Fatalf("%s: %s (%s)", o.Code, o.Message, o.Stage)
+	}
+	if !bytes.Equal(o.Body, data) || o.DecodedLen != int64(len(data)) {
+		t.Fatalf("decoded %d bytes, decodedLen=%d", len(o.Body), o.DecodedLen)
+	}
+}
+
 func TestStreamingMultipleTrailers(t *testing.T) {
 	v := liveVerifier()
 	trailers := [][2]string{{"x-amz-checksum-sha256", "47DEQpj8HBSa+/TImW+5JCeuQeRkm5NMpJWZG3hSuFU="}, {"x-amz-meta-extra", "v"}}
@@ -407,9 +425,12 @@ func TestStreamingErrors(t *testing.T) {
 		{"bad chunk size", streamCase{mode: PayloadStreamingUnsignedTrailer, data: []byte("abc"), mutate: replaceOnce("3\r\n", "z\r\n")}, "InvalidRequest", "body"},
 		{"empty chunk size", streamCase{mode: PayloadStreamingUnsignedTrailer, data: []byte("abc"), mutate: replaceOnce("3\r\n", ";\r\n")}, "InvalidRequest", "body"},
 		{"chunk size overflow", streamCase{mode: PayloadStreamingUnsignedTrailer, data: []byte("abc"), mutate: replaceOnce("3\r\n", "fffffffffffffffff\r\n")}, "InvalidRequest", "body"},
-		{"chunk too large", streamCase{mode: PayloadStreamingUnsignedTrailer, data: []byte("abc"),
+		{"signed chunk too large", streamCase{mode: PayloadStreamingSigned, data: []byte("abc"),
+			header: func(h http.Header) { h.Set("X-Amz-Decoded-Content-Length", strconv.Itoa(MaxChunkSize+1)) },
+			mutate: replaceOnce("3;", strconv.FormatInt(MaxChunkSize+1, 16)+";")}, "InvalidRequest", "body"},
+		{"unsigned chunk too large", streamCase{mode: PayloadStreamingUnsignedTrailer, data: []byte("abc"),
 			header: func(h http.Header) { h.Del("X-Amz-Decoded-Content-Length") },
-			mutate: replaceOnce("3\r\n", strconv.FormatInt(MaxChunkSize+1, 16)+"\r\n")}, "InvalidRequest", "body"},
+			mutate: replaceOnce("3\r\n", strconv.FormatInt(maxUnsignedChunkSize+1, 16)+"\r\n")}, "InvalidRequest", "body"},
 		{"chunk longer than declared", streamCase{mode: PayloadStreamingUnsignedTrailer, data: []byte("abc"), mutate: replaceOnce("3\r\n", "4\r\n")}, "IncompleteBody", "body"},
 		{"oversized chunk header", streamCase{mode: PayloadStreamingUnsignedTrailer, data: []byte("abc"),
 			mutate: replaceOnce("3\r\n", "3;"+strings.Repeat("x", maxChunkHeaderLen)+"\r\n")}, "InvalidRequest", "body"},

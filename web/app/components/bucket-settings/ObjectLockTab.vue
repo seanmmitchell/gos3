@@ -90,7 +90,8 @@ async function onSave() {
       description: `Every new object version will be undeletable for ${amount.value} ${unit.value}. This cannot be bypassed by any user.`,
       confirmLabel: 'Use compliance mode',
       color: 'warning',
-      icon: 'i-lucide-shield-alert'
+      icon: 'i-lucide-shield-alert',
+      irreversible: true
     })
     if (!ok) return
   }

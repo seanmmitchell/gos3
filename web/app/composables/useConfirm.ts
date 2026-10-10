@@ -10,6 +10,8 @@ export interface ConfirmOptions {
   icon?: string
   /** When set, the user must type this text to enable the confirm button. */
   requireText?: string
+  /** Say "This action cannot be undone." (default: only for color 'error'). */
+  irreversible?: boolean
 }
 
 /**

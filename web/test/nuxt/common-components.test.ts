@@ -4,6 +4,7 @@ import { mountSuspended } from '@nuxt/test-utils/runtime'
 import { describe, expect, it } from 'vitest'
 import { nextTick } from 'vue'
 import ByteSize from '~/components/common/ByteSize.vue'
+import ConfirmModal from '~/components/common/ConfirmModal.vue'
 import EmptyState from '~/components/common/EmptyState.vue'
 import ErrorAlert from '~/components/common/ErrorAlert.vue'
 import JsonEditor from '~/components/common/JsonEditor.vue'
@@ -22,6 +23,20 @@ describe('common components', () => {
     expect(w.find('h1').text()).toBe('Buckets')
     expect(w.text()).toContain('All buckets')
     expect(w.text()).toContain('ACTION')
+  })
+
+  it('ConfirmModal only claims irreversibility for destructive actions', async () => {
+    const body = () => document.body.textContent ?? ''
+    const destructive = await mountSuspended(ConfirmModal, { props: { open: true, title: 'Delete it?', icon: 'i-lucide-trash-2' } as never })
+    await nextTick()
+    expect(body()).toContain('This action cannot be undone.')
+    destructive.unmount()
+    await nextTick()
+    const reversible = await mountSuspended(ConfirmModal, { props: { open: true, title: 'Grant public access?', color: 'warning', icon: 'i-lucide-globe' } as never })
+    await nextTick()
+    expect(body()).toContain('Grant public access?')
+    expect(body()).not.toContain('This action cannot be undone.')
+    reversible.unmount()
   })
 
   it('EmptyState renders title and description with role=status', async () => {

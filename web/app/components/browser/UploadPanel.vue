@@ -2,6 +2,12 @@
 /**
  * Floating upload queue panel (bottom-right): overall progress, per-file
  * progress / speed / errors, cancel, retry and clear. Backed by useUploads().
+ *
+ * The panel floats over the page, so it renders an invisible spacer of its
+ * own height at the end of the page content: the last rows of a listing can
+ * always be scrolled above it instead of being covered (their row actions
+ * would be unreachable). The file list collapses by itself once every upload
+ * has finished without errors, and expands again when new uploads start.
  */
 import type { UploadItem } from '~/composables/useUploads'
 
@@ -11,6 +17,27 @@ const expanded = ref(true)
 const listId = useId()
 
 const visible = computed(() => uploads.items.length > 0)
+
+// Auto-collapse when a batch finishes cleanly; re-expand for a new batch.
+watch(() => stats.value.pending, (pending, before) => {
+  if (pending > 0 && !before) expanded.value = true
+  else if (pending === 0 && before && !stats.value.failed) expanded.value = false
+})
+
+// Height of the floating panel, mirrored by the spacer.
+const panel = ref<HTMLElement | null>(null)
+const panelHeight = ref(0)
+let resizeObserver: ResizeObserver | undefined
+watch(panel, (el) => {
+  resizeObserver?.disconnect()
+  resizeObserver = undefined
+  panelHeight.value = el?.offsetHeight ?? 0
+  if (el && typeof ResizeObserver !== 'undefined') {
+    resizeObserver = new ResizeObserver(() => (panelHeight.value = el.offsetHeight))
+    resizeObserver.observe(el)
+  }
+})
+onBeforeUnmount(() => resizeObserver?.disconnect())
 const percent = computed(() => (stats.value.total ? Math.round((stats.value.loaded / stats.value.total) * 100) : 0))
 
 const title = computed(() => {
@@ -60,8 +87,10 @@ onBeforeUnmount(() => window.removeEventListener('beforeunload', beforeUnload))
 </script>
 
 <template>
+  <div v-if="visible" class="shrink-0" aria-hidden="true" data-testid="upload-panel-spacer" :style="{ height: `${panelHeight + 16}px` }" />
   <section
     v-if="visible"
+    ref="panel"
     class="fixed inset-x-2 bottom-2 z-40 flex max-h-[70vh] flex-col overflow-hidden rounded-xl border border-default bg-default shadow-xl sm:inset-x-auto sm:right-4 sm:bottom-4 sm:w-[26rem]"
     aria-label="Uploads"
   >

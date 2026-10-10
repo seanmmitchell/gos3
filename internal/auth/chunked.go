@@ -20,9 +20,16 @@ import (
 // (never buffered per chunk), so these only bound framing overhead and guard
 // against hostile input.
 const (
-	// MaxChunkSize is the largest accepted aws-chunked chunk (64 MiB). AWS
-	// SDKs use 64 KiB (Go, JS, Python) to 128 KiB (Java) chunks.
+	// MaxChunkSize is the largest accepted signed aws-chunked chunk
+	// (64 MiB). Signing clients use 8 KiB to 128 KiB chunks. Unsigned
+	// chunks (STREAMING-UNSIGNED-PAYLOAD-TRAILER) are bounded only by
+	// maxUnsignedChunkSize and x-amz-decoded-content-length: the AWS SDK for
+	// Go v2 sends a body of known length as a single chunk, so a 5 GiB
+	// PutObject over HTTPS is one 5 GiB chunk.
 	MaxChunkSize = 64 << 20
+	// maxUnsignedChunkSize bounds unsigned chunks at the largest S3 object
+	// (5 TiB), which also keeps sizes far from int64 overflow.
+	maxUnsignedChunkSize = 5 << 40
 	// maxChunkHeaderLen bounds one "<hex-size>;chunk-signature=<sig>" line.
 	maxChunkHeaderLen = 4096
 	// maxTrailerBytes bounds the whole trailer section.
@@ -223,8 +230,11 @@ func (c *chunkedReader) nextChunk() error {
 	if perr != nil {
 		return malformedChunk("invalid chunk size")
 	}
-	if size > MaxChunkSize {
+	if c.signer != nil && size > MaxChunkSize {
 		return malformedChunk("chunk size exceeds the maximum of " + strconv.Itoa(MaxChunkSize) + " bytes")
+	}
+	if size > maxUnsignedChunkSize {
+		return malformedChunk("chunk size exceeds the maximum object size")
 	}
 	if c.declared >= 0 && c.decoded+int64(size) > c.declared {
 		return s3err.ErrIncompleteBody.WithMessage("The decoded body is longer than the x-amz-decoded-content-length header.")

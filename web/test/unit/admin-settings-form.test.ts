@@ -10,9 +10,11 @@ import {
   settingsToForm,
   validateBeaconGroup,
   validateDomain,
+  validateExposeHeader,
   validateOrigin,
   validateSeed,
-  validateSettingsForm
+  validateSettingsForm,
+  validateSrvName
 } from '~/components/admin/-settings-form'
 
 function sample(): Settings {
@@ -174,8 +176,9 @@ describe('settings validation', () => {
 
   it('validates individual list items', () => {
     expect(validateDomain('s3.local')).toBeUndefined()
-    expect(validateDomain('s3.local:9000')).toBeUndefined()
-    expect(validateDomain('s3.local:99999')).toBeDefined()
+    // The server matches Host without the port, so domains carry none.
+    expect(validateDomain('s3.local:9000')).toBeDefined()
+    expect(validateDomain('-bad.local')).toBeDefined()
     expect(validateOrigin('*')).toBeUndefined()
     expect(validateOrigin('https://*.example.com')).toBeUndefined()
     expect(validateOrigin('https://*.*.example.com')).toBeDefined()
@@ -186,6 +189,61 @@ describe('settings validation', () => {
     expect(validateSeed('nas.local:9000')).toBeUndefined()
     expect(validateSeed('nas.local')).toBeUndefined()
     expect(validateSeed('http://')).toBeDefined()
+    // Like the server: base URLs only (no path, query or credentials).
+    expect(validateSeed('http://nas:9000/')).toBeUndefined()
+    expect(validateSeed('http://nas:9000/sub')).toBeDefined()
+    expect(validateSeed('http://u:p@nas:9000')).toBeDefined()
+    expect(validateSrvName('example.com')).toBeUndefined()
+    expect(validateSrvName('example.com.')).toBeUndefined()
+    expect(validateSrvName('exa mple.com')).toBeDefined()
+    expect(validateExposeHeader('*')).toBeUndefined()
+    expect(validateExposeHeader('ETag')).toBeUndefined()
+    expect(validateExposeHeader('x-amz-*')).toBeDefined()
+  })
+
+  it('accepts the settings a real gos3 returns by default (GET then PUT round trip)', () => {
+    // Shape of GET /config from a gos3 started with defaults: exposeHeaders
+    // starts with "*" (all headers readable cross-origin).
+    const s: Settings = {
+      ...sample(),
+      domains: [],
+      cors: {
+        allowedOrigins: ['http://localhost:3000'],
+        allowedHeaders: ['*'],
+        exposeHeaders: ['*', 'ETag', 'Content-Length', 'x-amz-version-id', 'x-amz-delete-marker', 'x-amz-checksum-crc64nvme', 'x-amz-object-lock-mode'],
+        maxAgeSeconds: 3600
+      },
+      discovery: { ...sample().discovery, mdns: false, beacon: false, seeds: ['http://127.0.0.1:19401'], dnsSrv: [] }
+    }
+    expect(validateSettingsForm(settingsToForm(s))).toEqual({})
+  })
+
+  it('enforces the server limits', () => {
+    const f = settingsToForm(sample())
+    f.discovery.beaconIntervalSeconds = 3601
+    f.discovery.maxScanHosts = 65537
+    f.discovery.peerTtlSeconds = 8 * 24 * 3600
+    f.cors.maxAgeSeconds = 604801
+    f.lifecycle.intervalSeconds = 59
+    f.region = 'us-east-'
+    f.discovery.dnsSrv = Array.from({ length: 65 }, (_, i) => `d${i}.example.com`)
+    expect(Object.keys(validateSettingsForm(f)).sort()).toEqual([
+      'cors.maxAgeSeconds',
+      'discovery.beaconIntervalSeconds',
+      'discovery.dnsSrv',
+      'discovery.maxScanHosts',
+      'discovery.peerTtlSeconds',
+      'lifecycle.intervalSeconds',
+      'region'
+    ])
+    f.discovery.beaconIntervalSeconds = 3600
+    f.discovery.maxScanHosts = 65536
+    f.discovery.peerTtlSeconds = 7 * 24 * 3600
+    f.cors.maxAgeSeconds = 604800
+    f.lifecycle.intervalSeconds = 60
+    f.region = 'us-east-1'
+    f.discovery.dnsSrv = ['example.com']
+    expect(validateSettingsForm(f)).toEqual({})
   })
 
   it('maps field paths to sections', () => {

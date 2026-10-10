@@ -84,8 +84,29 @@ describe('BrowserUploadPanel', () => {
     await new Promise(r => setTimeout(r, 0))
     await w.vm.$nextTick()
     expect(w.text()).toContain('1 upload complete')
+    // A clean batch collapses the file list so the panel covers less of the page.
+    expect(w.find('button[aria-label="Expand upload list"]').exists()).toBe(true)
+    // The spacer lets the page scroll its last rows above the floating panel.
+    expect(w.find('[data-testid="upload-panel-spacer"]').exists()).toBe(true)
     uploads.clearFinished()
     await w.vm.$nextTick()
     expect(w.find('section[aria-label="Uploads"]').exists()).toBe(false)
+    expect(w.find('[data-testid="upload-panel-spacer"]').exists()).toBe(false)
+  })
+
+  it('keeps the list expanded when an upload failed', async () => {
+    const client: Uploader = {
+      putObject: () => Promise.reject(new Error('boom')),
+      uploadLarge: () => Promise.reject(new Error('unused'))
+    }
+    const uploads = useUploads()
+    uploads.enqueue({ client, connectionId: 'c', bucket: 'bkt', files: [{ file: new File(['x'], 'bad.txt'), key: 'bad.txt' }] })
+    const w = await mountSuspended(UploadPanel)
+    await new Promise(r => setTimeout(r, 0))
+    await w.vm.$nextTick()
+    expect(w.text()).toContain('1 upload failed')
+    expect(w.find('button[aria-label="Collapse upload list"]').exists()).toBe(true)
+    uploads.clearFinished()
+    for (const it of [...uploads.items]) uploads.remove(it.id)
   })
 })

@@ -215,17 +215,46 @@ export function isFormDirty(current: SettingsForm, original: SettingsForm | null
   return formSignature(current) !== formSignature(original)
 }
 
-const REGION_RE = /^[a-z0-9][a-z0-9-]{0,62}$/
-const HOST_RE = /^(?=.{1,253}$)[a-z0-9_](?:[a-z0-9_-]{0,62})(?:\.[a-z0-9_](?:[a-z0-9_-]{0,62}))*\.?$/i
-const HOST_PORT_RE = /^([^\s:/]+|\[[0-9a-f:.]+\]):(\d{1,5})$/i
+// Limits mirror the server's validator (internal/config ValidateSettings),
+// so that a form that passes here is not rejected with a 400 on save.
+export const SETTINGS_LIMITS = {
+  maxNameLength: 128,
+  maxListEntries: 256,
+  maxDnsSrv: 64,
+  maxCorsMaxAgeSeconds: 7 * 24 * 3600,
+  minBeaconIntervalSeconds: 1,
+  maxBeaconIntervalSeconds: 3600,
+  minPeerTtlSeconds: 1,
+  maxPeerTtlSeconds: 7 * 24 * 3600,
+  maxScanHosts: 65536,
+  minLifecycleSeconds: 60,
+  maxLifecycleSeconds: 365 * 24 * 3600
+} as const
 
-function isHttpUrl(s: string): boolean {
+const REGION_RE = /^[a-z0-9]([a-z0-9-]{0,62}[a-z0-9])?$/
+// DNS name: dot-separated labels of letters, digits, '-' and '_' (no
+// leading/trailing '-'); a trailing dot only where noted.
+const LABEL_RE = /^(?!-)[a-z0-9_-]{1,63}(?<!-)$/i
+const HOST_PORT_RE = /^([^\s:/]+|\[[0-9a-f:.]+\]):(\d{1,5})$/i
+// RFC 7230 header field token (also allows '*' patterns for allowed headers).
+const HEADER_TOKEN_RE = /^[!#$%&'*+.^_`|~0-9a-z-]+$/i
+
+function isHostname(s: string): boolean {
+  return s.length >= 1 && s.length <= 253 && s.split('.').every(l => LABEL_RE.test(l))
+}
+
+/** Absolute http(s) URL without credentials, query or fragment (and no path unless allowPath). */
+function baseUrlError(s: string, allowPath: boolean): string | undefined {
+  let u: URL
   try {
-    const u = new URL(s)
-    return (u.protocol === 'http:' || u.protocol === 'https:') && !!u.host
+    u = new URL(s)
   } catch {
-    return false
+    return `"${s}" is not a valid URL`
   }
+  if ((u.protocol !== 'http:' && u.protocol !== 'https:') || !u.hostname) return `"${s}" must be an http:// or https:// URL`
+  if (u.username || u.password || u.search || u.hash || s.includes('?') || s.includes('#')) return `"${s}" must not contain credentials, a query or a fragment`
+  if (!allowPath && u.pathname !== '/' && u.pathname !== '') return `"${s}" must not contain a path`
+  return undefined
 }
 
 function validPort(p: string | number): boolean {
@@ -233,19 +262,30 @@ function validPort(p: string | number): boolean {
   return Number.isInteger(n) && n >= 1 && n <= 65535
 }
 
-/** "host" or "host:port" (no scheme), e.g. a virtual-hosted-style base domain. */
+/** Virtual-host base domain: a DNS name without scheme, port or path (e.g. s3.example.com). */
 export function validateDomain(d: string): string | undefined {
-  const [host, port, ...rest] = d.split(':')
-  if (rest.length || !host || !HOST_RE.test(host)) return `"${d}" is not a valid domain`
-  if (port !== undefined && !validPort(port)) return `"${d}" has an invalid port`
+  if (d.includes(':') || d.includes('/')) return `"${d}" must be a DNS name without scheme, port or path`
+  if (!isHostname(d)) return `"${d}" is not a valid domain`
   return undefined
 }
 
 /** CORS origin: "*", or scheme://host[:port] where host may contain one "*". */
 export function validateOrigin(o: string): string | undefined {
   if (o === '*') return undefined
-  const m = /^([a-z][a-z0-9+.-]*):\/\/([^/\s]+)$/i.exec(o)
+  const m = /^([a-z][a-z0-9+.-]*):\/\/([^/\s?#@]+)$/i.exec(o)
   if (!m || (m[2] ?? '').split('*').length > 2) return `"${o}" is not a valid origin (use "*" or e.g. https://app.example.com)`
+  return undefined
+}
+
+/** Allowed request header: a header name or a "*" pattern (e.g. x-amz-*). */
+export function validateAllowedHeader(h: string): string | undefined {
+  return HEADER_TOKEN_RE.test(h) ? undefined : `"${h}" is not a valid header name or pattern`
+}
+
+/** Exposed response header: a header name, or a lone "*" (every header). */
+export function validateExposeHeader(h: string): string | undefined {
+  if (h === '*') return undefined
+  if (!HEADER_TOKEN_RE.test(h) || h.includes('*')) return `"${h}" is not a valid header name (only a lone "*" wildcard is allowed)`
   return undefined
 }
 
@@ -260,66 +300,79 @@ export function validateBeaconGroup(g: string): string | undefined {
   return undefined
 }
 
-/** Static seed: a base URL (http[s]://host:port) or host:port. */
+/** Static seed: a base URL without path (http[s]://host:port) or host[:port]. */
 export function validateSeed(s: string): string | undefined {
-  if (/^https?:\/\//i.test(s)) return isHttpUrl(s) ? undefined : `"${s}" is not a valid URL`
+  if (/^[a-z][a-z0-9+.-]*:\/\//i.test(s)) return baseUrlError(s, false)
   const m = HOST_PORT_RE.exec(s)
   if (m && validPort(m[2]!)) return undefined
-  if (HOST_RE.test(s)) return undefined
+  if (isHostname(s)) return undefined
   return `"${s}" is not a valid seed (use http://host:9000 or host:9000)`
 }
 
-/** DNS SRV name, e.g. _gos3._tcp.example.com. */
+/** DNS SRV domain, e.g. example.com (queried as _gos3._tcp.<domain>); a trailing dot is fine. */
 export function validateSrvName(s: string): string | undefined {
-  return HOST_RE.test(s) ? undefined : `"${s}" is not a valid DNS name`
+  return isHostname(s.replace(/\.$/, '')) ? undefined : `"${s}" is not a valid DNS name`
 }
 
-function firstListError(items: readonly string[], fn: (s: string) => string | undefined): string | undefined {
-  for (const it of normalizeList(items)) {
+function firstListError(items: readonly string[], fn: (s: string) => string | undefined, max: number = SETTINGS_LIMITS.maxListEntries): string | undefined {
+  const list = normalizeList(items)
+  if (list.length > max) return `At most ${max} entries`
+  for (const it of list) {
     const e = fn(it)
     if (e) return e
   }
   return undefined
 }
 
-function isNonNegInt(n: number): boolean {
-  return Number.isInteger(n) && n >= 0
+function inRange(n: number, min: number, max: number): boolean {
+  return Number.isFinite(n) && n >= min && n <= max
 }
 
 /** Client-side validation; returns field path → message (empty = valid). */
 export function validateSettingsForm(f: SettingsForm): SettingsErrors {
+  const L = SETTINGS_LIMITS
   const e: SettingsErrors = {}
   const set = (k: string, msg: string | undefined) => {
     if (msg && !e[k]) e[k] = msg
   }
 
   if (!f.name.trim()) set('name', 'Name is required')
-  else if (f.name.trim().length > 128) set('name', 'At most 128 characters')
+  else if (f.name.trim().length > L.maxNameLength) set('name', `At most ${L.maxNameLength} characters`)
+  // eslint-disable-next-line no-control-regex
+  else if (/[\u0000-\u001f\u007f]/.test(f.name)) set('name', 'Control characters are not allowed')
   if (!REGION_RE.test(f.region.trim())) set('region', 'Use lowercase letters, digits and dashes, e.g. us-east-1')
-  if (f.publicUrl.trim() && !isHttpUrl(f.publicUrl.trim())) set('publicUrl', 'Must be an http:// or https:// URL')
+  if (f.publicUrl.trim()) set('publicUrl', baseUrlError(f.publicUrl.trim().replace(/\/+$/, ''), true))
   set('domains', firstListError(f.domains, validateDomain))
 
   set('cors.allowedOrigins', firstListError(f.cors.allowedOrigins, validateOrigin))
-  set('cors.allowedHeaders', firstListError(f.cors.allowedHeaders, h => (/^[\w*-]+$/.test(h) ? undefined : `"${h}" is not a valid header name`)))
-  set('cors.exposeHeaders', firstListError(f.cors.exposeHeaders, h => (/^[\w-]+$/.test(h) ? undefined : `"${h}" is not a valid header name`)))
-  if (!isNonNegInt(f.cors.maxAgeSeconds)) set('cors.maxAgeSeconds', 'Must be a whole number of seconds ≥ 0')
+  set('cors.allowedHeaders', firstListError(f.cors.allowedHeaders, validateAllowedHeader))
+  set('cors.exposeHeaders', firstListError(f.cors.exposeHeaders, validateExposeHeader))
+  if (!Number.isInteger(f.cors.maxAgeSeconds) || !inRange(f.cors.maxAgeSeconds, 0, L.maxCorsMaxAgeSeconds)) {
+    set('cors.maxAgeSeconds', `Must be a whole number of seconds between 0 and ${L.maxCorsMaxAgeSeconds} (7 days)`)
+  }
 
   const d = f.discovery
-  if (d.beacon || d.beaconGroup.trim()) set('discovery.beaconGroup', validateBeaconGroup(d.beaconGroup.trim()))
-  if (!Number.isFinite(d.beaconIntervalSeconds) || d.beaconIntervalSeconds < 1) set('discovery.beaconIntervalSeconds', 'Must be at least 1 second')
-  if (!Number.isFinite(d.peerTtlSeconds) || d.peerTtlSeconds < 1) set('discovery.peerTtlSeconds', 'Must be at least 1 second')
-  else if (d.beacon && d.peerTtlSeconds < d.beaconIntervalSeconds * 2) {
+  // The server validates the group even while the beacon is off.
+  set('discovery.beaconGroup', validateBeaconGroup(d.beaconGroup.trim()))
+  if (!inRange(d.beaconIntervalSeconds, L.minBeaconIntervalSeconds, L.maxBeaconIntervalSeconds)) {
+    set('discovery.beaconIntervalSeconds', `Must be between ${L.minBeaconIntervalSeconds} and ${L.maxBeaconIntervalSeconds} seconds`)
+  }
+  if (!inRange(d.peerTtlSeconds, L.minPeerTtlSeconds, L.maxPeerTtlSeconds)) {
+    set('discovery.peerTtlSeconds', `Must be between ${L.minPeerTtlSeconds} second and ${L.maxPeerTtlSeconds} seconds (7 days)`)
+  } else if (d.beacon && d.peerTtlSeconds < d.beaconIntervalSeconds * 2) {
     set('discovery.peerTtlSeconds', 'Should be at least twice the beacon interval, otherwise peers flap')
   }
-  if (!Number.isInteger(d.maxScanHosts) || d.maxScanHosts < 1) set('discovery.maxScanHosts', 'Must be a whole number ≥ 1')
+  if (!Number.isInteger(d.maxScanHosts) || !inRange(d.maxScanHosts, 1, L.maxScanHosts)) {
+    set('discovery.maxScanHosts', `Must be a whole number between 1 and ${L.maxScanHosts}`)
+  }
   set('discovery.seeds', firstListError(d.seeds, validateSeed))
-  set('discovery.dnsSrv', firstListError(d.dnsSrv, validateSrvName))
+  set('discovery.dnsSrv', firstListError(d.dnsSrv, validateSrvName, L.maxDnsSrv))
 
   if (!(LOG_LEVELS as readonly string[]).includes(f.logging.level)) set('logging.level', 'Unknown log level')
   if (!(LOG_FORMATS as readonly string[]).includes(f.logging.format)) set('logging.format', 'Unknown log format')
 
-  if (!Number.isInteger(f.lifecycle.intervalSeconds) || f.lifecycle.intervalSeconds < 1) {
-    set('lifecycle.intervalSeconds', 'Must be a whole number of seconds ≥ 1')
+  if (!Number.isInteger(f.lifecycle.intervalSeconds) || !inRange(f.lifecycle.intervalSeconds, L.minLifecycleSeconds, L.maxLifecycleSeconds)) {
+    set('lifecycle.intervalSeconds', `Must be a whole number of seconds between ${L.minLifecycleSeconds} and ${L.maxLifecycleSeconds} (1 year)`)
   }
   return e
 }

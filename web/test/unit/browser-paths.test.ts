@@ -6,6 +6,7 @@ import {
   browserRoute,
   encodeKeyPath,
   entryId,
+  entryVersionParam,
   filterBrowserEntries,
   folderKey,
   guessContentType,
@@ -170,5 +171,16 @@ describe('keys for new objects', () => {
     expect(guessContentType('a/readme.MD')).toBe('text/markdown')
     expect(guessContentType('x.json', 'application/x-custom')).toBe('application/x-custom')
     expect(guessContentType('noext')).toBeUndefined()
+  })
+})
+
+describe('entryVersionParam', () => {
+  it('omits the version of the latest object but keeps old versions and delete markers', () => {
+    expect(entryVersionParam({})).toBeUndefined()
+    expect(entryVersionParam({ versionId: 'v2', isLatest: true })).toBeUndefined()
+    expect(entryVersionParam({ versionId: 'v1', isLatest: false })).toBe('v1')
+    // A latest delete marker must be addressed by its version: the plain key is 404.
+    expect(entryVersionParam({ versionId: 'dm', isLatest: true, isDeleteMarker: true })).toBe('dm')
+    expect(entryVersionParam({ versionId: 'dm0', isLatest: false, isDeleteMarker: true })).toBe('dm0')
   })
 })

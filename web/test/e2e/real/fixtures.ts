@@ -105,6 +105,22 @@ export async function fillSignIn(page: Page, accessKey: string, secretKey: strin
   await page.getByRole('button', { name: /^sign in$/i }).click()
 }
 
+/**
+ * Answers the confirmation modal (useConfirm): types the required text when
+ * asked ("Type <x> to confirm.") and clicks the confirm button.
+ */
+export async function confirmDialog(page: Page, button: string | RegExp = /^(Delete|Confirm|Remove|Restore|Disable|Enable|Save|Continue)/): Promise<void> {
+  const dialog = page.getByRole('dialog').filter({ has: page.getByRole('button', { name: 'Cancel' }) }).last()
+  await expect(dialog).toBeVisible()
+  const typed = dialog.getByRole('textbox', { name: /^Type .* to confirm\.$/ })
+  if (await typed.count()) {
+    const text = (await dialog.locator('label code').first().textContent()) ?? ''
+    await typed.fill(text)
+  }
+  await dialog.getByRole('button', { name: button }).last().click()
+  await expect(dialog).toBeHidden()
+}
+
 /** Waits for a toast whose title matches and returns it. */
 export function toast(page: Page, title: string | RegExp) {
   return page.locator('[data-slot="root"], li[role="status"], [role="status"], [role="alert"]').filter({ hasText: title }).first()

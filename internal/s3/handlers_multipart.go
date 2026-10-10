@@ -180,6 +180,7 @@ func (s *Server) handleCreateMultipartUpload(w http.ResponseWriter, r *http.Requ
 		hdr.Set("X-Amz-Checksum-Algorithm", algo)
 		hdr.Set("X-Amz-Checksum-Type", typ)
 	}
+	s.setAbortHeaders(ctx, hdr, up)
 	return writeXML(w, http.StatusOK, initiateMultipartUploadResult{Bucket: rc.bucket, Key: rc.key, UploadID: up.UploadID})
 }
 

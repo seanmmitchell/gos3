@@ -13,9 +13,11 @@ const confirm = useConfirm()
 // --- canned ACL -------------------------------------------------------------
 const ACL_ITEMS: { label: string, value: CannedACL, description: string }[] = [
   { label: 'private', value: 'private', description: 'Owner only (recommended).' },
-  { label: 'public-read', value: 'public-read', description: 'Anyone can list the bucket and read objects.' },
-  { label: 'public-read-write', value: 'public-read-write', description: 'Anyone can list, read, write and delete objects.' },
-  { label: 'authenticated-read', value: 'authenticated-read', description: 'Any authenticated user can read.' }
+  // A bucket ACL covers the bucket itself (listing, writing objects); reading
+  // an object is governed by the object's own ACL or a bucket policy.
+  { label: 'public-read', value: 'public-read', description: 'Anyone can list the objects. Reading them also needs a public object ACL or a bucket policy (Policy tab).' },
+  { label: 'public-read-write', value: 'public-read-write', description: 'Anyone can list, upload, overwrite and delete objects. Reading them also needs a public object ACL or a bucket policy.' },
+  { label: 'authenticated-read', value: 'authenticated-read', description: 'Any authenticated user can list the objects.' }
 ]
 const acl = ref<CannedACL | 'custom'>('private')
 const aclLoader = useLoader(async () => {

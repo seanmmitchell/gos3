@@ -4,7 +4,7 @@
 // signed Node client.
 import { readFile } from 'node:fs/promises'
 import type { Page } from '@playwright/test'
-import { bytes, expect, test, THIS_SERVER, uniqueName } from './fixtures'
+import { bytes, confirmDialog, expect, test, THIS_SERVER, uniqueName } from './fixtures'
 
 test.describe.configure({ mode: 'serial' })
 
@@ -202,15 +202,13 @@ test.describe('object browser', () => {
   test('deletes objects and folders', async ({ api }) => {
     await row(page, 'big.bin').getByRole('button', { name: 'Actions for big.bin' }).click()
     await page.getByRole('menuitem', { name: /Delete/ }).click()
-    const confirm = page.getByRole('alertdialog').or(page.getByRole('dialog')).filter({ hasText: /Delete/ }).last()
-    await confirm.getByRole('button', { name: /^Delete/ }).click()
+    await confirmDialog(page)
     await expect(row(page, 'big.bin')).toHaveCount(0)
     expect((await api.fetch(`/${bucket}/big.bin`, { method: 'HEAD' })).status).toBe(404)
 
     await page.getByRole('checkbox', { name: 'Select docs' }).click()
     await page.getByRole('region', { name: 'Selection actions' }).getByRole('button', { name: 'Delete' }).click()
-    const confirm2 = page.getByRole('alertdialog').or(page.getByRole('dialog')).filter({ hasText: /Delete/ }).last()
-    await confirm2.getByRole('button', { name: /^Delete/ }).click()
+    await confirmDialog(page)
     await expect(row(page, 'docs/')).toHaveCount(0)
     const list = await api.getText(bucket, '', '?list-type=2&prefix=docs/')
     expect(list.text).not.toContain('<Key>')
