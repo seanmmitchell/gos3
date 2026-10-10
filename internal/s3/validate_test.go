@@ -111,7 +111,11 @@ func TestTags(t *testing.T) {
 				tags[i] = Tag{Key: string(rune('a' + i)), Value: "v"}
 			}
 		}
-		if _, err := validateObjectTags(tags); codeOf(err) != "InvalidTag" {
+		want := "InvalidTag"
+		if name == "too many" {
+			want = "BadRequest" // as AWS answers for more than 10 object tags
+		}
+		if _, err := validateObjectTags(tags); codeOf(err) != want {
 			t.Errorf("%s: %v", name, err)
 		}
 	}

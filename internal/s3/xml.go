@@ -196,7 +196,12 @@ func taggingFromMap(tags map[string]string) Tagging {
 }
 
 // validateObjectTags validates an object tag set and returns it as a map.
+// More than 10 tags is BadRequest on AWS (not InvalidTag), both for the
+// x-amz-tagging header and for PutObjectTagging.
 func validateObjectTags(tags []Tag) (map[string]string, error) {
+	if len(tags) > maxObjectTags {
+		return nil, s3err.ErrBadRequest.WithMessage("Object tags cannot be greater than 10")
+	}
 	return validateTags(tags, maxObjectTags, "Object tags cannot be greater than 10")
 }
 

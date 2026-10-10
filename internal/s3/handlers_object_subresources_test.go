@@ -45,7 +45,7 @@ func TestObjectTaggingSDK(t *testing.T) {
 		tooMany[i] = types.Tag{Key: aws.String(fmt.Sprintf("k%d", i)), Value: aws.String("v")}
 	}
 	_, err = e.client.PutObjectTagging(ctx, &awss3.PutObjectTaggingInput{Bucket: aws.String("bkt"), Key: aws.String("k"), Tagging: &types.Tagging{TagSet: tooMany}})
-	objSDKErr(t, err, 400, "InvalidTag")
+	objSDKErr(t, err, 400, "BadRequest") // AWS: "Object tags cannot be greater than 10"
 	_, err = e.client.PutObjectTagging(ctx, &awss3.PutObjectTaggingInput{Bucket: aws.String("bkt"), Key: aws.String("missing"),
 		Tagging: &types.Tagging{TagSet: []types.Tag{{Key: aws.String("a"), Value: aws.String("b")}}}})
 	objSDKErr(t, err, 404, "NoSuchKey")

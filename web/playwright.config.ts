@@ -2,8 +2,15 @@ import { existsSync, readdirSync } from 'node:fs'
 import { join } from 'node:path'
 import { defineConfig, devices } from '@playwright/test'
 
-// E2E smoke tests against the embedded static build served by
-// test/e2e/serve.mjs (which also mocks GET /_gos3/info).
+// Two kinds of E2E tests:
+//
+// - project "chromium": smoke tests against the embedded static build served
+//   by test/e2e/serve.mjs (which mocks GET /_gos3/info); feature specs mock
+//   the APIs with page.route().
+// - project "real-server": test/e2e/real/*.spec.ts drive the UI embedded in a
+//   real gos3 binary. Its setup project (real/global.setup.ts) builds the
+//   binary and starts two gos3 instances; the teardown project stops them.
+//   Run with `pnpm test:e2e:real` (= playwright test --project real-server).
 // Browsers are never downloaded: we use a locally installed Chromium
 // (PW_CHROMIUM_PATH, or the newest chromium-* under PLAYWRIGHT_BROWSERS_PATH
 // / /opt/pw-browsers).
@@ -24,6 +31,14 @@ function localChromium(): string | undefined {
 
 const PORT = Number(process.env.E2E_PORT || 4173)
 
+// The static mock server is only needed by the "chromium" project. Skip it
+// when only the real-server project runs, so its `pnpm generate:embed` does
+// not race with the real-server setup's own UI build.
+const argv = process.argv.join(' ')
+const realOnly = process.env.E2E_REAL_ONLY === '1' || /--project[= ]real-server\b/.test(argv)
+
+const chrome = { ...devices['Desktop Chrome'], launchOptions: { executablePath: localChromium() } }
+
 export default defineConfig({
   testDir: 'test/e2e',
   timeout: 30_000,
@@ -36,10 +51,33 @@ export default defineConfig({
   projects: [
     {
       name: 'chromium',
-      use: { ...devices['Desktop Chrome'], launchOptions: { executablePath: localChromium() } }
+      testIgnore: ['real/**'],
+      use: chrome
+    },
+    {
+      name: 'real-server-setup',
+      testDir: 'test/e2e/real',
+      testMatch: /global\.setup\.ts$/,
+      teardown: 'real-server-teardown'
+    },
+    {
+      name: 'real-server-teardown',
+      testDir: 'test/e2e/real',
+      testMatch: /global\.teardown\.ts$/
+    },
+    {
+      name: 'real-server',
+      testDir: 'test/e2e/real',
+      testMatch: /\.spec\.ts$/,
+      dependencies: ['real-server-setup'],
+      timeout: 120_000,
+      expect: { timeout: 15_000 },
+      // Specs share two servers; files run in parallel but use unique names.
+      fullyParallel: false,
+      use: { ...chrome, baseURL: undefined, acceptDownloads: true, actionTimeout: 20_000, navigationTimeout: 30_000 }
     }
   ],
-  webServer: {
+  webServer: realOnly ? undefined : {
     command: `pnpm generate:embed && node test/e2e/serve.mjs`,
     url: `http://127.0.0.1:${PORT}/_gos3/ui/`,
     reuseExistingServer: !process.env.CI,

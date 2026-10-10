@@ -66,7 +66,7 @@ func TestObjectMetaFromHeaders(t *testing.T) {
 		"bad storage class":   {map[string]string{"X-Amz-Storage-Class": "FAST"}, "InvalidStorageClass"},
 		"bad tagging":         {map[string]string{"X-Amz-Tagging": "a=1&a=2"}, "InvalidArgument"},
 		"bad tagging escape":  {map[string]string{"X-Amz-Tagging": "a=%zz"}, "InvalidArgument"},
-		"too many tags":       {map[string]string{"X-Amz-Tagging": "a=1&b=1&c=1&d=1&e=1&f=1&g=1&h=1&i=1&j=1&k=1"}, "InvalidTag"},
+		"too many tags":       {map[string]string{"X-Amz-Tagging": "a=1&b=1&c=1&d=1&e=1&f=1&g=1&h=1&i=1&j=1&k=1"}, "BadRequest"},
 		"aws tag":             {map[string]string{"X-Amz-Tagging": "aws:x=1"}, "InvalidTag"},
 		"bad acl":             {map[string]string{"X-Amz-Acl": "log-delivery-write"}, "InvalidArgument"},
 		"grant header":        {map[string]string{"X-Amz-Grant-Read": "uri=x"}, "NotImplemented"},

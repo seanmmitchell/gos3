@@ -22,6 +22,7 @@ import (
 
 	"github.com/seanmmitchell/gos3/internal/auth"
 	"github.com/seanmmitchell/gos3/internal/config"
+	"github.com/seanmmitchell/gos3/internal/discovery"
 	"github.com/seanmmitchell/gos3/internal/iam"
 	"github.com/seanmmitchell/gos3/internal/metrics"
 	"github.com/seanmmitchell/gos3/internal/storage"
@@ -75,7 +76,14 @@ func withOptions(f func(*Options)) testEnvOption {
 // newTestEnv starts a test server; it is shut down by t.Cleanup.
 func newTestEnv(t testing.TB, opts ...testEnvOption) *testEnv {
 	t.Helper()
-	cfg := testEnvConfig{settings: config.Settings{Region: "us-east-1", Logging: config.LoggingConfig{AccessLog: true}}}
+	// Complete, valid settings (config.Store.Update validates the whole
+	// document), without global CORS and virtual-host domains.
+	cfg := testEnvConfig{settings: config.Settings{
+		Region:    "us-east-1",
+		Discovery: discovery.DefaultConfig(),
+		Logging:   config.LoggingConfig{Level: "info", Format: "text", AccessLog: true},
+		Lifecycle: config.LifecycleSettings{Enabled: true, IntervalSeconds: 3600},
+	}}
 	for _, o := range opts {
 		o(&cfg)
 	}

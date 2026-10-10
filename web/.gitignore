@@ -7,3 +7,6 @@ dist
 *.tsbuildinfo
 test-results/
 playwright-report/
+
+# real-server e2e: cached gos3 binary + run state
+.e2e-cache/
