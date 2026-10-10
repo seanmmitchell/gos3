@@ -452,8 +452,14 @@ func TestGracefulShutdown(t *testing.T) {
 		err    error
 	}
 	done := make(chan result, 1)
+	// A fresh connection: reusing the idle keep-alive connection of the
+	// CreateBucket request would race with Shutdown, which closes
+	// connections that are still idle because the server has not read the
+	// new request's headers yet (a client then sees a closed connection).
+	// New connections are left to finish.
+	uploadClient := &http.Client{Transport: &http.Transport{Proxy: nil, DisableKeepAlives: true}}
 	go func() {
-		resp, err := noRedirectClient.Do(req)
+		resp, err := uploadClient.Do(req)
 		if err != nil {
 			done <- result{err: err}
 			return

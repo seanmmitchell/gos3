@@ -88,6 +88,8 @@ printf 'unicode\n' >"$src/docs/żółć 日本.txt"
 printf 'space\n' >"$src/with space/file +plus.txt"
 printf 'odd\n' >"$src/docs/pct%20sign #hash?q=1&x.txt"
 : >"$src/docs/empty.txt"
+mkdir -p "$src/many"
+for i in $(seq -w 1 150); do printf 'small %s\n' "$i" >"$src/many/f$i.txt"; done
 head -c 4096 /dev/urandom >"$src/img/random.bin"
 # 20 MiB: above the 8 MB multipart threshold.
 head -c $((20 * 1024 * 1024)) /dev/urandom >"$src/big.bin"

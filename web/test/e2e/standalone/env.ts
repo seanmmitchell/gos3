@@ -68,7 +68,7 @@ export interface StandaloneState {
   beta: Gos3Instance
   /** Plain standalone UI (no presets) — the one most specs use. */
   ui: UiInstance
-  /** Second UI: a build with public/servers.json, started with NUXT_PUBLIC_SERVERS. */
+  /** Second UI: a build with public/servers.json, started with NUXT_PUBLIC_SERVERS and GOS3_UI_LOCAL_DISCOVERY=false. */
   presetUi: UiInstance
 }
 

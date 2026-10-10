@@ -1,0 +1,43 @@
+# Only cmd/, internal/, go.mod/go.sum and web/ (sources) are needed to build
+# the image. Keep the context small and free of local state and secrets.
+.git
+.github
+.editorconfig
+*.log
+.env
+.env.*
+**/.DS_Store
+
+# Go / local build output and runtime data
+bin/
+dist/
+data/
+*.db
+*.test
+*.out
+coverage.*
+
+# Docs, deployment manifests and the out-of-process test suites
+docs/
+deploy/
+test/
+README.md
+docker-compose.yml
+Dockerfile
+.dockerignore
+
+# Embedded UI build output: the image builds its own UI. Keep the committed
+# placeholder (the Go package needs a non-empty dist/ to compile).
+internal/webui/dist/*
+!internal/webui/dist/.keep
+!internal/webui/dist/index.html
+
+# Web UI dependencies, build output, caches and test artefacts
+**/node_modules/
+web/.nuxt/
+web/.output/
+web/.data/
+web/.e2e-cache/
+web/dist
+web/test-results/
+web/playwright-report/

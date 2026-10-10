@@ -146,7 +146,8 @@ describe('LocalDiscoveryClient', () => {
     }
     expect(await new LocalDiscoveryClient('/', { fetch: offline }).capabilities()).toBeNull()
     const disabled: FetchLike = async () => new Response(JSON.stringify({ ...caps, localDiscovery: false }))
-    expect(await new LocalDiscoveryClient('/', { fetch: disabled }).capabilities()).toBeNull()
+    // Turned off on the UI server: reported (so the UI can say so), not null.
+    expect(await new LocalDiscoveryClient('/', { fetch: disabled }).capabilities()).toEqual({ ...caps, localDiscovery: false })
   })
 
   it('calls the discovery routes and parses error envelopes', async () => {

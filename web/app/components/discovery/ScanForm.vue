@@ -60,12 +60,19 @@ function submit() {
       <UFormField label="Ports" :error="shown.ports" help="Comma separated (default 9000).">
         <UInput v-model="model.ports" class="w-full font-mono" placeholder="9000" inputmode="numeric" :disabled="running" />
       </UFormField>
-      <UFormField label="Schemes" :error="shown.schemes">
-        <div class="flex h-8 items-center gap-4">
+      <!-- A fieldset, not UFormField: the form field would label both checkboxes "Schemes". -->
+      <fieldset class="min-w-0">
+        <legend class="block text-sm font-medium text-default">
+          Schemes
+        </legend>
+        <div class="mt-1 flex h-8 items-center gap-4">
           <UCheckbox v-model="model.http" label="http" :disabled="running" />
           <UCheckbox v-model="model.https" label="https" :disabled="running" />
         </div>
-      </UFormField>
+        <p v-if="shown.schemes" class="mt-2 text-sm text-error">
+          {{ shown.schemes }}
+        </p>
+      </fieldset>
       <UFormField label="Timeout per probe (s)" :error="shown.timeoutSeconds">
         <UInputNumber v-model="model.timeoutSeconds" :min="0.01" :max="30" :step="0.5" :format-options="{ maximumFractionDigits: 2 }" class="w-full" :disabled="running" />
       </UFormField>

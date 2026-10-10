@@ -558,3 +558,42 @@ def test_listing_beyond_1000_keys(s3, bucket):
     for op in ("list_objects", "list_objects_v2"):
         got = [o["Key"] for p in s3.get_paginator(op).paginate(Bucket=bucket) for o in p.get("Contents", [])]
         assert got == keys, op
+
+
+def test_conditional_writes_complete_copy_delete(s3, bucket):
+    s3.put_object(Bucket=bucket, Key="exists", Body=b"1")
+
+    def mpu(key):
+        uid = s3.create_multipart_upload(Bucket=bucket, Key=key)["UploadId"]
+        etag = s3.upload_part(Bucket=bucket, Key=key, UploadId=uid, PartNumber=1, Body=b"x")["ETag"]
+        return uid, {"Parts": [{"PartNumber": 1, "ETag": etag}]}
+
+    uid, parts = mpu("exists")
+    with pytest.raises(ClientError) as ei:
+        s3.complete_multipart_upload(Bucket=bucket, Key="exists", UploadId=uid, MultipartUpload=parts, IfNoneMatch="*")
+    assert error_code(ei) == "PreconditionFailed"
+    s3.abort_multipart_upload(Bucket=bucket, Key="exists", UploadId=uid)
+
+    uid, parts = mpu("new")
+    s3.complete_multipart_upload(Bucket=bucket, Key="new", UploadId=uid, MultipartUpload=parts, IfNoneMatch="*")
+
+    with pytest.raises(ClientError) as ei:
+        s3.copy_object(Bucket=bucket, Key="exists", CopySource=f"{bucket}/new", IfNoneMatch="*")
+    assert error_code(ei) == "PreconditionFailed"
+
+    with pytest.raises(ClientError) as ei:
+        s3.delete_object(Bucket=bucket, Key="exists", IfMatch='"0123"')
+    assert error_code(ei) == "PreconditionFailed"
+    etag = s3.head_object(Bucket=bucket, Key="exists")["ETag"]
+    s3.delete_object(Bucket=bucket, Key="exists", IfMatch=etag)
+
+
+def test_content_encoding_gzip_is_opaque(s3, bucket):
+    import gzip
+
+    data = gzip.compress(b"hello " * 1000)
+    s3.put_object(Bucket=bucket, Key="gz", Body=data, ContentEncoding="gzip", ContentType="text/plain")
+    got = s3.get_object(Bucket=bucket, Key="gz")
+    assert got["ContentEncoding"] == "gzip"
+    assert got["ContentLength"] == len(data)
+    assert got["Body"].read() == data

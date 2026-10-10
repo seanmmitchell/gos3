@@ -196,6 +196,9 @@ const STATE_CLASSES = {
             <p v-else-if="local.checking.value || !local.checked.value" class="flex items-center gap-2 text-sm text-muted">
               <UIcon name="i-lucide-loader-circle" class="size-4 animate-spin" aria-hidden="true" /> Checking whether the UI server supports local discovery…
             </p>
+            <p v-else-if="local.capabilities.value && !local.capabilities.value.localDiscovery" class="text-sm text-muted">
+              Turned off on the UI server (<code class="font-mono text-xs">GOS3_UI_LOCAL_DISCOVERY</code>). Probes from this browser still work.
+            </p>
             <p v-else-if="!local.available.value" class="text-sm text-muted">
               Not available: this console is served as static files. Run it as a Node server (<code class="font-mono text-xs">node .output/server/index.mjs</code>) for mDNS / beacon discovery and scans from the UI host.
             </p>

@@ -11,6 +11,29 @@ It ships in two modes from one codebase:
 | **Embedded** | `pnpm generate:embed` → `.output/public/` | the gos3 binary at `/_gos3/ui/` (copied to `internal/webui/dist/` by the integration build) | fully static, offline-safe; auto-detects the hosting server (same origin, no CORS) |
 | **Standalone** | `pnpm build` → `.output/` | `node .output/server/index.mjs` | adds Nitro server routes in `server/` for *local* network discovery (mDNS / beacon / scan) |
 
+## Screenshots
+
+| | |
+|---|---|
+| ![Dashboard](../docs/screenshots/dashboard.png) | ![Object browser](../docs/screenshots/browser.png) |
+| Dashboard: every server with live status, identity and storage totals | Object browser: folders, uploads (drag & drop, multipart), bulk actions |
+| ![Object details](../docs/screenshots/object-details.png) | ![Bucket settings](../docs/screenshots/bucket-settings.png) |
+| Object details: metadata, checksums, preview, tags, versions, share links | Bucket settings: versioning, policy, CORS, lifecycle, tags, encryption, object lock |
+| ![Server overview](../docs/screenshots/overview.png) | ![Users](../docs/screenshots/users.png) |
+| Server overview: storage, request metrics and per-operation latency | IAM users, access keys, policies and a permission simulator |
+| ![Discovery](../docs/screenshots/discovery.png) | ![Dark mode](../docs/screenshots/browser-dark.png) |
+| Discovery: peers found via mDNS, beacon, seeds, DNS SRV and scans | Dark mode follows the system (also [dashboard](../docs/screenshots/dashboard-dark.png)) |
+
+The images are produced by `pnpm screenshots` (Playwright project
+`screenshots`, `test/e2e/screenshots/readme.shots.ts`): it builds a gos3
+binary with the current embedded UI (into `.e2e-cache/`, never touching
+`.output` or `internal/webui/dist`), starts two instances, fills one with demo
+data (buckets, folders, varied file types, a versioned bucket with lifecycle
+rules, users), keeps S3 traffic flowing for `SHOTS_TRAFFIC_MINUTES` (default
+5) so the metrics chart has data, and writes 1440×900 PNGs (each checked to
+stay under 400 KB) to `docs/screenshots/`. `SHOTS_ONLY=dashboard,users`
+re-captures a subset.
+
 ## Commands
 
 ```bash
@@ -24,7 +47,14 @@ pnpm generate:embed   # static SPA at base '/_gos3/ui/' (NUXT_PUBLIC_EMBEDDED=tr
 pnpm preview          # preview the last build
 pnpm test:e2e         # Playwright tests against mocked APIs (builds the embed bundle first)
 pnpm test:e2e:real    # Playwright end-to-end tests against real gos3 binaries (see below)
+pnpm test:e2e:standalone  # Playwright: standalone Node UI + two real gos3 binaries, cross-origin
+pnpm screenshots      # regenerate docs/screenshots/*.png (see Screenshots)
 ```
+
+Builds normally write `.nuxt/` and `.output/`. `NUXT_BUILD_DIR` and
+`NUXT_OUTPUT_DIR` redirect them, so a second build can run next to the usual
+one without overwriting it (the standalone e2e setup builds into
+`.e2e-cache/standalone-*` this way).
 
 `pnpm test:e2e` never downloads browsers: `playwright.config.ts` uses
 `PW_CHROMIUM_PATH` or the newest `chromium-*` under `PLAYWRIGHT_BROWSERS_PATH`
@@ -32,8 +62,72 @@ pnpm test:e2e:real    # Playwright end-to-end tests against real gos3 binaries (
 under `/_gos3/ui/` and mocks `GET /_gos3/info`.
 
 During `pnpm dev` against a local gos3, the gos3 server must allow the dev
-origin via CORS (`cors.allowed_origins: ["http://localhost:3000"]`) and expose
-`ETag`, `x-amz-version-id`, … (`cors.expose_headers`).
+origin via CORS (`cors.allowed_origins: ["http://localhost:3000"]`, or
+`gos3 serve --cors-origin http://localhost:3000`; `make dev` does this) and
+expose `ETag`, `x-amz-version-id`, … (`cors.expose_headers`).
+
+## Standalone mode
+
+```bash
+pnpm build
+PORT=3000 HOST=0.0.0.0 node .output/server/index.mjs     # Nitro node-server (also NITRO_PORT / NITRO_HOST)
+NUXT_PUBLIC_SERVERS='[{"name":"NAS","endpoint":"http://10.0.0.5:9000"}]' node .output/server/index.mjs
+```
+
+The browser talks to every S3 server **directly** (requests are signed in the
+browser), so each server must allow the UI's origin via CORS and expose the
+response headers the UI reads:
+
+| Header | Needed for |
+|---|---|
+| `ETag` | multipart uploads (else `S3Error` `MissingETag`), object details |
+| `x-amz-meta-*` | the metadata editor — if not exposed, existing metadata looks empty and **saving it would wipe it** |
+| `x-amz-version-id`, `x-amz-delete-marker`, `x-amz-checksum-*`, `x-amz-object-lock-*`, `Content-*`, `Last-Modified` | versions, details, checksums, retention |
+
+gos3's default `cors.expose_headers` starts with `"*"` and lists these names
+explicitly, so only `cors.allowed_origins` needs the UI origin. For other S3
+services, configure the equivalent (`ExposeHeaders` in the bucket CORS rules
+for AWS; `x-amz-meta-*` wildcards are not supported there, list the names).
+`GET /_gos3/info` always sends `Access-Control-Allow-Origin: *`, so the UI
+can detect a gos3 server (and tell "CORS blocked" from "unreachable") before
+CORS is configured.
+
+### Local discovery routes (Nitro, standalone only)
+
+The Node server adds routes that discover gos3 servers **from the UI host**
+(the browser cannot do mDNS, multicast or port scans). The static/embedded
+build has no server routes; the UI detects that (`capabilities` → 404 or HTML)
+and hides the feature.
+
+| Route | Body / query | Response |
+|---|---|---|
+| `GET /api/discovery/capabilities` | | `{localDiscovery, mdns, beacon, scan, maxScanHosts}` |
+| `GET /api/discovery/local?wait=<ms>` | `wait` 500–10000 (default 3000) | mDNS browse (`_gos3._tcp`) + beacon query (`239.255.73.83:7373`), then `/_gos3/info` verification: `{peers, errors, candidates, elapsedMs}` |
+| `POST /api/discovery/scan` | admin API `ScanRequest` (`timeout` in ns) | `ScanResult`; ≤ 1024 hosts, ≤ 64 ports, ≤ 4096 probes, concurrency ≤ 64 |
+| `POST /api/discovery/probe` | `{"url": "http://host:9000"}` | the server's `Info`, or 502 `ProbeFailed` |
+
+- Errors use the admin envelope `{"error": {"code", "message"}}`.
+- POSTs require `Content-Type: application/json` (415 otherwise). A
+  cross-site page cannot send that without a CORS preflight, which this
+  server never approves, so this doubles as CSRF protection.
+- The Node server has **no authentication**: anyone who can reach it can make
+  it probe and scan (bounded as above). Bind it to a trusted interface, or
+  turn them off with **`GOS3_UI_LOCAL_DISCOVERY=false`** (also `0`, `off`,
+  `no`, `disabled`): `local`, `scan` and `probe` then answer 403,
+  `capabilities` reports `localDiscovery: false` and the UI hides local
+  discovery.
+- mDNS uses `multicast-dns` when it can be loaded; the beacon needs UDP
+  multicast on the host's network (often unavailable in containers — scans
+  and probes still work).
+
+### Connect page parameters
+
+| URL | Shows |
+|---|---|
+| `/connect?server=<id>&redirect=<path>` | sign-in for an existing connection, then `redirect` (internal paths only; `//…`, schemes and `/connect` are ignored) |
+| `/connect` | the hosting server's sign-in when embedded and not signed in, else the new-server form |
+| `/connect?new=1` | always the new-server form (`appRoutes.newServer()`; used by every "Add server" entry) |
+| `/connect?new=1&endpoint=<url>&name=<name>` | new-server form, prefilled (`appRoutes.newServer({ endpoint, name })`; `endpoint` alone implies `new`) |
 
 ### Configuration
 
@@ -45,7 +139,14 @@ origin via CORS (`cors.allowed_origins: ["http://localhost:3000"]`) and expose
 | `public.appName` | `NUXT_PUBLIC_APP_NAME` | display name (default `gos3`) |
 
 Presets can also be shipped as `public/servers.json` (served as
-`${baseURL}servers.json`; a missing file or an SPA HTML fallback is ignored):
+`${baseURL}servers.json`; a missing file or an SPA HTML fallback is ignored).
+`public/servers.example.json` is a documented template (shipped, never
+loaded): copy it to `public/servers.json` **before** building. Both builds
+bundle `public/` at build time — the standalone Node server serves public
+files from a manifest made by `nuxt build`, so a `servers.json` dropped into
+`.output/public` afterwards is not served. For runtime configuration of the
+standalone server use `NUXT_PUBLIC_SERVERS`; the embedded build is static, so
+there both mechanisms are fixed at build time.
 
 ```json
 { "servers": [
@@ -56,7 +157,10 @@ Presets can also be shipped as `public/servers.json` (served as
 
 Accepted keys: `id, name, endpoint|url, region, accessKeyId|accessKey,
 secretAccessKey|secretKey, kind ('gos3'|'s3'), forcePathStyle|pathStyle,
-color`. Presets without `id` get `preset-<endpoint-slug>`.
+color`. Presets without `id` get `preset-<endpoint-slug>`. Preset definitions
+are read-only in the UI (only credentials can be entered); removing a preset
+hides it in that browser. Avoid shipping secret keys: anyone who can load the
+UI can read them.
 
 ### Offline / no remote assets
 
@@ -101,7 +205,9 @@ app/
 server/                   Nitro routes for standalone local discovery (servers & discovery agent)
 test/unit/                Vitest "unit" project (node env + DOMParser/Storage from test/setup.ts)
 test/nuxt/                Vitest "nuxt" project (@nuxt/test-utils, components & composables)
-test/e2e/                 Playwright smoke tests + static server
+test/e2e/                 Playwright: mocked smoke/feature specs + static server (serve.mjs),
+                          real/ (embedded UI in real gos3), standalone/ (Node UI + real gos3),
+                          screenshots/ (README screenshots, `pnpm screenshots`)
 ```
 
 Nuxt auto-imports only top-level `app/utils/*.ts`; the clients in
@@ -167,7 +273,8 @@ multipart upload needs `ETag` (else `S3Error` code `MissingETag`).
 
 ### Connections & capabilities
 
-- `useConnectionsStore()` — `connections`, `sorted`, `activeId`, `active`,
+- `useConnectionsStore()` — `connections`, `sorted`, `ordered` (default server
+  first), `activeId`, `active`, `defaultId`, `defaultConnection`, `setDefault`,
   `byId`, `add`, `update`, `remove`, `setActive`, `setCredentials`,
   `clearCredentials`, `exportJson({ includeSecrets })`, `importJson(text)`,
   `statusOf(id)`, `refreshStatus(id)`, `ensureStatus(id, maxAgeMs)`, `refreshAll()`,
@@ -184,6 +291,10 @@ multipart upload needs `ETag` (else `S3Error` code `MissingETag`).
   Discovery only for `manageUsers` / `managePolicies` / `manageConfig` /
   `discovery`. Pages should still handle `AccessDenied` gracefully.
 - `EMBEDDED_CONNECTION_ID` (`'this-server'`) is the connection for the hosting gos3.
+- Default server: `store.defaultId` (persisted with the connections; the
+  former `gos3.defaultServer.v1` key is migrated) orders the dashboard, the
+  servers table and the sidebar switcher, and is the sidebar's connection when
+  no server is active (`useConnection()` falls back to active, then default).
 - Route guard: every `/servers/:id/**` page may assume the connection exists
   and has credentials; `/connect?server=<id>&redirect=<path>` is where users
   enter credentials (then `router.replace(redirect)`).
@@ -191,7 +302,9 @@ multipart upload needs `ETag` (else `S3Error` code `MissingETag`).
 ### Routes
 
 Always build links with `appRoutes` (`appRoutes.bucket(id, bucket, prefix)`,
-`appRoutes.object(id, bucket, key, versionId)`, `appRoutes.connect(id, redirect)` …).
+`appRoutes.object(id, bucket, key, versionId)`, `appRoutes.connect(id, redirect)`,
+`appRoutes.newServer({ endpoint?, name? })` …). Never link "Add server" to a bare
+`appRoutes.connect()`: when embedded it opens the hosting server's sign-in.
 Folder browsing uses `?prefix=` on the bucket page; object details use the
 catch-all `objects/[...path]` (`routeParamToKey(route.params.path)`). The
 layout derives breadcrumbs from these routes; override with
@@ -257,6 +370,29 @@ layout derives breadcrumbs from these routes; override with
   assert the server name. Env: `GOS3_BIN=<path>` uses a prebuilt binary,
   `E2E_SKIP_UI_BUILD=1` skips the bundle check, `E2E_KEEP_DATA=1` keeps data
   dirs and logs (`/tmp/gos3-e2e-*`).
+- Standalone E2E: `pnpm test:e2e:standalone` runs the Playwright project
+  `standalone` (`test/e2e/standalone/*.spec.ts`): the standalone UI as a real
+  Node server against two real gos3 instances, so every API call is
+  cross-origin. Its setup project (`standalone/global.setup.ts`):
+  - runs `pnpm build` into `.e2e-cache/standalone-output` (via
+    `NUXT_BUILD_DIR` / `NUXT_OUTPUT_DIR`, so `.output` stays untouched) when
+    `app/`, `server/`, `public/` or the config changed, plus a second build of
+    a temp copy of the sources (outside `web/`) that adds
+    `public/servers.json` — presets never touch `web/public`;
+  - `go build`s `.e2e-cache/gos3-standalone` when Go sources changed
+    (`bin/gos3` is the fallback if that fails; `GOS3_BIN=<path>` overrides);
+  - starts gos3 *alpha* and *beta* (memory backend, root keys `saroot` /
+    `saroot-secret-key`, discovery with scans but no multicast and no seeds,
+    CORS for both UI origins) and two UI servers: the plain one on
+    `http://localhost:3000` (a free port if 3000 is taken) and a preset one
+    (`servers.json` + `NUXT_PUBLIC_SERVERS` at runtime). Processes run under
+    `real/watchdog.mjs`, so an aborted run does not leave them behind.
+  Specs cover adding a server (type detection, test connection, credentials),
+  import/export, presets, browsing/uploads (multipart reads `ETag`) and the
+  metadata editor reading `x-amz-meta-*` cross-origin, and the Discover page
+  (UI-host scan of `127.0.0.1` with both ports, browser/UI-host probes, peer
+  tables of connected servers). Env: `E2E_SKIP_UI_BUILD=1`, `E2E_KEEP_DATA=1`
+  (keeps `/tmp/gos3-standalone-*` with the logs).
 - E2E: `pnpm test:e2e` (Playwright, `test/e2e/*.spec.ts`) builds the embedded
   bundle and serves it via `test/e2e/serve.mjs`, which mocks `GET /_gos3/info`.
   Extend the mock server there if your feature needs canned API responses.

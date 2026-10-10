@@ -16,6 +16,8 @@ import { defineConfig, devices } from '@playwright/test'
 //   .e2e-cache/) against two real gos3 binaries, cross-origin (CORS). Its
 //   setup/teardown projects start and stop everything. Run with
 //   `pnpm test:e2e:standalone`.
+// - project "screenshots": regenerates the README screenshots in
+//   docs/screenshots/ (`pnpm screenshots`); never part of a test run.
 // Browsers are never downloaded: we use a locally installed Chromium
 // (PW_CHROMIUM_PATH, or the newest chromium-* under PLAYWRIGHT_BROWSERS_PATH
 // / /opt/pw-browsers).
@@ -58,7 +60,7 @@ export default defineConfig({
   projects: [
     {
       name: 'chromium',
-      testIgnore: ['real/**', 'standalone/**'],
+      testIgnore: ['real/**', 'standalone/**', 'screenshots/**'],
       use: chrome
     },
     {
@@ -105,6 +107,18 @@ export default defineConfig({
       // files may run in parallel; they use unique bucket names.
       fullyParallel: false,
       use: { ...chrome, baseURL: undefined, acceptDownloads: true, actionTimeout: 20_000, navigationTimeout: 30_000 }
+    },
+    {
+      // README screenshots (docs/screenshots/*.png): `pnpm screenshots`.
+      name: 'screenshots',
+      testDir: 'test/e2e/screenshots',
+      testMatch: /\.shots\.ts$/,
+      timeout: 600_000,
+      expect: { timeout: 20_000 },
+      fullyParallel: false,
+      workers: 1,
+      // No traces: the run is long and its contexts outlive single tests.
+      use: { ...chrome, baseURL: undefined, trace: 'off', actionTimeout: 20_000, navigationTimeout: 30_000 }
     }
   ],
   webServer: realOnly ? undefined : {

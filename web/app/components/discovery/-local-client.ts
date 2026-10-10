@@ -81,11 +81,15 @@ export class LocalDiscoveryClient {
     }
   }
 
-  /** Capabilities, or null when the routes do not exist (static build). Never throws. */
+  /**
+   * Capabilities, or null when the routes do not exist (static build). When
+   * the UI server turned local discovery off (GOS3_UI_LOCAL_DISCOVERY=false)
+   * the result has `localDiscovery: false`. Never throws.
+   */
   async capabilities(timeoutMs = 3000): Promise<LocalCapabilities | null> {
     try {
       const caps = await this.request<unknown>('GET', 'api/discovery/capabilities', undefined, { timeoutMs })
-      return isLocalCapabilities(caps) && caps.localDiscovery ? caps : null
+      return isLocalCapabilities(caps) ? caps : null
     } catch {
       return null
     }
