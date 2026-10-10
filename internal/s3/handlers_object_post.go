@@ -263,28 +263,22 @@ func (s *Server) handlePostObject(w http.ResponseWriter, r *http.Request, rc *re
 		}
 	}
 
-	// The form fields stand in for the request headers that the condition
-	// context reads for other writes, including the request tags.
-	conds := map[string][]string{}
-	for _, k := range []string{"x-amz-acl", "x-amz-storage-class", "x-amz-server-side-encryption", "x-amz-website-redirect-location"} {
-		if v := hdr.Get(k); v != "" {
-			conds["s3:"+k] = []string{v}
-		}
-	}
-	putConds := maps.Clone(conds)
-	if tagging != "" {
-		maps.Copy(putConds, requestTagConditions(meta.Tags))
-	}
-	if err := s.authorizeTarget(ctx, r, rc, authzTarget{Action: "s3:PutObject", Bucket: rc.bucket, Key: key, Conditions: putConds}); err != nil {
+	// The form fields stand in for the request headers: the condition keys
+	// describing the object (ACL, storage class, encryption, website
+	// redirect, object lock, tags) come from the parsed and normalised
+	// fields, never from the POST request's own headers.
+	acl := hdr.Get("X-Amz-Acl")
+	legalHoldSet := hdr.Get("X-Amz-Object-Lock-Legal-Hold") != ""
+	attrs := objectAttrConditions(meta, acl != "", legalHoldSet, tagging != "", s.now())
+	if err := s.authorizeTarget(ctx, r, rc, authzTarget{Action: "s3:PutObject", Bucket: rc.bucket, Key: key, ObjectAttrs: attrs}); err != nil {
 		return err
 	}
-	acl := hdr.Get("X-Amz-Acl")
 	if err := s.prepareNewObject(ctx, r, rc, bi, key, &meta, newObjectOpts{
-		legalHoldSet: hdr.Get("X-Amz-Object-Lock-Legal-Hold") != "",
-		acl:          acl,
+		legalHoldSet: legalHoldSet,
+		acl:          meta.ACL,
 		aclSet:       acl != "",
 		tagsSet:      tagging != "",
-		conds:        conds,
+		attrs:        attrs,
 	}); err != nil {
 		return err
 	}

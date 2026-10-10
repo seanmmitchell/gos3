@@ -1,4 +1,4 @@
-# syntax=docker/dockerfile:1
+# syntax=docker/dockerfile:1@sha256:4edf897a3ffa55b89f906fc8cc78afdb3f1834cc9c7083565e611a8a7d5fe99e
 #
 # gos3 container image: the web UI is built with pnpm, embedded into a static
 # Go binary, and shipped on distroless (non-root, no shell).
@@ -10,14 +10,16 @@
 #
 # `make docker` passes VERSION, COMMIT and DATE. The build stages run on the
 # build platform and cross-compile, so multi-arch builds need no emulation.
-
-ARG GO_VERSION=1.26
-ARG NODE_VERSION=22
+#
+# Base images are pinned by digest (multi-arch index) so a retagged image
+# cannot change a release build; Dependabot (.github/dependabot.yml) proposes
+# tag and digest updates. To build on another Go or Node version, edit the tag
+# and the digest of the FROM line together.
 
 # ---------------------------------------------------------------------------
 # Web UI: static SPA with base /_gos3/ui/ (web/.output/public)
 # ---------------------------------------------------------------------------
-FROM --platform=$BUILDPLATFORM node:${NODE_VERSION}-bookworm-slim AS ui
+FROM --platform=$BUILDPLATFORM node:22-bookworm-slim@sha256:c3de60bf2f9dd0ac6370e6117950ff62d6e339527e7472301c9c78a017978392 AS ui
 ENV PNPM_HOME=/pnpm \
     COREPACK_ENABLE_DOWNLOAD_PROMPT=0 \
     NUXT_TELEMETRY_DISABLED=1 \
@@ -41,7 +43,7 @@ RUN --mount=type=cache,id=gos3-pnpm,target=/pnpm/store \
 # ---------------------------------------------------------------------------
 # Go binary with the UI embedded (internal/webui/dist)
 # ---------------------------------------------------------------------------
-FROM --platform=$BUILDPLATFORM golang:${GO_VERSION}-bookworm AS build
+FROM --platform=$BUILDPLATFORM golang:1.26-bookworm@sha256:d9c68c2c51161e12fd77e4c6320687c9cd86e1af1e3ad6e6cd63ff970641453c AS build
 ARG TARGETOS
 ARG TARGETARCH
 ARG VERSION=dev
@@ -72,7 +74,7 @@ RUN --mount=type=cache,target=/go/pkg/mod \
 # ---------------------------------------------------------------------------
 # Runtime: distroless static, uid/gid 65532 (nonroot)
 # ---------------------------------------------------------------------------
-FROM gcr.io/distroless/static-debian12:nonroot
+FROM gcr.io/distroless/static-debian12:nonroot@sha256:afa5c872c891853ca7fcf1f12c3edb23f7eeef36189728842dd51042ff57f7ab
 ARG VERSION=dev
 LABEL org.opencontainers.image.title="gos3" \
       org.opencontainers.image.description="S3-compatible object storage server with an embedded web UI" \

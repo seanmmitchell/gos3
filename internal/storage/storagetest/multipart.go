@@ -29,7 +29,7 @@ func multipartTests() []testCase {
 		{"UploadGoneAfterCompleteOrAbort", testMultipartGone},
 		{"WrongKey", testMultipartWrongKey},
 		{"PartCommitAfterAbort", testMultipartPartCommitAfterAbort},
-		{"KeepsBucketNonEmpty", testMultipartKeepsBucketNonEmpty},
+		{"DeleteBucketAbortsUploads", testMultipartDeleteBucketAbortsUploads},
 		{"CompleteHonoursVersioning", testMultipartVersioning},
 		{"MetadataIsolation", testMultipartIsolation},
 	}
@@ -539,12 +539,43 @@ func testMultipartPartCommitAfterAbort(e *env) {
 	}
 }
 
-func testMultipartKeepsBucketNonEmpty(e *env) {
+// testMultipartDeleteBucketAbortsUploads checks that in-progress uploads do
+// not keep a bucket alive (as on AWS, recursive-delete tools never abort
+// them): DeleteBucket aborts them, but only when no object versions or
+// delete markers remain.
+func testMultipartDeleteBucketAbortsUploads(e *env) {
 	e.mkBucket("b")
+	e.put("b", "obj", []byte("x"))
 	id := e.uploadWithPart("b", "k", []byte("p"))
-	e.wantErr("DeleteBucket with an in-progress upload", e.b.DeleteBucket(e.ctx, "b"), storage.ErrBucketNotEmpty)
-	e.noErr("AbortMultipartUpload", e.b.AbortMultipartUpload(e.ctx, "b", "k", id))
-	e.noErr("DeleteBucket after aborting the upload", e.b.DeleteBucket(e.ctx, "b"))
+	e.wantErr("DeleteBucket with an object and an upload", e.b.DeleteBucket(e.ctx, "b"), storage.ErrBucketNotEmpty)
+	_, err := e.b.GetMultipartUpload(e.ctx, "b", "k", id)
+	e.noErr("GetMultipartUpload after a refused DeleteBucket", err)
+	_, err = e.b.DeleteObject(e.ctx, "b", "obj", "")
+	e.noErr("DeleteObject", err)
+
+	id2 := e.createUpload("b", "k2", storage.ObjectMeta{}).UploadID
+	late, err := e.b.NewPartWriter(e.ctx, "b", "k", id, 2)
+	e.noErr("NewPartWriter", err)
+	if _, err := late.Write([]byte("late part")); err != nil {
+		e.t.Fatalf("Write: %v", err)
+	}
+	e.noErr("DeleteBucket with only in-progress uploads", e.b.DeleteBucket(e.ctx, "b"))
+	_, err = late.Commit(e.ctx, storage.PartMeta{ETag: etagOf([]byte("late part"))})
+	e.wantErr("PartWriter.Commit after DeleteBucket", err, storage.ErrBucketNotFound, storage.ErrUploadNotFound)
+	_ = late.Abort()
+	_, err = e.b.GetMultipartUpload(e.ctx, "b", "k", id)
+	e.wantErr("GetMultipartUpload after DeleteBucket", err, storage.ErrBucketNotFound)
+
+	// A bucket recreated under the same name starts without uploads.
+	e.mkBucket("b")
+	ups, err := e.b.ListMultipartUploads(e.ctx, "b")
+	e.noErr("ListMultipartUploads", err)
+	if len(ups) != 0 {
+		e.t.Errorf("recreated bucket lists %d uploads, want none", len(ups))
+	}
+	e.wantUploadGone("recreated bucket", "b", "k", id)
+	e.wantUploadGone("recreated bucket", "b", "k2", id2)
+	e.noErr("DeleteBucket of the recreated bucket", e.b.DeleteBucket(e.ctx, "b"))
 }
 
 func testMultipartVersioning(e *env) {

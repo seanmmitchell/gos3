@@ -26,7 +26,7 @@ endpoint off (404).
 
 | Metric | Type | Labels | Description |
 |---|---|---|---|
-| `gos3_requests_total` | counter | `op`, `code_class` (`1xx`…`5xx`, `other`) | Requests by operation and status class. |
+| `gos3_requests_total` | counter | `op`, `code_class` (`1xx`…`5xx`, `other`, `aborted`) | Requests by operation and status class. `aborted` is status 499: the client closed the request (for example an upload whose connection dropped); these are not counted as `4xx`. |
 | `gos3_request_duration_seconds` | histogram | `op` | Latency; buckets 5 ms … 60 s. |
 | `gos3_bytes_in_total` | counter | `op` | Request body bytes received. |
 | `gos3_bytes_out_total` | counter | `op` | Response body bytes sent. |
@@ -52,7 +52,9 @@ scrape_configs:
       - targets: ["nas.lan:9000"]
 ```
 
-Example alerts: `rate(gos3_requests_total{code_class="5xx"}[5m]) > 0`, and
+Example alerts: `rate(gos3_requests_total{code_class="5xx"}[5m]) > 0`,
+`rate(gos3_requests_total{code_class="aborted"}[5m])` for clients dropping
+uploads, and
 `histogram_quantile(0.99, sum by (le, op) (rate(gos3_request_duration_seconds_bucket[5m])))`
 for latency.
 

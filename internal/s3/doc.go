@@ -126,7 +126,11 @@ package s3
 // src.Key, src.VersionID) for CopyObject/UploadPartCopy sources, and
 // s.authorize(r, rc, "s3:DeleteObject"/"s3:DeleteObjectVersion", bucket,
 // key, vid) for each DeleteObjects entry. For extra condition keys use
-// s.authorizeTarget(ctx, r, rc, authzTarget{...}). After changing a policy,
+// s.authorizeTarget(ctx, r, rc, authzTarget{...}); when the attributes of
+// the object written come from a body, form or multipart upload rather
+// than from request headers, set authzTarget.ObjectAttrs (see
+// objectAttrConditions) so header-derived keys are replaced, not merged.
+// After changing a policy,
 // CORS, ACL or public access block document (or deleting a bucket) call
 // s.invalidateBucketConfig(bucket).
 //

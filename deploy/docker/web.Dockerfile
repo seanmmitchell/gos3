@@ -1,4 +1,4 @@
-# syntax=docker/dockerfile:1
+# syntax=docker/dockerfile:1@sha256:4edf897a3ffa55b89f906fc8cc78afdb3f1834cc9c7083565e611a8a7d5fe99e
 #
 # Standalone gos3 web UI (Nuxt node-server build). It manages any number of
 # gos3 / S3 servers and adds local discovery routes (mDNS, beacon, scan) that
@@ -17,9 +17,10 @@
 #   -e GOS3_UI_ALLOWED_HOSTS=console.example.com
 # See docs/web-ui.md.
 
-ARG NODE_VERSION=22
+# Base images are pinned by digest; Dependabot proposes updates. Change the
+# tag and the digest together (both stages use the same image).
 
-FROM node:${NODE_VERSION}-bookworm-slim AS build
+FROM node:22-bookworm-slim@sha256:c3de60bf2f9dd0ac6370e6117950ff62d6e339527e7472301c9c78a017978392 AS build
 ENV PNPM_HOME=/pnpm \
     COREPACK_ENABLE_DOWNLOAD_PROMPT=0 \
     NUXT_TELEMETRY_DISABLED=1 \
@@ -37,7 +38,7 @@ RUN --mount=type=cache,id=gos3-pnpm,target=/pnpm/store \
     pnpm install --frozen-lockfile --offline && \
     pnpm build
 
-FROM node:${NODE_VERSION}-bookworm-slim
+FROM node:22-bookworm-slim@sha256:c3de60bf2f9dd0ac6370e6117950ff62d6e339527e7472301c9c78a017978392
 ENV NODE_ENV=production \
     HOST=0.0.0.0 \
     PORT=3000 \

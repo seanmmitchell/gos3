@@ -125,6 +125,10 @@ readable, which the web UI's metadata editor needs. The explicit names cover
 browsers that do not honour `*`. A standalone web UI only needs its origin in
 `allowed_origins`; see [web-ui.md](web-ui.md#cors).
 
+For S3 requests, the `*` entry admits only signed requests (an
+`Authorization` header or a presigned URL); explicitly listed origins also
+apply to anonymous requests. See [security.md](security.md#cors).
+
 ### `discovery`
 
 All discovery keys are runtime settings (`discovery.<camelCase>` in the admin

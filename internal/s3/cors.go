@@ -4,6 +4,8 @@ import (
 	"context"
 	"encoding/xml"
 	"net/http"
+	"net/url"
+	"slices"
 	"strconv"
 	"strings"
 
@@ -40,6 +42,11 @@ type CORSConfiguration struct {
 	XMLName xml.Name   `xml:"CORSConfiguration"`
 	XMLNS   string     `xml:"xmlns,attr,omitempty"`
 	Rules   []CORSRule `xml:"CORSRule"`
+
+	// global marks the configuration built from the server-wide settings
+	// (globalCORS); its "*" origin only serves signed requests (see
+	// corsSignedOnly).
+	global bool
 }
 
 // CORSRule is one <CORSRule>.
@@ -166,6 +173,20 @@ func (r *CORSRule) allowsHeaders(headers []string) bool {
 	return true
 }
 
+// allowsOriginOnlyByWildcard reports whether the rule allows origin only
+// through a bare "*" entry (no other pattern of the rule matches it).
+func (r *CORSRule) allowsOriginOnlyByWildcard(origin string) bool {
+	star := false
+	for _, o := range r.AllowedOrigins {
+		if o == "*" {
+			star = true
+		} else if wildcardMatchFold(o, origin) {
+			return false
+		}
+	}
+	return star
+}
+
 // wildcardOrigin reports whether the rule allows any origin ("*").
 func (r *CORSRule) wildcardOrigin() bool {
 	for _, o := range r.AllowedOrigins {
@@ -214,7 +235,7 @@ func globalCORS(c config.CORSConfig) *CORSConfiguration {
 	if maxAge <= 0 {
 		maxAge = 3600
 	}
-	return &CORSConfiguration{Rules: []CORSRule{{
+	return &CORSConfiguration{global: true, Rules: []CORSRule{{
 		AllowedMethods: []string{"GET", "PUT", "HEAD", "POST", "DELETE"},
 		AllowedOrigins: origins,
 		AllowedHeaders: headers,
@@ -241,6 +262,33 @@ func (s *Server) corsConfigFor(ctx context.Context, bucket string, settings conf
 	return globalCORS(settings.CORS)
 }
 
+// corsSignedOnly reports whether a CORS response for origin must be
+// withheld from a request that carries no SigV4 authentication: the rule
+// is the global (settings) rule and allows origin only through "*".
+//
+// Browsers send no credentials of their own to S3, so a cross-origin
+// client legitimately using the "*" default always signs its requests
+// (an Authorization header, or a presigned URL). An unsigned request is
+// served anonymously, and anonymous access may depend on where the
+// request comes from (aws:SourceIp allow-lists, LAN-only public buckets):
+// any website the user visits could otherwise make the user's browser
+// read such objects, or write to such buckets, and see the response.
+// Bucket CORS configurations and global rules that list explicit
+// origins are what an operator opted into and keep applying to anonymous
+// requests.
+func corsSignedOnly(cfg *CORSConfiguration, rule *CORSRule, origin string) bool {
+	return cfg.global && rule.allowsOriginOnlyByWildcard(origin)
+}
+
+// requestCarriesSigV4 reports whether r carries SigV4 authentication: an
+// Authorization header or presigned query parameters. Authentication
+// either verifies such a request or rejects it, so it is never served
+// anonymously.
+func requestCarriesSigV4(r *http.Request, q url.Values) bool {
+	return r.Header.Get("Authorization") != "" ||
+		q.Has("X-Amz-Credential") || q.Has("X-Amz-Signature") || q.Has("X-Amz-Algorithm")
+}
+
 // splitHeaderList splits a comma-separated header list, lowercasing and
 // dropping empty entries.
 func splitHeaderList(v string) []string {
@@ -255,7 +303,8 @@ func splitHeaderList(v string) []string {
 
 // handlePreflight answers a CORS preflight (OPTIONS) request without
 // authentication: 400 without Origin or Access-Control-Request-Method,
-// 403 AccessForbidden when no rule matches, else 200 with the
+// 403 AccessForbidden when no rule matches (or only the global "*" rule
+// does and the actual request will not be signed), else 200 with the
 // Access-Control-* headers.
 func (s *Server) handlePreflight(w http.ResponseWriter, r *http.Request, rc *reqContext, settings config.Settings) {
 	origin := r.Header.Get("Origin")
@@ -277,6 +326,14 @@ func (s *Server) handlePreflight(w http.ResponseWriter, r *http.Request, rc *req
 	rule := cfg.match(origin, method, reqHeaders)
 	h := w.Header()
 	h.Add("Vary", "Origin, Access-Control-Request-Headers, Access-Control-Request-Method")
+	// Under the global "*" rule only requests that will be signed are
+	// approved: the actual request must send an Authorization header
+	// (which the browser lists here) or be a presigned URL. A preflight
+	// itself never carries credentials.
+	if rule != nil && corsSignedOnly(cfg, rule, origin) &&
+		!slices.Contains(reqHeaders, "authorization") && !requestCarriesSigV4(r, rc.query) {
+		rule = nil
+	}
 	if rule == nil {
 		s.writeError(w, r, rc, s3err.ErrCORSForbidden)
 		return
@@ -297,8 +354,9 @@ func (s *Server) handlePreflight(w http.ResponseWriter, r *http.Request, rc *req
 
 // applyCORSHeaders adds CORS response headers to an actual (non-preflight)
 // request carrying an Origin header, when a rule allows the origin and
-// method. They are set before the handler runs so error responses carry
-// them too.
+// method (under the global "*" rule, only for signed requests; see
+// corsSignedOnly). They are set before the handler runs so error
+// responses carry them too.
 func (s *Server) applyCORSHeaders(w http.ResponseWriter, r *http.Request, rc *reqContext, settings config.Settings) {
 	origin := r.Header.Get("Origin")
 	cfg := s.corsConfigFor(r.Context(), rc.bucket, settings)
@@ -308,7 +366,7 @@ func (s *Server) applyCORSHeaders(w http.ResponseWriter, r *http.Request, rc *re
 	h := w.Header()
 	h.Add("Vary", "Origin")
 	rule := cfg.match(origin, r.Method, nil)
-	if rule == nil {
+	if rule == nil || (corsSignedOnly(cfg, rule, origin) && !requestCarriesSigV4(r, rc.query)) {
 		return
 	}
 	setCORSOrigin(h, rule, origin)

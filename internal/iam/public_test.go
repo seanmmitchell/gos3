@@ -1,6 +1,11 @@
 package iam
 
-import "testing"
+import (
+	"fmt"
+	"strconv"
+	"strings"
+	"testing"
+)
 
 func TestIsPublicPolicy(t *testing.T) {
 	stmt := func(s string) string { return `{"Statement":[` + s + `]}` }
@@ -47,5 +52,49 @@ func TestIsPublicPolicy(t *testing.T) {
 	}
 	if !IsPublicPolicy(&PolicyDocument{Statement: []Statement{{Effect: "Allow", Principal: &Principal{AWS: StringOrSlice{"*"}}}}}) {
 		t.Fatal("constructed star principal not public")
+	}
+}
+
+// TestIsPublicPolicyRound2 covers ForAllValues conditions (vacuously true
+// for keys anonymous callers lack) and aws:SourceIp ranges split across
+// statements.
+func TestIsPublicPolicyRound2(t *testing.T) {
+	allow := func(cond string) string {
+		return `{"Effect":"Allow","Principal":"*","Action":"s3:GetObject","Resource":"arn:aws:s3:::b/*","Condition":` + cond + `}`
+	}
+	var split []string
+	for i := 0; i < 64; i++ {
+		split = append(split, allow(fmt.Sprintf(`{"IpAddress":{"aws:SourceIp":"%d.0.0.0/6"}}`, i*4)))
+	}
+	var sameNet []string
+	for i := 0; i < 10; i++ {
+		sameNet = append(sameNet, `{"Effect":"Allow","Principal":"*","Action":"s3:GetObject","Resource":"arn:aws:s3:::b/p`+strconv.Itoa(i)+`/*","Condition":{"IpAddress":{"aws:SourceIp":["10.0.0.0/8","10.1.0.0/16"]}}}`)
+	}
+	tests := []struct {
+		name string
+		doc  string
+		want bool
+	}{
+		{"forallvalues username", allow(`{"ForAllValues:StringEquals":{"aws:username":"alice"}}`), true},
+		{"forallvalues vpc", allow(`{"ForAllValues:StringEquals":{"aws:SourceVpc":"vpc-1"}}`), true},
+		{"forallvalues sourceip", allow(`{"ForAllValues:IpAddress":{"aws:SourceIp":"10.0.0.0/8"}}`), true},
+		{"foranyvalue username", allow(`{"ForAnyValue:StringEquals":{"aws:username":"alice"}}`), false},
+		{"foranyvalue negated", allow(`{"ForAnyValue:StringNotEquals":{"aws:username":"alice"}}`), true},
+		{"forallvalues plus restricting", allow(`{"ForAllValues:StringEquals":{"aws:username":"alice"},"StringEquals":{"aws:SourceVpce":"vpce-1"}}`), false},
+		{"split across statements", strings.Join(split, ","), true},
+		{"split across statements, half", strings.Join(split[:2], ","), true},
+		{"repeated narrow range", strings.Join(sameNet, ","), false},
+		{"two statements, two /8", allow(`{"IpAddress":{"aws:SourceIp":"10.0.0.0/8"}}`) + "," + allow(`{"IpAddress":{"aws:SourceIp":"11.0.0.0/8"}}`), false},
+		{"five /8 across statements", allow(`{"IpAddress":{"aws:SourceIp":["10.0.0.0/8","11.0.0.0/8"]}}`) + "," + allow(`{"IpAddress":{"aws:SourceIp":["12.0.0.0/8","13.0.0.0/8"]}}`) + "," + allow(`{"IpAddress":{"aws:SourceIp":"14.0.0.0/8"}}`), true},
+		{"ip plus other restriction not counted", allow(`{"IpAddress":{"aws:SourceIp":"0.0.0.0/1"},"StringEquals":{"aws:username":"alice"}}`), false},
+		{"narrowest of two ip conditions", allow(`{"IpAddress":{"aws:SourceIp":"0.0.0.0/1"},"ForAnyValue:IpAddress":{"aws:SourceIp":"10.0.0.0/8"}}`), false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			doc := mustBucketPolicy(t, "b", `{"Statement":[`+tt.doc+`]}`)
+			if got := IsPublicPolicy(doc); got != tt.want {
+				t.Fatalf("IsPublicPolicy = %v, want %v", got, tt.want)
+			}
+		})
 	}
 }

@@ -10,12 +10,12 @@ import (
 )
 
 // classLabels maps statusClass results to code_class label values.
-var classLabels = [6]string{"other", "1xx", "2xx", "3xx", "4xx", "5xx"}
+var classLabels = [numClasses]string{"other", "1xx", "2xx", "3xx", "4xx", "5xx", "aborted"}
 
 // opSnapshot is a consistent copy of one operation's counters.
 type opSnapshot struct {
 	name     string
-	classes  [6]int64
+	classes  [numClasses]int64
 	requests int64
 	bytesIn  int64
 	bytesOut int64
@@ -42,7 +42,7 @@ func (r *Registry) writePrometheus(w io.Writer, extra map[string]float64) error 
 		started = float64(r.started.UnixNano()) / 1e9
 	}
 
-	header(bw, "gos3_requests_total", "counter", "Total API requests by operation and HTTP status class.")
+	header(bw, "gos3_requests_total", "counter", "Total API requests by operation and HTTP status class (\"aborted\": the client closed the request, status 499).")
 	for _, o := range ops {
 		for c, n := range o.classes {
 			if n == 0 {

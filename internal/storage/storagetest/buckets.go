@@ -208,19 +208,8 @@ func testBucketDeleteNotEmpty(e *env) {
 			},
 			cleanup: func(e *env, b string) { e.del(b, "never-existed", storage.NullVersionID) },
 		},
-		{
-			name: "OnlyMultipartUpload",
-			setup: func(e *env, b string) {
-				u := e.createUpload(b, "mp", storage.ObjectMeta{})
-				e.part(b, "mp", u.UploadID, 1, []byte("part"))
-			},
-			cleanup: func(e *env, b string) { e.deleteAllVersions(b) },
-		},
-		{
-			name:    "OnlyMultipartUploadWithoutParts",
-			setup:   func(e *env, b string) { e.createUpload(b, "mp", storage.ObjectMeta{}) },
-			cleanup: func(e *env, b string) { e.deleteAllVersions(b) },
-		},
+		// In-progress multipart uploads alone do not make a bucket
+		// non-empty; see testMultipartDeleteBucketAbortsUploads.
 	}
 	for _, tc := range cases {
 		e.runFresh(tc.name, func(e *env) {

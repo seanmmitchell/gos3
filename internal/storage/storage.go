@@ -215,9 +215,10 @@ type Backend interface {
 	// ErrInvalidName for names it cannot store.
 	CreateBucket(ctx context.Context, name string, opts CreateBucketOptions) error
 	GetBucket(ctx context.Context, name string) (BucketInfo, error)
-	// DeleteBucket removes an empty bucket (no versions, delete markers or
-	// in-progress uploads remain, otherwise ErrBucketNotEmpty) along with its
-	// configuration documents.
+	// DeleteBucket removes an empty bucket (no versions or delete markers
+	// remain, otherwise ErrBucketNotEmpty) along with its configuration
+	// documents. In-progress multipart uploads do not make a bucket
+	// non-empty: they are aborted with it, as on AWS.
 	DeleteBucket(ctx context.Context, name string) error
 	// SetBucketVersioning changes the versioning state. Setting
 	// VersioningUnversioned on a bucket that has been versioned is invalid and

@@ -327,7 +327,7 @@ func validPrincipal(p *Principal) bool {
 	if p.Any {
 		return true
 	}
-	if len(p.AWS) == 0 {
+	if len(p.AWS) == 0 && len(p.other) == 0 {
 		return false
 	}
 	for _, v := range p.AWS {

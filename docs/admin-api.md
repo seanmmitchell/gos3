@@ -96,7 +96,7 @@ Non-2xx responses: `{"error": {"code": "<Code>", "message": "<text>"}}`.
 
 // Stats
 {
-  "metrics": metrics.Snapshot,          // see internal/metrics
+  "metrics": metrics.Snapshot,          // see below
   "storage": { "buckets": 3, "objects": 1200, "bytes": 123456789,
                "versions": 1300, "versionBytes": 133456789,
                "deleteMarkers": 4, "pendingUploads": 1,
@@ -104,7 +104,26 @@ Non-2xx responses: `{"error": {"code": "<Code>", "message": "<text>"}}`.
   "runtime": { "goroutines": 42, "heapAllocBytes": 1234, "sysBytes": 5678, "gcPauseTotalNs": 1 },
   "disk": { "path": "/data", "totalBytes": 1, "freeBytes": 1, "usedBytes": 1 } // fs backend only, else null
 }
+
+// metrics.Snapshot (internal/metrics)
+{
+  "startedAt": "…", "uptimeSeconds": 1234,
+  "requests": 5000, "errors4xx": 12, "errors5xx": 0, "aborted": 1,
+  "bytesIn": 1, "bytesOut": 1, "inFlight": 2,
+  "ops": [                              // sorted by op
+    { "op": "GetObject", "requests": 4000, "errors4xx": 10, "errors5xx": 0, "aborted": 0,
+      "bytesIn": 0, "bytesOut": 1, "avgLatencyMs": 1.2, "p50LatencyMs": 0.9, "p99LatencyMs": 8.5 }
+  ],
+  "recent": [                           // per minute, last 60 minutes, oldest first
+    { "minute": "…", "requests": 80, "errors": 1, "aborted": 0, "bytesIn": 1, "bytesOut": 1 }
+  ]
+}
 ```
+
+`aborted` counts requests the client abandoned (status 499, for example an
+upload whose connection dropped). They are not included in `errors4xx`, and
+a `recent[].errors` value counts only 4xx and 5xx responses, leaving aborted
+requests out.
 
 `config.Settings` (see `internal/config`):
 
@@ -170,7 +189,7 @@ environment and flags for these fields.
 |---|---|---|---|
 | GET | `/buckets` | ListBuckets | `{"buckets": BucketSummary[]}`; `?usage=true` includes usage (cached 30s) |
 | GET | `/buckets/{name}` | GetBucket | `BucketSummary` with usage |
-| DELETE | `/buckets/{name}?force=true` | ForceDeleteBucket | deletes all versions, delete markers, uploads and configs, then the bucket → 204. Without `force` behaves like S3 DeleteBucket (409 if not empty). |
+| DELETE | `/buckets/{name}?force=true` | ForceDeleteBucket | deletes all versions, delete markers, uploads and configs, then the bucket → 204. Without `force` behaves like S3 DeleteBucket (409 if not empty; in-progress uploads alone do not make a bucket non-empty, they are aborted with it). |
 
 ```jsonc
 // BucketSummary

@@ -2,6 +2,7 @@ package metrics
 
 import (
 	"bytes"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"strings"
@@ -284,5 +285,65 @@ func TestConcurrent(t *testing.T) {
 	}
 	if sum != s.Requests {
 		t.Fatalf("op sum %d != %d", sum, s.Requests)
+	}
+}
+
+// TestClientAbortedNotAnError: status 499 (client closed request, recorded
+// by the S3 layer when an upload is cut off by the client) is counted in its
+// own "aborted" class, never as a 4xx error, in the snapshot totals, per op,
+// per minute and in the Prometheus output.
+func TestClientAbortedNotAnError(t *testing.T) {
+	c := newClock()
+	r := newRegistry(c.now)
+	r.Begin()("PutObject", StatusClientClosedRequest, 10, 0)
+	r.Begin()("PutObject", StatusClientClosedRequest, 20, 0)
+	r.Begin()("PutObject", 400, 0, 0)
+	r.Begin()("GetObject", 200, 0, 5)
+
+	s := r.Snapshot()
+	if s.Requests != 4 || s.Errors4xx != 1 || s.Errors5xx != 0 || s.Aborted != 2 || s.BytesIn != 30 {
+		t.Fatalf("totals: %+v", s)
+	}
+	if len(s.Ops) != 2 {
+		t.Fatalf("ops: %+v", s.Ops)
+	}
+	if g := s.Ops[0]; g.Op != "GetObject" || g.Aborted != 0 || g.Errors4xx != 0 {
+		t.Fatalf("GetObject: %+v", g)
+	}
+	if p := s.Ops[1]; p.Op != "PutObject" || p.Requests != 3 || p.Errors4xx != 1 || p.Aborted != 2 {
+		t.Fatalf("PutObject: %+v", p)
+	}
+	if last := s.Recent[59]; last.Requests != 4 || last.Errors != 1 || last.Aborted != 2 {
+		t.Fatalf("minute: %+v", last)
+	}
+
+	var b bytes.Buffer
+	if err := r.WritePrometheus(&b, nil); err != nil {
+		t.Fatal(err)
+	}
+	out := b.String()
+	for _, want := range []string{
+		`gos3_requests_total{op="PutObject",code_class="aborted"} 2` + "\n",
+		`gos3_requests_total{op="PutObject",code_class="4xx"} 1` + "\n",
+		`gos3_requests_total{op="GetObject",code_class="2xx"} 1` + "\n",
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("missing %q in:\n%s", want, out)
+		}
+	}
+	if strings.Contains(out, `code_class="4xx"} 3`) || strings.Contains(out, `code_class="4xx"} 2`) {
+		t.Errorf("aborted requests counted as 4xx:\n%s", out)
+	}
+
+	// The new fields are additive: the existing JSON keys are unchanged and
+	// "aborted" appears alongside them.
+	js, err := json.Marshal(s)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, key := range []string{`"errors4xx":1`, `"errors5xx":0`, `"aborted":2`, `"requests":4`} {
+		if !strings.Contains(string(js), key) {
+			t.Errorf("snapshot JSON missing %s: %s", key, js)
+		}
 	}
 }

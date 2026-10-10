@@ -82,8 +82,13 @@ Notes:
   machines should use, because the container only knows its internal address.
 - The image is built for `linux/amd64` and `linux/arm64`:
   `docker buildx build --platform linux/amd64,linux/arm64 -t <registry>/gos3 --push .`.
-- Build arguments: `VERSION`, `COMMIT` and `DATE` (shown by `gos3 version`),
-  `GO_VERSION` (default 1.26) and `NODE_VERSION` (default 22).
+- Build arguments: `VERSION`, `COMMIT` and `DATE` (shown by `gos3 version`).
+- The base images (`node:22-bookworm-slim`, `golang:1.26-bookworm`,
+  `gcr.io/distroless/static-debian12:nonroot`) and the Dockerfile frontend
+  are pinned by digest, and the GitHub Actions in `.github/workflows` by
+  commit SHA, so a retagged upstream image or action cannot change a release.
+  Dependabot proposes updates weekly. To build on another Go or Node
+  version, edit the tag and the digest of the `FROM` line together.
 
 The standalone web UI has its own image, `deploy/docker/web.Dockerfile`
 (`make docker-ui`); see [web-ui.md](web-ui.md#standalone-mode).

@@ -117,7 +117,7 @@ func TestParseBucketPolicy(t *testing.T) {
 		{"missing principal", stmt(`{"Effect":"Allow","Action":"s3:*","Resource":"arn:aws:s3:::photos/*"}`), "Missing required field Principal"},
 		{"both principals", stmt(`{"Effect":"Allow","Principal":"*","NotPrincipal":"*","Action":"s3:*","Resource":"arn:aws:s3:::photos/*"}`), "both Principal and NotPrincipal"},
 		{"bad principal string", stmt(`{"Effect":"Allow","Principal":"alice","Action":"s3:*","Resource":"arn:aws:s3:::photos/*"}`), "Invalid principal in policy"},
-		{"service principal", stmt(`{"Effect":"Allow","Principal":{"Service":"logging.s3.amazonaws.com"},"Action":"s3:*","Resource":"arn:aws:s3:::photos/*"}`), "Invalid principal in policy"},
+		{"unknown principal type", stmt(`{"Effect":"Allow","Principal":{"OIDC":"x"},"Action":"s3:*","Resource":"arn:aws:s3:::photos/*"}`), "Invalid principal in policy"},
 		{"empty principal", stmt(`{"Effect":"Allow","Principal":{},"Action":"s3:*","Resource":"arn:aws:s3:::photos/*"}`), "Invalid principal in policy"},
 		{"null principal", stmt(`{"Effect":"Allow","Principal":null,"Action":"s3:*","Resource":"arn:aws:s3:::photos/*"}`), "Invalid principal in policy"},
 		{"bad principal chars", stmt(`{"Effect":"Allow","Principal":{"AWS":"al ice"},"Action":"s3:*","Resource":"arn:aws:s3:::photos/*"}`), "Invalid principal in policy"},

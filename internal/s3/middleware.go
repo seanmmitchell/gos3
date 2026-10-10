@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"net/url"
 	"runtime/debug"
 	"strings"
 
@@ -146,7 +147,21 @@ func (s *Server) serve(w *responseWriter, r *http.Request, rc *reqContext) {
 		s.handlePreflight(w, r, rc, settings)
 		return
 	}
-	name, err := detectOp(r.Method, t, rc.query, r.Header)
+	// x-amz-* request headers that a presigner moved into the (signed)
+	// query string count as headers (AWS semantics). They are applied to
+	// the request only once the presigned signature has been verified;
+	// routing already needs them (x-amz-copy-source).
+	hoisted, err := presignedQueryHeaders(r, rc.query)
+	if err != nil {
+		s.writeError(w, r, rc, err)
+		return
+	}
+	routeHdr := r.Header
+	if len(hoisted) > 0 {
+		routeHdr = r.Header.Clone()
+		mergeHeaders(routeHdr, hoisted)
+	}
+	name, err := detectOp(r.Method, t, rc.query, routeHdr)
 	if err != nil {
 		s.writeError(w, r, rc, err)
 		return
@@ -191,6 +206,9 @@ func (s *Server) serve(w *responseWriter, r *http.Request, rc *reqContext) {
 		}
 		rc.auth, rc.identity = res, res.Identity
 		r.Body = res.Body
+		if res.Method == auth.MethodPresignedV4 {
+			mergeHeaders(r.Header, hoisted)
+		}
 		stripAWSChunked(r.Header)
 	}
 	rc.body = r.Body
@@ -210,6 +228,61 @@ func (s *Server) serve(w *responseWriter, r *http.Request, rc *reqContext) {
 	}
 	if err := handler(s, w, r, rc); err != nil {
 		s.writeError(w, r, rc, s.hideMissingObject(w, r, rc, err))
+	}
+}
+
+// presignedQueryNonHeaders are x-amz-* query parameters (lower-cased)
+// that never stand for request headers: the SigV4 query authentication
+// parameters and body framing headers, which must come with the request.
+var presignedQueryNonHeaders = map[string]bool{
+	"x-amz-algorithm": true, "x-amz-credential": true, "x-amz-date": true,
+	"x-amz-expires": true, "x-amz-signedheaders": true, "x-amz-signature": true,
+	"x-amz-security-token": true, "x-amz-content-sha256": true,
+	"x-amz-trailer": true, "x-amz-decoded-content-length": true,
+}
+
+// presignedQueryHeaders returns the x-amz-* query parameters of a request
+// that uses SigV4 query authentication, as request headers. Presigners
+// such as the AWS SDK for JavaScript v3 move x-amz-* headers (copy source,
+// metadata, ACL, tagging, storage class, object lock, ...) into the query
+// string, where the signature covers them; S3 treats them as the
+// corresponding headers. Parameters whose header is also sent are
+// skipped (the header wins), as are the authentication parameters and
+// x-amz-checksum-* / x-amz-sdk-checksum-algorithm: presigners compute
+// those over an empty body when the URL is created, so honouring them
+// would fail every upload through such a URL. Nil for other requests;
+// InvalidArgument for a value that is not a valid header value.
+func presignedQueryHeaders(r *http.Request, q url.Values) (http.Header, error) {
+	if !q.Has("X-Amz-Signature") && !q.Has("X-Amz-Credential") && !q.Has("X-Amz-Algorithm") {
+		return nil, nil
+	}
+	var out http.Header
+	for k, vs := range q {
+		lk := strings.ToLower(k)
+		if !strings.HasPrefix(lk, "x-amz-") || presignedQueryNonHeaders[lk] ||
+			strings.HasPrefix(lk, "x-amz-checksum-") || lk == "x-amz-sdk-checksum-algorithm" ||
+			len(r.Header.Values(k)) > 0 {
+			continue
+		}
+		if out == nil {
+			out = http.Header{}
+		}
+		for _, v := range vs {
+			if strings.ContainsFunc(v, func(c rune) bool { return (c < 0x20 && c != '\t') || c == 0x7f }) {
+				return nil, s3err.ErrInvalidArgument.WithMessage("Invalid value for query parameter %s.", k).With("ArgumentName", k)
+			}
+			out.Add(k, v)
+		}
+	}
+	return out, nil
+}
+
+// mergeHeaders adds the values of src to dst.
+func mergeHeaders(dst, src http.Header) {
+	for k, vs := range src {
+		for _, v := range vs {
+			dst.Add(k, v)
+		}
 	}
 }
 

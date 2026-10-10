@@ -77,9 +77,15 @@ Setting an ACL or tags while writing an object needs more than
 directive), CreateMultipartUpload and PostObject also require
 `s3:PutObjectAcl` when an ACL is given (`x-amz-acl` or the `acl` form field)
 and `s3:PutObjectTagging` when tags are given (`x-amz-tagging` or the
-`tagging` form field). A principal limited to `s3:PutObject` (such as the
-built-in `writeonly` policy) can therefore neither publish an object through
-an ACL nor plant tags that `s3:ExistingObjectTag` conditions rely on. The
+`tagging` form field). CopyObject with the `COPY` tagging directive (the
+default) from a tagged source copies the tags, so it also needs
+`s3:GetObjectTagging` on the source (`s3:GetObjectVersionTagging` when a
+`versionId` is given) and `s3:PutObjectTagging` on the destination,
+evaluated with the copied tags as `s3:RequestObjectTag/<key>` keys. Copying
+an untagged source, or `REPLACE` without tags, needs only `s3:GetObject` and
+`s3:PutObject`. A principal limited to `s3:PutObject` (such as the built-in
+`writeonly` policy) can therefore neither publish an object through an ACL
+nor plant tags that `s3:ExistingObjectTag` conditions rely on. The
 `s3:RequestObjectTag/<key>` and `s3:RequestObjectTagKeys` condition keys are
 evaluated for these uploads, for PutObjectTagging (from the XML body) and for
 PostObject (from the `tagging` field).
@@ -151,38 +157,63 @@ embedded web UI. An uploaded `text/html` or `image/svg+xml` object opened in a
 browser could otherwise run script with the UI's origin and read the
 connections and remembered secret keys it stores. Therefore every GetObject
 and HeadObject response carries `X-Content-Type-Options: nosniff` and, except
-for `application/pdf`, `Content-Security-Policy: sandbox`. HTML and SVG
+for PDFs, `Content-Security-Policy: sandbox`. HTML and SVG
 objects opened in a browser render without scripts, forms or same-origin
 access, so HTML applications cannot be hosted in a bucket and opened directly
 (images, media and downloads are unaffected).
 
+Only a `Content-Type` that parses as exactly `application/pdf`, sent as a
+single header value without a comma, is exempt from the sandbox; such
+responses are served as the bare `application/pdf` (parameters are dropped).
+Browsers use the last type of a comma-separated list, so a list such as
+`application/pdf, text/html` is always sandboxed.
+
 ## CORS
 
-The default global CORS policy allows **any origin** (`*`). That is
-reasonably safe, because browsers send no credentials automatically: a page can
-only make signed requests if it already has a secret key. Still, in production,
-list the origins of the web UIs you use (`cors.allowed_origins`, `--cors-origin`,
-or **Settings → CORS**). Bucket CORS configurations take precedence for their
-bucket. `/_gos3/info` always answers with `Access-Control-Allow-Origin: *`.
+The default global CORS policy allows **any origin** (`*`), but only for
+**signed requests**: requests with an `Authorization` header, or presigned
+URLs (`X-Amz-Credential` / `X-Amz-Signature` in the query). Browsers send no
+credentials of their own to S3, so a page can only make signed requests if it
+already has a secret key. Under the global `*` rule:
 
-**Known issue:** with the `*` default, objects that are anonymous only for
-some networks (a bucket policy with an `aws:SourceIp` condition, e.g. an
-intranet allow-list) can be read by scripts on *any* website that a user on
-those networks visits, because the browser makes the request from the user's
-address and the response is shared with every origin. Until this is fixed in
-the S3 CORS handling, restrict `cors.allowed_origins` (or set a bucket CORS
-configuration) on servers that use IP-based anonymous access.
+- Unsigned (anonymous) responses get no `Access-Control-Allow-Origin` (they
+  still carry `Vary: Origin`), so the calling script cannot read them.
+- Preflights are approved only when `Access-Control-Request-Headers`
+  includes `authorization` or the URL is presigned; otherwise the answer is
+  `403 AccessForbidden`.
+
+Websites therefore cannot use a visitor's browser to read or write
+anonymously accessible data, such as buckets restricted by `aws:SourceIp`
+or reachable only on the LAN, and see the response. The embedded and
+standalone web UIs are unaffected, because they sign every request.
+
+Explicitly listed global origins (`cors.allowed_origins`, `--cors-origin`, or
+**Settings → CORS**) and bucket CORS configurations, including a bucket rule
+with `*`, still apply to anonymous requests. Bucket CORS configurations take
+precedence for their bucket. To serve a public bucket to scripts on other
+sites, set a bucket CORS configuration. Browser POST-policy uploads
+(PostObject) under the global `*` rule still store the object, but their
+response is not readable cross-origin; use a bucket CORS rule for them too.
+In production, list the origins of the web UIs you use rather than relying
+on `*`. `/_gos3/info` always answers with `Access-Control-Allow-Origin: *`.
 
 ## Public access evaluation
 
 Block Public Access (`BlockPublicPolicy`, `RestrictPublicBuckets`),
 `GetBucketPolicyStatus` and the admin API's `public` flags treat a bucket
 policy statement that allows anonymous access as **non-public** only when a
-condition restricts it to a bounded set of sources. An `aws:SourceIp`
-condition counts as restricting only when its ranges together cover at most
-four IPv4 /8 networks and four IPv6 /32 networks (overlapping ranges are
-counted twice; `::ffff:a.b.c.d/96+n` counts as the IPv4 /n). Wider
-allow-lists, such as `fd00::/8` or many large ranges, count as public.
+condition restricts it to a bounded set of sources. Negated, `...IfExists`
+and `ForAllValues:` conditions never count as restricting; `ForAllValues:`
+conditions hold when the key is missing, as it is for anonymous callers.
+
+Allow statements for everyone that are restricted only by `aws:SourceIp`
+are judged together: the union of their ranges across the whole policy may
+cover at most four IPv4 /8 networks and four IPv6 /32 networks, so splitting
+a wide range across statements does not hide it. Overlapping or repeated
+ranges are merged, not counted twice, and `::ffff:a.b.c.d/96+n` counts as
+the IPv4 /n. Wider allow-lists, such as `fd00::/8` or many large ranges,
+count as public. Statements that also carry another restricting key
+(`aws:username`, `aws:SourceVpce`, ...) are not counted towards that union.
 
 ## Public endpoints
 
@@ -229,10 +260,13 @@ then cannot verify it.
   Restrict access to it, or set `GOS3_UI_LOCAL_DISCOVERY=false`. Against DNS
   rebinding and other websites, its `/api/discovery/*` routes answer 403
   unless the `Host` is an IP address, `localhost`/`*.localhost` or a name in
-  `GOS3_UI_ALLOWED_HOSTS`, and refuse a foreign `Origin` or `Sec-Fetch-Site:
-  cross-site`/`same-site`. Its probes read at most 64 KiB of `/_gos3/info`
-  (with or without `Content-Length`); local discovery keeps at most 2048
-  mDNS records and 1024 beacon candidates and verifies at most 256 URLs.
+  `GOS3_UI_ALLOWED_HOSTS`, and refuse a foreign `Origin` (one that matches
+  neither the `Host` nor a name listed in `GOS3_UI_ALLOWED_HOSTS`) or
+  `Sec-Fetch-Site: cross-site`/`same-site`. At most 2 scans and 4 local
+  discoveries run at once per UI server (`429 TooManyRequests`). Its probes
+  read at most 64 KiB of `/_gos3/info` (with or without `Content-Length`);
+  local discovery keeps at most 2048 mDNS records and 1024 beacon candidates
+  and verifies at most 256 URLs.
 
 ## Admin API notes
 

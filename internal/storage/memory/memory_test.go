@@ -200,7 +200,8 @@ func TestDeleteBucketNotEmpty(t *testing.T) {
 			put(t, b, "bkt", "k", "v")
 			_, _ = b.DeleteObject(ctx, "bkt", "k", "")
 		}},
-		{"upload", func(t *testing.T, b *Backend) {
+		{"object and upload", func(t *testing.T, b *Backend) {
+			put(t, b, "bkt", "k", "v")
 			if _, err := b.CreateMultipartUpload(ctx, "bkt", "k", storage.ObjectMeta{}, ""); err != nil {
 				t.Fatal(err)
 			}

@@ -359,8 +359,9 @@ func TestBucketCORS(t *testing.T) {
 	_, err = c.GetBucketCors(ctx(t), &s3.GetBucketCorsInput{Bucket: aws.String(b)})
 	wantErr(t, err, "NoSuchCORSConfiguration", http.StatusNotFound)
 	// Without a bucket configuration the server-wide CORS settings apply
-	// (default: any origin, Access-Control-Allow-Origin "*").
-	r = pre("https://app.example.com", "GET", "")
+	// (default: any origin, Access-Control-Allow-Origin "*", for signed
+	// requests only, see TestGlobalCORSAnonymous).
+	r = pre("https://app.example.com", "GET", "authorization")
 	if r.status != 200 || r.header.Get("Access-Control-Allow-Origin") != "*" || !strings.Contains(r.header.Get("Access-Control-Expose-Headers"), "ETag") {
 		t.Errorf("preflight with global CORS: %d %v", r.status, r.header)
 	}

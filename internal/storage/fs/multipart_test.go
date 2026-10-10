@@ -8,6 +8,8 @@ import (
 	"testing"
 	"time"
 
+	"go.etcd.io/bbolt"
+
 	"github.com/seanmmitchell/gos3/internal/storage"
 )
 
@@ -298,4 +300,49 @@ func TestCompleteRetriesWhenPartReplaced(t *testing.T) {
 		t.Fatalf("object created by failed completion: %v", err)
 	}
 	eq(t, "data files", len(dataFiles(t, b)), 1)
+}
+
+// TestDeleteBucketRemovesUploads checks that DeleteBucket on a bucket with
+// only in-progress uploads removes their part files, upload directories and
+// global index entries, leaving nothing for recovery to clean up.
+func TestDeleteBucketRemovesUploads(t *testing.T) {
+	b, bkt := newBucket(t, storage.VersioningEnabled)
+	waitRecovery(t, b)
+	var ids []string
+	for _, key := range []string{"a", "b"} {
+		up, err := b.CreateMultipartUpload(ctx, bkt, key, storage.ObjectMeta{}, "")
+		if err != nil {
+			t.Fatal(err)
+		}
+		uploadPart(t, b, bkt, key, up.UploadID, 1, "part-"+key)
+		ids = append(ids, up.UploadID)
+	}
+	if len(partFiles(t, b)) != 2 {
+		t.Fatalf("part files before delete: %v", partFiles(t, b))
+	}
+	if err := b.DeleteBucket(ctx, bkt); err != nil {
+		t.Fatalf("DeleteBucket: %v", err)
+	}
+	if f := partFiles(t, b); len(f) != 0 {
+		t.Errorf("part files left after DeleteBucket: %v", f)
+	}
+	for _, id := range ids {
+		if _, err := os.Stat(b.uploadPath(id)); !errors.Is(err, os.ErrNotExist) {
+			t.Errorf("upload directory %s: %v, want gone", id, err)
+		}
+	}
+	if err := b.view(func(tx *bbolt.Tx) error {
+		if k, _ := tx.Bucket(topUploads).Cursor().First(); k != nil {
+			t.Errorf("global upload index still holds %q", k)
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	var st recoveryStats
+	b.recoverData(ctx, &st)
+	b.recoverUploads(ctx, &st)
+	if st.dataFiles+st.partFiles+st.bucketDirs+st.uploadDirs != 0 {
+		t.Errorf("recovery found leftovers: %+v", st)
+	}
 }

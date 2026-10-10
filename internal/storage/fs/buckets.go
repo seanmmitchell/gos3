@@ -103,13 +103,18 @@ func (b *Backend) GetBucket(ctx context.Context, name string) (storage.BucketInf
 }
 
 // DeleteBucket removes an empty bucket, its configuration documents and its
-// data directory.
+// data directory. In-progress multipart uploads do not count: they are
+// aborted along with the bucket and their part directories removed.
 func (b *Backend) DeleteBucket(ctx context.Context, name string) error {
 	if err := b.begin(ctx); err != nil {
 		return err
 	}
-	var id string
+	var (
+		id      string
+		uploads []string
+	)
 	err := b.update(func(tx *bbolt.Tx) error {
+		uploads = nil
 		rec, bb, err := loadBucket(tx, name)
 		if err != nil {
 			return err
@@ -117,8 +122,14 @@ func (b *Backend) DeleteBucket(ctx context.Context, name string) error {
 		if k, _ := bb.Bucket(subVersions).Cursor().First(); k != nil {
 			return fmt.Errorf("%w: %q", storage.ErrBucketNotEmpty, name)
 		}
-		if k, _ := bb.Bucket(subUploads).Cursor().First(); k != nil {
-			return fmt.Errorf("%w: %q has in-progress multipart uploads", storage.ErrBucketNotEmpty, name)
+		// The upload and part records go with the per-bucket data bucket;
+		// only the global upload index needs explicit cleanup.
+		top := tx.Bucket(topUploads)
+		if err := bb.Bucket(subUploads).ForEach(func(k, _ []byte) error {
+			uploads = append(uploads, string(k))
+			return top.Delete(k)
+		}); err != nil {
+			return err
 		}
 		id = rec.ID
 		if err := tx.DeleteBucket(bucketDataName(rec.ID)); err != nil {
@@ -128,6 +139,9 @@ func (b *Backend) DeleteBucket(ctx context.Context, name string) error {
 	})
 	if err != nil {
 		return err
+	}
+	for _, u := range uploads {
+		b.removeUploadDir(u)
 	}
 	if err := os.RemoveAll(b.bucketDataDir(id)); err != nil {
 		b.log.Warn("fs: remove bucket data directory", "bucket", name, "bucket_id", id, "err", err)

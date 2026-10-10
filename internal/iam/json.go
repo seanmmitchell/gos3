@@ -97,8 +97,10 @@ func scalarString(r []byte) (string, error) {
 }
 
 // UnmarshalJSON accepts "*", {"AWS": "*"|"id"|[...]} and tolerates
-// {"CanonicalUser": ...}, whose values are matched like AWS principals.
-// Other principal types (Service, Federated, ...) are rejected.
+// {"CanonicalUser": ...}, whose values are matched like AWS principals,
+// and {"Service": ...} / {"Federated": ...}, which are kept but never
+// match (gos3 has no service or federated identities). Other principal
+// types are rejected.
 func (p *Principal) UnmarshalJSON(data []byte) error {
 	data = bytes.TrimSpace(data)
 	if len(data) == 0 {
@@ -122,6 +124,21 @@ func (p *Principal) UnmarshalJSON(data []byte) error {
 		}
 		out := Principal{}
 		for k, vals := range m {
+			if typ := otherPrincipalType(k); typ != "" {
+				for _, v := range vals {
+					if v == "" {
+						return errPrincipal
+					}
+				}
+				if len(vals) == 0 {
+					return errPrincipal
+				}
+				if out.other == nil {
+					out.other = map[string]StringOrSlice{}
+				}
+				out.other[typ] = append(out.other[typ], vals...)
+				continue
+			}
 			if !strings.EqualFold(k, "AWS") && !strings.EqualFold(k, "CanonicalUser") {
 				return errPrincipal
 			}
@@ -135,6 +152,7 @@ func (p *Principal) UnmarshalJSON(data []byte) error {
 		}
 		if out.Any {
 			out.AWS = nil // "*" subsumes everything else
+			out.other = nil
 		}
 		*p = out
 		return nil
@@ -142,17 +160,32 @@ func (p *Principal) UnmarshalJSON(data []byte) error {
 	return errPrincipal
 }
 
-// MarshalJSON renders "*" for Any and {"AWS": ...} otherwise.
+// otherPrincipalType returns the canonical name of a principal type that
+// is accepted but never matches ("Service", "Federated"), or "".
+func otherPrincipalType(k string) string {
+	switch {
+	case strings.EqualFold(k, "Service"):
+		return "Service"
+	case strings.EqualFold(k, "Federated"):
+		return "Federated"
+	}
+	return ""
+}
+
+// MarshalJSON renders "*" for Any and {"AWS": ..., "Service": ...,
+// "Federated": ...} otherwise.
 func (p Principal) MarshalJSON() ([]byte, error) {
 	if p.Any {
 		return []byte(`"*"`), nil
 	}
-	if len(p.AWS) == 0 {
-		return []byte(`{}`), nil
+	m := make(map[string]StringOrSlice, 1+len(p.other))
+	if len(p.AWS) > 0 {
+		m["AWS"] = p.AWS
 	}
-	return json.Marshal(struct {
-		AWS StringOrSlice `json:"AWS"`
-	}{p.AWS})
+	for k, v := range p.other {
+		m[k] = v
+	}
+	return json.Marshal(m)
 }
 
 // UnmarshalJSON decodes a policy document, accepting "Statement" as either
@@ -242,7 +275,14 @@ func clonePrincipal(p *Principal) *Principal {
 	if p == nil {
 		return nil
 	}
-	return &Principal{Any: p.Any, AWS: cloneSlice(p.AWS)}
+	out := &Principal{Any: p.Any, AWS: cloneSlice(p.AWS)}
+	if p.other != nil {
+		out.other = make(map[string]StringOrSlice, len(p.other))
+		for k, v := range p.other {
+			out.other[k] = cloneSlice(v)
+		}
+	}
+	return out
 }
 
 func cloneSlice(s StringOrSlice) StringOrSlice {

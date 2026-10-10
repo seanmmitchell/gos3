@@ -58,13 +58,14 @@ func TestNewObjectACLAndTagsNeedPermissions(t *testing.T) {
 		t.Fatalf("object published by a writer without s3:PutObjectAcl: %d", resp.StatusCode)
 	}
 
-	// Plain writes still work for writeonly; copies keep the source's tags
-	// (COPY directive) without s3:PutObjectTagging.
+	// Plain writes still work for writeonly; copying the source's tags
+	// (COPY directive) needs s3:PutObjectTagging (and s3:GetObjectTagging
+	// on the source, see TestCopyObjectCopiedTagsNeedPermissions).
 	if resp := e.signedAs(w, "PUT", "/priv/a", []byte("x"), nil); resp.StatusCode != 200 {
 		t.Fatalf("writeonly plain put: %d %s", resp.StatusCode, resp.Data)
 	}
-	if resp := e.signedAs(d, "PUT", "/priv/c", nil, objHdr("X-Amz-Copy-Source", "/priv/src")); resp.StatusCode != 200 {
-		t.Fatalf("copy with source tags: %d %s", resp.StatusCode, resp.Data)
+	if resp := e.signedAs(d, "PUT", "/priv/c", nil, objHdr("X-Amz-Copy-Source", "/priv/src")); resp.StatusCode != 403 {
+		t.Fatalf("copy with source tags under a tagging Deny: %d %s", resp.StatusCode, resp.Data)
 	}
 	// With the permissions, ACL and tags are accepted.
 	if resp := e.signedAs(ok, "PUT", "/priv/b", []byte("x"), objHdr("X-Amz-Acl", "public-read", "X-Amz-Tagging", "a=b")); resp.StatusCode != 200 {

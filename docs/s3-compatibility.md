@@ -16,7 +16,7 @@ supported, operation by operation, and where gos3 differs from AWS.
 | Virtual-hosted-style URLs (`bucket.s3.example.com`) | ✅ | Needs `server.domains` and wildcard DNS (and a wildcard certificate for TLS). The longest matching domain wins; the port is ignored. |
 | Signature Version 4, `Authorization` header | ✅ | Payload as hex SHA-256 or `UNSIGNED-PAYLOAD`. Allowed clock skew is 15 minutes. Signature comparison is constant-time. `SignedHeaders` listing a header twice is rejected (`AuthorizationHeaderMalformed`, or `AuthorizationQueryParametersError` for presigned URLs). `SignatureDoesNotMatch` echoes at most 16 KiB of `StringToSign` and `CanonicalRequest`. A signed `Expect: 100-continue` header also verifies over HTTP/2 (Go's HTTP/2 server removes that header before gos3 sees it). |
 | SigV4 streaming (`aws-chunked`) | ✅ | `STREAMING-AWS4-HMAC-SHA256-PAYLOAD`, `…-PAYLOAD-TRAILER` and `STREAMING-UNSIGNED-PAYLOAD-TRAILER` (the default of current AWS SDKs). Trailing checksums are verified. AWS's 8 KiB minimum chunk size is not enforced. |
-| Presigned URLs (SigV4 query) | ✅ | `X-Amz-Expires` up to 7 days. |
+| Presigned URLs (SigV4 query) | ✅ | `X-Amz-Expires` up to 7 days. Other `x-amz-*` query parameters are covered by the signature and treated as the corresponding request headers, as the AWS SDK for JavaScript v3 presigner produces them (for example `x-amz-copy-source`, `x-amz-meta-*`, `x-amz-tagging`, `x-amz-acl`, `x-amz-storage-class` and `x-amz-object-lock-*`); a header actually sent takes precedence. Unlike AWS, `x-amz-checksum-*` and `x-amz-sdk-checksum-algorithm` query parameters are ignored, because presigners compute them over an empty body when the URL is created. Parameter values containing control characters get `400 InvalidArgument`. |
 | Browser POST uploads (POST policy) | ✅ | V4 form fields, every policy condition including `content-length-range`, `${filename}`, `success_action_redirect` / `success_action_status`. |
 | Anonymous access | ✅ | Allowed only by a bucket policy with `"Principal": "*"` or by a public canned ACL. |
 | Region in the credential scope | ✅ | Any region is accepted unless `auth.strict_region` is set. Use `us-east-1` (or `server.region`). |
@@ -34,7 +34,7 @@ HEAD errors have no body. Unknown query parameters are ignored, as on AWS.
 |---|---|---|
 | ListBuckets | ✅ | `max-buckets`, `continuation-token`, `prefix`, `bucket-region`. Every bucket on the server is listed (one account); `BucketRegion` is always included. |
 | CreateBucket | ✅ | Name rules as AWS. `LocationConstraint` is stored as the bucket region (`EU` → `eu-west-1`). Supports `x-amz-acl` (canned), `x-amz-object-ownership` and `x-amz-bucket-object-lock-enabled`. Directory buckets ❌. New buckets do **not** get AWS's 2023 defaults (BucketOwnerEnforced, Block Public Access): canned ACLs work as in classic S3. |
-| DeleteBucket | ✅ | `BucketNotEmpty` also counts noncurrent versions, delete markers and in-progress uploads. |
+| DeleteBucket | ✅ | `BucketNotEmpty` also counts noncurrent versions and delete markers. In-progress multipart uploads do not keep a bucket alive; they are aborted with it, as on AWS. |
 | HeadBucket | ✅ | `x-amz-bucket-region`. |
 | GetBucketLocation | ✅ | Empty `LocationConstraint` for `us-east-1`. |
 | ListObjects (v1) | ✅ | `prefix`, `delimiter`, `marker`, `max-keys` (≤ 1000), `encoding-type=url`. |
@@ -52,7 +52,7 @@ HEAD errors have no body. Unknown query parameters are ignored, as on AWS.
 | `?policy`, `?policyStatus` | ✅ | IAM policy language with conditions (see [Authorization](#authorization)). Policies are stored byte for byte. `IsPublic` reflects anonymous access. |
 | `?lifecycle` | 🟡 | Every rule form is validated and stored. Executed by the lifecycle worker: Expiration (Days, Date, ExpiredObjectDeleteMarker), NoncurrentVersionExpiration (NoncurrentDays, NewerNoncurrentVersions) and AbortIncompleteMultipartUpload. Filters: prefix, tags, object size. **Transitions are stored but never executed** (there are no storage tiers). `x-amz-expiration` and `x-amz-abort-date` headers are reported. |
 | `?encryption` | 🟡 | Configuration stored and reported (AES256, aws:kms, aws:kms:dsse); objects get the matching `x-amz-server-side-encryption` headers. **gos3 does not encrypt data at rest**; use disk encryption. |
-| `?acl` | 🟡 | Canned ACLs (`private`, `public-read`, `public-read-write`, `authenticated-read`, `log-delivery-write`), as `x-amz-acl` or as an equivalent `AccessControlPolicy`. Grants to individual users or e-mail addresses and `x-amz-grant-*` headers ❌. |
+| `?acl` | 🟡 | Canned ACLs (`private`, `public-read`, `public-read-write`, `authenticated-read`, `log-delivery-write`), as `x-amz-acl` or as an equivalent `AccessControlPolicy`; what each grants is listed under [Authorization](#authorization). Grants to individual users or e-mail addresses and `x-amz-grant-*` headers ❌. |
 | `?object-lock` | ✅ | Default retention (GOVERNANCE / COMPLIANCE, Days or Years). Lock can be enabled at creation or later on a versioned bucket. |
 | `?ownershipControls` | ✅ | `BucketOwnerEnforced` disables ACLs. |
 | `?publicAccessBlock` | ✅ | Enforced: `BlockPublicAcls`, `IgnorePublicAcls`, `BlockPublicPolicy`, `RestrictPublicBuckets`. |
@@ -73,7 +73,7 @@ HEAD errors have no body. Unknown query parameters are ignored, as on AWS.
 | HeadObject | ✅ | Same as GetObject without a body. |
 | DeleteObject | ✅ | Versioning semantics (delete markers), `x-amz-bypass-governance-retention`, `If-Match`. |
 | DeleteObjects | ✅ | Up to 1000 keys, `Quiet` mode, per-key `ETag` condition, object lock checks. |
-| CopyObject | ✅ | Versioned sources, `x-amz-copy-source-if-*`, `x-amz-metadata-directive` / `x-amz-tagging-directive` (COPY / REPLACE), checksum recomputation. Like UploadPartCopy and CompleteMultipartUpload, a copy that takes longer than about 5 s sends `200` early with whitespace keep-alives and may then report an `<Error>` inside the 200 body, as AWS does; the copy stops when the client disconnects. An ACL or `REPLACE` tags need `s3:PutObjectAcl` / `s3:PutObjectTagging`. |
+| CopyObject | ✅ | Versioned sources, `x-amz-copy-source-if-*`, `x-amz-metadata-directive` / `x-amz-tagging-directive` (COPY / REPLACE), checksum recomputation. Like UploadPartCopy and CompleteMultipartUpload, a copy that takes longer than about 5 s sends `200` early with whitespace keep-alives and may then report an `<Error>` inside the 200 body, as AWS does; the copy stops when the client disconnects. An ACL or `REPLACE` tags need `s3:PutObjectAcl` / `s3:PutObjectTagging`; copying the tags of a tagged source (`COPY`, the default) needs tagging permissions too (see [Authorization](#authorization)). |
 | GetObjectAttributes | ✅ | ETag, Checksum, ObjectParts (paged), StorageClass, ObjectSize. |
 | Get/Put/DeleteObjectTagging | ✅ | Up to 10 tags; version-aware. PutObjectTagging evaluates `s3:RequestObjectTag/<key>` and `s3:RequestObjectTagKeys` from the XML body. |
 | Get/PutObjectAcl | 🟡 | Canned ACLs only (see bucket `?acl`). |
@@ -124,19 +124,79 @@ ListObjectsV2, ListParts and GetObjectAttributes.
 - **Bucket policies** are evaluated together with identity policies, and an
   explicit Deny wins (except for root). Supported condition keys include
   `aws:SourceIp`, `aws:SecureTransport`, `aws:username`, `aws:CurrentTime`,
-  `s3:prefix`, `s3:delimiter`, `s3:max-keys`, `s3:x-amz-acl`, `s3:VersionId`,
-  `s3:ExistingObjectTag/<key>`, and `s3:RequestObjectTag/<key>` /
-  `s3:RequestObjectTagKeys` (PutObject, CopyObject, CreateMultipartUpload,
-  PostObject and PutObjectTagging).
+  `s3:prefix`, `s3:delimiter`, `s3:max-keys`, `s3:VersionId`,
+  `s3:ExistingObjectTag/<key>`, `s3:x-amz-copy-source`,
+  `s3:x-amz-metadata-directive`, and the object-attribute keys `s3:x-amz-acl`,
+  `s3:x-amz-server-side-encryption`,
+  `s3:x-amz-server-side-encryption-aws-kms-key-id`, `s3:x-amz-storage-class`,
+  `s3:x-amz-website-redirect-location`, `s3:object-lock-mode`,
+  `s3:object-lock-retain-until-date`,
+  `s3:object-lock-remaining-retention-days`, `s3:object-lock-legal-hold`,
+  `s3:RequestObjectTag/<key>` and `s3:RequestObjectTagKeys`.
+- **Where the object-attribute keys come from**, per operation:
+  - PutObject, CreateMultipartUpload and CopyObject: the request headers.
+  - PostObject: the normalised form fields; the POST's own headers are
+    ignored.
+  - PutObjectTagging, PutObjectRetention and PutObjectLegalHold: the XML
+    body. These operations are authorized after the body is read, so
+    `MalformedXML` and invalid dates are reported before `AccessDenied`,
+    `InvalidRequest` (no object lock) or `NoSuchKey`.
+  - UploadPart, UploadPartCopy and CompleteMultipartUpload: the attributes
+    recorded at CreateMultipartUpload (including bucket default encryption
+    and retention applied then). The AWS "require SSE" bucket policy
+    therefore works for multipart uploads.
+  - `s3:RequestObjectTag/<key>` and `s3:RequestObjectTagKeys` come from
+    `x-amz-tagging` only where that header is stored: PutObject,
+    CreateMultipartUpload, and CopyObject with `REPLACE` (PostObject uses its
+    `tagging` field, PutObjectTagging its body, and a `COPY` CopyObject the
+    copied tags, described below).
+  - `s3:object-lock-remaining-retention-days` is the number of days until
+    the retain-until date, rounded up. On PutObject, CreateMultipartUpload
+    and CopyObject it is not set for bucket default retention.
 - Writing an object with an ACL (`x-amz-acl`, or the `acl` form field of
   PostObject) also requires `s3:PutObjectAcl`, and writing it with tags
   (`x-amz-tagging`, CopyObject's `REPLACE` tagging directive, or the
   `tagging` form field) also requires `s3:PutObjectTagging`, as on AWS. The
   built-in `writeonly` policy therefore cannot upload with an ACL or tags.
+- CopyObject with the `COPY` tagging directive (the default) from a tagged
+  source needs `s3:GetObjectTagging` on the source
+  (`s3:GetObjectVersionTagging` when a `versionId` is given) and
+  `s3:PutObjectTagging` on the destination, evaluated with the copied tags
+  as `s3:RequestObjectTag/<key>` keys. Untagged sources, and `REPLACE`
+  without tags, need only `s3:GetObject` plus `s3:PutObject`.
+- **Principals** in bucket policies: `"*"`, `AWS` (user names, access key
+  IDs, `arn:<partition>:iam::<account>:user/[path/]<name>`, the account
+  principal) and `CanonicalUser` (matched like `AWS`). `Service` and
+  `Federated` principals are accepted and stored but match no gos3
+  identity: a statement with only them never applies, and a `NotPrincipal`
+  naming only them applies to everyone. Other principal types (for example
+  OIDC) are rejected with `MalformedPolicy`.
+- The **account principal** (`arn:<partition>:iam::<account>:root` or a
+  12-digit account ID; the account number is not checked, because gos3 has
+  one account) is read in whichever way grants less:
+  - `Deny` with `Principal` account: every authenticated IAM user (root is
+    never denied).
+  - `Allow` with `Principal` account: root only. It delegates to identity
+    policies and grants IAM users nothing by itself.
+  - `Allow` with `NotPrincipal` account: only anonymous callers get the
+    grant (the policy counts as public).
+  - `Deny` with `NotPrincipal` account: does not exempt IAM users; list the
+    user's ARN or name as well.
 - IAM actions follow AWS (for example `s3:GetObjectVersion` when `versionId` is
   given, and `s3:ListBucket` for HeadBucket). Admin API actions are
   `admin:<Action>` on resource `arn:gos3:admin:::*` (see
   [admin-api.md](admin-api.md)).
+- **Canned ACLs** grant exactly:
+  - `public-read` / `authenticated-read` (to everyone / to every
+    authenticated identity): on a bucket, `s3:ListBucket`,
+    `s3:ListBucketVersions` and `s3:GetBucketLocation`; on an object,
+    `s3:GetObject` and `s3:GetObjectVersion`, through the object's own ACL.
+  - `public-read-write`: the read set plus `s3:PutObject`, `s3:DeleteObject`
+    (a delete marker in versioned buckets) and
+    `s3:ListBucketMultipartUploads`. It does not grant permanent version
+    deletes (`s3:DeleteObjectVersion`), aborting uploads
+    (`s3:AbortMultipartUpload`) or listing parts
+    (`s3:ListMultipartUploadParts`); these need a policy.
 - A bucket ACL grants bucket-level access and object writes, but never object
   reads, as on AWS. To publish a bucket, use a bucket policy (the web UI has
   templates).

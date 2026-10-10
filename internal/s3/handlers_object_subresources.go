@@ -350,14 +350,12 @@ func (s *Server) handleGetObjectRetention(w http.ResponseWriter, r *http.Request
 // can only be extended unless the caller bypasses governance
 // (x-amz-bypass-governance-retention: true + s3:BypassGovernanceRetention).
 // An empty <Retention/> removes the retention (same rules).
+//
+// The op is authorized here, after the (small) body is decoded, because
+// its s3:object-lock-mode, s3:object-lock-retain-until-date and
+// s3:object-lock-remaining-retention-days condition keys come from the
+// body, as in AWS; request headers do not count.
 func (s *Server) handlePutObjectRetention(w http.ResponseWriter, r *http.Request, rc *reqContext) error {
-	if err := s.requireBucketObjectLock(r, rc); err != nil {
-		return err
-	}
-	info, _, err := s.subresourceTarget(w, r, rc)
-	if err != nil {
-		return err
-	}
 	var doc objectRetention
 	if err := s.decodeValidatedXML(r, rc, maxSubresourceBody, &doc); err != nil {
 		return err
@@ -382,6 +380,20 @@ func (s *Server) handlePutObjectRetention(w http.ResponseWriter, r *http.Request
 				With("ArgumentName", "RetainUntilDate").With("ArgumentValue", dateStr)
 		}
 		until = t
+	}
+	attrs := map[string][]string{}
+	if mode != "" {
+		attrs = retentionConditions(mode, until, s.now())
+	}
+	if err := s.authorizeOpWith(r.Context(), r, rc, attrs); err != nil {
+		return err
+	}
+	if err := s.requireBucketObjectLock(r, rc); err != nil {
+		return err
+	}
+	info, _, err := s.subresourceTarget(w, r, rc)
+	if err != nil {
+		return err
 	}
 	bypass := s.canBypassGovernance(r, rc, rc.bucket, rc.key, info.VersionID)
 	now := s.now()
@@ -421,14 +433,9 @@ func (s *Server) handleGetObjectLegalHold(w http.ResponseWriter, r *http.Request
 }
 
 // handlePutObjectLegalHold implements PutObjectLegalHold (ON / OFF).
+// The op is authorized after the body is decoded: its
+// s3:object-lock-legal-hold condition key is the status in the body.
 func (s *Server) handlePutObjectLegalHold(w http.ResponseWriter, r *http.Request, rc *reqContext) error {
-	if err := s.requireBucketObjectLock(r, rc); err != nil {
-		return err
-	}
-	info, _, err := s.subresourceTarget(w, r, rc)
-	if err != nil {
-		return err
-	}
 	var doc objectLegalHold
 	if err := s.decodeValidatedXML(r, rc, maxSubresourceBody, &doc); err != nil {
 		return err
@@ -440,6 +447,17 @@ func (s *Server) handlePutObjectLegalHold(w http.ResponseWriter, r *http.Request
 	case "OFF":
 	default:
 		return s3err.ErrMalformedXML
+	}
+	attrs := map[string][]string{"s3:object-lock-legal-hold": {legalHoldStatus(on)}}
+	if err := s.authorizeOpWith(r.Context(), r, rc, attrs); err != nil {
+		return err
+	}
+	if err := s.requireBucketObjectLock(r, rc); err != nil {
+		return err
+	}
+	info, _, err := s.subresourceTarget(w, r, rc)
+	if err != nil {
+		return err
 	}
 	if _, err := s.updateObjectMeta(r, rc, info, func(m *storage.ObjectMeta) error {
 		m.LegalHold = on

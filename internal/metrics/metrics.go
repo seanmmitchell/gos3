@@ -16,10 +16,13 @@ import (
 
 // OpStats aggregates one API operation (e.g. "PutObject").
 type OpStats struct {
-	Op           string  `json:"op"`
-	Requests     int64   `json:"requests"`
-	Errors4xx    int64   `json:"errors4xx"`
-	Errors5xx    int64   `json:"errors5xx"`
+	Op        string `json:"op"`
+	Requests  int64  `json:"requests"`
+	Errors4xx int64  `json:"errors4xx"`
+	Errors5xx int64  `json:"errors5xx"`
+	// Aborted counts requests the client gave up on (status
+	// StatusClientClosedRequest); they are not included in Errors4xx.
+	Aborted      int64   `json:"aborted"`
 	BytesIn      int64   `json:"bytesIn"`
 	BytesOut     int64   `json:"bytesOut"`
 	AvgLatencyMs float64 `json:"avgLatencyMs"`
@@ -34,10 +37,13 @@ type Snapshot struct {
 	Requests      int64     `json:"requests"`
 	Errors4xx     int64     `json:"errors4xx"`
 	Errors5xx     int64     `json:"errors5xx"`
-	BytesIn       int64     `json:"bytesIn"`
-	BytesOut      int64     `json:"bytesOut"`
-	InFlight      int64     `json:"inFlight"`
-	Ops           []OpStats `json:"ops"` // sorted by Op
+	// Aborted counts requests the client gave up on (status
+	// StatusClientClosedRequest); they are not included in Errors4xx.
+	Aborted  int64     `json:"aborted"`
+	BytesIn  int64     `json:"bytesIn"`
+	BytesOut int64     `json:"bytesOut"`
+	InFlight int64     `json:"inFlight"`
+	Ops      []OpStats `json:"ops"` // sorted by Op
 	// Recent is per-minute request counts for the last 60 minutes, oldest first.
 	Recent []MinuteBucket `json:"recent"`
 }
@@ -46,9 +52,11 @@ type Snapshot struct {
 type MinuteBucket struct {
 	Minute   time.Time `json:"minute"`
 	Requests int64     `json:"requests"`
-	Errors   int64     `json:"errors"`
-	BytesIn  int64     `json:"bytesIn"`
-	BytesOut int64     `json:"bytesOut"`
+	// Errors counts 4xx and 5xx responses, excluding aborted requests.
+	Errors   int64 `json:"errors"`
+	Aborted  int64 `json:"aborted"`
+	BytesIn  int64 `json:"bytesIn"`
+	BytesOut int64 `json:"bytesOut"`
 }
 
 const (
@@ -64,6 +72,18 @@ const (
 	// OtherOp is the operation name used once maxOps distinct names exist,
 	// and for empty operation names.
 	OtherOp = "Other"
+
+	// StatusClientClosedRequest is the non-standard status (nginx's 499)
+	// recorded for a request the client abandoned mid-flight, e.g. an
+	// upload whose connection dropped. It is counted in the separate
+	// "aborted" class, not as a 4xx error: the server did nothing wrong
+	// and the client never saw a response.
+	StatusClientClosedRequest = 499
+
+	// classAborted is the status-class index of aborted requests (see
+	// statusClass); numClasses is the number of class slots.
+	classAborted = 6
+	numClasses   = 7
 )
 
 // durationBuckets are the upper bounds (seconds) of the Prometheus request
@@ -74,7 +94,7 @@ var durationBuckets = [...]float64{0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 
 type opStats struct {
 	mu        sync.Mutex
 	requests  int64
-	classes   [6]int64 // index 1..5 = 1xx..5xx; 0 = anything else
+	classes   [numClasses]int64 // index 1..5 = 1xx..5xx; classAborted; 0 = anything else
 	bytesIn   int64
 	bytesOut  int64
 	latSum    float64                         // seconds
@@ -89,6 +109,7 @@ type minuteSlot struct {
 	minute   int64 // unix minute this slot currently holds
 	requests int64
 	errors   int64
+	aborted  int64
 	bytesIn  int64
 	bytesOut int64
 }
@@ -101,6 +122,7 @@ type Registry struct {
 	requests atomic.Int64
 	errors4  atomic.Int64
 	errors5  atomic.Int64
+	aborted  atomic.Int64
 	bytesIn  atomic.Int64
 	bytesOut atomic.Int64
 	inFlight atomic.Int64
@@ -159,6 +181,8 @@ func (r *Registry) record(op string, status int, bytesIn, bytesOut int64, d time
 		r.errors4.Add(1)
 	case 5:
 		r.errors5.Add(1)
+	case classAborted:
+		r.aborted.Add(1)
 	}
 
 	secs := d.Seconds()
@@ -184,8 +208,11 @@ func (r *Registry) record(op string, status int, bytesIn, bytesOut int64, d time
 		*slot = minuteSlot{minute: m}
 	}
 	slot.requests++
-	if class >= 4 {
+	switch class {
+	case 4, 5:
 		slot.errors++
+	case classAborted:
+		slot.aborted++
 	}
 	slot.bytesIn += bytesIn
 	slot.bytesOut += bytesOut
@@ -219,10 +246,14 @@ func (r *Registry) opStats(op string) *opStats {
 	return st
 }
 
-// statusClass returns 1..5 for 1xx..5xx and 0 otherwise.
+// statusClass returns 1..5 for 1xx..5xx, classAborted for
+// StatusClientClosedRequest and 0 otherwise.
 func statusClass(status int) int {
 	if status == 0 {
 		status = 200 // nothing written means net/http sends 200
+	}
+	if status == StatusClientClosedRequest {
+		return classAborted
 	}
 	if status < 100 || status > 599 {
 		return 0
@@ -248,6 +279,7 @@ func (r *Registry) Snapshot() Snapshot {
 		Requests:      r.requests.Load(),
 		Errors4xx:     r.errors4.Load(),
 		Errors5xx:     r.errors5.Load(),
+		Aborted:       r.aborted.Load(),
 		BytesIn:       r.bytesIn.Load(),
 		BytesOut:      r.bytesOut.Load(),
 		InFlight:      r.inFlight.Load(),
@@ -263,6 +295,7 @@ func (r *Registry) Snapshot() Snapshot {
 			Requests:  e.st.requests,
 			Errors4xx: e.st.classes[4],
 			Errors5xx: e.st.classes[5],
+			Aborted:   e.st.classes[classAborted],
 			BytesIn:   e.st.bytesIn,
 			BytesOut:  e.st.bytesOut,
 		}
@@ -284,7 +317,8 @@ func (r *Registry) Snapshot() Snapshot {
 	for m := cur - recentMinutes + 1; m <= cur; m++ {
 		b := MinuteBucket{Minute: time.Unix(m*60, 0).UTC()}
 		if slot := r.minutes[mod(m, recentMinutes)]; slot.minute == m {
-			b.Requests, b.Errors, b.BytesIn, b.BytesOut = slot.requests, slot.errors, slot.bytesIn, slot.bytesOut
+			b.Requests, b.Errors, b.Aborted = slot.requests, slot.errors, slot.aborted
+			b.BytesIn, b.BytesOut = slot.bytesIn, slot.bytesOut
 		}
 		s.Recent = append(s.Recent, b)
 	}

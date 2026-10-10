@@ -79,9 +79,25 @@ export function isAllowedHost(host: string | undefined, allowed: string[] = allo
 }
 
 /**
+ * True when origin is an http(s) origin whose host name is listed
+ * explicitly in GOS3_UI_ALLOWED_HOSTS (the "*" wildcard does not count).
+ */
+export function isListedOrigin(origin: string, allowed: string[] = allowedHostsFromEnv()): boolean {
+  let u: URL
+  try {
+    u = new URL(origin)
+  } catch {
+    return false
+  }
+  if (u.protocol !== 'http:' && u.protocol !== 'https:') return false
+  const name = hostnameOf(u.host)
+  return name !== '' && name !== '*' && allowed.includes(name)
+}
+
+/**
  * Rejects requests a browser made on behalf of another site: a Host header
  * that is not allowed (DNS rebinding), an Origin that differs from the Host
- * (cross-origin), or Sec-Fetch-Site cross-site / same-site. Returns the
+ * and is not listed in GOS3_UI_ALLOWED_HOSTS (cross-origin), or Sec-Fetch-Site cross-site / same-site. Returns the
  * error envelope to send, or undefined when the request may proceed.
  */
 export function rejectForeignRequest(event: H3Event): ErrorEnvelope | undefined {
@@ -97,9 +113,58 @@ export function rejectForeignRequest(event: H3Event): ErrorEnvelope | undefined 
     } catch {
       sameOrigin = false
     }
-    if (!sameOrigin) return errorResponse(event, 403, 'AccessDenied', 'Cross-origin discovery requests are not allowed.')
+    // Behind a reverse proxy that rewrites Host (nginx's default), the
+    // browser's Origin carries the public name while Host is the upstream
+    // address; accept an Origin whose name the operator listed explicitly.
+    // "*" only relaxes the Host check: it does not trust every Origin.
+    if (!sameOrigin) sameOrigin = isListedOrigin(origin)
+    if (!sameOrigin) return errorResponse(event, 403, 'AccessDenied', 'Cross-origin discovery requests are not allowed. Behind a reverse proxy, forward the original Host header or add the console\'s host name to GOS3_UI_ALLOWED_HOSTS.')
   }
   const site = getRequestHeader(event, 'sec-fetch-site')
   if (site === 'cross-site' || site === 'same-site') return errorResponse(event, 403, 'AccessDenied', 'Cross-site discovery requests are not allowed.')
   return undefined
+}
+
+/**
+ * A fixed number of slots for expensive routes. The Node server has no
+ * authentication, so without a global bound any client that can reach it
+ * could run hundreds of scans or multicast listeners at once.
+ */
+export class Slots {
+  private used = 0
+
+  constructor(readonly size: number) {}
+
+  /** Takes a slot and returns its release function (idempotent), or undefined when all are in use. */
+  tryAcquire(): (() => void) | undefined {
+    if (this.used >= this.size) return undefined
+    this.used++
+    let released = false
+    return () => {
+      if (released) return
+      released = true
+      this.used--
+    }
+  }
+
+  /** Slots currently in use. */
+  get inUse(): number {
+    return this.used
+  }
+}
+
+/** At most this many POST /api/discovery/scan run at once (as the admin API). */
+export const MAX_CONCURRENT_SCANS = 2
+/** At most this many GET /api/discovery/local run at once. */
+export const MAX_CONCURRENT_LOCAL = 4
+
+/** Process-wide slots for /api/discovery/scan. */
+export const scanSlots = new Slots(MAX_CONCURRENT_SCANS)
+/** Process-wide slots for /api/discovery/local. */
+export const localSlots = new Slots(MAX_CONCURRENT_LOCAL)
+
+/** The 429 TooManyRequests envelope sent when slots are full. */
+export function tooManyRequests(event: H3Event, what: string, max: number): ErrorEnvelope {
+  setResponseHeader(event, 'retry-after', 5)
+  return errorResponse(event, 429, 'TooManyRequests', `${max} ${what} are already running on this UI server; retry when one has finished.`)
 }

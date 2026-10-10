@@ -438,6 +438,11 @@ func TestGracefulShutdown(t *testing.T) {
 	if r := do(t, "PUT", srv.url+"/slow", nil, &rootCreds, nil); r.status != 200 {
 		t.Fatalf("CreateBucket: %d %s", r.status, r.body)
 	}
+	// The CreateBucket request may still count as in flight for a moment
+	// after its response reached the client; wait for it to drain so the
+	// in-flight gauge below observes the upload alone.
+	inFlight := func() int64 { return srv.Metrics().Snapshot().InFlight }
+	waitFor(t, 5*time.Second, "CreateBucket to finish", func() bool { return inFlight() == 0 })
 
 	// Start an upload whose body arrives slowly.
 	pr, pw := io.Pipe()
@@ -472,6 +477,12 @@ func TestGracefulShutdown(t *testing.T) {
 	if _, err := pw.Write(chunk); err != nil {
 		t.Fatal(err)
 	}
+	// The client having written the chunk only means it reached the
+	// socket: the server may not have accepted the connection or read the
+	// request headers yet, and Shutdown would then reset the not yet
+	// accepted (or still idle) connection. Wait until the S3 handler is
+	// running, i.e. the connection is active and Shutdown must wait for it.
+	waitFor(t, 5*time.Second, "upload handler to start", func() bool { return inFlight() == 1 })
 
 	stopped := make(chan error, 1)
 	go func() { stopped <- srv.stop() }()

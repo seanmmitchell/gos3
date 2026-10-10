@@ -108,12 +108,8 @@ func TestDeleteBucketNotEmpty(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := b.DeleteBucket(ctx, bkt); !errors.Is(err, storage.ErrBucketNotEmpty) {
-		t.Fatalf("delete with upload: %v", err)
-	}
-	if err := b.AbortMultipartUpload(ctx, bkt, "mp", up.UploadID); err != nil {
-		t.Fatal(err)
-	}
+	// An in-progress upload does not keep the bucket alive: DeleteBucket
+	// aborts it.
 	if err := b.PutBucketConfig(ctx, bkt, storage.ConfigCORS, []byte("<x/>")); err != nil {
 		t.Fatal(err)
 	}
@@ -130,6 +126,9 @@ func TestDeleteBucketNotEmpty(t *testing.T) {
 	}
 	if got := keysOf(t, b, bkt, "", ""); len(got) != 0 {
 		t.Fatalf("objects survived recreate: %v", got)
+	}
+	if _, err := b.GetMultipartUpload(ctx, bkt, "mp", up.UploadID); !errors.Is(err, storage.ErrUploadNotFound) {
+		t.Fatalf("upload survived recreate: %v", err)
 	}
 }
 

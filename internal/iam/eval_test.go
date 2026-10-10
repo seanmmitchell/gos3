@@ -222,7 +222,7 @@ func TestAuthorizeBucketPolicyAndACL(t *testing.T) {
 		{"Sid":"Key","Effect":"Allow","Principal":{"AWS":"AKNOBODY"},"Action":"s3:GetObject","Resource":"arn:aws:s3:::shared/*"},
 		{"Sid":"Name","Effect":"Allow","Principal":{"AWS":"writer"},"Action":"s3:GetObject","Resource":"arn:aws:s3:::shared/w/*"},
 		{"Sid":"CanonicalNobody","Effect":"Allow","Principal":{"CanonicalUser":"nobody"},"Action":"s3:ListBucket","Resource":"arn:aws:s3:::shared"},
-		{"Sid":"Root","Effect":"Deny","Principal":{"AWS":"arn:aws:iam::1:root"},"Action":"s3:*","Resource":"arn:aws:s3:::shared/*"}]}`)
+		{"Sid":"Root","Effect":"Allow","Principal":{"AWS":"arn:aws:iam::1:root"},"Action":"s3:*","Resource":"arn:aws:s3:::shared/*"}]}`)
 	denyAlice := mustBucketPolicy(t, "b", `{"Statement":[
 		{"Sid":"NoAlice","Effect":"Deny","Principal":{"AWS":"alice"},"Action":"s3:DeleteObject","Resource":"arn:aws:s3:::b/*"}]}`)
 	notPrincipal := mustBucketPolicy(t, "b", `{"Statement":[
@@ -273,10 +273,10 @@ func TestAuthorizeBucketPolicyAndACL(t *testing.T) {
 		{name: "acl public-read acl denied", id: anon, action: "s3:GetObjectAcl", bucket: "b", key: "k", acl: "public-read", want: false},
 		{name: "acl public-read-write put", id: anon, action: "s3:PutObject", bucket: "b", key: "k", acl: "public-read-write", want: true},
 		{name: "acl public-read-write delete", id: anon, action: "s3:DeleteObject", bucket: "b", key: "k", acl: "public-read-write", want: true},
-		{name: "acl public-read-write delete version", id: anon, action: "s3:DeleteObjectVersion", bucket: "b", key: "k", acl: "public-read-write", want: true},
-		{name: "acl public-read-write mpu", id: anon, action: "s3:ListMultipartUploadParts", bucket: "b", key: "k", acl: "public-read-write", want: true},
+		{name: "acl public-read-write delete version", id: anon, action: "s3:DeleteObjectVersion", bucket: "b", key: "k", acl: "public-read-write", want: false},
+		{name: "acl public-read-write mpu", id: anon, action: "s3:ListMultipartUploadParts", bucket: "b", key: "k", acl: "public-read-write", want: false},
 		{name: "acl public-read-write uploads", id: anon, action: "s3:ListBucketMultipartUploads", bucket: "b", acl: "Public-Read-Write", want: true},
-		{name: "acl public-read-write abort", id: anon, action: "s3:AbortMultipartUpload", bucket: "b", key: "k", acl: "public-read-write", want: true},
+		{name: "acl public-read-write abort", id: anon, action: "s3:AbortMultipartUpload", bucket: "b", key: "k", acl: "public-read-write", want: false},
 		{name: "acl public-read-write no policy put", id: anon, action: "s3:PutBucketPolicy", bucket: "b", acl: "public-read-write", want: false},
 		{name: "acl authenticated anon", id: anon, action: "s3:GetObject", bucket: "b", key: "k", acl: "authenticated-read", want: false},
 		{name: "acl authenticated user", id: user("nobody"), action: "s3:GetObject", bucket: "b", key: "k", acl: "authenticated-read", want: true},
@@ -297,29 +297,86 @@ func TestAuthorizeBucketPolicyRootPrincipal(t *testing.T) {
 	if !d.Allowed {
 		t.Fatalf("root denied: %+v", d)
 	}
-	// The root ARN principal matches only the root identity.
+	// In the narrow reading the account principal matches only the root
+	// identity; in the broad one (Deny statements) every authenticated
+	// identity.
 	c := newEvalCtx(&AuthzRequest{Identity: root}, fixedNow)
-	if !c.principalMatches(&Principal{AWS: StringOrSlice{"arn:aws:iam::123:root"}}) {
-		t.Fatal("root ARN did not match root")
-	}
-	if !c.principalMatches(&Principal{AWS: StringOrSlice{"123456789012"}}) {
-		t.Fatal("account id did not match root")
+	for _, broad := range []bool{false, true} {
+		if !c.principalMatches(&Principal{AWS: StringOrSlice{"arn:aws:iam::123:root"}}, broad) {
+			t.Fatal("root ARN did not match root")
+		}
+		if !c.principalMatches(&Principal{AWS: StringOrSlice{"123456789012"}}, broad) {
+			t.Fatal("account id did not match root")
+		}
 	}
 	c = newEvalCtx(&AuthzRequest{Identity: user("alice")}, fixedNow)
-	if c.principalMatches(&Principal{AWS: StringOrSlice{"arn:aws:iam::123:root", "123456789012", "arn:aws:iam::1:user/bob", ""}}) {
-		t.Fatal("root principals matched a user")
+	if c.principalMatches(&Principal{AWS: StringOrSlice{"arn:aws:iam::123:root", "123456789012", "arn:aws:iam::1:user/bob", ""}}, false) {
+		t.Fatal("root principals matched a user (narrow)")
 	}
-	if !c.principalMatches(&Principal{AWS: StringOrSlice{"arn:aws:iam::1:user/team/alice"}}) {
+	for _, v := range []string{"arn:aws:iam::123:root", "123456789012"} {
+		if !c.principalMatches(&Principal{AWS: StringOrSlice{v}}, true) {
+			t.Fatalf("account principal %s did not match a user (broad)", v)
+		}
+	}
+	anonCtx := newEvalCtx(&AuthzRequest{Identity: auth.Anonymous}, fixedNow)
+	if anonCtx.principalMatches(&Principal{AWS: StringOrSlice{"arn:aws:iam::123:root", "123456789012"}}, true) {
+		t.Fatal("account principal matched anonymous")
+	}
+	if !c.principalMatches(&Principal{AWS: StringOrSlice{"arn:aws:iam::1:user/team/alice"}}, false) {
 		t.Fatal("user ARN with path did not match")
 	}
-	if c.principalMatches(&Principal{AWS: StringOrSlice{"arn:aws:iam::1:group/alice", "arn:aws:s3:::alice", "arn:short"}}) {
+	if c.principalMatches(&Principal{AWS: StringOrSlice{"arn:aws:iam::1:group/alice", "arn:aws:s3:::alice", "arn:short"}}, true) {
 		t.Fatal("non-user ARNs matched")
 	}
-	if c.principalMatches(nil) {
+	if c.principalMatches(nil, true) {
 		t.Fatal("nil principal matched")
 	}
-	if !c.principalMatches(&Principal{AWS: StringOrSlice{"*"}}) {
+	if !c.principalMatches(&Principal{AWS: StringOrSlice{"*"}}, false) {
 		t.Fatal("explicit * entry did not match")
+	}
+}
+
+// TestAuthorizeAccountPrincipal: a Deny naming the account principal
+// applies to every IAM user (as on AWS); an Allow naming it delegates to
+// identity policies and grants users nothing by itself; NotPrincipal reads
+// the account principal the way that grants less.
+func TestAuthorizeAccountPrincipal(t *testing.T) {
+	m := newEvalManager(t)
+	ctx := context.Background()
+	alice := user("alice")
+	for _, acct := range []string{`"arn:aws:iam::123456789012:root"`, `"123456789012"`} {
+		deny := mustBucketPolicy(t, "b", `{"Statement":[{"Effect":"Deny","Principal":{"AWS":`+acct+`},"Action":"s3:*","Resource":["arn:aws:s3:::b","arn:aws:s3:::b/*"]},
+			{"Effect":"Allow","Principal":"*","Action":"s3:GetObject","Resource":"arn:aws:s3:::b/*"}]}`)
+		if d := m.Authorize(ctx, AuthzRequest{Identity: alice, Action: "s3:GetObject", Bucket: "b", Key: "k", BucketPolicy: deny}); d.Allowed || !d.ExplicitDeny {
+			t.Fatalf("%s: Deny on account principal did not deny alice: %+v", acct, d)
+		}
+		if d := m.Authorize(ctx, AuthzRequest{Identity: auth.Anonymous, Action: "s3:GetObject", Bucket: "b", Key: "k", BucketPolicy: deny}); !d.Allowed {
+			t.Fatalf("%s: account Deny applied to anonymous: %+v", acct, d)
+		}
+		allow := mustBucketPolicy(t, "b", `{"Statement":[{"Effect":"Allow","Principal":{"AWS":`+acct+`},"Action":"s3:*","Resource":"arn:aws:s3:::b/*"}]}`)
+		if d := m.Authorize(ctx, AuthzRequest{Identity: user("eve"), Action: "s3:GetObject", Bucket: "b", Key: "k", BucketPolicy: allow}); d.Allowed {
+			t.Fatalf("%s: Allow on account principal granted alice: %+v", acct, d)
+		}
+		// Allow NotPrincipal account: only anonymous callers get it.
+		notAllow := mustBucketPolicy(t, "b", `{"Statement":[{"Effect":"Allow","NotPrincipal":{"AWS":`+acct+`},"Action":"s3:GetObject","Resource":"arn:aws:s3:::b/*"}]}`)
+		if d := m.Authorize(ctx, AuthzRequest{Identity: user("eve"), Action: "s3:GetObject", Bucket: "b", Key: "k", BucketPolicy: notAllow}); d.Allowed {
+			t.Fatalf("%s: Allow NotPrincipal account granted alice: %+v", acct, d)
+		}
+		if !IsPublicPolicy(notAllow) {
+			t.Fatalf("%s: Allow NotPrincipal account not public", acct)
+		}
+		// Deny NotPrincipal account: an IAM user is not exempted by the
+		// account entry alone, only by an entry naming the user.
+		notDeny := mustBucketPolicy(t, "b", `{"Statement":[{"Effect":"Deny","NotPrincipal":{"AWS":[`+acct+`]},"Action":"s3:*","Resource":"arn:aws:s3:::b/*"},
+			{"Effect":"Allow","Principal":"*","Action":"s3:GetObject","Resource":"arn:aws:s3:::b/*"}]}`)
+		if d := m.Authorize(ctx, AuthzRequest{Identity: alice, Action: "s3:GetObject", Bucket: "b", Key: "k", BucketPolicy: notDeny}); d.Allowed {
+			t.Fatalf("%s: Deny NotPrincipal account exempted alice: %+v", acct, d)
+		}
+		notDenyAlice := mustBucketPolicy(t, "b", `{"Statement":[{"Effect":"Deny","NotPrincipal":{"AWS":[`+acct+`,"arn:aws:iam::123456789012:user/alice"]},"Action":"s3:*","Resource":"arn:aws:s3:::b/*"},
+			{"Effect":"Allow","Principal":"*","Action":"s3:GetObject","Resource":"arn:aws:s3:::b/*"}]}`)
+		if d := m.Authorize(ctx, AuthzRequest{Identity: alice, Action: "s3:GetObject", Bucket: "b", Key: "k", BucketPolicy: notDenyAlice}); !d.Allowed {
+			t.Fatalf("%s: Deny NotPrincipal [account, alice] denied alice: %+v", acct, d)
+		}
 	}
 }
 
@@ -429,5 +486,31 @@ func BenchmarkAuthorize(b *testing.B) {
 		if !m.Authorize(ctx, req).Allowed {
 			b.Fatal("denied")
 		}
+	}
+}
+
+// TestServiceAndFederatedPrincipals: policies ported from AWS with Service
+// or Federated principals are accepted; those statements match no gos3
+// identity (a NotPrincipal naming only them therefore applies to everyone).
+func TestServiceAndFederatedPrincipals(t *testing.T) {
+	m := newEvalManager(t)
+	ctx := context.Background()
+	bp := mustBucketPolicy(t, "b", `{"Version":"2012-10-17","Statement":[
+		{"Sid":"OAC","Effect":"Allow","Principal":{"Service":"cloudfront.amazonaws.com"},"Action":"s3:GetObject","Resource":"arn:aws:s3:::b/*","Condition":{"StringEquals":{"AWS:SourceArn":"arn:aws:cloudfront::1:distribution/X"}}},
+		{"Sid":"Fed","Effect":"Allow","Principal":{"Federated":["cognito-identity.amazonaws.com","*.example"]},"Action":"s3:*","Resource":"arn:aws:s3:::b/*"},
+		{"Sid":"DenyAllButLogs","Effect":"Deny","NotPrincipal":{"Service":"logging.s3.amazonaws.com"},"Action":"s3:PutObject","Resource":"arn:aws:s3:::b/logs/*"}]}`)
+	for _, id := range []auth.Identity{anon, user("eve")} {
+		if d := m.Authorize(ctx, AuthzRequest{Identity: id, Action: "s3:GetObject", Bucket: "b", Key: "k", BucketPolicy: bp}); d.Allowed {
+			t.Fatalf("%+v: service/federated principal matched: %+v", id, d)
+		}
+		if d := m.Authorize(ctx, AuthzRequest{Identity: id, Action: "s3:PutObject", Bucket: "b", Key: "logs/x", BucketPolicy: bp}); !d.ExplicitDeny {
+			t.Fatalf("%+v: Deny NotPrincipal Service did not apply: %+v", id, d)
+		}
+	}
+	if IsPublicPolicy(bp) {
+		t.Fatal("service/federated principals reported public")
+	}
+	if !IsPublicPolicy(mustBucketPolicy(t, "b", `{"Statement":[{"Effect":"Allow","NotPrincipal":{"Service":"x.amazonaws.com"},"Action":"s3:GetObject","Resource":"arn:aws:s3:::b/*"}]}`)) {
+		t.Fatal("Allow NotPrincipal Service not public")
 	}
 }

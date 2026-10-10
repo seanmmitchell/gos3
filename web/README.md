@@ -115,8 +115,15 @@ and hides the feature.
   an IP address, `localhost` / `*.localhost`, or a name listed in
   **`GOS3_UI_ALLOWED_HOSTS`** (comma separated; `*` turns the check off).
   Requests with a foreign `Origin` or `Sec-Fetch-Site: cross-site` /
-  `same-site` are refused too. Opening the console via another host name
-  without listing it hides local discovery.
+  `same-site` are refused too. An `Origin` counts as foreign unless it
+  matches `Host` or its host name is listed in `GOS3_UI_ALLOWED_HOSTS`
+  (`*` does not count). Behind a reverse proxy that rewrites `Host` (nginx's
+  default `proxy_pass`), list the public name or forward `Host`
+  (`proxy_set_header Host $host;`), otherwise probes and scans get 403.
+  Opening the console via another host name without listing it hides local
+  discovery.
+- At most 2 scans and 4 local discoveries run at once per UI server; more
+  get 429 `TooManyRequests` (with `Retry-After`).
 - Probes read at most 64 KiB of an identity document (with or without
   `Content-Length`); local discovery keeps at most 2048 mDNS records and
   1024 beacon candidates, and verifies at most 256 URLs.

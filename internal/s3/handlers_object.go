@@ -10,6 +10,7 @@ import (
 	"errors"
 	"io"
 	"log/slog"
+	"mime"
 	"net/http"
 	"net/url"
 	"sort"
@@ -269,9 +270,10 @@ func (s *Server) newObjectPayload(r *http.Request, rc *reqContext, opts payloadO
 //   - a canned ACL (o.aclSet: given explicitly) requires s3:PutObjectAcl
 //     and must be allowed by the bucket's ownership controls and public
 //     access block;
-//   - tags given with the request (o.tagsSet; meta.Tags holds them)
-//     require s3:PutObjectTagging, evaluated with the
-//     s3:RequestObjectTag/<key> and s3:RequestObjectTagKeys condition keys.
+//   - tags given with the request or copied from a copy source (o.tagsSet;
+//     meta.Tags holds them) require s3:PutObjectTagging, evaluated with
+//     the s3:RequestObjectTag/<key> and s3:RequestObjectTagKeys condition
+//     keys.
 //
 // AWS requires the same extra permissions, so a principal limited to
 // s3:PutObject can neither publish objects through an ACL nor plant tags
@@ -285,30 +287,26 @@ func (s *Server) prepareNewObject(ctx context.Context, r *http.Request, rc *reqC
 		return s3err.ErrInvalidRequest.WithMessage("Bucket is missing Object Lock Configuration")
 	}
 	if meta.RetentionMode != "" {
-		if err := s.authorize(r, rc, "s3:PutObjectRetention", bi.Name, key, ""); err != nil {
+		if err := s.authorizeTarget(ctx, r, rc, authzTarget{Action: "s3:PutObjectRetention", Bucket: bi.Name, Key: key,
+			ObjectAttrs: o.attrs}); err != nil {
 			return err
 		}
 	}
 	if o.legalHoldSet {
-		if err := s.authorize(r, rc, "s3:PutObjectLegalHold", bi.Name, key, ""); err != nil {
+		if err := s.authorizeTarget(ctx, r, rc, authzTarget{Action: "s3:PutObjectLegalHold", Bucket: bi.Name, Key: key,
+			ObjectAttrs: o.attrs}); err != nil {
 			return err
 		}
 	}
 	if o.aclSet {
 		if err := s.authorizeTarget(ctx, r, rc, authzTarget{Action: "s3:PutObjectAcl", Bucket: bi.Name, Key: key,
-			Conditions: o.conds}); err != nil {
+			ObjectAttrs: o.attrs}); err != nil {
 			return err
 		}
 	}
 	if o.tagsSet {
-		conds := requestTagConditions(meta.Tags)
-		for k, v := range o.conds {
-			if _, ok := conds[k]; !ok {
-				conds[k] = v
-			}
-		}
 		if err := s.authorizeTarget(ctx, r, rc, authzTarget{Action: "s3:PutObjectTagging", Bucket: bi.Name, Key: key,
-			Conditions: conds}); err != nil {
+			Conditions: requestTagConditions(meta.Tags), ObjectAttrs: o.attrs}); err != nil {
 			return err
 		}
 	}
@@ -342,11 +340,11 @@ type newObjectOpts struct {
 	legalHoldSet bool   // an object lock legal hold header or field was given
 	acl          string // the canned ACL
 	aclSet       bool   // a canned ACL was given explicitly
-	tagsSet      bool   // tags were given explicitly (they are in meta.Tags)
-	// conds are extra condition keys for the s3:PutObjectAcl and
-	// s3:PutObjectTagging checks (PostObject's form fields, which are not
-	// request headers).
-	conds map[string][]string
+	tagsSet      bool   // tags were given or copied (they are in meta.Tags)
+	// attrs, when non-nil, are the object attribute condition keys for the
+	// extra checks (authzTarget.ObjectAttrs): PostObject's form fields,
+	// which are not request headers. Nil uses the request headers.
+	attrs map[string][]string
 }
 
 // headerObjectOpts returns the newObjectOpts of a request whose object
@@ -798,14 +796,29 @@ func (s *Server) serveObject(w http.ResponseWriter, r *http.Request, rc *reqCont
 // forms and plugins disabled; it does not affect images, media or
 // downloads. PDFs are exempt: browsers refuse to render them in a sandbox,
 // and their viewers never expose the page origin to the document's
-// scripts. X-Content-Type-Options: nosniff stops browsers from executing
-// objects whose stored type is not a script or style type.
+// scripts. Only a Content-Type that parses as exactly application/pdf
+// is exempt, and it is then rewritten to the bare canonical type: browsers
+// split the header on commas and use the last MIME type of the list (so
+// "application/pdf; x=y, text/html" renders as HTML), which a lenient
+// check would let through. X-Content-Type-Options: nosniff stops browsers
+// from executing objects whose stored type is not a script or style type.
 func setActiveContentHeaders(h http.Header) {
 	h.Set("X-Content-Type-Options", "nosniff")
-	mt, _, _ := strings.Cut(h.Get("Content-Type"), ";")
-	if !strings.EqualFold(strings.TrimSpace(mt), "application/pdf") {
-		h.Set("Content-Security-Policy", "sandbox")
+	if isPlainPDF(h.Values("Content-Type")) {
+		h.Set("Content-Type", "application/pdf")
+		return
 	}
+	h.Set("Content-Security-Policy", "sandbox")
+}
+
+// isPlainPDF reports whether a Content-Type header (all its values) is a
+// single application/pdf media type without any comma.
+func isPlainPDF(vals []string) bool {
+	if len(vals) != 1 || strings.Contains(vals[0], ",") {
+		return false
+	}
+	mt, _, err := mime.ParseMediaType(vals[0])
+	return err == nil && mt == "application/pdf"
 }
 
 // --- DeleteObject ---

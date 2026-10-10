@@ -159,8 +159,23 @@ func (s *Server) handleCopyObject(w http.ResponseWriter, r *http.Request, rc *re
 		meta.Tags = maps.Clone(info.Tags)
 	}
 	opts := headerObjectOpts(h)
-	// Tags copied from the source (COPY directive) are not request tags.
-	opts.tagsSet = tagDir == directiveReplace && len(meta.Tags) > 0
+	// The new object's tags, whether given (REPLACE) or copied from the
+	// source (COPY), need s3:PutObjectTagging with them as the request
+	// tags; copying the source's tags also needs permission to read them
+	// (s3:GetObjectTagging / s3:GetObjectVersionTagging), as on AWS.
+	// Otherwise a principal limited to s3:GetObject and s3:PutObject could
+	// read tags it may not read and plant tags that
+	// s3:ExistingObjectTag conditions rely on.
+	opts.tagsSet = len(meta.Tags) > 0
+	if tagDir == directiveCopy && len(meta.Tags) > 0 {
+		action := "s3:GetObjectTagging"
+		if src.VersionID != "" {
+			action = "s3:GetObjectVersionTagging"
+		}
+		if err := s.authorize(r, rc, action, src.Bucket, src.Key, src.VersionID); err != nil {
+			return err
+		}
+	}
 	if err := s.prepareNewObject(ctx, r, rc, bi, rc.key, &meta, opts); err != nil {
 		return err
 	}

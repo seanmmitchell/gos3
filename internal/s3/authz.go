@@ -6,11 +6,13 @@ import (
 	"context"
 	"errors"
 	"log/slog"
+	"maps"
 	"net/http"
 	"net/url"
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/seanmmitchell/gos3/internal/auth"
 	"github.com/seanmmitchell/gos3/internal/iam"
@@ -39,6 +41,13 @@ type authzTarget struct {
 	NoBucketLookup bool
 	// Conditions are extra condition keys merged over the request context.
 	Conditions map[string][]string
+	// ObjectAttrs, when non-nil, replaces every condition key describing
+	// the object written (ACL, storage class, encryption, website redirect,
+	// object lock and request tags; see objectAttrConditions) that would
+	// otherwise be derived from the request headers. Handlers whose object attributes
+	// come from a request body or form, or from a multipart upload, set it
+	// so headers that are not applied cannot satisfy or dodge a condition.
+	ObjectAttrs map[string][]string
 }
 
 // authorizeOp authorizes the request's primary resource with the
@@ -47,9 +56,10 @@ func (s *Server) authorizeOp(ctx context.Context, r *http.Request, rc *reqContex
 	return s.authorizeOpWith(ctx, r, rc, nil)
 }
 
-// authorizeOpWith is authorizeOp with extra condition keys, for handlers
-// (AuthzByHandler) whose condition keys come from the request body.
-func (s *Server) authorizeOpWith(ctx context.Context, r *http.Request, rc *reqContext, conds map[string][]string) error {
+// authorizeOpWith is authorizeOp for handlers (AuthzByHandler) whose
+// object attribute condition keys come from the request body: attrs
+// replaces the header-derived ones (see authzTarget.ObjectAttrs).
+func (s *Server) authorizeOpWith(ctx context.Context, r *http.Request, rc *reqContext, attrs map[string][]string) error {
 	op := rc.op
 	v := rc.versionID()
 	t := authzTarget{
@@ -57,7 +67,21 @@ func (s *Server) authorizeOpWith(ctx context.Context, r *http.Request, rc *reqCo
 		VersionID:      v,
 		ObjectRead:     op.ObjectRead,
 		NoBucketLookup: op.NoBucketLookup,
-		Conditions:     conds,
+		ObjectAttrs:    attrs,
+	}
+	if attrs == nil && !(rc.identity.IsRoot && !rc.identity.IsAnonymous) {
+		// UploadPart, UploadPartCopy and CompleteMultipartUpload write the
+		// object that CreateMultipartUpload described: its recorded
+		// attributes (for example the encryption a "require SSE" policy
+		// checks) are the ones that apply, not this request's headers.
+		switch op.Name {
+		case "UploadPart", "UploadPartCopy", "CompleteMultipartUpload":
+			if up, err := s.backend.GetMultipartUpload(ctx, rc.bucket, rc.key, rc.query.Get("uploadId")); err == nil {
+				t.ObjectAttrs = objectAttrConditions(up.Meta, up.Meta.ACL != "", up.Meta.LegalHold, len(up.Meta.Tags) > 0, s.now())
+			} else {
+				t.ObjectAttrs = map[string][]string{}
+			}
+		}
 	}
 	switch op.Kind {
 	case resBucket:
@@ -272,32 +296,119 @@ func (s *Server) conditionContext(r *http.Request, rc *reqContext, t authzTarget
 	}
 	set("s3:VersionId", t.VersionID)
 	h := r.Header
-	for _, name := range [...]string{
-		"x-amz-acl", "x-amz-server-side-encryption", "x-amz-server-side-encryption-aws-kms-key-id",
-		"x-amz-storage-class", "x-amz-copy-source", "x-amz-metadata-directive",
-		"x-amz-website-redirect-location",
-	} {
-		set("s3:"+name, h.Get(name))
-	}
-	set("s3:object-lock-mode", h.Get("x-amz-object-lock-mode"))
-	set("s3:object-lock-retain-until-date", h.Get("x-amz-object-lock-retain-until-date"))
-	set("s3:object-lock-legal-hold", h.Get("x-amz-object-lock-legal-hold"))
-	if tags := h.Get("x-amz-tagging"); tags != "" {
-		if vals, err := url.ParseQuery(tags); err == nil {
-			keys := make([]string, 0, len(vals))
-			for k, v := range vals {
-				if len(v) > 0 {
-					c["s3:RequestObjectTag/"+k] = []string{v[0]}
-				}
-				keys = append(keys, k)
+	set("s3:x-amz-copy-source", h.Get("x-amz-copy-source"))
+	set("s3:x-amz-metadata-directive", h.Get("x-amz-metadata-directive"))
+	if t.ObjectAttrs != nil {
+		for k, v := range t.ObjectAttrs {
+			if len(v) > 0 || k == "s3:RequestObjectTagKeys" {
+				c[k] = v
 			}
-			c["s3:RequestObjectTagKeys"] = keys
+		}
+	} else {
+		for _, name := range [...]string{
+			"x-amz-acl", "x-amz-server-side-encryption", "x-amz-server-side-encryption-aws-kms-key-id",
+			"x-amz-storage-class", "x-amz-website-redirect-location",
+		} {
+			set("s3:"+name, h.Get(name))
+		}
+		set("s3:object-lock-mode", h.Get("x-amz-object-lock-mode"))
+		if until := h.Get("x-amz-object-lock-retain-until-date"); until != "" {
+			set("s3:object-lock-retain-until-date", until)
+			if ut, ok := parseISOTime(until); ok {
+				set("s3:object-lock-remaining-retention-days", remainingRetentionDays(ut, now))
+			}
+		}
+		set("s3:object-lock-legal-hold", h.Get("x-amz-object-lock-legal-hold"))
+		// Request tags come from x-amz-tagging only where that header is
+		// what gets stored: not for CopyObject with the (default) COPY
+		// tagging directive, which keeps the source's tags.
+		tags := h.Get("x-amz-tagging")
+		if rc.opName == "CopyObject" && !strings.EqualFold(strings.TrimSpace(h.Get("X-Amz-Tagging-Directive")), directiveReplace) {
+			tags = ""
+		}
+		if tags != "" {
+			if vals, err := url.ParseQuery(tags); err == nil {
+				keys := make([]string, 0, len(vals))
+				for k, v := range vals {
+					if len(v) > 0 {
+						c["s3:RequestObjectTag/"+k] = []string{v[0]}
+					}
+					keys = append(keys, k)
+				}
+				c["s3:RequestObjectTagKeys"] = keys
+			}
 		}
 	}
 	for k, v := range t.Conditions {
 		c[k] = v
 	}
 	return c
+}
+
+// objectAttrConditions returns the condition keys describing the
+// attributes of an object being written, from its parsed metadata (see
+// authzTarget.ObjectAttrs): s3:x-amz-acl (when aclSet; "private" for the
+// default), s3:x-amz-storage-class, s3:x-amz-server-side-encryption(-aws-
+// kms-key-id), s3:x-amz-website-redirect-location, s3:object-lock-mode,
+// s3:object-lock-retain-until-date, s3:object-lock-remaining-retention-days,
+// s3:object-lock-legal-hold (when legalHoldSet) and, when tagsSet, the
+// request tag keys. Values are the normalised ones that are stored.
+func objectAttrConditions(m storage.ObjectMeta, aclSet, legalHoldSet, tagsSet bool, now time.Time) map[string][]string {
+	c := map[string][]string{}
+	set := func(k, v string) {
+		if v != "" {
+			c[k] = []string{v}
+		}
+	}
+	if aclSet {
+		acl := m.ACL
+		if acl == "" {
+			acl = aclPrivate
+		}
+		set("s3:x-amz-acl", acl)
+	}
+	set("s3:x-amz-storage-class", m.StorageClass)
+	set("s3:x-amz-server-side-encryption", m.SSE)
+	set("s3:x-amz-server-side-encryption-aws-kms-key-id", m.SSEKMSKeyID)
+	set("s3:x-amz-website-redirect-location", m.WebsiteRedirect)
+	if m.RetentionMode != "" {
+		maps.Copy(c, retentionConditions(m.RetentionMode, m.RetainUntil, now))
+	}
+	if legalHoldSet {
+		c["s3:object-lock-legal-hold"] = []string{legalHoldStatus(m.LegalHold)}
+	}
+	if tagsSet {
+		maps.Copy(c, requestTagConditions(m.Tags))
+	}
+	return c
+}
+
+// retentionConditions returns the object lock retention condition keys for
+// a retention mode and retain-until date.
+func retentionConditions(mode string, until, now time.Time) map[string][]string {
+	return map[string][]string{
+		"s3:object-lock-mode":                     {mode},
+		"s3:object-lock-retain-until-date":        {until.UTC().Format(time.RFC3339)},
+		"s3:object-lock-remaining-retention-days": {remainingRetentionDays(until, now)},
+	}
+}
+
+// remainingRetentionDays is s3:object-lock-remaining-retention-days: the
+// whole days from now until the retain-until date, rounded up.
+func remainingRetentionDays(until, now time.Time) string {
+	d := until.Sub(now)
+	if d <= 0 {
+		return "0"
+	}
+	return strconv.FormatInt(int64((d+24*time.Hour-1)/(24*time.Hour)), 10)
+}
+
+// legalHoldStatus is "ON" or "OFF".
+func legalHoldStatus(on bool) string {
+	if on {
+		return "ON"
+	}
+	return "OFF"
 }
 
 // bucketAuthz is the authorization-relevant configuration of a bucket.

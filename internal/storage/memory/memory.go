@@ -412,11 +412,14 @@ func (b *Backend) DeleteBucket(ctx context.Context, name string) error {
 	}
 	bk.mu.Lock()
 	defer bk.mu.Unlock()
-	if bk.objects.Len() > 0 || len(bk.uploads) > 0 {
+	if bk.objects.Len() > 0 {
 		return fmt.Errorf("%w: %q", storage.ErrBucketNotEmpty, name)
 	}
+	// In-progress multipart uploads do not keep a bucket alive (as on
+	// AWS); they are aborted with it.
 	bk.deleted = true
 	bk.configs = nil
+	clear(bk.uploads)
 	delete(b.buckets, name)
 	return nil
 }

@@ -407,15 +407,15 @@ func TestDeleteBucket(t *testing.T) {
 	})
 	t.Run("multipart upload", func(t *testing.T) {
 		e.createBucket("del-upload")
-		up, err := e.backend.CreateMultipartUpload(ctx, "del-upload", "k", storage.ObjectMeta{}, "")
-		if err != nil {
-			t.Fatal(err)
-		}
-		bktExpect(t, e.signed(http.MethodDelete, "/del-upload", nil, nil), 409, "BucketNotEmpty")
-		if err := e.backend.AbortMultipartUpload(ctx, "del-upload", "k", up.UploadID); err != nil {
+		// In-progress uploads do not keep a bucket alive: they are aborted
+		// with it, as on AWS.
+		if _, err := e.backend.CreateMultipartUpload(ctx, "del-upload", "k", storage.ObjectMeta{}, ""); err != nil {
 			t.Fatal(err)
 		}
 		bktExpect(t, e.signed(http.MethodDelete, "/del-upload", nil, nil), 204, "")
+		if _, err := e.backend.GetBucket(ctx, "del-upload"); err == nil {
+			t.Fatal("bucket with only an upload still exists")
+		}
 	})
 	t.Run("sdk", func(t *testing.T) {
 		e.createBucket("del-sdk")

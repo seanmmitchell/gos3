@@ -144,7 +144,7 @@ Other runtime variables of the Node server:
 | `NUXT_PUBLIC_SERVERS` | Preset connections (JSON array). |
 | `NUXT_PUBLIC_APP_NAME` | Display name (default `gos3`). |
 | `GOS3_UI_LOCAL_DISCOVERY` | `false` (also `0`, `off`, `no`, `disabled`) turns off the local discovery routes below. |
-| `GOS3_UI_ALLOWED_HOSTS` | Extra host names (comma separated) under which the discovery routes below answer, for example `console.example.com`. IP addresses, `localhost` and `*.localhost` are always accepted; `*` turns the check off. Set it whenever the UI is reached through a DNS name. |
+| `GOS3_UI_ALLOWED_HOSTS` | Extra host names (comma separated) under which the discovery routes below answer, for example `console.example.com`. IP addresses, `localhost` and `*.localhost` are always accepted as `Host`. A listed name is also accepted as the host name of the browser's `Origin` (any port), which matters behind a reverse proxy that rewrites `Host`. `*` only turns the `Host` check off; it does not accept any `Origin`. Set it whenever the UI is reached through a DNS name. |
 
 ### Local discovery routes
 
@@ -162,6 +162,10 @@ standalone Node server does this from the UI host:
 probe and scan, within the limits above. Bind it to a trusted interface, put it
 behind an authenticating proxy, or set `GOS3_UI_LOCAL_DISCOVERY=false`.
 
+Each UI server runs at most 2 `POST /api/discovery/scan` and 4
+`GET /api/discovery/local` requests at once; further requests get
+`429 TooManyRequests` (the admin API error envelope) with `Retry-After: 5`.
+
 Protection against other websites:
 
 - Against DNS rebinding (a site whose name later resolves to the UI host
@@ -171,7 +175,13 @@ Protection against other websites:
   off). Opening the console through an unlisted host name hides local
   discovery.
 - Requests with a foreign `Origin`, or with `Sec-Fetch-Site: cross-site` or
-  `same-site`, are refused too.
+  `same-site`, are refused too. An `Origin` counts as foreign unless it
+  matches the `Host` header or its host name is listed in
+  `GOS3_UI_ALLOWED_HOSTS` (`*` does not count for `Origin`). Behind a
+  reverse proxy that rewrites `Host` (nginx's default `proxy_pass`), either
+  list the public name in `GOS3_UI_ALLOWED_HOSTS` or forward the original
+  host (`proxy_set_header Host $host;`); otherwise
+  `POST /api/discovery/probe` and `/scan` answer 403.
 - POST routes require `Content-Type: application/json`, which a cross-site
   page cannot send without a CORS preflight that the server never approves.
 
@@ -198,7 +208,9 @@ manages from another origin must:
 
 **gos3**: the default `cors.expose_headers` already covers all of these
 (including `*` for `x-amz-meta-*`). The default `cors.allowed_origins` is `*`,
-which admits any UI. To restrict it, list the UI origins:
+which admits any UI (it applies to signed requests only, and the UI signs
+every request; see [security.md](security.md#cors)). To restrict it, list the
+UI origins:
 
 ```sh
 gos3 serve --cors-origin https://console.example.com --cors-origin http://localhost:3000

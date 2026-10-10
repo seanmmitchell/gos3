@@ -293,8 +293,10 @@ specified in [docs/discovery.md](docs/discovery.md).
 - **TLS**: gos3 speaks plain HTTP unless you pass `--tls-cert`/`--tls-key` or
   put it behind a TLS reverse proxy. Do not send keys over the internet in
   clear text.
-- **CORS**: the default allows any origin, which is fine for signed requests
-  but best narrowed to your UI origins in production.
+- **CORS**: the default (`*`) allows any origin for signed requests only, so
+  other websites cannot read anonymously accessible data through a visitor's
+  browser. Narrow it to your UI origins in production, and use a bucket CORS
+  configuration to serve a public bucket to scripts on other sites.
 - **Discovery and scans**: servers announce their name, version and URLs on
   the LAN. Turn this off with `discovery.advertise: false` or
   `--no-discovery`. Network scans need `admin:ScanNetwork` and can be disabled

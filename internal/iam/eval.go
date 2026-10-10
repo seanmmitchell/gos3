@@ -142,8 +142,17 @@ func (c *evalCtx) resourceMatches(patterns []string) bool {
 	return false
 }
 
-// principalMatches reports whether p names the request identity.
-func (c *evalCtx) principalMatches(p *Principal) bool {
+// principalMatches reports whether p names the request identity. broad
+// selects how account principals (arn:<p>:iam::<acct>:root or a 12-digit
+// account ID) are read: gos3 has a single account, so in the broad reading
+// they name every authenticated identity (as the account principal does on
+// AWS), in the narrow one only the root identity. Callers pick whichever
+// makes the statement grant less: broad for Deny statements' Principal
+// and Allow statements' NotPrincipal, narrow for Allow statements'
+// Principal (an Allow to the account delegates to identity policies, as
+// on AWS) and Deny statements' NotPrincipal (an IAM user is only exempted
+// by an entry naming that user).
+func (c *evalCtx) principalMatches(p *Principal, broad bool) bool {
 	if p == nil {
 		return false
 	}
@@ -151,7 +160,7 @@ func (c *evalCtx) principalMatches(p *Principal) bool {
 		return true
 	}
 	for _, v := range p.AWS {
-		if principalEntryMatches(v, c.id) {
+		if principalEntryMatches(v, c.id, broad) {
 			return true
 		}
 	}
@@ -159,9 +168,11 @@ func (c *evalCtx) principalMatches(p *Principal) bool {
 }
 
 // principalEntryMatches matches one principal entry: "*", a user name, an
-// access key ID, arn:<p>:iam::<any>:user/[path/]<name>, arn:<p>:iam::<any>:root
-// (the root identity) or a 12-digit account id (root).
-func principalEntryMatches(v string, id auth.Identity) bool {
+// access key ID, arn:<p>:iam::<any>:user/[path/]<name>, or an account
+// principal arn:<p>:iam::<any>:root / 12-digit account ID (the root
+// identity, or with broad every authenticated identity; see
+// principalMatches).
+func principalEntryMatches(v string, id auth.Identity, broad bool) bool {
 	if v == "*" {
 		return true
 	}
@@ -174,7 +185,7 @@ func principalEntryMatches(v string, id auth.Identity) bool {
 			return false
 		}
 		if parts[5] == "root" {
-			return id.IsRoot
+			return id.IsRoot || broad
 		}
 		name, ok := strings.CutPrefix(parts[5], "user/")
 		if !ok || id.IsRoot {
@@ -185,7 +196,7 @@ func principalEntryMatches(v string, id auth.Identity) bool {
 		}
 		return name != "" && name == id.User
 	}
-	if id.IsRoot && isAccountID(v) {
+	if isAccountID(v) && (id.IsRoot || broad) {
 		return true
 	}
 	return v == id.User || v == id.AccessKey
@@ -207,13 +218,14 @@ func isAccountID(s string) bool {
 // elements are only checked for resource (bucket) policies.
 func (c *evalCtx) statementApplies(st *Statement, resourcePolicy bool) bool {
 	if resourcePolicy {
+		deny := st.Effect == "Deny"
 		switch {
 		case st.Principal != nil:
-			if !c.principalMatches(st.Principal) {
+			if !c.principalMatches(st.Principal, deny) {
 				return false
 			}
 		case st.NotPrincipal != nil:
-			if c.principalMatches(st.NotPrincipal) {
+			if c.principalMatches(st.NotPrincipal, !deny) {
 				return false
 			}
 		default:
@@ -267,13 +279,18 @@ var (
 		"s3:listbucketversions": true,
 		"s3:getbucketlocation":  true,
 	}
+	// aclWriteActions are granted by bucket WRITE (public-read-write). As
+	// on AWS, WRITE lets grantees create, overwrite and delete objects
+	// (a delete marker in a versioned bucket) but not permanently delete
+	// versions, which needs s3:DeleteObjectVersion from a policy.
+	// Aborting or listing the parts of an upload (reserved on AWS for its
+	// initiator and the bucket owner) is not granted either: gos3 does not
+	// track initiators, and granting it to everyone would let anyone
+	// abort or read other clients' uploads.
 	aclWriteActions = map[string]bool{
 		"s3:putobject":                  true,
 		"s3:deleteobject":               true,
-		"s3:deleteobjectversion":        true,
-		"s3:abortmultipartupload":       true,
 		"s3:listbucketmultipartuploads": true,
-		"s3:listmultipartuploadparts":   true,
 	}
 )
 

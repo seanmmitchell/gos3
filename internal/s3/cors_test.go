@@ -5,7 +5,9 @@ import (
 	"net/http"
 	"strings"
 	"testing"
+	"time"
 
+	"github.com/seanmmitchell/gos3/internal/auth"
 	"github.com/seanmmitchell/gos3/internal/config"
 	"github.com/seanmmitchell/gos3/internal/s3err"
 	"github.com/seanmmitchell/gos3/internal/storage"
@@ -225,5 +227,90 @@ func TestCORSActualRequests(t *testing.T) {
 	resp = e.signed("GET", "/bkt/k", nil, nil)
 	if resp.Header.Get("Access-Control-Allow-Origin") != "" || resp.Header.Get("Vary") != "" {
 		t.Fatalf("no origin: %v", resp.Header)
+	}
+}
+
+// TestGlobalWildcardCORSSignedOnly: the global "*" rule serves only signed
+// requests (Authorization header or presigned URL), so a website cannot
+// make a visitor's browser read or write anonymously accessible data (for
+// example a bucket allowed by aws:SourceIp) and see the response. Bucket
+// CORS configurations and explicit global origins still apply to
+// anonymous requests.
+func TestGlobalWildcardCORSSignedOnly(t *testing.T) {
+	e := newTestEnv(t, withSettings(func(s *config.Settings) {
+		s.CORS = config.CORSConfig{AllowedOrigins: []string{"*", "https://ui.example"}}
+	}))
+	requireAuthz(t, e)
+	e.createBucket("lan")
+	e.putObject("lan", "k", []byte("intranet"), storage.ObjectMeta{})
+	e.putBucketConfig("lan", storage.ConfigPolicy, `{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":"*",
+		"Action":["s3:GetObject","s3:PutObject"],"Resource":"arn:aws:s3:::lan/*","Condition":{"IpAddress":{"aws:SourceIp":"127.0.0.0/8"}}}]}`)
+	evil := http.Header{"Origin": {"https://evil.example"}}
+
+	// Unsigned actual requests: served, but without Access-Control-*.
+	for _, m := range []string{"GET", "PUT"} {
+		var body []byte
+		if m == "PUT" {
+			body = []byte("x")
+		}
+		resp := e.anon(m, "/lan/k", body, evil)
+		if resp.StatusCode != 200 {
+			t.Fatalf("anonymous %s: %d %s", m, resp.StatusCode, resp.Data)
+		}
+		if got := resp.Header.Get("Access-Control-Allow-Origin"); got != "" {
+			t.Errorf("anonymous %s from any origin: Access-Control-Allow-Origin %q", m, got)
+		}
+		if resp.Header.Get("Vary") != "Origin" {
+			t.Errorf("anonymous %s: Vary %q", m, resp.Header.Get("Vary"))
+		}
+	}
+	// Preflights for unsigned requests are refused; for signed ones
+	// (Authorization header requested, or presigned URL) approved.
+	if resp := preflight(e, "/lan/k", "https://evil.example", "PUT", "content-type"); resp.StatusCode != 403 {
+		t.Errorf("preflight unsigned PUT: %d %v", resp.StatusCode, resp.Header)
+	}
+	if resp := preflight(e, "/lan/k", "https://evil.example", "DELETE", ""); resp.StatusCode != 403 {
+		t.Errorf("preflight unsigned DELETE: %d", resp.StatusCode)
+	}
+	if resp := preflight(e, "/lan/k", "https://evil.example", "PUT", "authorization,x-amz-date,x-amz-content-sha256"); resp.StatusCode != 200 ||
+		resp.Header.Get("Access-Control-Allow-Origin") != "*" {
+		t.Errorf("preflight signed PUT: %d %v", resp.StatusCode, resp.Header)
+	}
+	if resp := preflight(e, "/lan/k?X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential=x&X-Amz-Signature=y", "https://evil.example", "PUT", "content-type"); resp.StatusCode != 200 {
+		t.Errorf("preflight presigned PUT: %d", resp.StatusCode)
+	}
+	// Signed requests (header and presigned) keep the CORS headers, errors
+	// included.
+	if resp := e.signed("GET", "/lan/k", nil, evil); resp.StatusCode != 200 || resp.Header.Get("Access-Control-Allow-Origin") != "*" {
+		t.Errorf("signed GET: %d %v", resp.StatusCode, resp.Header)
+	}
+	if resp := e.signed("GET", "/lan/missing", nil, evil); resp.StatusCode != 404 || resp.Header.Get("Access-Control-Allow-Origin") != "*" {
+		t.Errorf("signed GET error: %d %v", resp.StatusCode, resp.Header)
+	}
+	u, err := auth.PresignURL("GET", e.url("/lan/k"), testRoot, "us-east-1", time.Minute, time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	req := e.newRequestURL("GET", u, nil)
+	req.Header.Set("Origin", "https://evil.example")
+	if resp := e.do(req); resp.StatusCode != 200 || resp.Header.Get("Access-Control-Allow-Origin") != "*" {
+		t.Errorf("presigned GET: %d %v", resp.StatusCode, resp.Header)
+	}
+	// An explicitly listed global origin keeps working for anonymous
+	// requests (the operator opted in).
+	ui := http.Header{"Origin": {"https://ui.example"}}
+	if resp := e.anon("GET", "/lan/k", nil, ui); resp.Header.Get("Access-Control-Allow-Origin") == "" {
+		t.Errorf("explicit origin anonymous: %v", resp.Header)
+	}
+	if resp := preflight(e, "/lan/k", "https://ui.example", "PUT", ""); resp.StatusCode != 200 {
+		t.Errorf("explicit origin preflight: %d", resp.StatusCode)
+	}
+	// A bucket CORS configuration with "*" applies to anonymous requests.
+	e.putBucketConfig("lan", storage.ConfigCORS, `<CORSConfiguration><CORSRule><AllowedOrigin>*</AllowedOrigin><AllowedMethod>GET</AllowedMethod></CORSRule></CORSConfiguration>`)
+	if resp := e.anon("GET", "/lan/k", nil, evil); resp.Header.Get("Access-Control-Allow-Origin") != "*" {
+		t.Errorf("bucket CORS * anonymous: %v", resp.Header)
+	}
+	if resp := preflight(e, "/lan/k", "https://evil.example", "GET", ""); resp.StatusCode != 200 {
+		t.Errorf("bucket CORS * preflight: %d", resp.StatusCode)
 	}
 }
