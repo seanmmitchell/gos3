@@ -7,7 +7,8 @@ import { useConnectionsStore } from '~/stores/connections'
  * Resolves a connection and its (memoised) S3 / admin clients.
  *
  * With no argument the connection is taken from the current route
- * (`/servers/:id/...`) and falls back to the store's active connection.
+ * (`/servers/:id/...`) and falls back to the store's active connection,
+ * then to the default server.
  *
  *   const { connection, s3, admin, requireS3 } = useConnection()
  *   const page = await requireS3().listObjectsV2(bucket, { delimiter: '/' })
@@ -23,7 +24,8 @@ export function useConnection(id?: MaybeRefOrGetter<string | null | undefined>) 
     if (explicit) return explicit
     const p = route.params.id
     if (typeof p === 'string' && p) return p
-    return store.activeId ?? undefined
+    // No server in the route: the active one, else the default server.
+    return store.activeId ?? store.defaultConnection?.id ?? undefined
   })
   const connection = computed(() => store.byId(connId.value))
   const connected = computed(() => hasCredentials(connection.value))

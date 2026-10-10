@@ -3,6 +3,7 @@ import type { DropdownMenuItem, TableColumn } from '@nuxt/ui'
 import type { BucketUsage } from '~/types/admin'
 import { S3Error } from '~/utils/s3/errors'
 import { AdminError } from '~/utils/admin/client'
+import { usageAgeNote } from '~/components/browser/-bucket-usage'
 
 /**
  * Bucket list. gos3 identities with admin rights get the admin listing
@@ -122,6 +123,9 @@ const columns = computed<TableColumn<BucketRow>[]>(() => {
   return cols
 })
 
+// Usage is cached by the server for up to 30 s: say how old it is.
+const usageNote = computed(() => (data.value && showUsage.value ? usageAgeNote(data.value.rows.map(r => r.usage)) : ''))
+
 const totals = computed(() => {
   const list = data.value?.rows ?? []
   if (!showUsage.value) return null
@@ -240,7 +244,7 @@ const isAccessDenied = computed(() => {
     <CommonPageHeader
       title="Buckets"
       icon="i-lucide-database"
-      :description="data ? `${data.rows.length} bucket${data.rows.length === 1 ? '' : 's'} on ${connection?.name ?? 'this server'}${totals ? ` · ${formatNumber(totals.objects)} objects · ${formatBytes(totals.bytes)}` : ''}` : `Buckets on ${connection?.name ?? 'this server'}`"
+      :description="data ? `${data.rows.length} bucket${data.rows.length === 1 ? '' : 's'} on ${connection?.name ?? 'this server'}${totals ? ` · ${formatNumber(totals.objects)} object${totals.objects === 1 ? '' : 's'} · ${formatBytes(totals.bytes)}${usageNote}` : ''}` : `Buckets on ${connection?.name ?? 'this server'}`"
     >
       <template #actions>
         <UButton

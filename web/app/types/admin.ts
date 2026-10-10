@@ -375,6 +375,8 @@ export interface BucketUsage {
   versionBytes: number
   deleteMarkers: number
   pendingUploads: number
+  /** When the server computed these figures (admin BucketSummary only; cached up to 30 s). */
+  computedAt?: Timestamp
 }
 
 export interface BucketSummary {

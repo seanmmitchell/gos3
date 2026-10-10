@@ -9,6 +9,10 @@
 //   when the browser session ends.
 // - Presets (runtime config NUXT_PUBLIC_SERVERS and `${baseURL}servers.json`)
 //   are merged in on every start; removing a preset hides it permanently.
+// - The "default server" (opened first: dashboard/server list order, sidebar
+//   fallback when no server is active) is persisted with the definitions as
+//   `defaultId`. It replaces the former 'gos3.defaultServer.v1' key, which is
+//   migrated on hydrate.
 // - In embedded mode the hosting gos3 server is added as 'This server'.
 //
 // The store is written with explicit imports (no Nuxt auto-imports) so it can
@@ -32,6 +36,8 @@ import { S3Error } from '~/utils/s3/errors'
 
 export const LOCAL_STORAGE_KEY = 'gos3.connections.v1'
 export const SESSION_STORAGE_KEY = 'gos3.secrets.v1'
+/** Former separate localStorage key of the default-server preference (migrated). */
+export const LEGACY_DEFAULT_SERVER_KEY = 'gos3.defaultServer.v1'
 
 /** Capabilities of identities without admin access (and of generic S3 servers). */
 export const NO_CAPABILITIES: Capabilities = Object.freeze({
@@ -69,6 +75,8 @@ export function corsBlockedMessage(endpoint: string): string {
 interface PersistedState {
   version: 1
   activeId: string | null
+  /** Default server (absent in state written by older versions). */
+  defaultId?: string | null
   connections: Connection[]
   dismissedPresets: string[]
 }
@@ -119,6 +127,12 @@ function writeJson(s: Storage | undefined, key: string, value: unknown): void {
 export const useConnectionsStore = defineStore('connections', () => {
   const connections = ref<Connection[]>([])
   const activeId = ref<string | null>(null)
+  /**
+   * Default server preference. May name a preset that is merged in later by
+   * init(), so it is not checked against `connections` on hydrate; use
+   * `defaultConnection` / `ordered`, which ignore a dangling ID.
+   */
+  const defaultId = ref<string | null>(null)
   const statuses = ref<Record<string, ConnectionStatus>>({})
   const dismissedPresets = ref<string[]>([])
   /** Info of the gos3 server hosting the UI (embedded mode), if detected. */
@@ -138,6 +152,13 @@ export const useConnectionsStore = defineStore('connections', () => {
       return a.name.localeCompare(b.name)
     })
   )
+
+  const defaultConnection = computed(() => (defaultId.value ? connections.value.find(c => c.id === defaultId.value) : undefined))
+  /** `sorted` with the default server first. */
+  const ordered = computed(() => {
+    const d = defaultConnection.value
+    return d ? [d, ...sorted.value.filter(c => c !== d)] : sorted.value
+  })
 
   function byId(id: string | null | undefined): Connection | undefined {
     if (!id) return undefined
@@ -175,6 +196,7 @@ export const useConnectionsStore = defineStore('connections', () => {
     const state: PersistedState = {
       version: 1,
       activeId: activeId.value,
+      defaultId: defaultId.value,
       connections: stored,
       dismissedPresets: dismissedPresets.value
     }
@@ -202,7 +224,24 @@ export const useConnectionsStore = defineStore('connections', () => {
       connections.value = list
       activeId.value = state.activeId && list.some(c => c.id === state.activeId) ? state.activeId : null
       dismissedPresets.value = Array.isArray(state.dismissedPresets) ? state.dismissedPresets : []
+      if (typeof state.defaultId === 'string' && state.defaultId) defaultId.value = state.defaultId
     }
+    migrateLegacyDefault(state?.defaultId === undefined)
+  }
+
+  /** Adopts (when `adopt`) and removes the pre-store default-server key. */
+  function migrateLegacyDefault(adopt: boolean): void {
+    const ls = storage('local')
+    let legacy: string | null = null
+    try {
+      legacy = ls?.getItem(LEGACY_DEFAULT_SERVER_KEY) ?? null
+      if (legacy !== null) ls?.removeItem(LEGACY_DEFAULT_SERVER_KEY)
+    } catch {
+      return
+    }
+    if (legacy === null) return
+    if (adopt && legacy) defaultId.value = legacy
+    persist()
   }
 
   // -- CRUD -----------------------------------------------------------------
@@ -245,6 +284,14 @@ export const useConnectionsStore = defineStore('connections', () => {
     delete statuses.value[id]
     clearClientCache(id)
     if (activeId.value === id) activeId.value = null
+    if (defaultId.value === id) defaultId.value = null
+    persist()
+  }
+
+  /** Sets (or with null clears) the default server. Unknown IDs are ignored. */
+  function setDefault(id: string | null): void {
+    if (id !== null && !byId(id)) return
+    defaultId.value = id
     persist()
   }
 
@@ -530,6 +577,7 @@ export const useConnectionsStore = defineStore('connections', () => {
   function resetState(): void {
     connections.value = []
     activeId.value = null
+    defaultId.value = null
     statuses.value = {}
     dismissedPresets.value = []
     embeddedInfo.value = null
@@ -543,6 +591,7 @@ export const useConnectionsStore = defineStore('connections', () => {
     // state
     connections,
     activeId,
+    defaultId,
     statuses,
     dismissedPresets,
     embeddedInfo,
@@ -550,6 +599,8 @@ export const useConnectionsStore = defineStore('connections', () => {
     // getters
     active,
     sorted,
+    ordered,
+    defaultConnection,
     byId,
     findByEndpoint,
     findByServerId,
@@ -565,6 +616,7 @@ export const useConnectionsStore = defineStore('connections', () => {
     update,
     remove,
     setActive,
+    setDefault,
     setCredentials,
     clearCredentials,
     exportData,

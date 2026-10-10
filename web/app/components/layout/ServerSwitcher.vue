@@ -11,9 +11,9 @@ const { connection } = useConnection()
 type Item = DropdownMenuItem & { connId?: string }
 
 const items = computed<Item[][]>(() => [
-  store.sorted.map(c => ({
+  store.ordered.map(c => ({
     label: c.name,
-    description: c.id === connection.value?.id ? `${c.endpoint} · active` : c.endpoint,
+    description: [c.endpoint, c.id === connection.value?.id ? 'active' : '', c.id === store.defaultId ? 'default' : ''].filter(Boolean).join(' · '),
     connId: c.id,
     color: c.id === connection.value?.id ? ('primary' as const) : undefined,
     onSelect: () => {
@@ -22,7 +22,7 @@ const items = computed<Item[][]>(() => [
   })),
   [
     { label: 'Manage servers', icon: 'i-lucide-server-cog', to: appRoutes.servers() },
-    { label: 'Add server', icon: 'i-lucide-plus', to: appRoutes.connect() },
+    { label: 'Add server', icon: 'i-lucide-plus', to: appRoutes.newServer() },
     { label: 'Discover servers', icon: 'i-lucide-radar', to: appRoutes.discover() }
   ]
 ])

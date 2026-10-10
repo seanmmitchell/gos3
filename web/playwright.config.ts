@@ -11,6 +11,11 @@ import { defineConfig, devices } from '@playwright/test'
 //   real gos3 binary. Its setup project (real/global.setup.ts) builds the
 //   binary and starts two gos3 instances; the teardown project stops them.
 //   Run with `pnpm test:e2e:real` (= playwright test --project real-server).
+// - project "standalone": test/e2e/standalone/*.spec.ts drive the standalone
+//   UI (`pnpm build` → node .output/server/index.mjs, built into
+//   .e2e-cache/) against two real gos3 binaries, cross-origin (CORS). Its
+//   setup/teardown projects start and stop everything. Run with
+//   `pnpm test:e2e:standalone`.
 // Browsers are never downloaded: we use a locally installed Chromium
 // (PW_CHROMIUM_PATH, or the newest chromium-* under PLAYWRIGHT_BROWSERS_PATH
 // / /opt/pw-browsers).
@@ -32,10 +37,12 @@ function localChromium(): string | undefined {
 const PORT = Number(process.env.E2E_PORT || 4173)
 
 // The static mock server is only needed by the "chromium" project. Skip it
-// when only the real-server project runs, so its `pnpm generate:embed` does
-// not race with the real-server setup's own UI build.
+// when only other projects run (E2E_REAL_ONLY=1 or --project without
+// chromium), so its `pnpm generate:embed` does not race with the real-server
+// setup's own UI build.
 const argv = process.argv.join(' ')
-const realOnly = process.env.E2E_REAL_ONLY === '1' || /--project[= ]real-server\b/.test(argv)
+const projectArgs = [...argv.matchAll(/--project[= ](\S+)/g)].map(m => m[1]!)
+const realOnly = process.env.E2E_REAL_ONLY === '1' || (projectArgs.length > 0 && !projectArgs.includes('chromium'))
 
 const chrome = { ...devices['Desktop Chrome'], launchOptions: { executablePath: localChromium() } }
 
@@ -51,7 +58,7 @@ export default defineConfig({
   projects: [
     {
       name: 'chromium',
-      testIgnore: ['real/**'],
+      testIgnore: ['real/**', 'standalone/**'],
       use: chrome
     },
     {
@@ -73,6 +80,29 @@ export default defineConfig({
       timeout: 120_000,
       expect: { timeout: 15_000 },
       // Specs share two servers; files run in parallel but use unique names.
+      fullyParallel: false,
+      use: { ...chrome, baseURL: undefined, acceptDownloads: true, actionTimeout: 20_000, navigationTimeout: 30_000 }
+    },
+    {
+      name: 'standalone-setup',
+      testDir: 'test/e2e/standalone',
+      testMatch: /global\.setup\.ts$/,
+      teardown: 'standalone-teardown'
+    },
+    {
+      name: 'standalone-teardown',
+      testDir: 'test/e2e/standalone',
+      testMatch: /global\.teardown\.ts$/
+    },
+    {
+      name: 'standalone',
+      testDir: 'test/e2e/standalone',
+      testMatch: /\.spec\.ts$/,
+      dependencies: ['standalone-setup'],
+      timeout: 120_000,
+      expect: { timeout: 15_000 },
+      // Specs share the servers (and the UI's localStorage is per test), so
+      // files may run in parallel; they use unique bucket names.
       fullyParallel: false,
       use: { ...chrome, baseURL: undefined, acceptDownloads: true, actionTimeout: 20_000, navigationTimeout: 30_000 }
     }

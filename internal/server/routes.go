@@ -246,6 +246,11 @@ func (s *Server) instrumentAdmin(h http.Handler) http.Handler {
 		rec := &statusRecorder{ResponseWriter: w}
 		var in *countingReader
 		if r.Body != nil && r.Body != http.NoBody {
+			// Replace the body on a shallow copy only: net/http must still
+			// see its own Request.Body after the handler returns, or it
+			// tries to drain an unread "Expect: 100-continue" body before
+			// flushing an early error response (see s3.Server.ServeHTTP).
+			r = r.WithContext(r.Context())
 			in = &countingReader{ReadCloser: r.Body}
 			r.Body = in
 		}

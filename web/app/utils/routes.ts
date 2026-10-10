@@ -20,6 +20,16 @@ export const appRoutes = {
     const s = q.toString()
     return s ? `/connect?${s}` : '/connect'
   },
+  /**
+   * "Connect to a new server" form (never the sign-in of an existing
+   * connection, not even the hosting server's), optionally prefilled.
+   */
+  newServer: (prefill: { endpoint?: string, name?: string } = {}) => {
+    const q = new URLSearchParams({ new: '1' })
+    if (prefill.endpoint) q.set('endpoint', prefill.endpoint)
+    if (prefill.name) q.set('name', prefill.name)
+    return `/connect?${q.toString()}`
+  },
   server: (id: string) => `/servers/${seg(id)}`,
   buckets: (id: string) => `/servers/${seg(id)}/buckets`,
   bucket: (id: string, bucket: string, prefix?: string) =>

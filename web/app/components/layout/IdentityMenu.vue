@@ -45,7 +45,7 @@ const items = computed<DropdownMenuItem[][]>(() => {
     }
   } else {
     groups.push([
-      { label: 'Add server', icon: 'i-lucide-plus', to: appRoutes.connect() },
+      { label: 'Add server', icon: 'i-lucide-plus', to: appRoutes.newServer() },
       { label: 'Discover servers', icon: 'i-lucide-radar', to: appRoutes.discover() }
     ])
   }

@@ -19,8 +19,8 @@ test.describe('server overview', () => {
       // Our own requests show up in the counters and in the per-operation table.
       await expect(requests.getByRole('figure', { name: /Requests per minute/ })).toBeVisible()
       const ops = main.getByRole('region', { name: 'Operations' }).getByRole('table')
-      await expect(ops.getByRole('row', { name: /PutObject/ })).toBeVisible()
-      await expect(ops.getByRole('row', { name: /^Admin/ })).toBeVisible()
+      await expect(ops.getByRole('row', { name: /^PutObject \d/ })).toBeVisible()
+      await expect(ops.getByRole('row', { name: /^Admin \d/ })).toBeVisible()
 
       // The multi-server dashboard shows the hosting server online with its storage totals.
       await page.goto(ui(''))

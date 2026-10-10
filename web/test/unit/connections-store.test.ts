@@ -1,6 +1,6 @@
 import { createPinia, setActivePinia } from 'pinia'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
-import { CORS_BLOCKED, LOCAL_STORAGE_KEY, NO_CAPABILITIES, SESSION_STORAGE_KEY, useConnectionsStore } from '~/stores/connections'
+import { CORS_BLOCKED, LEGACY_DEFAULT_SERVER_KEY, LOCAL_STORAGE_KEY, NO_CAPABILITIES, SESSION_STORAGE_KEY, useConnectionsStore } from '~/stores/connections'
 import { EMBEDDED_CONNECTION_ID } from '~/utils/connections'
 import { clearClientCache } from '~/utils/clients'
 import type { Info } from '~/types/admin'
@@ -110,6 +110,52 @@ describe('connections store: CRUD & persistence', () => {
     const c = s.add({ endpoint: 'http://a:9000', kind: 's3' })
     expect(s.capabilitiesOf(c.id)).toEqual(NO_CAPABILITIES)
     expect(s.statusOf(c.id).state).toBe('unknown')
+  })
+})
+
+describe('connections store: default server', () => {
+  it('persists the default, orders it first and ignores unknown ids', () => {
+    const s = useConnectionsStore()
+    const b = s.add({ name: 'B', endpoint: 'http://b:9000' })
+    const a = s.add({ name: 'A', endpoint: 'http://a:9000' })
+    expect(s.ordered.map(c => c.name)).toEqual(['A', 'B'])
+    s.setDefault(b.id)
+    expect(s.defaultConnection?.id).toBe(b.id)
+    expect(s.ordered.map(c => c.name)).toEqual(['B', 'A'])
+    expect(local().defaultId).toBe(b.id)
+    s.setDefault('nope')
+    expect(s.defaultId).toBe(b.id)
+
+    setActivePinia(createPinia())
+    const s2 = useConnectionsStore()
+    s2.hydrate()
+    expect(s2.defaultId).toBe(b.id)
+    s2.remove(b.id)
+    expect(s2.defaultId).toBeNull()
+    expect(s2.ordered.map(c => c.id)).toEqual([a.id])
+  })
+
+  it('migrates the former separate localStorage key', () => {
+    const s = useConnectionsStore()
+    const a = s.add({ name: 'A', endpoint: 'http://a:9000' })
+    const state = local()
+    delete state.defaultId
+    localStorage.setItem(LOCAL_STORAGE_KEY, JSON.stringify(state))
+    localStorage.setItem(LEGACY_DEFAULT_SERVER_KEY, a.id)
+
+    setActivePinia(createPinia())
+    const s2 = useConnectionsStore()
+    s2.hydrate()
+    expect(s2.defaultId).toBe(a.id)
+    expect(localStorage.getItem(LEGACY_DEFAULT_SERVER_KEY)).toBeNull()
+    expect(local().defaultId).toBe(a.id)
+  })
+
+  it('keeps a default that names a preset merged in by init()', async () => {
+    localStorage.setItem(LEGACY_DEFAULT_SERVER_KEY, 'nas')
+    const s = useConnectionsStore()
+    await s.init({ presets: [{ id: 'nas', name: 'NAS', endpoint: 'http://nas:9000' }], skipServersJson: true, fetch: async () => new Response('', { status: 404 }) })
+    expect(s.defaultConnection?.name).toBe('NAS')
   })
 })
 

@@ -19,7 +19,9 @@ import {
   validateRegion,
   validateServerForm
 } from '~/components/servers/-form'
-import { DEFAULT_SERVER_KEY, defaultFirst, readDefaultServerId, useDefaultServer, writeDefaultServerId } from '~/components/servers/-default'
+import { createPinia, setActivePinia } from 'pinia'
+import { defaultFirst, useDefaultServer } from '~/components/servers/-default'
+import { LOCAL_STORAGE_KEY, useConnectionsStore } from '~/stores/connections'
 
 const CONN: Connection = {
   id: 'abc',
@@ -136,18 +138,22 @@ describe('misc helpers', () => {
 })
 
 describe('default server', () => {
-  beforeEach(() => localStorage.clear())
+  beforeEach(() => {
+    localStorage.clear()
+    setActivePinia(createPinia())
+  })
 
-  it('persists the default id', () => {
-    expect(readDefaultServerId()).toBeNull()
-    writeDefaultServerId('abc')
-    expect(localStorage.getItem(DEFAULT_SERVER_KEY)).toBe('abc')
+  it('reads and writes the preference through the connections store', () => {
+    const store = useConnectionsStore()
+    const a = store.add({ name: 'A', endpoint: 'http://a:9000' })
     const { defaultId, setDefault } = useDefaultServer()
-    setDefault('xyz')
-    expect(defaultId.value).toBe('xyz')
-    expect(readDefaultServerId()).toBe('xyz')
+    expect(defaultId.value).toBeNull()
+    setDefault(a.id)
+    expect(defaultId.value).toBe(a.id)
+    expect(store.defaultId).toBe(a.id)
+    expect(JSON.parse(localStorage.getItem(LOCAL_STORAGE_KEY) ?? '{}').defaultId).toBe(a.id)
     setDefault(null)
-    expect(readDefaultServerId()).toBeNull()
+    expect(defaultId.value).toBeNull()
   })
 
   it('sorts the default first', () => {

@@ -11,12 +11,20 @@
 
 const baseURL = process.env.NUXT_APP_BASE_URL || '/'
 
+// Optional alternative build/output directories (default .nuxt / .output) so
+// that a second build — e.g. the standalone e2e build in .e2e-cache — can run
+// next to the regular ones without overwriting them.
+const buildDir = process.env.NUXT_BUILD_DIR || undefined
+const outputDir = process.env.NUXT_OUTPUT_DIR || undefined
+
 export default defineNuxtConfig({
   compatibilityDate: '2026-10-01',
 
   modules: ['@nuxt/ui', '@pinia/nuxt'],
 
   ssr: false,
+
+  ...(buildDir ? { buildDir } : {}),
 
   devtools: { enabled: false },
 
@@ -93,7 +101,8 @@ export default defineNuxtConfig({
   nitro: {
     // `nuxt build` → standalone Node server. `nuxt generate` overrides the
     // preset with its static output automatically.
-    preset: process.env.NITRO_PRESET || 'node-server'
+    preset: process.env.NITRO_PRESET || 'node-server',
+    ...(outputDir ? { output: { dir: outputDir } } : {})
   },
 
   vite: {

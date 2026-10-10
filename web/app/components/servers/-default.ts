@@ -1,38 +1,15 @@
-// "Default server" preference: the connection opened first (dashboard order,
-// connect page fallback). Kept per browser in localStorage, separate from
-// the connections store's `activeId` (which follows navigation).
-import { ref, type Ref } from 'vue'
+// "Default server" preference: the connection opened first (dashboard and
+// server list order, sidebar fallback when no server is active). It lives in
+// the connections store (`defaultId`, persisted with the definitions); this
+// module keeps the small composable the pages use plus a sort helper.
+import { computed, type ComputedRef } from 'vue'
+import { useConnectionsStore } from '~/stores/connections'
 
-export const DEFAULT_SERVER_KEY = 'gos3.defaultServer.v1'
-
-export function readDefaultServerId(): string | null {
-  try {
-    return globalThis.localStorage?.getItem(DEFAULT_SERVER_KEY) || null
-  } catch {
-    return null
-  }
-}
-
-export function writeDefaultServerId(id: string | null): void {
-  try {
-    if (id) globalThis.localStorage?.setItem(DEFAULT_SERVER_KEY, id)
-    else globalThis.localStorage?.removeItem(DEFAULT_SERVER_KEY)
-  } catch {
-    // storage unavailable: preference lasts for this page load only
-  }
-}
-
-let state: Ref<string | null> | undefined
-
-/** Shared reactive default-server ID. */
-export function useDefaultServer() {
-  state ??= ref(readDefaultServerId())
-  const defaultId = state
-  function setDefault(id: string | null) {
-    defaultId.value = id
-    writeDefaultServerId(id)
-  }
-  return { defaultId, setDefault }
+/** Reactive default-server ID backed by the connections store. */
+export function useDefaultServer(): { defaultId: ComputedRef<string | null>, setDefault: (id: string | null) => void } {
+  const store = useConnectionsStore()
+  const defaultId = computed(() => store.defaultConnection?.id ?? null)
+  return { defaultId, setDefault: (id: string | null) => store.setDefault(id) }
 }
 
 /** Sort helper: default server first, then the given order. */

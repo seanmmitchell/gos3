@@ -99,6 +99,9 @@ describe('routes', () => {
     expect(appRoutes.object('abc', 'photos', 'a b/c#.txt', 'v1')).toBe('/servers/abc/buckets/photos/objects/a%20b/c%23.txt?versionId=v1')
     expect(appRoutes.connect('abc', '/servers/abc/users')).toBe('/connect?server=abc&redirect=%2Fservers%2Fabc%2Fusers')
     expect(appRoutes.connect()).toBe('/connect')
+    // "Add server" must never fall back to the hosting server's sign-in.
+    expect(appRoutes.newServer()).toBe('/connect?new=1')
+    expect(appRoutes.newServer({ endpoint: 'http://10.0.0.5:9000', name: 'NAS' })).toBe('/connect?new=1&endpoint=http%3A%2F%2F10.0.0.5%3A9000&name=NAS')
     expect(appRoutes.user('x', 'a/b')).toBe('/servers/x/users/a%2Fb')
     expect(routeParam(['a', 'b'])).toBe('a')
     expect(routeParam(undefined)).toBe('')

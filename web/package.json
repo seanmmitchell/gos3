@@ -15,7 +15,8 @@
     "test": "vitest run",
     "test:watch": "vitest",
     "test:e2e": "playwright test --project chromium",
-    "test:e2e:real": "E2E_REAL_ONLY=1 playwright test --project real-server"
+    "test:e2e:real": "E2E_REAL_ONLY=1 playwright test --project real-server",
+    "test:e2e:standalone": "E2E_REAL_ONLY=1 playwright test --project standalone"
   },
   "packageManager": "pnpm@10.28.0",
   "dependencies": {

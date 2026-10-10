@@ -173,6 +173,34 @@ def test_bucket_policy_deny_wins(s3, s3_anon, bucket):
     assert error_code(ei) == "AccessDenied"
 
 
+def test_missing_key_needs_list_bucket(s3, s3_anon, bucket):
+    """AWS answers reads of missing keys with 403 unless the caller may
+    s3:ListBucket, so existence cannot be probed; with it, 404."""
+    statements = [
+        {"Effect": "Allow", "Principal": "*", "Action": "s3:GetObject", "Resource": f"arn:aws:s3:::{bucket}/*"}
+    ]
+    s3.put_bucket_policy(Bucket=bucket, Policy=json.dumps({"Version": "2012-10-17", "Statement": statements}))
+    s3.put_object(Bucket=bucket, Key="exists", Body=b"x")
+    assert s3_anon.get_object(Bucket=bucket, Key="exists")["Body"].read() == b"x"
+    with pytest.raises(ClientError) as ei:
+        s3_anon.get_object(Bucket=bucket, Key="missing")
+    assert error_code(ei) == "AccessDenied"
+    with pytest.raises(ClientError) as ei:
+        s3_anon.head_object(Bucket=bucket, Key="missing")
+    assert status_code(ei) == 403
+
+    statements.append(
+        {"Effect": "Allow", "Principal": "*", "Action": "s3:ListBucket", "Resource": f"arn:aws:s3:::{bucket}"}
+    )
+    s3.put_bucket_policy(Bucket=bucket, Policy=json.dumps({"Version": "2012-10-17", "Statement": statements}))
+    with pytest.raises(ClientError) as ei:
+        s3_anon.get_object(Bucket=bucket, Key="missing")
+    assert error_code(ei) == "NoSuchKey"
+    with pytest.raises(ClientError) as ei:
+        s3_anon.head_object(Bucket=bucket, Key="missing")
+    assert status_code(ei) == 404
+
+
 def test_malformed_policy(s3, bucket):
     with pytest.raises(ClientError) as ei:
         s3.put_bucket_policy(Bucket=bucket, Policy="{not json")

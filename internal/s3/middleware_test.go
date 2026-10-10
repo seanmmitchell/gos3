@@ -1,17 +1,22 @@
 package s3
 
 import (
+	"bufio"
 	"context"
 	"encoding/xml"
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"regexp"
 	"strings"
 	"testing"
+	"time"
 
+	"github.com/seanmmitchell/gos3/internal/auth"
+	"github.com/seanmmitchell/gos3/internal/iam"
 	"github.com/seanmmitchell/gos3/internal/s3err"
 	"github.com/seanmmitchell/gos3/internal/storage"
 	"github.com/seanmmitchell/gos3/internal/storage/memory"
@@ -353,4 +358,95 @@ func TestErrorDocExtras(t *testing.T) {
 	if string(data) != want {
 		t.Fatalf("%s", data)
 	}
+}
+
+// TestExpectContinueEarlyError checks that a request rejected before its
+// body is read gets its response immediately when the client sent
+// "Expect: 100-continue" and is waiting for permission to send the body
+// (botocore and the AWS CLI do this for uploads). Previously the S3 handler
+// replaced the server's own Request.Body, so net/http tried to drain the
+// unread body before flushing the response and the client only saw the
+// error after its 100-continue timeout (1 s).
+func TestExpectContinueEarlyError(t *testing.T) {
+	e := newTestEnv(t)
+	conn, err := net.Dial("tcp", e.srv.Listener.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	req := "PUT /no-such-bucket/key HTTP/1.1\r\n" +
+		"Host: " + e.srv.Listener.Addr().String() + "\r\n" +
+		"Content-Length: 1048576\r\n" +
+		"Expect: 100-continue\r\n\r\n"
+	if _, err := io.WriteString(conn, req); err != nil {
+		t.Fatal(err)
+	}
+	// Never send the body: the response must arrive on its own.
+	_ = conn.SetReadDeadline(time.Now().Add(5 * time.Second))
+	start := time.Now()
+	resp, err := http.ReadResponse(bufio.NewReader(conn), nil)
+	if err != nil {
+		t.Fatalf("no response without the body: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode == http.StatusContinue {
+		t.Fatal("server sent 100 Continue for a request it rejects")
+	}
+	if resp.StatusCode != http.StatusForbidden && resp.StatusCode != http.StatusNotFound {
+		t.Fatalf("status = %d, want an error", resp.StatusCode)
+	}
+	if d := time.Since(start); d > 500*time.Millisecond {
+		t.Fatalf("error response took %v; the server waited for the body", d)
+	}
+}
+
+// TestMissingObjectWithoutListBucket checks AWS's rule for reads of keys
+// that do not exist: callers without s3:ListBucket get 403 AccessDenied (so
+// they cannot probe for keys), callers with it (and root) get 404.
+func TestMissingObjectWithoutListBucket(t *testing.T) {
+	e := newTestEnv(t)
+	e.createBucket("pub")
+	e.putObject("pub", "a/b.txt", []byte("x"), storage.ObjectMeta{})
+	e.putBucketConfig("pub", storage.ConfigPolicy, publicReadPolicy)
+	reader := e.createUser("reader")
+	e.putPolicy("getonly", `{"Statement":[{"Effect":"Allow","Action":"s3:GetObject*","Resource":"arn:aws:s3:::pub/*"}]}`)
+	getOnly := e.createUser("getonly", "getonly")
+	lister := e.createUser("lister", iam.PolicyReadOnly)
+
+	check := func(who string, do func(method, path string) *testResponse, method, path string, status int, code string) {
+		t.Helper()
+		resp := do(method, path)
+		if resp.StatusCode != status || (method != "HEAD" && resp.code() != code) {
+			t.Errorf("%s %s %s: %d %s, want %d %s", who, method, path, resp.StatusCode, resp.code(), status, code)
+		}
+		if resp.Header.Get("X-Amz-Delete-Marker") != "" && status == 403 {
+			t.Errorf("%s %s %s: delete marker revealed", who, method, path)
+		}
+	}
+	anon := func(m, p string) *testResponse { return e.anon(m, p, nil, nil) }
+	as := func(c auth.Credentials) func(m, p string) *testResponse {
+		return func(m, p string) *testResponse { return e.signedAs(c, m, p, nil, nil) }
+	}
+	for _, m := range []string{"GET", "HEAD"} {
+		check("anonymous", anon, m, "/pub/a/b.txt", 200, "")
+		check("anonymous", anon, m, "/pub/missing", 403, "AccessDenied")
+		check("get-only user", as(getOnly), m, "/pub/missing", 403, "AccessDenied")
+		check("user without policies", as(reader), m, "/pub/missing", 403, "AccessDenied")
+		check("readonly user", as(lister), m, "/pub/missing", 404, "NoSuchKey")
+		check("root", func(m, p string) *testResponse { return e.signed(m, p, nil, nil) }, m, "/pub/missing", 404, "NoSuchKey")
+	}
+	attrs := func(c auth.Credentials) func(m, p string) *testResponse {
+		return func(m, p string) *testResponse {
+			return e.signedAs(c, m, p, nil, http.Header{"X-Amz-Object-Attributes": {"ETag"}})
+		}
+	}
+	check("get-only user", attrs(getOnly), "GET", "/pub/missing?attributes", 403, "AccessDenied")
+	check("readonly user", attrs(lister), "GET", "/pub/missing?attributes", 404, "NoSuchKey")
+
+	// With s3:ListBucket granted by the bucket policy, anonymous callers get
+	// the real 404.
+	e.putBucketConfig("pub", storage.ConfigPolicy, `{"Version":"2012-10-17","Statement":[
+		{"Effect":"Allow","Principal":"*","Action":"s3:GetObject","Resource":"arn:aws:s3:::pub/*"},
+		{"Effect":"Allow","Principal":"*","Action":"s3:ListBucket","Resource":"arn:aws:s3:::pub"}]}`)
+	check("anonymous with list", anon, "GET", "/pub/missing", 404, "NoSuchKey")
 }

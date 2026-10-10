@@ -283,7 +283,7 @@ const others = computed(() => store.sorted.filter(c => c.id !== target.value?.id
         <UIcon name="i-lucide-arrow-left" class="size-4" aria-hidden="true" /> Manage servers
       </NuxtLink>
       <div class="flex items-center gap-3">
-        <NuxtLink v-if="mode === 'signin'" to="/connect?new=1" class="text-muted hover:text-highlighted">
+        <NuxtLink v-if="mode === 'signin'" :to="appRoutes.newServer()" class="text-muted hover:text-highlighted">
           Different server
         </NuxtLink>
         <NuxtLink :to="appRoutes.discover()" class="inline-flex items-center gap-1 text-muted hover:text-highlighted">

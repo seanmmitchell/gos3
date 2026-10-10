@@ -3,6 +3,7 @@ package s3
 import (
 	"crypto/rand"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net"
@@ -31,6 +32,14 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if s.metrics != nil {
 		done = s.metrics.Begin()
 	}
+	// Work on a shallow copy of the request: net/http inspects the Body of
+	// its own *Request after the handler returns. When that is still its
+	// expectContinueReader and no "100 Continue" was sent, it simply closes
+	// the connection; any other Body type makes it try to discard up to
+	// 256 KiB of the unread body first, which blocks until a client that
+	// sent "Expect: 100-continue" gives up waiting (1 s for botocore and
+	// curl) before the already written error response is flushed.
+	r = r.WithContext(r.Context())
 	if r.Body == nil {
 		r.Body = http.NoBody
 	}
@@ -151,8 +160,41 @@ func (s *Server) serve(w *responseWriter, r *http.Request, rc *reqContext) {
 		}
 	}
 	if err := handler(s, w, r, rc); err != nil {
-		s.writeError(w, r, rc, err)
+		s.writeError(w, r, rc, s.hideMissingObject(w, r, rc, err))
 	}
+}
+
+// hideMissingObject applies AWS's rule for reads of objects that do not
+// exist: a caller without s3:ListBucket on the bucket gets AccessDenied
+// (403) instead of NoSuchKey (404), so key existence cannot be probed by
+// someone who may only read objects (e.g. anonymous users of a public-read
+// bucket policy). Root, and callers allowed to list, get the 404.
+func (s *Server) hideMissingObject(w http.ResponseWriter, r *http.Request, rc *reqContext, err error) error {
+	switch rc.opName {
+	case "GetObject", "HeadObject", "GetObjectAttributes":
+	default:
+		return err
+	}
+	if rc.identity.IsRoot && !rc.identity.IsAnonymous {
+		return err
+	}
+	if !errors.Is(mapStorageError(err), s3err.ErrNoSuchKey) {
+		return err
+	}
+	reason := rc.authzReason
+	listErr := s.authorizeTarget(r.Context(), r, rc, authzTarget{Action: "s3:ListBucket", Bucket: rc.bucket})
+	rc.authzReason = reason
+	if listErr == nil {
+		return err
+	}
+	if !errors.Is(listErr, s3err.ErrAccessDenied) {
+		return listErr
+	}
+	// Do not reveal a delete marker either.
+	h := w.Header()
+	h.Del("X-Amz-Delete-Marker")
+	h.Del("X-Amz-Version-Id")
+	return s3err.ErrAccessDenied
 }
 
 // stripAWSChunked removes the "aws-chunked" token from Content-Encoding (it

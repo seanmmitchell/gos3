@@ -523,3 +523,38 @@ def test_delete_objects_versioned(s3, versioned_bucket):
     with pytest.raises(ClientError) as ei:
         s3.get_object(Bucket=bucket, Key="k", VersionId=v1)
     assert error_code(ei) == "NoSuchVersion"
+
+
+def test_early_error_does_not_wait_for_100_continue(s3, bucket):
+    """botocore sends "Expect: 100-continue" on uploads and waits up to 1 s
+    for the server's answer before sending the body; an early error must be
+    answered at once instead of after that timeout."""
+    import time
+
+    body = b"x" * (2 * 1024 * 1024)
+    for _ in range(2):
+        start = time.monotonic()
+        with pytest.raises(ClientError) as ei:
+            s3.put_object(Bucket=unique_name("missing"), Key="k", Body=body)
+        assert error_code(ei) == "NoSuchBucket"
+        assert time.monotonic() - start < 0.8
+    # The connection pool still works afterwards.
+    s3.put_object(Bucket=bucket, Key="after", Body=body)
+
+
+def test_listing_beyond_1000_keys(s3, bucket):
+    from concurrent.futures import ThreadPoolExecutor
+
+    keys = [f"many/{i:05d}" for i in range(1105)]
+    with ThreadPoolExecutor(16) as pool:
+        list(pool.map(lambda k: s3.put_object(Bucket=bucket, Key=k, Body=b""), keys))
+    first = s3.list_objects_v2(Bucket=bucket)
+    assert first["KeyCount"] == 1000
+    assert first["IsTruncated"] is True
+    v1 = s3.list_objects(Bucket=bucket)
+    assert len(v1["Contents"]) == 1000
+    assert v1["IsTruncated"] is True
+    assert "NextMarker" not in v1  # only sent with a delimiter
+    for op in ("list_objects", "list_objects_v2"):
+        got = [o["Key"] for p in s3.get_paginator(op).paginate(Bucket=bucket) for o in p.get("Contents", [])]
+        assert got == keys, op
