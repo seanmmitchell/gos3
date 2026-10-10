@@ -58,7 +58,14 @@ type Backend struct {
 	now func() time.Time
 }
 
-var _ storage.Backend = (*Backend)(nil)
+var (
+	_ storage.Backend            = (*Backend)(nil)
+	_ storage.ConditionalDeleter = (*Backend)(nil)
+)
+var (
+	_ storage.ConditionalDeleter = (*Backend)(nil)
+	_ storage.UploadWalker       = (*Backend)(nil)
+)
 
 // New returns an empty in-memory backend.
 func New() *Backend {
@@ -76,6 +83,8 @@ type bucket struct {
 	configs map[string][]byte
 	objects *skipList[*object]
 	uploads map[string]*upload
+	// uploadOrder indexes uploads by uploadOrderKey (listing order).
+	uploadOrder *skipList[*upload]
 	// deleted is set when the bucket is removed (or the backend closed) so
 	// that operations holding a stale pointer fail with ErrBucketNotFound.
 	deleted bool
@@ -382,6 +391,8 @@ func (b *Backend) CreateBucket(ctx context.Context, name string, opts storage.Cr
 		configs: make(map[string][]byte),
 		objects: newSkipList[*object](),
 		uploads: make(map[string]*upload),
+
+		uploadOrder: newSkipList[*upload](),
 	}
 	return nil
 }
@@ -420,6 +431,7 @@ func (b *Backend) DeleteBucket(ctx context.Context, name string) error {
 	bk.deleted = true
 	bk.configs = nil
 	clear(bk.uploads)
+	bk.uploadOrder = newSkipList[*upload]()
 	delete(b.buckets, name)
 	return nil
 }

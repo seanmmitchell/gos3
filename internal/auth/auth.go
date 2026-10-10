@@ -86,6 +86,10 @@ type Result struct {
 	// PayloadMode is the x-amz-content-sha256 value (or "" for anonymous /
 	// presigned requests, which are UNSIGNED-PAYLOAD).
 	PayloadMode string
+	// SignedAt is when the request was signed (X-Amz-Date, or Date for
+	// header authentication); the s3:signatureAge condition key is measured
+	// from it. Zero for anonymous requests.
+	SignedAt time.Time
 }
 
 // Options configures a Verifier.

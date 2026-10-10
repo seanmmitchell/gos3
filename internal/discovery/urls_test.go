@@ -276,3 +276,61 @@ func TestResolveDefaults(t *testing.T) {
 		t.Errorf("explicit ttl: %v", e.ttl)
 	}
 }
+
+// TestHostTrailingDots is a regression test: only a single trailing (root)
+// dot of a host name is removed, so hosts ending in ".." are rejected
+// instead of being "normalised" to a form that still ends in a dot.
+func TestHostTrailingDots(t *testing.T) {
+	for _, in := range []string{"http://nas..:9000", "nas..", "000..", "http://1.2.3.4..", "http://..", "http://."} {
+		if got, err := NormalizeBaseURL(in); err == nil {
+			t.Errorf("NormalizeBaseURL(%q) = %q, want error", in, got)
+		}
+	}
+	for _, tt := range []struct{ in, want string }{
+		{"http://nas.:9000", "http://nas:9000"},
+		{"http://1.2.3.4.:9000", "http://1.2.3.4:9000"},
+		{"HTTPS://[fe80::1%251..]", "https://[fe80::1%251..]"}, // zone kept verbatim
+		{"http://[FE80::A]:9000", "http://[fe80::a]:9000"},
+		{"http://[::ffff:10.0.0.5]:9000", "http://10.0.0.5:9000"},
+	} {
+		if got, err := NormalizeBaseURL(tt.in); err != nil || got != tt.want {
+			t.Errorf("NormalizeBaseURL(%q) = %q, %v; want %q", tt.in, got, err, tt.want)
+		}
+	}
+	if _, err := parseScanTarget("nas..:9000"); err == nil {
+		t.Error(`parseScanTarget("nas..:9000") succeeded, want error`)
+	}
+	if got := SelfAdvertisedURLs("nas..:9000", "", false); len(got) != 0 {
+		t.Errorf(`SelfAdvertisedURLs("nas..:9000") = %v, want none`, got)
+	}
+	if got := SelfAdvertisedURLs("NAS.:9000", "", false); !slices.Equal(got, []string{"http://nas:9000"}) {
+		t.Errorf(`SelfAdvertisedURLs("NAS.:9000") = %v`, got)
+	}
+}
+
+// FuzzNormalizeBaseURL checks that NormalizeBaseURL is idempotent: its
+// output is accepted and returned unchanged.
+func FuzzNormalizeBaseURL(f *testing.F) {
+	for _, s := range []string{"nas.local:9000", "000..", "http://nas.", "HTTPS://[fe80::1%251..]", "http://[::1]:9000", "1.2.3.4.", "https://H:1/p?q#f"} {
+		f.Add(s)
+	}
+	f.Fuzz(func(t *testing.T, in string) {
+		n1, err := NormalizeBaseURL(in)
+		if err != nil {
+			return
+		}
+		n2, err := NormalizeBaseURL(n1)
+		if err != nil || n2 != n1 {
+			t.Fatalf("NormalizeBaseURL(%q) = %q, renormalised to %q, %v", in, n1, n2, err)
+		}
+	})
+}
+
+// TestResolveDNSSRVTrailingDots: only the root dot is stripped from DNS-SRV
+// domains; "local.." is dropped rather than kept as "local.".
+func TestResolveDNSSRVTrailingDots(t *testing.T) {
+	e := resolve(Config{DNSSRV: []string{"Local.", "local", "other..", "x.example"}})
+	if want := []string{"local", "x.example"}; !slices.Equal(e.domains, want) {
+		t.Errorf("domains = %v, want %v", e.domains, want)
+	}
+}

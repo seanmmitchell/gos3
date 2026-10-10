@@ -33,6 +33,11 @@ const nameError = computed(() => {
   return validateFolderName(name.value) ?? validateObjectKey(folderKey(props.prefix, name.value))
 })
 const key = computed(() => (name.value && !nameError.value ? folderKey(props.prefix, name.value) : ''))
+// Spaces are kept (they are part of the key): point them out.
+const help = computed(() => {
+  if (!key.value) return 'Use “/” to create nested folders.'
+  return /(^|\/)\s|\s(\/|$)/.test(name.value) ? `Key: “${key.value}” (the spaces at the start or end of a name are kept)` : `Key: ${key.value}`
+})
 
 async function submit() {
   touched.value = true
@@ -59,7 +64,7 @@ async function submit() {
     </template>
     <template #body>
       <form id="create-folder-form" class="space-y-4" novalidate @submit.prevent="submit">
-        <UFormField label="Folder name" :error="nameError" :help="key ? `Key: ${key}` : 'Use “/” to create nested folders.'" required>
+        <UFormField label="Folder name" :error="nameError" :help="help" required>
           <UInput v-model="name" class="w-full font-mono" placeholder="reports/2026" autocomplete="off" autofocus spellcheck="false" @blur="touched = true" />
         </UFormField>
         <CommonErrorAlert v-if="error" :error="error" title="Could not create the folder" />

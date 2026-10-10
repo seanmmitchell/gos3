@@ -224,10 +224,13 @@ func canonicalQueryString(params []queryParam, exclude string) string {
 	return b.String()
 }
 
-// canonicalHeaderValue trims v and collapses runs of spaces into one, as
-// SigV4 requires.
+// canonicalHeaderValue trims the spaces and tabs around v and collapses
+// runs of spaces into one, as SigV4 requires. Other (Unicode) whitespace is
+// part of the signed value: trimming it too would let anyone holding a
+// presigned URL append, say, U+00A0 to a signed header without breaking
+// the signature.
 func canonicalHeaderValue(v string) string {
-	v = strings.TrimSpace(v)
+	v = strings.Trim(v, " \t")
 	if !strings.Contains(v, "  ") {
 		return v
 	}

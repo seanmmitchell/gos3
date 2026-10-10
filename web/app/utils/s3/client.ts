@@ -160,6 +160,59 @@ export function encodeHeaderValue(v: string): string {
   return `=?UTF-8?B?${btoa(bin)}?=`
 }
 
+/**
+ * Content-Disposition value safe to send as a header. Non-ASCII characters
+ * are only allowed in the filename parameter: they are moved into an RFC
+ * 5987 `filename*` parameter (with an ASCII `filename` fallback), as RFC
+ * 6266 specifies. RFC 2047 encoded-words, which encodeHeaderValue produces
+ * for user metadata, are not understood by browsers in this header. Throws
+ * an Error for other non-ASCII content (it cannot be represented).
+ */
+export function contentDispositionHeader(v: string): string {
+  // eslint-disable-next-line no-control-regex
+  if (/^[\x20-\x7e\t]*$/.test(v)) return v
+  // Split on ';' outside quoted strings.
+  const parts: string[] = []
+  let cur = ''
+  let quoted = false
+  for (let i = 0; i < v.length; i++) {
+    const c = v[i]!
+    if (quoted && c === '\\' && i + 1 < v.length) {
+      cur += c + v[++i]
+      continue
+    }
+    if (c === '"') quoted = !quoted
+    if (c === ';' && !quoted) {
+      parts.push(cur)
+      cur = ''
+    } else {
+      cur += c
+    }
+  }
+  parts.push(cur)
+  const [type, ...params] = parts.map(p => p.trim()).filter(Boolean)
+  const nonAscii = (s: string) => /[^\x20-\x7e\t]/.test(s)
+  if (!type || nonAscii(type)) throw new Error('Content-Disposition: only the filename may contain non-ASCII characters (e.g. attachment; filename="résumé.pdf").')
+  const out = [type]
+  const hasExtended = params.some(p => /^filename\*\s*=/i.test(p))
+  for (const p of params) {
+    if (!nonAscii(p)) {
+      out.push(p)
+      continue
+    }
+    const m = p.match(/^filename\s*=\s*(.*)$/is)
+    if (!m) throw new Error('Content-Disposition: only the filename may contain non-ASCII characters (e.g. attachment; filename="résumé.pdf").')
+    let name = m[1]!.trim()
+    if (name.length >= 2 && name.startsWith('"') && name.endsWith('"')) name = name.slice(1, -1).replace(/\\(.)/g, '$1')
+    const ascii = name.replace(/[^\x20-\x7e]/g, '_').replace(/["\\]/g, '_')
+    out.push(`filename="${ascii}"`)
+    if (!hasExtended) {
+      out.push(`filename*=UTF-8''${encodeURIComponent(name).replace(/['()*]/g, c => `%${c.charCodeAt(0).toString(16).toUpperCase()}`)}`)
+    }
+  }
+  return out.join('; ')
+}
+
 /** Decodes RFC 2047 encoded-words (B and Q encodings, UTF-8 / ISO-8859-1). */
 export function decodeHeaderValue(v: string): string {
   return v.replace(/=\?([^?]+)\?([BbQq])\?([^?]*)\?=/g, (whole, charset: string, enc: string, data: string) => {
@@ -181,8 +234,15 @@ export function decodeHeaderValue(v: string): string {
 
 const CHECKSUM_ALGOS: ChecksumAlgorithm[] = ['CRC32', 'CRC32C', 'CRC64NVME', 'SHA1', 'SHA256']
 
-/** Parses object response headers into a HeadResult. */
-export function parseHeadHeaders(headers: Headers): HeadResult {
+/**
+ * Parses object response headers into a HeadResult. Pass `crossOrigin` for
+ * responses read cross-origin (Response.type 'cors'): the browser then only
+ * shows the headers the server's CORS rule exposes, and `headersHidden` is
+ * set unless the Date header (sent by every S3 server, never safelisted and
+ * practically never listed explicitly) is visible, which means that every
+ * header is exposed ("*").
+ */
+export function parseHeadHeaders(headers: Headers, opts: { crossOrigin?: boolean } = {}): HeadResult {
   const all: Record<string, string> = {}
   const metadata: Record<string, string> = {}
   headers.forEach((value, name) => {
@@ -202,7 +262,8 @@ export function parseHeadHeaders(headers: Headers): HeadResult {
     contentLength: int(all['content-length']) ?? 0,
     contentType: all['content-type'],
     contentEncoding: all['content-encoding'],
-    contentDisposition: all['content-disposition'],
+    // Decoded: earlier UI versions stored non-ASCII values as RFC 2047 words.
+    contentDisposition: all['content-disposition'] === undefined ? undefined : decodeHeaderValue(all['content-disposition']),
     contentLanguage: all['content-language'],
     cacheControl: all['cache-control'],
     expires: all['expires'],
@@ -225,6 +286,7 @@ export function parseHeadHeaders(headers: Headers): HeadResult {
     replicationStatus: all['x-amz-replication-status'],
     restore: all['x-amz-restore'],
     websiteRedirectLocation: all['x-amz-website-redirect-location'],
+    headersHidden: opts.crossOrigin && all.date === undefined ? true : undefined,
     headers: all
   }
 }
@@ -282,7 +344,7 @@ function objectWriteHeaders(opts: Pick<PutObjectOptions, 'contentType' | 'cacheC
   const h: Record<string, string> = {}
   if (opts.contentType) h['Content-Type'] = opts.contentType
   if (opts.cacheControl) h['Cache-Control'] = opts.cacheControl
-  if (opts.contentDisposition) h['Content-Disposition'] = encodeHeaderValue(opts.contentDisposition)
+  if (opts.contentDisposition) h['Content-Disposition'] = contentDispositionHeader(opts.contentDisposition)
   if (opts.contentEncoding) h['Content-Encoding'] = opts.contentEncoding
   if (opts.contentLanguage) h['Content-Language'] = opts.contentLanguage
   if (opts.acl) h['x-amz-acl'] = opts.acl
@@ -582,7 +644,7 @@ export class S3Client {
       query: { versionId: opts.versionId },
       headers: { 'x-amz-checksum-mode': opts.checksumMode === false ? undefined : 'ENABLED' }
     })
-    return parseHeadHeaders(response.headers)
+    return parseHeadHeaders(response.headers, { crossOrigin: response.type === 'cors' })
   }
 
   /** GET with a byte range (inclusive end). */

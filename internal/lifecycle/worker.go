@@ -341,14 +341,22 @@ type pass struct {
 	now    time.Time
 	st     *Stats
 
+	// cd deletes conditionally (nil when the backend cannot): see
+	// expireCurrent and deleteVersion.
+	cd           storage.ConditionalDeleter
+	warnedNoCond bool // the missing ConditionalDeleter was logged
+
 	rules      []*compiledRule // enabled rules, in document order
 	objects    bool            // some rule acts on object versions
 	uploads    bool            // some rule aborts uploads
 	walkPrefix string          // common key prefix of all object rules
+	// uploadPrefix is the common key prefix of all upload rules.
+	uploadPrefix string
 }
 
 func newPass(w *Worker, b storage.BucketInfo, cfg *Configuration, now time.Time, st *Stats) *pass {
 	p := &pass{w: w, bucket: b, now: now, st: st}
+	p.cd, _ = w.backend.(storage.ConditionalDeleter)
 	first := true
 	for i := range cfg.Rules {
 		r := &cfg.Rules[i]
@@ -358,6 +366,11 @@ func newPass(w *Worker, b storage.BucketInfo, cfg *Configuration, now time.Time,
 		cr := &compiledRule{Rule: r, pred: r.predicate()}
 		p.rules = append(p.rules, cr)
 		if r.AbortIncompleteMultipartUpload != nil {
+			if !p.uploads {
+				p.uploadPrefix = cr.pred.prefix
+			} else {
+				p.uploadPrefix = commonPrefix(p.uploadPrefix, cr.pred.prefix)
+			}
 			p.uploads = true
 		}
 		if r.Expiration != nil || r.NoncurrentVersionExpiration != nil {
@@ -623,50 +636,101 @@ func (p *pass) processKey(ctx context.Context, vs []storage.ObjectInfo) {
 	}
 }
 
+// errSkip is returned by the conditional delete checks of expireCurrent
+// and deleteVersion when the version changed since the walk or is
+// protected; the delete is then not performed.
+var errSkip = errors.New("lifecycle: version changed or protected")
+
+// noConditionalDelete logs, once per pass, that a permanent delete was
+// skipped because the backend cannot delete conditionally: an
+// unconditional delete could remove data written or locked after the
+// worker's last check.
+func (p *pass) noConditionalDelete() {
+	if !p.warnedNoCond {
+		p.warnedNoCond = true
+		p.w.log.Warn("lifecycle: storage backend cannot delete conditionally; skipping permanent deletes",
+			"bucket", p.bucket.Name)
+	}
+}
+
 // expireCurrent applies Expiration Days/Date to o, the current version of
 // its key. versions holds all versions of the key in a versioned bucket
 // (nil for unversioned buckets).
+//
+// The delete (no version ID) is conditional, atomically in the backend, on
+// the key's latest version still being o, unchanged (so a version written
+// meanwhile is never removed or hidden), still expired by a rule (its tags
+// may have changed) and, in unversioned and suspended buckets where the
+// delete removes it permanently, not protected by object lock.
 func (p *pass) expireCurrent(ctx context.Context, o *storage.ObjectInfo, versions []storage.ObjectInfo) {
-	r := p.currentRule(o)
-	if r == nil {
+	if p.currentRule(o) == nil {
 		return
 	}
-	b := p.w.backend
-	// Re-read the current version right before acting: it may have been
-	// overwritten, deleted or re-tagged since the walk.
-	fresh, err := b.GetObjectInfo(ctx, p.bucket.Name, o.Key, "")
-	if err != nil {
-		if !errors.Is(err, storage.ErrObjectNotFound) && !errors.Is(err, storage.ErrBucketNotFound) {
-			p.fail("read object", o, err)
-		}
+	permanent := p.bucket.Versioning != storage.VersioningEnabled
+	if permanent && p.cd == nil {
+		p.noConditionalDelete()
 		return
 	}
-	if fresh.DeleteMarker || fresh.VersionID != o.VersionID || !fresh.LastModified.Equal(o.LastModified) ||
-		fresh.ETag != o.ETag || p.currentRule(&fresh) == nil {
-		return
-	}
-	// Which data a delete with no version ID removes permanently: the null
-	// version in unversioned and suspended buckets (in the latter, the
-	// null delete marker replaces it); nothing in enabled buckets.
-	switch p.bucket.Versioning {
-	case storage.VersioningUnversioned:
-		if Protected(fresh, p.now) {
-			p.protected(&fresh, r)
-			return
-		}
-	case storage.VersioningSuspended:
+	// In a suspended bucket the delete replaces the null version, which
+	// may be a noncurrent version the check below does not see. Object
+	// lock cannot be enabled on suspended buckets, so this snapshot test
+	// is only defensive.
+	if p.bucket.Versioning == storage.VersioningSuspended {
 		for i := range versions {
 			if versions[i].VersionID == storage.NullVersionID && Protected(versions[i], p.now) {
-				p.protected(&versions[i], r)
+				p.protected(&versions[i], p.currentRule(o))
 				return
 			}
 		}
 	}
-	res, err := b.DeleteObject(ctx, p.bucket.Name, o.Key, "")
-	if err != nil {
-		if !errors.Is(err, storage.ErrBucketNotFound) {
-			p.fail("expire object", o, err)
+	var (
+		r         *compiledRule // the rule expiring the fresh version
+		protected *storage.ObjectInfo
+	)
+	check := func(fresh storage.ObjectInfo) error {
+		r, protected = nil, nil
+		if fresh.DeleteMarker || !fresh.IsLatest || fresh.VersionID != o.VersionID ||
+			!fresh.LastModified.Equal(o.LastModified) || fresh.ETag != o.ETag {
+			return errSkip
 		}
+		if r = p.currentRule(&fresh); r == nil {
+			return errSkip
+		}
+		if permanent && Protected(fresh, p.now) {
+			protected = &fresh
+			return errSkip
+		}
+		return nil
+	}
+	b := p.w.backend
+	var (
+		res storage.DeleteResult
+		err error
+	)
+	if p.cd != nil {
+		res, err = p.cd.DeleteObjectIf(ctx, p.bucket.Name, o.Key, "", check)
+	} else {
+		// Versioning enabled: the delete only adds a delete marker, so a
+		// snapshot check is enough (a version written in between stays
+		// readable as a noncurrent version).
+		var fresh storage.ObjectInfo
+		if fresh, err = b.GetObjectInfo(ctx, p.bucket.Name, o.Key, ""); err == nil {
+			if err = check(fresh); err == nil {
+				res, err = b.DeleteObject(ctx, p.bucket.Name, o.Key, "")
+			}
+		}
+	}
+	switch {
+	case err == nil:
+	case errors.Is(err, errSkip):
+		if protected != nil {
+			p.protected(protected, r)
+		}
+		return
+	case errors.Is(err, storage.ErrObjectNotFound), errors.Is(err, storage.ErrBucketNotFound):
+		return
+	default:
+		p.fail("expire object", o, err)
 		return
 	}
 	p.st.Expired++
@@ -686,36 +750,48 @@ const (
 	versionGone                         // already removed by someone else
 )
 
-// deleteVersion permanently removes the version v after re-checking that
-// it is unchanged since the walk, that it is (latest) or is not (!latest)
-// the key's latest version, so a noncurrent version that has become the
-// latest is never deleted, and that it is not protected by object lock.
+// deleteVersion permanently removes the version v, which rule r selected.
+// The delete is conditional, atomically in the backend, on v being
+// unchanged since the walk, being (latest) or not being (!latest) the
+// key's latest version, so a noncurrent version that has become the latest
+// (e.g. a null version replaced by a new current one) is never deleted,
+// still being selected by r, and not being protected by object lock (a
+// retention or legal hold set meanwhile is honoured).
 func (p *pass) deleteVersion(ctx context.Context, v *storage.ObjectInfo, latest bool, r *compiledRule, msg string) deleteOutcome {
-	b := p.w.backend
-	fresh, err := b.GetObjectInfo(ctx, p.bucket.Name, v.Key, v.VersionID)
+	if v.IsLatest != latest {
+		return versionKept
+	}
+	if p.cd == nil {
+		p.noConditionalDelete()
+		return versionKept
+	}
+	var protected *storage.ObjectInfo
+	check := func(fresh storage.ObjectInfo) error {
+		protected = nil
+		if fresh.IsLatest != latest || fresh.DeleteMarker != v.DeleteMarker ||
+			!fresh.LastModified.Equal(v.LastModified) || fresh.ETag != v.ETag || !r.matchesVersion(&fresh) {
+			return errSkip // changed since the walk; the next pass decides
+		}
+		if Protected(fresh, p.now) {
+			protected = &fresh
+			return errSkip
+		}
+		return nil
+	}
+	_, err := p.cd.DeleteObjectIf(ctx, p.bucket.Name, v.Key, v.VersionID, check)
 	switch {
+	case err == nil:
+	case errors.Is(err, errSkip):
+		if protected != nil {
+			p.protected(protected, r)
+		}
+		return versionKept
 	case errors.Is(err, storage.ErrVersionNotFound), errors.Is(err, storage.ErrObjectNotFound):
 		return versionGone
-	case err != nil:
-		if !errors.Is(err, storage.ErrBucketNotFound) {
-			p.fail("read version", v, err)
-		}
+	case errors.Is(err, storage.ErrBucketNotFound):
 		return versionKept
-	}
-	if fresh.IsLatest != latest || v.IsLatest != latest || fresh.DeleteMarker != v.DeleteMarker || !fresh.LastModified.Equal(v.LastModified) {
-		return versionKept // changed since the walk; the next pass decides
-	}
-	if Protected(fresh, p.now) {
-		p.protected(&fresh, r)
-		return versionKept
-	}
-	if _, err := b.DeleteObject(ctx, p.bucket.Name, v.Key, v.VersionID); err != nil {
-		if errors.Is(err, storage.ErrVersionNotFound) || errors.Is(err, storage.ErrObjectNotFound) {
-			return versionGone
-		}
-		if !errors.Is(err, storage.ErrBucketNotFound) {
-			p.fail("delete version", v, err)
-		}
+	default:
+		p.fail("delete version", v, err)
 		return versionKept
 	}
 	p.w.log.Info("lifecycle: "+msg, "bucket", p.bucket.Name, "key", v.Key, "versionId", v.VersionID,
@@ -748,38 +824,58 @@ func (p *pass) onlyVersion(ctx context.Context, dm *storage.ObjectInfo) bool {
 }
 
 // abortUploads aborts the bucket's expired incomplete multipart uploads.
+// Uploads are walked in batches of walkBatch (never all at once: a bucket
+// may hold any number of pending uploads), each batch processed after its
+// walk returned.
 func (p *pass) abortUploads(ctx context.Context) error {
 	b := p.w.backend
-	uploads, err := b.ListMultipartUploads(ctx, p.bucket.Name)
-	if err != nil {
-		if errors.Is(err, storage.ErrBucketNotFound) {
+	var after storage.UploadPosition
+	for {
+		batch := make([]storage.UploadInfo, 0, 64)
+		err := storage.WalkMultipartUploads(ctx, b, p.bucket.Name, p.uploadPrefix, after, func(u storage.UploadInfo) error {
+			batch = append(batch, u)
+			if len(batch) >= walkBatch {
+				return storage.ErrStopWalk
+			}
+			return nil
+		})
+		if err != nil {
+			if errors.Is(err, storage.ErrBucketNotFound) {
+				return nil
+			}
+			return fmt.Errorf("list multipart uploads: %w", err)
+		}
+		for i := range batch {
+			if err := ctx.Err(); err != nil {
+				return err
+			}
+			p.abortUpload(ctx, &batch[i])
+		}
+		if len(batch) < walkBatch {
 			return nil
 		}
-		return fmt.Errorf("list multipart uploads: %w", err)
+		after = storage.PositionOf(batch[len(batch)-1])
 	}
-	for i := range uploads {
-		if err := ctx.Err(); err != nil {
-			return err
-		}
-		u := &uploads[i]
-		r := p.abortRule(u)
-		if r == nil {
-			continue
-		}
-		if err := b.AbortMultipartUpload(ctx, p.bucket.Name, u.Key, u.UploadID); err != nil {
-			if errors.Is(err, storage.ErrUploadNotFound) || errors.Is(err, storage.ErrBucketNotFound) {
-				continue // completed or aborted concurrently
-			}
-			p.st.Errors++
-			p.w.log.Warn("lifecycle: abort multipart upload failed", "bucket", p.bucket.Name, "key", u.Key,
-				"uploadId", u.UploadID, "error", err)
-			continue
-		}
-		p.st.UploadsAborted++
-		p.w.log.Info("lifecycle: incomplete multipart upload aborted", "bucket", p.bucket.Name, "key", u.Key,
-			"uploadId", u.UploadID, "initiated", u.Initiated, "rule", r.ID)
+}
+
+// abortUpload aborts u if a rule says it has expired.
+func (p *pass) abortUpload(ctx context.Context, u *storage.UploadInfo) {
+	r := p.abortRule(u)
+	if r == nil {
+		return
 	}
-	return nil
+	if err := p.w.backend.AbortMultipartUpload(ctx, p.bucket.Name, u.Key, u.UploadID); err != nil {
+		if errors.Is(err, storage.ErrUploadNotFound) || errors.Is(err, storage.ErrBucketNotFound) {
+			return // completed or aborted concurrently
+		}
+		p.st.Errors++
+		p.w.log.Warn("lifecycle: abort multipart upload failed", "bucket", p.bucket.Name, "key", u.Key,
+			"uploadId", u.UploadID, "error", err)
+		return
+	}
+	p.st.UploadsAborted++
+	p.w.log.Info("lifecycle: incomplete multipart upload aborted", "bucket", p.bucket.Name, "key", u.Key,
+		"uploadId", u.UploadID, "initiated", u.Initiated, "rule", r.ID)
 }
 
 // fail records a failed action on o.

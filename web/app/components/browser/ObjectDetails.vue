@@ -260,6 +260,15 @@ function onVersionsChanged(info: { deletedVersionId?: string }) {
                 </dd>
               </template>
             </dl>
+            <UAlert
+              v-if="head.headersHidden"
+              class="mt-4"
+              color="neutral"
+              variant="subtle"
+              icon="i-lucide-eye-off"
+              title="Some headers are hidden"
+              description="The server's CORS configuration does not expose every response header to this page: user metadata, Content-Disposition and Content-Encoding may be missing here."
+            />
             <div v-if="metaEntries.length" class="mt-5">
               <h3 class="mb-2 text-sm font-medium text-highlighted">
                 User metadata

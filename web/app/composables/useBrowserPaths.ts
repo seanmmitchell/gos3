@@ -248,10 +248,14 @@ export function filterBrowserEntries(entries: BrowserEntry[], query: string): Br
 // Keys for new objects
 // ---------------------------------------------------------------------------
 
-/** Normalises a relative upload path ('./a\\b.txt' → 'a/b.txt'). */
+/**
+ * Normalises a relative upload path ('./a//b.txt' → 'a/b.txt'). Backslashes
+ * are kept: they are legal in file names on Linux and macOS, and browsers
+ * already give relative paths (webkitRelativePath, dropped folders) with '/'
+ * separators, also on Windows.
+ */
 export function normalizeRelativePath(p: string): string {
   return p
-    .replace(/\\/g, '/')
     .split('/')
     .filter(s => s !== '' && s !== '.')
     .join('/')
@@ -262,10 +266,13 @@ export function uploadKey(prefix: string, relativePath: string): string {
   return `${prefix}${normalizeRelativePath(relativePath)}`
 }
 
-/** Validates a new folder name (may contain '/' for nested folders). */
+/**
+ * Validates a new folder name (may contain '/' for nested folders). Names
+ * are not trimmed: spaces are part of S3 keys.
+ */
 export function validateFolderName(name: string): string | undefined {
-  const n = name.trim()
-  if (!n) return 'Folder name must not be empty'
+  const n = name
+  if (!n.trim()) return 'Folder name must not be empty'
   const parts = n.replace(/\/+$/, '').split('/')
   if (parts.some(p => p === '')) return 'Folder names must not contain empty segments ("//") or start with "/"'
   if (parts.some(p => p === '.' || p === '..')) return 'Folder names must not contain "." or ".." segments'
@@ -274,7 +281,7 @@ export function validateFolderName(name: string): string | undefined {
 
 /** Folder key for a new folder under prefix ('a/' + 'b' → 'a/b/'). */
 export function folderKey(prefix: string, name: string): string {
-  return `${prefix}${name.trim().replace(/\/+$/, '')}/`
+  return `${prefix}${name.replace(/\/+$/, '')}/`
 }
 
 /**

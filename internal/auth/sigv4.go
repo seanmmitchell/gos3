@@ -549,6 +549,7 @@ func (v *Verifier) authenticateHeader(r *http.Request, authz string, params []qu
 		Region:      cred.region,
 		Service:     cred.service,
 		PayloadMode: mode,
+		SignedAt:    t,
 	}
 	signer := &chunkSigner{key: key, amzDate: amzDateStr, scope: cred.scope(), prevSig: ah.signature}
 	if err := setBody(res, r, kind, mode, signer); err != nil {
@@ -676,6 +677,7 @@ func (v *Verifier) authenticatePresigned(r *http.Request, params []queryParam) (
 		Method:   MethodPresignedV4,
 		Region:   cred.region,
 		Service:  cred.service,
+		SignedAt: t,
 	}
 	if mode != PayloadUnsigned {
 		res.PayloadMode = mode

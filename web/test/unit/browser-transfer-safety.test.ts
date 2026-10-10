@@ -88,8 +88,15 @@ describe('existing destination objects', () => {
     expect(r.existing.sort()).toEqual(['dst/17', 'dst/3'])
     expect(r.complete).toBe(true)
     expect(s.heads).toHaveLength(0)
+    // Listing capped: the keys it did not reach are checked with HeadObject.
     const capped = await findExistingDestinations(s.client, 'b', plan.map(p => ({ ...p, dstKey: `${p.src.key}c` })), { maxListed: 4 })
-    expect(capped.complete).toBe(false)
+    expect(capped).toEqual({ existing: [], complete: true })
+    expect(s.heads.length).toBeGreaterThan(0)
+    s.client.headObject = async () => {
+      throw Object.assign(new Error('Forbidden'), { status: 403 })
+    }
+    const denied = await findExistingDestinations(s.client, 'b', plan.map(p => ({ ...p, dstKey: `${p.src.key}c` })), { maxListed: 4 })
+    expect(denied.complete).toBe(false)
   })
 
   it('does not report unknown objects when HeadObject is not allowed', async () => {

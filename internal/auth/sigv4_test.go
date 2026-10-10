@@ -811,6 +811,8 @@ func TestCanonicalHeaderValue(t *testing.T) {
 		"\ta  b\t":    "a b",
 		"":            "",
 		"x    y    z": "x y z",
+		"a\u00a0":     "a\u00a0",
+		"\u0085a ":    "\u0085a",
 	}
 	for in, want := range tests {
 		if got := canonicalHeaderValue(in); got != want {

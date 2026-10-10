@@ -42,7 +42,7 @@ const (
 
 // parseDirective validates a COPY|REPLACE directive header (default COPY).
 func parseDirective(h http.Header, name string) (string, error) {
-	v := strings.TrimSpace(h.Get(name))
+	v := trimHeaderSpace(h.Get(name))
 	switch strings.ToUpper(v) {
 	case "", directiveCopy:
 		return directiveCopy, nil

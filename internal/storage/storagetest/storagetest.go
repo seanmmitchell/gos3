@@ -50,6 +50,7 @@ func groups() []group {
 		{"List", listTests()},
 		{"Multipart", multipartTests()},
 		{"Concurrency", concurrencyTests()},
+		{"Optional", optionalTests()},
 	}
 }
 

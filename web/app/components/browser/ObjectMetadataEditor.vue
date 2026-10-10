@@ -5,10 +5,14 @@
  * object is copied onto itself with metadata directive REPLACE (in versioned
  * buckets this creates a new version). CopyObject does not copy the ACL, so
  * a canned ACL (e.g. public-read) is read first and passed on.
+ *
+ * REPLACE drops everything that is not sent again, so editing is refused
+ * when the HeadObject response did not show every header (cross-origin, the
+ * server's CORS rule hid user metadata, Content-Disposition …).
  */
 import type { HeadResult } from '~/types/s3'
 import type { KeyValuePair } from '~/types/ui'
-import type { S3Client } from '~/utils/s3/client'
+import { contentDispositionHeader, type S3Client } from '~/utils/s3/client'
 
 const props = defineProps<{
   client: S3Client | undefined
@@ -58,8 +62,21 @@ function validateMetaKey(k: string): string | undefined {
 
 const tooLargeToCopy = computed(() => props.head.contentLength > 5 * 1024 ** 3)
 
+/** Headers are hidden by CORS: saving would delete what the form cannot show. */
+const headersHidden = computed(() => !!props.head.headersHidden)
+
+/** Content-Disposition that cannot be sent (non-ASCII outside the filename). */
+const dispositionError = computed<string | undefined>(() => {
+  try {
+    contentDispositionHeader(contentDisposition.value.trim())
+    return undefined
+  } catch (e) {
+    return e instanceof Error ? e.message : 'Invalid Content-Disposition'
+  }
+})
+
 async function save() {
-  if (!props.client || !metaValid.value || !dirty.value) return
+  if (!props.client || !metaValid.value || !dirty.value || headersHidden.value || dispositionError.value) return
   busy.value = true
   error.value = null
   const h = props.head
@@ -109,6 +126,14 @@ async function save() {
       icon="i-lucide-triangle-alert"
       title="Objects larger than 5 GiB cannot be copied, so their metadata cannot be edited."
     />
+    <UAlert
+      v-if="headersHidden && !readOnly"
+      color="warning"
+      variant="subtle"
+      icon="i-lucide-eye-off"
+      title="Metadata cannot be edited here"
+      description="The server's CORS configuration hides some response headers from this page (user metadata, Content-Disposition, Content-Encoding …), so the values below may be incomplete and saving would delete the hidden ones. Use the UI embedded in gos3 or another S3 client; on gos3, buckets without their own CORS rules expose every header."
+    />
     <div class="grid gap-3">
       <UFormField label="Content-Type">
         <UInput v-model="contentType" class="w-full font-mono" placeholder="application/octet-stream" :readonly="readOnly" autocomplete="off" />
@@ -116,7 +141,7 @@ async function save() {
       <UFormField label="Cache-Control">
         <UInput v-model="cacheControl" class="w-full font-mono" placeholder="max-age=3600" :readonly="readOnly" autocomplete="off" />
       </UFormField>
-      <UFormField label="Content-Disposition">
+      <UFormField label="Content-Disposition" :error="dispositionError">
         <UInput v-model="contentDisposition" class="w-full font-mono" placeholder="inline" :readonly="readOnly" autocomplete="off" />
       </UFormField>
     </div>
@@ -147,7 +172,7 @@ async function save() {
         Saving creates a new version of the object.
       </p>
       <UButton color="neutral" variant="ghost" label="Reset" :disabled="!dirty || busy" @click="reset" />
-      <UButton type="submit" label="Save metadata" icon="i-lucide-save" :loading="busy" :disabled="!dirty || !metaValid || metaSize > TOO_BIG || tooLargeToCopy" />
+      <UButton type="submit" label="Save metadata" icon="i-lucide-save" :loading="busy" :disabled="!dirty || !metaValid || metaSize > TOO_BIG || tooLargeToCopy || headersHidden || !!dispositionError" />
     </div>
   </form>
 </template>

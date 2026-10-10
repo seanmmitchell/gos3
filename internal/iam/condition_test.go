@@ -79,6 +79,8 @@ func TestConditionOperators(t *testing.T) {
 		{"DateGreaterThanEquals future", "DateGreaterThanEquals", "aws:CurrentTime", []string{"2026-03-01T12:00:01Z"}, nil, false},
 		{"Date explicit ctx", "DateLessThan", "aws:CurrentTime", []string{"2020-01-01"}, kv("aws:CurrentTime", "2019-12-31T23:59:59Z"), true},
 		{"Date invalid ctx", "DateLessThan", "s3:x", []string{"2020-01-01"}, kv("s3:x", "never"), false},
+		{"Date compact ctx", "DateGreaterThan", "s3:x", []string{"2030-01-01T00:00:00Z"}, kv("s3:x", "20990101T000000Z"), true},
+		{"Date fraction offset ctx", "DateGreaterThan", "s3:x", []string{"2030-01-01T00:00:00Z"}, kv("s3:x", "2099-01-01T00:00:00.000+0000"), true},
 
 		// Bool
 		{"Bool true", "Bool", "aws:SecureTransport", []string{"true"}, kv("aws:SecureTransport", "true"), true},

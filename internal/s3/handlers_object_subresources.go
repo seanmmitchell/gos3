@@ -212,6 +212,9 @@ func (s *Server) handlePutObjectAcl(w http.ResponseWriter, r *http.Request, rc *
 		if acl, err = cannedFromGrants(&p, owner.ID, ownerFor(rc.userName()).ID); err != nil {
 			return err
 		}
+		if err := s.authorizeOpWith(ctx, r, rc, aclBodyConditions(acl, &p)); err != nil {
+			return err
+		}
 	}
 	if err := s.checkObjectACLAllowed(ctx, rc.bucket, acl); err != nil {
 		return err
@@ -225,6 +228,29 @@ func (s *Server) handlePutObjectAcl(w http.ResponseWriter, r *http.Request, rc *
 	setVersionHeader(w, bi.Versioning != storage.VersioningUnversioned, info.VersionID)
 	writeEmpty(w, http.StatusOK)
 	return nil
+}
+
+// aclBodyConditions returns the condition keys of an AccessControlPolicy
+// body (PutObjectAcl, PutBucketAcl), which the core authorized without
+// them: s3:x-amz-acl is the canned ACL the grants map to (canned, ""
+// meaning private) and s3:x-amz-grant-<permission> lists the grantees in
+// the header form ("id=..." or "uri=..."). AWS sets neither for a body;
+// gos3 does so that policies denying public ACLs cover both forms.
+func aclBodyConditions(canned string, p *AccessControlPolicy) map[string][]string {
+	if canned == "" {
+		canned = aclPrivate
+	}
+	c := map[string][]string{"s3:x-amz-acl": {canned}}
+	for _, g := range p.Grants {
+		key := "s3:x-amz-grant-" + strings.ReplaceAll(strings.ToLower(strings.TrimSpace(g.Permission)), "_", "-")
+		switch {
+		case strings.TrimSpace(g.Grantee.URI) != "":
+			c[key] = append(c[key], "uri="+strings.TrimSpace(g.Grantee.URI))
+		case strings.TrimSpace(g.Grantee.ID) != "":
+			c[key] = append(c[key], "id="+strings.TrimSpace(g.Grantee.ID))
+		}
+	}
+	return c
 }
 
 // cannedFromGrants maps the grants of an AccessControlPolicy to the

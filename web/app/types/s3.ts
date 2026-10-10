@@ -138,6 +138,12 @@ export interface HeadResult {
   replicationStatus?: string
   restore?: string
   websiteRedirectLocation?: string
+  /**
+   * The response was read cross-origin and the server's CORS rule did not
+   * expose every header: user metadata, Content-Disposition,
+   * Content-Encoding … may exist although they are missing here.
+   */
+  headersHidden?: boolean
   /** All response headers (lower-case names). */
   headers: Record<string, string>
 }

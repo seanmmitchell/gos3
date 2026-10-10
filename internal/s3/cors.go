@@ -283,7 +283,8 @@ func corsSignedOnly(cfg *CORSConfiguration, rule *CORSRule, origin string) bool 
 // requestCarriesSigV4 reports whether r carries SigV4 authentication: an
 // Authorization header or presigned query parameters. Authentication
 // either verifies such a request or rejects it, so it is never served
-// anonymously.
+// anonymously; that does not hold for operations the core does not
+// authenticate (PostObject, see actualRequestSigned).
 func requestCarriesSigV4(r *http.Request, q url.Values) bool {
 	return r.Header.Get("Authorization") != "" ||
 		q.Has("X-Amz-Credential") || q.Has("X-Amz-Signature") || q.Has("X-Amz-Algorithm")
@@ -366,7 +367,7 @@ func (s *Server) applyCORSHeaders(w http.ResponseWriter, r *http.Request, rc *re
 	h := w.Header()
 	h.Add("Vary", "Origin")
 	rule := cfg.match(origin, r.Method, nil)
-	if rule == nil || (corsSignedOnly(cfg, rule, origin) && !requestCarriesSigV4(r, rc.query)) {
+	if rule == nil || (corsSignedOnly(cfg, rule, origin) && !actualRequestSigned(r, rc)) {
 		return
 	}
 	setCORSOrigin(h, rule, origin)
@@ -377,6 +378,15 @@ func (s *Server) applyCORSHeaders(w http.ResponseWriter, r *http.Request, rc *re
 	if rule.MaxAgeSeconds != nil {
 		h.Set("Access-Control-Max-Age", strconv.Itoa(*rule.MaxAgeSeconds))
 	}
+}
+
+// actualRequestSigned reports whether an actual (routed) request will be
+// served only once its SigV4 authentication has been verified. PostObject
+// (NoAuth) never is: it authenticates from its form fields and serves forms
+// without a policy signature anonymously, whatever Authorization header or
+// X-Amz-* query parameters come with them.
+func actualRequestSigned(r *http.Request, rc *reqContext) bool {
+	return rc.op != nil && !rc.op.NoAuth && requestCarriesSigV4(r, rc.query)
 }
 
 // setCORSOrigin sets Access-Control-Allow-Origin ("*" for wildcard rules,

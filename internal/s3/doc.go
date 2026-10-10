@@ -79,6 +79,8 @@ package s3
 //
 //	validBucketName / validateBucketName, validateObjectKey,
 //	normalizeStorageClass, storageClassOrStandard, validateCannedACL(v, bucket),
+//	trimHeaderSpace (the only trimming of header values that become object
+//	attributes and condition keys),
 //	parseMaxKeys(q, name, def, limit), parsePartNumber, and the limits
 //	maxKeyLength, maxUserMetaSize, maxListKeys, maxDeleteObjects,
 //	min/maxPartNumber, minPartSize.

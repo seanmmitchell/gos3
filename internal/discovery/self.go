@@ -54,16 +54,14 @@ func SelfAdvertisedURLs(listenAddr, publicURL string, tls bool) []string {
 	if tls {
 		scheme = "https"
 	}
-	host = strings.TrimSuffix(host, ".")
-	if !isWildcardHost(host) {
-		if !validHost(host) {
+	if host != "" {
+		h, ok := canonicalHost(host)
+		if !ok {
 			return out
 		}
-		if ip, err := netip.ParseAddr(host); err == nil {
-			host = ip.Unmap().String()
-		} else {
-			host = strings.ToLower(host)
-		}
+		host = h
+	}
+	if !isWildcardHost(host) {
 		add(baseURL(scheme, host, port))
 		return out
 	}

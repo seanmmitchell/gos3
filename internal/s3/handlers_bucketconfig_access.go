@@ -88,6 +88,9 @@ func (s *Server) handlePutBucketAcl(w http.ResponseWriter, r *http.Request, rc *
 		if canned, err = bucketCannedFromGrants(&p, ownerFor(bi.Owner).ID, ownerFor(rc.userName()).ID); err != nil {
 			return err
 		}
+		if err := s.authorizeOpWith(ctx, r, rc, aclBodyConditions(canned, &p)); err != nil {
+			return err
+		}
 	}
 
 	unlock := lockBucketState(rc.bucket)

@@ -115,14 +115,11 @@ func parseScanTarget(raw string) (scanTarget, error) {
 		}
 		host, port = h, n
 	}
-	host = strings.TrimSuffix(host, ".")
-	if ip, err := netip.ParseAddr(host); err == nil {
-		return scanTarget{host: ip.Unmap().String(), port: port}, nil
-	}
-	if !validHostname(host) {
+	host, ok := canonicalHost(host)
+	if !ok {
 		return scanTarget{}, fmt.Errorf("%w: target %q is not a host name, IP, CIDR or URL", ErrInvalidScan, clip(s, 64))
 	}
-	return scanTarget{host: strings.ToLower(host), port: port}, nil
+	return scanTarget{host: host, port: port}, nil
 }
 
 // scanPlan is a validated ScanRequest.

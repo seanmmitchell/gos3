@@ -36,6 +36,11 @@ type clockBackend struct {
 	afterWalkOnce sync.Once
 	// walks counts WalkObjects/WalkVersions calls.
 	walks atomic.Int64
+	// beforeDelete, when set, runs at the start of every DeleteObject and
+	// DeleteObjectIf call (before the conditional check), simulating a
+	// client request that commits between the worker's decision and its
+	// delete.
+	beforeDelete func(bucket, key, versionID string)
 }
 
 func (c *clockBackend) hook() {
@@ -104,12 +109,39 @@ func (c *clockBackend) DeleteObject(ctx context.Context, bucket, key, versionID 
 	if c.failDelete != "" && strings.HasPrefix(key, c.failDelete) {
 		return storage.DeleteResult{}, errors.New("injected delete failure")
 	}
+	if c.beforeDelete != nil {
+		c.beforeDelete(bucket, key, versionID)
+	}
 	res, err := c.Backend.DeleteObject(ctx, bucket, key, versionID)
+	c.stampMarker(bucket, key, versionID, res, err)
+	return res, err
+}
+
+// DeleteObjectIf passes the wrapped backend's version info to check with
+// the test-controlled LastModified times.
+func (c *clockBackend) DeleteObjectIf(ctx context.Context, bucket, key, versionID string, check func(storage.ObjectInfo) error) (storage.DeleteResult, error) {
+	if c.failDelete != "" && strings.HasPrefix(key, c.failDelete) {
+		return storage.DeleteResult{}, errors.New("injected delete failure")
+	}
+	if c.beforeDelete != nil {
+		c.beforeDelete(bucket, key, versionID)
+	}
+	cd := c.Backend.(storage.ConditionalDeleter)
+	res, err := cd.DeleteObjectIf(ctx, bucket, key, versionID, func(o storage.ObjectInfo) error { return check(c.fix(o)) })
+	c.stampMarker(bucket, key, versionID, res, err)
+	return res, err
+}
+
+// stampMarker stamps a delete marker created by the worker with the fake
+// clock.
+func (c *clockBackend) stampMarker(bucket, key, versionID string, res storage.DeleteResult, err error) {
 	if err == nil && versionID == "" && res.DeleteMarker && c.now != nil {
 		c.setTime(bucket, key, res.VersionID, c.now())
 	}
-	return res, err
 }
+
+// plainBackend hides the optional extensions of the wrapped backend.
+type plainBackend struct{ storage.Backend }
 
 // env is a test fixture: a clock backend, a fake clock and a Worker.
 type env struct {

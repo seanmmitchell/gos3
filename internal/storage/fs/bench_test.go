@@ -5,6 +5,9 @@ import (
 	"fmt"
 	"sync/atomic"
 	"testing"
+	"time"
+
+	"go.etcd.io/bbolt"
 
 	"github.com/seanmmitchell/gos3/internal/storage"
 )
@@ -91,4 +94,53 @@ func BenchmarkListObjects(b *testing.B) {
 			}
 		}
 	})
+}
+
+// BenchmarkListUploadsPage measures one ListMultipartUploads page
+// (max-uploads 1) against a bucket with many pending uploads: it must cost
+// a page, not the whole bucket (compare BenchmarkListAllUploads).
+func BenchmarkListUploadsPage(b *testing.B) {
+	be := benchUploads(b, 20000)
+	b.ResetTimer()
+	for b.Loop() {
+		r, err := storage.ListUploads(ctx, be, "bkt", storage.UploadListParams{MaxUploads: 1, KeyMarker: "k/10000"})
+		if err != nil || len(r.Uploads) != 1 {
+			b.Fatal(r, err)
+		}
+	}
+}
+
+func BenchmarkListAllUploads(b *testing.B) {
+	be := benchUploads(b, 20000)
+	b.ResetTimer()
+	for b.Loop() {
+		if _, err := be.ListMultipartUploads(ctx, "bkt"); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+func benchUploads(b *testing.B, n int) *Backend {
+	be := openTest(b, "")
+	mkBucket(b, be, "bkt", "")
+	if err := be.db.Update(func(tx *bbolt.Tx) error {
+		_, bb, err := loadBucket(tx, "bkt")
+		if err != nil {
+			return err
+		}
+		for i := range n {
+			rec := uploadRecord{Key: fmt.Sprintf("k/%05d", i), Initiated: time.Now().UTC()}
+			id := newUploadID()
+			if err := putRecord(bb.Bucket(subUploads), []byte(id), &rec); err != nil {
+				return err
+			}
+			if err := putUploadIndex(bb, id, &rec); err != nil {
+				return err
+			}
+		}
+		return nil
+	}); err != nil {
+		b.Fatal(err)
+	}
+	return be
 }

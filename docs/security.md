@@ -90,6 +90,18 @@ nor plant tags that `s3:ExistingObjectTag` conditions rely on. The
 evaluated for these uploads, for PutObjectTagging (from the XML body) and for
 PostObject (from the `tagging` field).
 
+Bucket policies see exactly the attribute values that get stored. The values
+of `x-amz-acl`, `x-amz-storage-class`, `x-amz-server-side-encryption(-aws-kms-key-id)`,
+`x-amz-object-lock-*` and the copy directives are trimmed of spaces and tabs
+only; a value padded with other whitespace (for example U+00A0) is rejected
+(`400 InvalidArgument` or `InvalidStorageClass`) instead of being normalised
+after authorization, where it could slip past a `StringEquals` condition.
+SigV4 canonical header values are likewise trimmed of spaces and tabs only,
+so other whitespace appended to a signed header breaks the signature. Query
+strings are decoded exactly as the signature covers them (`;` and invalid
+`%`-escapes stay literal), so a presigned parameter cannot be rewritten into
+one the server ignores.
+
 ## Data at rest
 
 The data directory (default `./data`, `/data` in the container) holds:
@@ -181,6 +193,10 @@ already has a secret key. Under the global `*` rule:
 - Preflights are approved only when `Access-Control-Request-Headers`
   includes `authorization` or the URL is presigned; otherwise the answer is
   `403 AccessForbidden`.
+- Browser POST-policy uploads (PostObject) never count as signed, even when
+  they come with an `Authorization` header or `X-Amz-*` query parameters:
+  PostObject authenticates from its form fields and accepts forms without a
+  policy signature anonymously.
 
 Websites therefore cannot use a visitor's browser to read or write
 anonymously accessible data, such as buckets restricted by `aws:SourceIp`

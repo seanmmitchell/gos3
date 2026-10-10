@@ -309,7 +309,33 @@ func (b *Backend) DeleteObject(ctx context.Context, bucketName, key, versionID s
 		return storage.DeleteResult{}, err
 	}
 	defer bk.mu.Unlock()
+	return b.deleteLocked(bk, key, versionID)
+}
 
+// DeleteObjectIf is DeleteObject made conditional on check, which is called
+// with the addressed version under the bucket's write lock (see
+// storage.ConditionalDeleter).
+func (b *Backend) DeleteObjectIf(ctx context.Context, bucketName, key, versionID string, check func(storage.ObjectInfo) error) (storage.DeleteResult, error) {
+	if check == nil {
+		return storage.DeleteResult{}, errors.New("memory: nil delete check")
+	}
+	bk, err := b.lockBucket(ctx, bucketName)
+	if err != nil {
+		return storage.DeleteResult{}, err
+	}
+	defer bk.mu.Unlock()
+	obj, i, err := findVersion(bk, key, versionID)
+	if err != nil {
+		return storage.DeleteResult{}, err
+	}
+	if err := check(obj.versions[i].info(bk.info.Name, key, i == len(obj.versions)-1)); err != nil {
+		return storage.DeleteResult{}, err
+	}
+	return b.deleteLocked(bk, key, versionID)
+}
+
+// deleteLocked implements DeleteObject with the bucket's write lock held.
+func (b *Backend) deleteLocked(bk *bucket, key, versionID string) (storage.DeleteResult, error) {
 	if versionID != "" {
 		obj, i, err := findVersion(bk, key, versionID)
 		if err != nil {

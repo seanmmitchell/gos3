@@ -76,6 +76,7 @@ type Listener = (item: UploadItem) => void
 
 interface Runtime {
   client: Uploader
+  /** Controller of the current attempt (identifies it: see start()). */
   controller?: AbortController
   lastSampleAt?: number
   lastSampleLoaded?: number
@@ -270,12 +271,16 @@ export class UploadQueue {
       }
     }
     const opts = { contentType: item.contentType, onProgress, signal: controller.signal }
+    // A canceled attempt can settle after a retry started the next one (a
+    // multipart upload is aborted server-side first): it must then leave the
+    // item and the runtime to the new attempt.
+    const current = () => rt.controller === controller
 
     try {
       const res = item.multipart
         ? await rt.client.uploadLarge(item.bucket, item.key, item.file, opts)
         : await rt.client.putObject(item.bucket, item.key, item.file, opts)
-      if (controller.signal.aborted) return
+      if (controller.signal.aborted || !current()) return
       const t = this.now()
       item.status = 'done'
       item.loaded = item.size
@@ -285,6 +290,7 @@ export class UploadQueue {
       item.speed = secs > 0 ? item.size / secs : 0
       this.emit(item)
     } catch (e) {
+      if (!current()) return
       if (controller.signal.aborted || isAbortedError(e)) {
         if (item.status === 'uploading') {
           item.status = 'canceled'
@@ -301,7 +307,7 @@ export class UploadQueue {
       item.finishedAt = this.now()
       this.emit(item)
     } finally {
-      rt.controller = undefined
+      if (current()) rt.controller = undefined
       this.pump()
     }
   }

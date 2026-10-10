@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"net/url"
 	"runtime/debug"
+	"slices"
 	"strings"
 
 	"github.com/seanmmitchell/gos3/internal/auth"
@@ -132,8 +133,16 @@ func clientAborted(r *http.Request, rc *reqContext) bool {
 func (s *Server) serve(w *responseWriter, r *http.Request, rc *reqContext) {
 	settings := s.settings.Get()
 	rc.accessLogInfo = settings.Logging.AccessLog
-	rc.query = r.URL.Query()
 	rc.sourceIP, rc.secure = s.clientInfo(r)
+	// The query as the signature verifier decodes it (not r.URL.Query(),
+	// which drops pairs containing ';' or an invalid escape that a
+	// signature still covers).
+	q, err := auth.QueryValues(r)
+	if err != nil {
+		s.writeError(w, r, rc, err)
+		return
+	}
+	rc.query = q
 
 	t, err := parseTarget(r, settings.Domains)
 	if err != nil {
@@ -248,10 +257,12 @@ var presignedQueryNonHeaders = map[string]bool{
 // string, where the signature covers them; S3 treats them as the
 // corresponding headers. Parameters whose header is also sent are
 // skipped (the header wins), as are the authentication parameters and
-// x-amz-checksum-* / x-amz-sdk-checksum-algorithm: presigners compute
-// those over an empty body when the URL is created, so honouring them
-// would fail every upload through such a URL. Nil for other requests;
-// InvalidArgument for a value that is not a valid header value.
+// the checksum values (x-amz-checksum-crc32, -sha256, ...) with
+// x-amz-sdk-checksum-algorithm: presigners compute those over an empty
+// body when the URL is created, so honouring them would fail every upload
+// through such a URL. The checksum settings x-amz-checksum-algorithm,
+// -type and -mode are hoisted. Nil for other requests; InvalidArgument for
+// a value that is not a valid header value.
 func presignedQueryHeaders(r *http.Request, q url.Values) (http.Header, error) {
 	if !q.Has("X-Amz-Signature") && !q.Has("X-Amz-Credential") && !q.Has("X-Amz-Algorithm") {
 		return nil, nil
@@ -260,8 +271,7 @@ func presignedQueryHeaders(r *http.Request, q url.Values) (http.Header, error) {
 	for k, vs := range q {
 		lk := strings.ToLower(k)
 		if !strings.HasPrefix(lk, "x-amz-") || presignedQueryNonHeaders[lk] ||
-			strings.HasPrefix(lk, "x-amz-checksum-") || lk == "x-amz-sdk-checksum-algorithm" ||
-			len(r.Header.Values(k)) > 0 {
+			presignedChecksumValue(lk) || len(r.Header.Values(k)) > 0 {
 			continue
 		}
 		if out == nil {
@@ -275,6 +285,18 @@ func presignedQueryHeaders(r *http.Request, q url.Values) (http.Header, error) {
 		}
 	}
 	return out, nil
+}
+
+// presignedChecksumValue reports whether the lower-cased query parameter
+// lk is a checksum value a presigner computed over an empty body
+// (x-amz-checksum-<algorithm>) or the SDK's announcement of one
+// (x-amz-sdk-checksum-algorithm).
+func presignedChecksumValue(lk string) bool {
+	if lk == "x-amz-sdk-checksum-algorithm" {
+		return true
+	}
+	alg, ok := strings.CutPrefix(lk, "x-amz-checksum-")
+	return ok && slices.ContainsFunc(checksumAlgorithms, func(a string) bool { return strings.EqualFold(a, alg) })
 }
 
 // mergeHeaders adds the values of src to dst.

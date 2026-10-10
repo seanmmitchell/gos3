@@ -16,7 +16,7 @@ supported, operation by operation, and where gos3 differs from AWS.
 | Virtual-hosted-style URLs (`bucket.s3.example.com`) | ✅ | Needs `server.domains` and wildcard DNS (and a wildcard certificate for TLS). The longest matching domain wins; the port is ignored. |
 | Signature Version 4, `Authorization` header | ✅ | Payload as hex SHA-256 or `UNSIGNED-PAYLOAD`. Allowed clock skew is 15 minutes. Signature comparison is constant-time. `SignedHeaders` listing a header twice is rejected (`AuthorizationHeaderMalformed`, or `AuthorizationQueryParametersError` for presigned URLs). `SignatureDoesNotMatch` echoes at most 16 KiB of `StringToSign` and `CanonicalRequest`. A signed `Expect: 100-continue` header also verifies over HTTP/2 (Go's HTTP/2 server removes that header before gos3 sees it). |
 | SigV4 streaming (`aws-chunked`) | ✅ | `STREAMING-AWS4-HMAC-SHA256-PAYLOAD`, `…-PAYLOAD-TRAILER` and `STREAMING-UNSIGNED-PAYLOAD-TRAILER` (the default of current AWS SDKs). Trailing checksums are verified. AWS's 8 KiB minimum chunk size is not enforced. |
-| Presigned URLs (SigV4 query) | ✅ | `X-Amz-Expires` up to 7 days. Other `x-amz-*` query parameters are covered by the signature and treated as the corresponding request headers, as the AWS SDK for JavaScript v3 presigner produces them (for example `x-amz-copy-source`, `x-amz-meta-*`, `x-amz-tagging`, `x-amz-acl`, `x-amz-storage-class` and `x-amz-object-lock-*`); a header actually sent takes precedence. Unlike AWS, `x-amz-checksum-*` and `x-amz-sdk-checksum-algorithm` query parameters are ignored, because presigners compute them over an empty body when the URL is created. Parameter values containing control characters get `400 InvalidArgument`. |
+| Presigned URLs (SigV4 query) | ✅ | `X-Amz-Expires` up to 7 days. Other `x-amz-*` query parameters are covered by the signature and treated as the corresponding request headers, as the AWS SDK for JavaScript v3 presigner produces them (for example `x-amz-copy-source`, `x-amz-meta-*`, `x-amz-tagging`, `x-amz-acl`, `x-amz-storage-class` and `x-amz-object-lock-*`); a header actually sent takes precedence. Unlike AWS, the checksum value parameters (`x-amz-checksum-crc32`, `-crc32c`, `-crc64nvme`, `-sha1`, `-sha256`) and `x-amz-sdk-checksum-algorithm` are ignored, because presigners compute them over an empty body when the URL is created; `x-amz-checksum-algorithm`, `x-amz-checksum-type` and `x-amz-checksum-mode` are honoured like the other parameters. Parameter values containing control characters get `400 InvalidArgument`. |
 | Browser POST uploads (POST policy) | ✅ | V4 form fields, every policy condition including `content-length-range`, `${filename}`, `success_action_redirect` / `success_action_status`. |
 | Anonymous access | ✅ | Allowed only by a bucket policy with `"Principal": "*"` or by a public canned ACL. |
 | Region in the credential scope | ✅ | Any region is accepted unless `auth.strict_region` is set. Use `us-east-1` (or `server.region`). |
@@ -27,6 +27,10 @@ supported, operation by operation, and where gos3 differs from AWS.
 Every response carries `x-amz-request-id`, `x-amz-id-2`, `Date` and
 `Server: gos3/<version>`. Errors are AWS-style XML (`<Error><Code/>…`), and
 HEAD errors have no body. Unknown query parameters are ignored, as on AWS.
+Query strings are decoded exactly as the SigV4 signature covers them: `;` and
+invalid `%`-escapes are literal characters of a parameter (not dropped, as
+some HTTP libraries do), and a request with more than 1000 query parameters
+gets `400 InvalidArgument`, whether it is signed or not.
 
 ## Service and bucket operations
 
@@ -71,7 +75,7 @@ HEAD errors have no body. Unknown query parameters are ignored, as on AWS.
 | PutObject | ✅ | `Content-MD5`, `x-amz-checksum-*` (header or trailer), user metadata (≤ 2 KiB), `x-amz-tagging`, canned `x-amz-acl`, storage class (recorded only), object lock headers, `x-amz-website-redirect-location`, standard content headers. Conditional writes: `If-None-Match: *` and `If-Match: <etag>`, checked atomically. Size limit `server.max_object_size` (5 GiB). An ACL needs `s3:PutObjectAcl` and tags need `s3:PutObjectTagging` in addition to `s3:PutObject` (see [Authorization](#authorization)). |
 | GetObject | ✅ | `Range` (single range), `partNumber`, conditional headers (`If-Match`, `If-None-Match`, `If-Modified-Since`, `If-Unmodified-Since`, `If-Range` with a strong ETag or the exact `Last-Modified`; a mismatch serves the whole object with 200), `response-*` overrides (signed requests only), `versionId`, `x-amz-checksum-mode: ENABLED`. `partNumber=1` on a single-part object returns 206 with `Content-Range`; an empty part returns an empty 200. Responses carry `X-Content-Type-Options: nosniff` and, except for PDFs, `Content-Security-Policy: sandbox` (see [security.md](security.md#object-responses)). |
 | HeadObject | ✅ | Same as GetObject without a body. |
-| DeleteObject | ✅ | Versioning semantics (delete markers), `x-amz-bypass-governance-retention`, `If-Match`. |
+| DeleteObject | ✅ | Versioning semantics (delete markers), `x-amz-bypass-governance-retention`, `If-Match`. The `If-Match` and object lock checks are atomic with the delete. |
 | DeleteObjects | ✅ | Up to 1000 keys, `Quiet` mode, per-key `ETag` condition, object lock checks. |
 | CopyObject | ✅ | Versioned sources, `x-amz-copy-source-if-*`, `x-amz-metadata-directive` / `x-amz-tagging-directive` (COPY / REPLACE), checksum recomputation. Like UploadPartCopy and CompleteMultipartUpload, a copy that takes longer than about 5 s sends `200` early with whitespace keep-alives and may then report an `<Error>` inside the 200 body, as AWS does; the copy stops when the client disconnects. An ACL or `REPLACE` tags need `s3:PutObjectAcl` / `s3:PutObjectTagging`; copying the tags of a tagged source (`COPY`, the default) needs tagging permissions too (see [Authorization](#authorization)). |
 | GetObjectAttributes | ✅ | ETag, Checksum, ObjectParts (paged), StorageClass, ObjectSize. |
@@ -123,8 +127,9 @@ ListObjectsV2, ListParts and GetObjectAttributes.
   `ForAnyValue:` / `ForAllValues:`.
 - **Bucket policies** are evaluated together with identity policies, and an
   explicit Deny wins (except for root). Supported condition keys include
-  `aws:SourceIp`, `aws:SecureTransport`, `aws:username`, `aws:CurrentTime`,
-  `s3:prefix`, `s3:delimiter`, `s3:max-keys`, `s3:VersionId`,
+  `aws:SourceIp`, `aws:SecureTransport`, `aws:username`, `aws:userid`,
+  `aws:PrincipalType`, `aws:CurrentTime`, `aws:EpochTime`, `aws:UserAgent`,
+  `aws:Referer`, `s3:prefix`, `s3:delimiter`, `s3:max-keys`, `s3:VersionId`,
   `s3:ExistingObjectTag/<key>`, `s3:x-amz-copy-source`,
   `s3:x-amz-metadata-directive`, and the object-attribute keys `s3:x-amz-acl`,
   `s3:x-amz-server-side-encryption`,
@@ -132,11 +137,39 @@ ListObjectsV2, ListParts and GetObjectAttributes.
   `s3:x-amz-website-redirect-location`, `s3:object-lock-mode`,
   `s3:object-lock-retain-until-date`,
   `s3:object-lock-remaining-retention-days`, `s3:object-lock-legal-hold`,
-  `s3:RequestObjectTag/<key>` and `s3:RequestObjectTagKeys`.
+  `s3:RequestObjectTag/<key>` and `s3:RequestObjectTagKeys`. The
+  authentication keys are:
+  - `s3:authType`: `REST-HEADER`, `REST-QUERY-STRING` (presigned URL) or
+    `POST` (browser form upload); absent for anonymous requests.
+  - `s3:signatureversion`: `AWS4-HMAC-SHA256` for every signed request.
+  - `s3:signatureAge`: milliseconds since the request was signed
+    (`X-Amz-Date`, or `Date` when a header-signed request has no
+    `X-Amz-Date`; for PostObject the form's `x-amz-date`), so AWS's "deny
+    presigned URLs older than N ms" policy works.
+  - `s3:x-amz-content-sha256`: the signed payload mode (a hex digest,
+    `UNSIGNED-PAYLOAD` or a `STREAMING-…` value); absent for presigned URLs
+    with an unsigned payload and for anonymous requests.
+  - `s3:TlsVersion`: `1.2` or `1.3`, only when TLS terminates at gos3. Behind
+    a TLS-terminating proxy the key is absent.
+
+  `s3:x-amz-grant-read`, `-write`, `-read-acp`, `-write-acp` and
+  `-full-control` are set only from AccessControlPolicy bodies (see below),
+  since `x-amz-grant-*` headers are not supported. Keys gos3 never sets (for
+  example `aws:SourceVpce`, `aws:SourceVpc`, `aws:PrincipalOrgID`) are
+  absent: positive operators on them evaluate to false, so `Allow`
+  statements using them never grant and `Deny` statements using them never
+  apply (use `…IfExists` or `Null` deliberately).
 - **Where the object-attribute keys come from**, per operation:
   - PutObject, CreateMultipartUpload and CopyObject: the request headers.
   - PostObject: the normalised form fields; the POST's own headers are
     ignored.
+  - PutObjectAcl and PutBucketAcl: the `x-amz-acl` header, or the
+    AccessControlPolicy body. A body is evaluated with `s3:x-amz-acl` set to
+    the equivalent canned ACL (`private` when nothing is granted) and
+    `s3:x-amz-grant-read`, `-write`, `-read-acp`, `-write-acp` and
+    `-full-control` set to its grantees as `id=<canonical id>` or
+    `uri=<group URI>`. AWS sets neither for a body; gos3 does, so that
+    "deny public ACL" policies cover both forms.
   - PutObjectTagging, PutObjectRetention and PutObjectLegalHold: the XML
     body. These operations are authorized after the body is read, so
     `MalformedXML` and invalid dates are reported before `AccessDenied`,
@@ -153,6 +186,10 @@ ListObjectsV2, ListParts and GetObjectAttributes.
   - `s3:object-lock-remaining-retention-days` is the number of days until
     the retain-until date, rounded up. On PutObject, CreateMultipartUpload
     and CopyObject it is not set for bucket default retention.
+  - On the header path, `s3:object-lock-retain-until-date` is reported in
+    RFC 3339 form (`2030-01-02T03:04:05Z`) whichever accepted ISO 8601 form
+    was sent, and `s3:x-amz-metadata-directive` is reported upper-cased
+    (`COPY` or `REPLACE`).
 - Writing an object with an ACL (`x-amz-acl`, or the `acl` form field of
   PostObject) also requires `s3:PutObjectAcl`, and writing it with tags
   (`x-amz-tagging`, CopyObject's `REPLACE` tagging directive, or the
@@ -260,7 +297,21 @@ ListObjectsV2, ListParts and GetObjectAttributes.
   completion, whatever per-part checksums the client sent.
 - XML responses escape quotes in `ETag` elements as `&#34;` rather than
   `&quot;`; both are equivalent XML and every tested client accepts them.
-- Object lock and conditional checks on DeleteObject/DeleteObjects run just
-  before the delete, not atomically with it.
+- Object lock and `If-Match` / `ETag` checks on DeleteObject and
+  DeleteObjects run in the same storage transaction (or under the same lock)
+  as the delete, so a version written or locked concurrently is never
+  removed by a check made against an older one. This relies on the optional
+  `storage.ConditionalDeleter` extension, which both built-in backends
+  implement; a backend without it gets a check made just before the delete.
+- Header values of `x-amz-acl`, `x-amz-storage-class`,
+  `x-amz-server-side-encryption`,
+  `x-amz-server-side-encryption-aws-kms-key-id`, `x-amz-object-lock-*` and
+  the copy directives (`x-amz-metadata-directive`,
+  `x-amz-tagging-directive`) are trimmed of spaces and tabs only. A value
+  padded with other whitespace (for example U+00A0) gets `400
+  InvalidArgument` (or `InvalidStorageClass`) rather than being normalised
+  after authorization, so the value a bucket policy sees is the value that
+  is stored. SigV4 canonical header values are likewise trimmed of spaces
+  and tabs only.
 - The admin API's force delete (`DELETE /_gos3/admin/v1/buckets/{name}?force=true`)
   removes locked object versions too. It requires `admin:ForceDeleteBucket`.

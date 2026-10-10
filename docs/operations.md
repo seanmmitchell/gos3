@@ -179,8 +179,16 @@ The worker applies bucket lifecycle rules (`PutBucketLifecycleConfiguration`):
 - Objects under object lock retention or legal hold are never removed.
 - A key that changes during a pass (for example a delete marker removed
   mid-pass, so the walk reports more than one latest version) is skipped
-  until the next pass. A noncurrent version is deleted only if it is still
-  noncurrent when it is re-checked just before the delete.
+  until the next pass.
+- Every lifecycle delete is conditional and atomic in the storage backend
+  (both built-in backends support this). A version is removed, or hidden
+  behind a delete marker, only if at the moment of deletion it is still the
+  version the pass examined (same version ID, `LastModified`, ETag and
+  current/noncurrent state), still matches the rule (tags, size) and is not
+  under retention or legal hold. Objects written, re-tagged or locked during
+  a pass are therefore never removed or hidden by it.
+- The abort pass handles multipart uploads in batches, so buckets with very
+  many pending uploads are never loaded into memory at once.
 
 Expiration times follow AWS: an object becomes eligible at the next 00:00 UTC
 after `LastModified + Days`. A pass starts at startup and then repeats

@@ -103,3 +103,45 @@ test.describe('object browser (cross-origin)', () => {
     expect(await alphaApi.getText(bucket, 'reports/q3.txt')).toBe('Quarterly numbers\n')
   })
 })
+
+test.describe('metadata hidden by a bucket CORS rule', () => {
+  // A bucket rule replaces the server's default rule (which exposes every
+  // header): with ExposeHeader ETag only, x-amz-meta-* and
+  // Content-Disposition are invisible cross-origin, and a REPLACE copy
+  // would delete them.
+  const bucket = uniqueName('sa-cors')
+  let page: Page
+  let connId = ''
+
+  test.beforeAll(async ({ browser, ui, alpha, alphaApi }) => {
+    await alphaApi.createBucket(bucket)
+    await alphaApi.putObject(bucket, 'm.txt', 'metadata', {
+      'content-type': 'text/plain',
+      'cache-control': 'max-age=60',
+      'content-disposition': 'attachment; filename="report.txt"',
+      'x-amz-meta-owner': 'alice'
+    })
+    const cors = '<CORSConfiguration><CORSRule><AllowedOrigin>*</AllowedOrigin><AllowedMethod>GET</AllowedMethod><AllowedMethod>PUT</AllowedMethod><AllowedMethod>POST</AllowedMethod><AllowedMethod>DELETE</AllowedMethod><AllowedMethod>HEAD</AllowedMethod><AllowedHeader>*</AllowedHeader><ExposeHeader>ETag</ExposeHeader></CORSRule></CORSConfiguration>'
+    const r = await alphaApi.fetch(`/${bucket}?cors`, { method: 'PUT', body: cors, headers: { 'content-type': 'application/xml' } })
+    expect(r.status, await r.text()).toBe(200)
+    page = await browser.newPage()
+    connId = await addServerViaUi(page, ui, alpha, 'Alpha CORS')
+  })
+  test.afterAll(async ({ alphaApi }) => {
+    await page.close()
+    await alphaApi.forceDeleteBucket(bucket)
+  })
+
+  test('refuses to edit metadata it cannot see', async ({ alphaApi, ui }) => {
+    await page.goto(ui(`servers/${connId}/buckets/${bucket}/objects/?key=m.txt`))
+    const details = page.getByRole('dialog', { name: 'm.txt' })
+    await expect(details.getByText('Some headers are hidden')).toBeVisible()
+    await details.getByRole('tab', { name: 'Metadata' }).click()
+    await expect(details.getByText('Metadata cannot be edited here')).toBeVisible()
+    await details.getByRole('textbox', { name: 'Cache-Control' }).fill('max-age=120')
+    await expect(details.getByRole('button', { name: 'Save metadata' })).toBeDisabled()
+    const head = await alphaApi.head(bucket, 'm.txt')
+    expect(head.headers.get('x-amz-meta-owner')).toBe('alice')
+    expect(head.headers.get('content-disposition')).toBe('attachment; filename="report.txt"')
+  })
+})

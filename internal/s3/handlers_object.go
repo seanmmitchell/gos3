@@ -832,8 +832,10 @@ func bypassGovernanceRequested(h http.Header) bool {
 // lockedAgainstDelete reports whether object lock forbids permanently
 // deleting (or shortening the retention of) the version info. GOVERNANCE
 // retention can be bypassed with x-amz-bypass-governance-retention: true
-// by callers allowed s3:BypassGovernanceRetention.
-func (s *Server) lockedAgainstDelete(r *http.Request, rc *reqContext, info storage.ObjectInfo) error {
+// by callers allowed s3:BypassGovernanceRetention (bypass, see
+// canBypassGovernance). It does no I/O, so it can run inside a backend
+// transaction (storage.ConditionalDeleter).
+func (s *Server) lockedAgainstDelete(info storage.ObjectInfo, bypass bool) error {
 	if info.DeleteMarker {
 		return nil
 	}
@@ -843,7 +845,7 @@ func (s *Server) lockedAgainstDelete(r *http.Request, rc *reqContext, info stora
 	if info.RetentionMode == "" || !info.RetainUntil.After(s.now()) {
 		return nil
 	}
-	if info.RetentionMode == "GOVERNANCE" && s.canBypassGovernance(r, rc, info.Bucket, info.Key, info.VersionID) {
+	if info.RetentionMode == "GOVERNANCE" && bypass {
 		return nil
 	}
 	return errObjectLocked
@@ -857,35 +859,50 @@ func (s *Server) canBypassGovernance(r *http.Request, rc *reqContext, bucket, ke
 }
 
 // deleteObjectVersion deletes bucket/key (version vid, "" = per versioning
-// semantics) after the object lock checks; deleting a version that does
-// not exist succeeds, as in S3.
+// semantics) after the If-Match precondition (ifMatch, "" = none) and the
+// object lock checks, atomically with the delete when the backend is a
+// storage.ConditionalDeleter (both built-in backends are); deleting a version that does not exist succeeds, as
+// in S3.
 func (s *Server) deleteObjectVersion(ctx context.Context, r *http.Request, rc *reqContext, bi storage.BucketInfo, key, vid, ifMatch string) (storage.DeleteResult, error) {
+	var res storage.DeleteResult
+	var err error
 	if ifMatch != "" || (vid != "" && bi.ObjectLockEnabled) {
-		info, err := s.backend.GetObjectInfo(ctx, bi.Name, key, vid)
-		switch {
-		case err == nil:
+		// Authorization does I/O, so it is decided before the check runs.
+		bypass := vid != "" && s.canBypassGovernance(r, rc, bi.Name, key, vid)
+		var checkErr error
+		check := func(info storage.ObjectInfo) error {
+			checkErr = nil
 			if ifMatch != "" {
 				if info.DeleteMarker {
-					return storage.DeleteResult{}, s3err.ErrNoSuchKey.With("Key", key)
-				}
-				if !etagListMatches(ifMatch, info.ETag) {
-					return storage.DeleteResult{}, s3err.ErrPreconditionFailed.With("Condition", "If-Match")
-				}
-			}
-			if vid != "" {
-				if err := s.lockedAgainstDelete(r, rc, info); err != nil {
-					return storage.DeleteResult{}, err
+					checkErr = s3err.ErrNoSuchKey.With("Key", key)
+				} else if !etagListMatches(ifMatch, info.ETag) {
+					checkErr = s3err.ErrPreconditionFailed.With("Condition", "If-Match")
 				}
 			}
-		case errors.Is(err, storage.ErrObjectNotFound), errors.Is(err, storage.ErrVersionNotFound):
-			if ifMatch != "" {
-				return storage.DeleteResult{}, s3err.ErrNoSuchKey.With("Key", key)
+			if checkErr == nil && vid != "" {
+				checkErr = s.lockedAgainstDelete(info, bypass)
 			}
-		default:
-			return storage.DeleteResult{}, bucketError(err, bi.Name)
+			return checkErr
 		}
+		if cd, ok := s.backend.(storage.ConditionalDeleter); ok {
+			res, err = cd.DeleteObjectIf(ctx, bi.Name, key, vid, check)
+		} else {
+			var info storage.ObjectInfo
+			if info, err = s.backend.GetObjectInfo(ctx, bi.Name, key, vid); err == nil {
+				if err = check(info); err == nil {
+					res, err = s.backend.DeleteObject(ctx, bi.Name, key, vid)
+				}
+			}
+		}
+		if checkErr != nil {
+			return storage.DeleteResult{}, checkErr
+		}
+		if ifMatch != "" && (errors.Is(err, storage.ErrObjectNotFound) || errors.Is(err, storage.ErrVersionNotFound)) {
+			return storage.DeleteResult{}, s3err.ErrNoSuchKey.With("Key", key)
+		}
+	} else {
+		res, err = s.backend.DeleteObject(ctx, bi.Name, key, vid)
 	}
-	res, err := s.backend.DeleteObject(ctx, bi.Name, key, vid)
 	if err != nil {
 		if errors.Is(err, storage.ErrObjectNotFound) || errors.Is(err, storage.ErrVersionNotFound) {
 			return storage.DeleteResult{VersionID: vid}, nil

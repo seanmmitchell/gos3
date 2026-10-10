@@ -244,6 +244,8 @@ func (s *Server) handlePostObject(w http.ResponseWriter, r *http.Request, rc *re
 	res.Identity = id
 	if policy != nil {
 		res.Method = auth.MethodPostPolicy
+		// VerifyPostPolicy validated the form's signing time.
+		res.SignedAt, _ = time.Parse("20060102T150405Z", fields["x-amz-date"])
 	}
 	rc.auth, rc.identity, rc.key = &res, id, key
 

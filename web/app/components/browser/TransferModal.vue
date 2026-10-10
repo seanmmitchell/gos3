@@ -66,14 +66,16 @@ watch(open, async (v) => {
   }
 }, { immediate: true })
 
+// Names are not trimmed: leading / trailing spaces are part of S3 keys (and
+// the fields are prefilled with the current, possibly space-padded, names).
 const normalizedPrefix = computed(() => {
-  const p = dstPrefix.value.trim().replace(/^\/+/, '')
+  const p = dstPrefix.value.replace(/^\/+/, '')
   return p && !p.endsWith('/') ? `${p}/` : p
 })
 
 const renameTo = computed(() => {
-  const n = newName.value.trim().replace(/^\/+/, '')
-  if (!n || !single.value) return ''
+  const n = newName.value.replace(/^\/+/, '')
+  if (!n.trim() || !single.value) return ''
   const base = `${props.fromPrefix}${n}`
   return single.value.isFolder ? base.replace(/\/*$/, '/') : base
 })
@@ -88,6 +90,7 @@ const formError = computed<string | undefined>(() => {
   }
   if (!dstBucket.value.trim()) return 'Choose a destination bucket'
   const sameBucket = dstBucket.value.trim() === props.bucket
+  if (dstPrefix.value && !dstPrefix.value.trim()) return 'The destination folder name must not be blank'
   if (sameBucket && normalizedPrefix.value === props.fromPrefix && !props.targets.some(t => t.versionId)) {
     return 'Choose a different destination folder'
   }
@@ -131,7 +134,8 @@ async function run() {
     // Ask before replacing existing objects (as uploads do).
     const others = plan.filter(p => !(p.src.bucket === target && p.src.key === p.dstKey))
     const found = await findExistingDestinations(client, target, others, { signal })
-    if (found.existing.length) {
+    // Also ask when some destinations could not be checked.
+    if (found.existing.length || !found.complete) {
       pending.value = { plan, target, existing: found.existing, complete: found.complete }
       phase.value = 'confirm'
       return
@@ -256,8 +260,8 @@ const percent = computed(() => (progress.value.total ? Math.round((progress.valu
           color="warning"
           variant="subtle"
           icon="i-lucide-triangle-alert"
-          :title="`${formatNumber(pending.existing.length)}${pending.complete ? '' : '+'} object${pending.existing.length === 1 ? '' : 's'} already exist${pending.existing.length === 1 ? 's' : ''} at the destination`"
-          :description="versionedHint"
+          :title="pending.existing.length ? `${formatNumber(pending.existing.length)}${pending.complete ? '' : '+'} object${pending.existing.length === 1 ? '' : 's'} already exist${pending.existing.length === 1 ? 's' : ''} at the destination` : 'Existing destination objects could not all be checked'"
+          :description="pending.complete ? versionedHint : `Not every destination could be checked (too many objects, or no permission to read them): objects may be overwritten. ${versionedHint}`"
         />
         <ul class="max-h-48 space-y-1 overflow-y-auto font-mono text-xs" aria-label="Existing destination objects">
           <li v-for="k in pending.existing.slice(0, 100)" :key="k" class="truncate" :title="k">

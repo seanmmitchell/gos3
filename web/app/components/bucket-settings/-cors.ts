@@ -7,6 +7,17 @@ import { normalizeList } from '~/components/admin/-settings-form'
 export const CORS_METHODS = ['GET', 'PUT', 'POST', 'DELETE', 'HEAD'] as const
 export const MAX_CORS_RULES = 100
 
+/**
+ * ExposeHeader defaults for new rules: what S3 clients in a browser read
+ * (the ETag of uploaded parts, versions, content headers). S3 has no
+ * wildcard for ExposeHeader: user metadata is only readable cross-origin
+ * when each x-amz-meta-<name> is listed.
+ */
+export const DEFAULT_EXPOSE_HEADERS = [
+  'ETag', 'Content-Disposition', 'Content-Encoding', 'Content-Language', 'Content-Range', 'Accept-Ranges',
+  'x-amz-request-id', 'x-amz-version-id', 'x-amz-delete-marker'
+] as const
+
 export interface CorsRuleForm {
   id: string
   allowedOrigins: string[]
@@ -24,7 +35,7 @@ export function newCorsRule(): CorsRuleForm {
     allowedOrigins: ['*'],
     allowedMethods: ['GET', 'HEAD'],
     allowedHeaders: ['*'],
-    exposeHeaders: ['ETag'],
+    exposeHeaders: [...DEFAULT_EXPOSE_HEADERS],
     maxAgeSeconds: 3600
   }
 }

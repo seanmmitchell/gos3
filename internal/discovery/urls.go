@@ -31,8 +31,11 @@ var ErrInvalidURL = errors.New("discovery: invalid base URL")
 //   - only http and https are accepted;
 //   - user info, path, query and fragment are dropped ("http://h:9000/x/" →
 //     "http://h:9000");
-//   - scheme and host name are lower-cased, a trailing dot of the host is
-//     removed and the port (if any) must be 1-65535.
+//   - the scheme is lower-cased and the host canonicalised by canonicalHost
+//     (lower-cased name without its single trailing root dot, or canonical
+//     IP literal); the port (if any) must be 1-65535.
+//
+// The result is a fixed point: normalising it again returns it unchanged.
 //
 // The port is kept as given; no default port is added.
 func NormalizeBaseURL(raw string) (string, error) {
@@ -51,8 +54,8 @@ func NormalizeBaseURL(raw string) (string, error) {
 	if scheme != "http" && scheme != "https" {
 		return "", fmt.Errorf("%w: unsupported scheme %q", ErrInvalidURL, clip(u.Scheme, 16))
 	}
-	host := strings.TrimSuffix(u.Hostname(), ".")
-	if host == "" || !validHost(host) {
+	host, ok := canonicalHost(u.Hostname())
+	if !ok {
 		return "", fmt.Errorf("%w: invalid host in %q", ErrInvalidURL, clip(raw, 64))
 	}
 	port := u.Port()
@@ -62,9 +65,6 @@ func NormalizeBaseURL(raw string) (string, error) {
 		}
 	} else if strings.HasSuffix(u.Host, ":") {
 		return "", fmt.Errorf("%w: empty port in %q", ErrInvalidURL, clip(raw, 64))
-	}
-	if _, err := netip.ParseAddr(host); err != nil {
-		host = strings.ToLower(host)
 	}
 	return scheme + "://" + joinHostPort(host, port), nil
 }
@@ -98,13 +98,24 @@ func baseURL(scheme, host string, port int) string {
 	return scheme + "://" + joinHostPort(host, strconv.Itoa(port))
 }
 
-// validHost reports whether h is an IP literal (optionally with an IPv6
-// zone) or a syntactically valid DNS host name.
-func validHost(h string) bool {
-	if _, err := netip.ParseAddr(h); err == nil {
-		return true
+// canonicalHost validates a host (without port or brackets) and returns its
+// canonical form: an IP literal is returned as netip.Addr.String() with
+// IPv4-mapped IPv6 addresses unmapped (an IPv6 zone is kept verbatim);
+// otherwise exactly one trailing root dot is removed and the remaining name
+// must be a valid DNS host name without a trailing dot, returned lower-cased.
+// The result is a fixed point of canonicalHost.
+func canonicalHost(h string) (string, bool) {
+	if ip, err := netip.ParseAddr(h); err == nil {
+		return ip.Unmap().String(), true
 	}
-	return validHostname(h)
+	h = strings.TrimSuffix(h, ".")
+	if strings.HasSuffix(h, ".") || !validHostname(h) {
+		return "", false
+	}
+	if ip, err := netip.ParseAddr(h); err == nil { // "10.0.0.5."
+		return ip.Unmap().String(), true
+	}
+	return strings.ToLower(h), true
 }
 
 // validHostname reports whether h is a DNS name made of labels of letters,

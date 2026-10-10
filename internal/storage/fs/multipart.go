@@ -9,7 +9,6 @@ import (
 	iofs "io/fs"
 	"maps"
 	"os"
-	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -88,6 +87,9 @@ func (b *Backend) CreateMultipartUpload(ctx context.Context, bucket, key string,
 			Initiator: initiator,
 		}
 		if err := putRecord(bb.Bucket(subUploads), []byte(id), &rec); err != nil {
+			return err
+		}
+		if err := putUploadIndex(bb, id, &rec); err != nil {
 			return err
 		}
 		if err := global.Put([]byte(id), []byte(br.ID)); err != nil {
@@ -312,6 +314,9 @@ func forEachPart(bb *bbolt.Bucket, uploadID string, fn func(n int, rec *partReco
 
 // ListMultipartUploads returns all in-progress uploads sorted by key, then
 // initiation time (oldest first), then upload ID.
+// The result is a snapshot read in one transaction from the listing-order
+// index; use WalkMultipartUploads (or storage.ListUploads) to read a page
+// without loading every upload.
 func (b *Backend) ListMultipartUploads(ctx context.Context, bucket string) ([]storage.UploadInfo, error) {
 	if err := b.begin(ctx); err != nil {
 		return nil, err
@@ -323,33 +328,32 @@ func (b *Backend) ListMultipartUploads(ctx context.Context, bucket string) ([]st
 		if err != nil {
 			return err
 		}
-		return bb.Bucket(subUploads).ForEach(func(k, v []byte) error {
+		upl := bb.Bucket(subUploads)
+		return bb.Bucket(subUploadOrder).ForEach(func(_, id []byte) error {
+			raw := upl.Get(id)
+			if raw == nil {
+				return nil
+			}
 			var rec uploadRecord
-			if err := decodeRecord(v, &rec); err != nil {
+			if err := decodeRecord(raw, &rec); err != nil {
 				return err
 			}
-			out = append(out, rec.info(bucket, string(k)))
+			out = append(out, rec.info(bucket, string(id)))
 			return nil
 		})
 	})
 	if err != nil {
 		return nil, err
 	}
-	slices.SortFunc(out, func(a, c storage.UploadInfo) int {
-		if r := strings.Compare(a.Key, c.Key); r != 0 {
-			return r
-		}
-		if r := a.Initiated.Compare(c.Initiated); r != 0 {
-			return r
-		}
-		return strings.Compare(a.UploadID, c.UploadID)
-	})
 	return out, nil
 }
 
-// deleteUploadTx removes an upload and all its part records.
-func deleteUploadTx(tx *bbolt.Tx, bb *bbolt.Bucket, uploadID string) error {
+// deleteUploadTx removes an upload (record rec) and all its part records.
+func deleteUploadTx(tx *bbolt.Tx, bb *bbolt.Bucket, uploadID string, rec *uploadRecord) error {
 	if err := bb.Bucket(subUploads).Delete([]byte(uploadID)); err != nil {
+		return err
+	}
+	if err := deleteUploadIndex(bb, uploadID, rec); err != nil {
 		return err
 	}
 	if err := tx.Bucket(topUploads).Delete([]byte(uploadID)); err != nil {
@@ -509,7 +513,8 @@ func (b *Backend) completeOnce(ctx context.Context, bucket, key, uploadID string
 		meta:     cloneMeta(meta),
 		opts:     opts,
 		pre: func(tx *bbolt.Tx, bb *bbolt.Bucket) error {
-			if _, err := loadUpload(bb, key, uploadID); err != nil {
+			up, err := loadUpload(bb, key, uploadID)
+			if err != nil {
 				return err
 			}
 			parts := bb.Bucket(subParts)
@@ -526,7 +531,7 @@ func (b *Backend) completeOnce(ctx context.Context, bucket, key, uploadID string
 					return errPartsChanged
 				}
 			}
-			return deleteUploadTx(tx, bb, uploadID)
+			return deleteUploadTx(tx, bb, uploadID, up)
 		},
 	})
 	if err != nil {
@@ -581,10 +586,11 @@ func (b *Backend) AbortMultipartUpload(ctx context.Context, bucket, key, uploadI
 		if err != nil {
 			return err
 		}
-		if _, err := loadUpload(bb, key, uploadID); err != nil {
+		up, err := loadUpload(bb, key, uploadID)
+		if err != nil {
 			return err
 		}
-		return deleteUploadTx(tx, bb, uploadID)
+		return deleteUploadTx(tx, bb, uploadID, up)
 	})
 	if err != nil {
 		return err

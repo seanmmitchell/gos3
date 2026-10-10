@@ -247,10 +247,8 @@ func ComputeBucketUsage(ctx context.Context, b Backend, bucket string) (BucketUs
 	if err != nil {
 		return BucketUsage{}, err
 	}
-	uploads, err := b.ListMultipartUploads(ctx, bucket)
-	if err != nil {
+	if u.PendingUploads, err = CountMultipartUploads(ctx, b, bucket); err != nil {
 		return BucketUsage{}, err
 	}
-	u.PendingUploads = int64(len(uploads))
 	return u, nil
 }

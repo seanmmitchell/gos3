@@ -140,7 +140,7 @@ describe('listing model', () => {
 
 describe('keys for new objects', () => {
   it('normalises relative upload paths', () => {
-    expect(normalizeRelativePath('./a\\b//c.txt')).toBe('a/b/c.txt')
+    expect(normalizeRelativePath('./a/b//c.txt')).toBe('a/b/c.txt')
     expect(uploadKey('docs/', 'photos/2024/a.jpg')).toBe('docs/photos/2024/a.jpg')
     expect(uploadKey('', '/x.txt')).toBe('x.txt')
   })
@@ -153,7 +153,7 @@ describe('keys for new objects', () => {
     expect(validateFolderName('reports/2026')).toBeUndefined()
     expect(validateFolderName('new folder/')).toBeUndefined()
     expect(folderKey('docs/', 'reports/2026/')).toBe('docs/reports/2026/')
-    expect(folderKey('', ' x ')).toBe('x/')
+    expect(folderKey('', ' x ')).toBe(' x /') // spaces are part of the key
   })
 
   it('rebases keys for copy / move', () => {

@@ -135,7 +135,7 @@ func resolve(c Config) effective {
 	}
 	for _, d := range c.DNSSRV {
 		d = strings.ToLower(strings.TrimSuffix(strings.TrimSpace(d), "."))
-		if validHostname(d) && !slices.Contains(e.domains, d) {
+		if !strings.HasSuffix(d, ".") && validHostname(d) && !slices.Contains(e.domains, d) {
 			e.domains = append(e.domains, d)
 		}
 	}

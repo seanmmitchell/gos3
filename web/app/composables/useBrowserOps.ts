@@ -148,8 +148,12 @@ export interface DestinationLookupClient {
   headObject(bucket: string, key: string, opts?: { versionId?: string, checksumMode?: boolean, signal?: AbortSignal }): Promise<HeadResult>
 }
 
-/** Plans up to this size are checked with one HeadObject per destination. */
+/** Up to this many keys are checked with one HeadObject each. */
 const HEAD_CHECK_LIMIT = 20
+/** After listing, at most this many remaining keys are checked with HeadObject. */
+const HEAD_FALLBACK_LIMIT = 500
+/** Parallel HeadObject requests. */
+const HEAD_CONCURRENCY = 6
 
 function commonPrefix(keys: string[]): string {
   if (!keys.length) return ''
@@ -163,45 +167,95 @@ function commonPrefix(keys: string[]): string {
   return p
 }
 
+/** Compares keys in S3 listing order (UTF-8 bytes = code points, not UTF-16 units). */
+export function compareKeys(a: string, b: string): number {
+  const x = [...a]
+  const y = [...b]
+  for (let i = 0; i < x.length && i < y.length; i++) {
+    const d = x[i]!.codePointAt(0)! - y[i]!.codePointAt(0)!
+    if (d) return d
+  }
+  return x.length - y.length
+}
+
 /**
- * Destination keys of a plan that already exist (best effort: objects the
- * identity may not see, or that appear meanwhile, are not reported). Small
- * plans use HeadObject; larger ones list the destinations' common prefix
- * (stopping after `maxListed` keys, then `complete` is false).
+ * Checks keys with HeadObject (HEAD_CONCURRENCY at a time). 404 means
+ * missing; any other error makes the result incomplete (e.g. 403, which S3
+ * also returns for missing keys without s3:ListBucket).
  */
-export async function findExistingDestinations(
+async function headKeys(client: DestinationLookupClient, bucket: string, keys: string[], signal?: AbortSignal): Promise<{ existing: Set<string>, complete: boolean }> {
+  const existing = new Set<string>()
+  let complete = true
+  let next = 0
+  const worker = async () => {
+    while (next < keys.length) {
+      const key = keys[next++]!
+      try {
+        await client.headObject(bucket, key, { checksumMode: false, signal })
+        existing.add(key)
+      } catch (e) {
+        if (signal?.aborted) throw e
+        if ((e as { status?: number })?.status !== 404) complete = false
+      }
+    }
+  }
+  await Promise.all(Array.from({ length: Math.min(HEAD_CONCURRENCY, keys.length) }, worker))
+  return { existing, complete }
+}
+
+/**
+ * Keys of `keys` that already exist in a bucket (best effort: objects that
+ * appear meanwhile are not reported). Few keys are checked with HeadObject;
+ * more are found by listing their common prefix (up to `maxListed` keys),
+ * then the keys the listing did not reach are checked with HeadObject (up
+ * to HEAD_FALLBACK_LIMIT). `complete` is false when some keys could not be
+ * checked: callers must then assume they may exist.
+ */
+export async function findExistingKeys(
+  client: DestinationLookupClient,
+  bucket: string,
+  keys: string[],
+  opts: { signal?: AbortSignal, maxListed?: number } = {}
+): Promise<{ existing: string[], complete: boolean }> {
+  const wanted = [...new Set(keys)]
+  const ordered = (found: Set<string>) => wanted.filter(k => found.has(k))
+  if (wanted.length <= HEAD_CHECK_LIMIT) {
+    const r = await headKeys(client, bucket, wanted, opts.signal)
+    return { existing: ordered(r.existing), complete: r.complete }
+  }
+  const set = new Set(wanted)
+  const found = new Set<string>()
+  const maxListed = opts.maxListed ?? Math.max(10000, wanted.length * 10)
+  let listed = 0
+  let token: string | undefined
+  let last: string | undefined
+  for (;;) {
+    const page = await client.listObjectsV2(bucket, { prefix: commonPrefix(wanted) || undefined, continuationToken: token }, opts.signal)
+    for (const o of page.objects) {
+      if (set.has(o.key)) found.add(o.key)
+      last = o.key
+    }
+    listed += page.objects.length
+    if (!page.isTruncated || !page.nextContinuationToken) return { existing: ordered(found), complete: true }
+    if (listed >= maxListed) break
+    token = page.nextContinuationToken
+  }
+  // The listing stopped early: keys after the last listed one are unknown.
+  const rest = wanted.filter(k => last === undefined || compareKeys(k, last) > 0)
+  if (rest.length > HEAD_FALLBACK_LIMIT) return { existing: ordered(found), complete: false }
+  const r = await headKeys(client, bucket, rest, opts.signal)
+  for (const k of r.existing) found.add(k)
+  return { existing: ordered(found), complete: r.complete }
+}
+
+/** Destination keys of a plan that already exist (see findExistingKeys). */
+export function findExistingDestinations(
   client: DestinationLookupClient,
   dstBucket: string,
   plan: TransferPlanItem[],
   opts: { signal?: AbortSignal, maxListed?: number } = {}
 ): Promise<{ existing: string[], complete: boolean }> {
-  const wanted = [...new Set(plan.map(p => p.dstKey))]
-  const existing: string[] = []
-  if (wanted.length <= HEAD_CHECK_LIMIT) {
-    let complete = true
-    await Promise.all(wanted.map(async (key) => {
-      try {
-        await client.headObject(dstBucket, key, { checksumMode: false, signal: opts.signal })
-        existing.push(key)
-      } catch (e) {
-        if (opts.signal?.aborted) throw e
-        if ((e as { status?: number })?.status !== 404) complete = false
-      }
-    }))
-    return { existing: wanted.filter(k => existing.includes(k)), complete }
-  }
-  const set = new Set(wanted)
-  const maxListed = opts.maxListed ?? Math.max(10000, wanted.length * 10)
-  let listed = 0
-  let token: string | undefined
-  for (;;) {
-    const page = await client.listObjectsV2(dstBucket, { prefix: commonPrefix(wanted) || undefined, continuationToken: token }, opts.signal)
-    for (const o of page.objects) if (set.has(o.key)) existing.push(o.key)
-    listed += page.objects.length
-    if (!page.isTruncated || !page.nextContinuationToken) return { existing, complete: true }
-    if (listed >= maxListed) return { existing, complete: false }
-    token = page.nextContinuationToken
-  }
+  return findExistingKeys(client, dstBucket, plan.map(p => p.dstKey), opts)
 }
 
 /**
@@ -276,9 +330,21 @@ export interface TransferDone {
   result: OpResult
 }
 
-/** Restores an old version by copying it over the current one (creates a new latest version). */
-export function restoreVersion(client: Pick<BrowserOpsClient, 'copyObject'>, bucket: string, key: string, versionId: string): Promise<CopyObjectResult> {
-  return client.copyObject({ bucket, key, versionId }, { bucket, key })
+/** Result of restoreVersion. */
+export interface RestoreResult {
+  copy: CopyObjectResult
+  /** The version had custom ACL grants, which were not carried over (the new version is private). */
+  aclReset: boolean
+}
+
+/**
+ * Restores an old version by copying it over the current one (creates a
+ * new latest version). The version's canned ACL is kept (see aclToKeep).
+ */
+export async function restoreVersion(client: Pick<BrowserOpsClient, 'copyObject' | 'getObjectAcl'>, bucket: string, key: string, versionId: string): Promise<RestoreResult> {
+  const acl = await aclToKeep(client, { bucket, key, versionId })
+  const copy = await client.copyObject({ bucket, key, versionId }, { bucket, key }, { acl: acl === 'custom' ? undefined : acl })
+  return { copy, aclReset: acl === 'custom' }
 }
 
 export interface Presigner {

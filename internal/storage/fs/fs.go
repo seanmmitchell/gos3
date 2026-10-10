@@ -149,7 +149,14 @@ type Backend struct {
 	commitFault func() error
 }
 
-var _ storage.Backend = (*Backend)(nil)
+var (
+	_ storage.Backend            = (*Backend)(nil)
+	_ storage.ConditionalDeleter = (*Backend)(nil)
+)
+var (
+	_ storage.ConditionalDeleter = (*Backend)(nil)
+	_ storage.UploadWalker       = (*Backend)(nil)
+)
 
 // Open opens (creating if needed) a filesystem backend rooted at root.
 func Open(root string, opts Options) (*Backend, error) {
@@ -303,6 +310,9 @@ func (b *Backend) initSchema() error {
 			return m.Put(keyFormat, []byte{schemaVersion})
 		case len(v) != 1 || v[0] != schemaVersion:
 			return fmt.Errorf("fs: unsupported metadata schema version %v", v)
+		}
+		if err := ensureUploadIndexes(tx); err != nil {
+			return fmt.Errorf("fs: index multipart uploads: %w", err)
 		}
 		return nil
 	})

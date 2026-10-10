@@ -389,6 +389,22 @@ func (b *Backend) UpdateObjectMeta(ctx context.Context, bucket, key, versionID s
 // (see storage.Backend). In an Unversioned bucket the result is always
 // DeleteResult{} (S3 reports no version information there).
 func (b *Backend) DeleteObject(ctx context.Context, bucket, key, versionID string) (storage.DeleteResult, error) {
+	return b.deleteObject(ctx, bucket, key, versionID, nil)
+}
+
+// DeleteObjectIf is DeleteObject made conditional on check, which is called
+// with the addressed version inside the delete's write transaction (see
+// storage.ConditionalDeleter).
+func (b *Backend) DeleteObjectIf(ctx context.Context, bucket, key, versionID string, check func(storage.ObjectInfo) error) (storage.DeleteResult, error) {
+	if check == nil {
+		return storage.DeleteResult{}, errors.New("fs: nil delete check")
+	}
+	return b.deleteObject(ctx, bucket, key, versionID, check)
+}
+
+// deleteObject implements DeleteObject and, with a non-nil check,
+// DeleteObjectIf.
+func (b *Backend) deleteObject(ctx context.Context, bucket, key, versionID string, check func(storage.ObjectInfo) error) (storage.DeleteResult, error) {
 	if err := b.begin(ctx); err != nil {
 		return storage.DeleteResult{}, err
 	}
@@ -404,6 +420,15 @@ func (b *Backend) DeleteObject(ctx context.Context, bucket, key, versionID strin
 			return err
 		}
 		bucketID = br.ID
+		if check != nil {
+			rec, _, latest, err := findVersion(bb, bucket, key, versionID)
+			if err != nil {
+				return err
+			}
+			if err := check(cloneInfo(rec.info(bucket, key, latest))); err != nil {
+				return err
+			}
+		}
 		if versionID != "" {
 			rec, vk, _, err := findVersion(bb, bucket, key, versionID)
 			if err != nil {

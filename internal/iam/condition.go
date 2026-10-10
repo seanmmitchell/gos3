@@ -382,6 +382,8 @@ func parseNumber(s string) (float64, bool) {
 var dateLayouts = []string{
 	time.RFC3339Nano,
 	"2006-01-02T15:04:05Z0700",
+	"2006-01-02T15:04:05.999999999Z0700",
+	"20060102T150405Z", // ISO 8601 basic format (x-amz-date)
 	"2006-01-02T15:04:05",
 	"2006-01-02T15:04Z07:00",
 	"2006-01-02T15:04",

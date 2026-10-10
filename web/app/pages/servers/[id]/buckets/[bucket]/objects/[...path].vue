@@ -284,20 +284,34 @@ async function enqueueFiles(files: DroppedFile[]) {
     toast.add({ title: `${invalid.length} file${invalid.length === 1 ? '' : 's'} skipped`, description: `Invalid object key: ${invalid.slice(0, 3).join(', ')}${invalid.length > 3 ? '…' : ''}`, color: 'warning', icon: 'i-lucide-triangle-alert' })
   }
   if (!items.length) return
-  const existing = new Set(entries.value.filter(e => e.type === 'object' && !e.versionId).map(e => e.key))
-  const overwrites = items.filter(i => existing.has(i.key)).length
-  if (overwrites) {
+  const target = { connectionId: serverId.value, bucket: bucket.value }
+  // Ask before replacing existing objects. The check asks the server: the
+  // listed rows only cover loaded pages of this level (not subfolders of a
+  // folder upload, nor files beyond the first pages).
+  let found: { existing: string[], complete: boolean }
+  try {
+    found = await findExistingKeys(client, target.bucket, items.map(i => i.key))
+  } catch {
+    found = { existing: [], complete: false }
+  }
+  if (found.existing.length || !found.complete) {
+    const n = found.existing.length
+    const consequence = versioned.value
+      ? 'The bucket is versioned: the current versions are kept as previous versions.'
+      : 'Objects with the same name are replaced.'
     const ok = await confirm({
-      title: `Overwrite ${overwrites} existing object${overwrites === 1 ? '' : 's'}?`,
-      description: versioned.value
-        ? 'The bucket is versioned: the current versions are kept as previous versions.'
-        : 'Objects with the same name are replaced.',
+      title: found.complete
+        ? `Overwrite ${n} existing object${n === 1 ? '' : 's'}?`
+        : n ? `Overwrite ${n} or more existing objects?` : 'Overwrite existing objects?',
+      description: found.complete
+        ? consequence
+        : `Not every destination could be checked (too many objects, or no permission to read them), so existing objects may be overwritten. ${consequence}`,
       confirmLabel: 'Upload and overwrite',
       color: 'warning'
     })
     if (!ok) return
   }
-  uploads.enqueue({ client, connectionId: serverId.value, bucket: bucket.value, files: items })
+  uploads.enqueue({ client, ...target, files: items })
 }
 
 function onPicked(e: Event) {
@@ -529,8 +543,9 @@ async function onAction(action: BrowserRowAction, e: BrowserEntry) {
     case 'restore':
       if (!t.versionId) return
       try {
-        await restoreVersion(requireS3(), bucket.value, e.key, t.versionId)
-        toast.add({ title: 'Version restored', description: `${e.key} now has this content as its latest version.`, color: 'success', icon: 'i-lucide-circle-check' })
+        const r = await restoreVersion(requireS3(), bucket.value, e.key, t.versionId)
+        if (r.aclReset) toast.add({ title: 'Version restored, ACL reset', description: `${e.key} now has this content as its latest version. The version had custom ACL grants, which cannot be carried over: it is private now.`, color: 'warning', icon: 'i-lucide-shield-alert' })
+        else toast.add({ title: 'Version restored', description: `${e.key} now has this content as its latest version.`, color: 'success', icon: 'i-lucide-circle-check' })
         void refresh()
       } catch (err) {
         toast.add({ title: 'Could not restore the version', description: errorMessage(err), color: 'error', icon: 'i-lucide-circle-alert' })

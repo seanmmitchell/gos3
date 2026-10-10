@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"container/list"
 	"context"
+	"crypto/tls"
 	"errors"
 	"log/slog"
 	"maps"
@@ -260,6 +261,19 @@ func (s *Server) conditionContext(r *http.Request, rc *reqContext, t authzTarget
 			c[k] = []string{v}
 		}
 	}
+	if r.TLS != nil {
+		// s3:TlsVersion of a connection terminated here ("1.2", "1.3").
+		switch r.TLS.Version {
+		case tls.VersionTLS10:
+			c["s3:TlsVersion"] = []string{"1.0"}
+		case tls.VersionTLS11:
+			c["s3:TlsVersion"] = []string{"1.1"}
+		case tls.VersionTLS12:
+			c["s3:TlsVersion"] = []string{"1.2"}
+		case tls.VersionTLS13:
+			c["s3:TlsVersion"] = []string{"1.3"}
+		}
+	}
 	set("aws:UserAgent", r.UserAgent())
 	set("aws:Referer", r.Referer())
 	id := rc.identity
@@ -287,6 +301,11 @@ func (s *Server) conditionContext(r *http.Request, rc *reqContext, t authzTarget
 			c["s3:signatureversion"] = []string{"AWS4-HMAC-SHA256"}
 		}
 		set("s3:x-amz-content-sha256", rc.auth.PayloadMode)
+		if !rc.auth.SignedAt.IsZero() {
+			// Milliseconds since the request (or presigned URL, or POST
+			// policy form) was signed.
+			c["s3:signatureAge"] = []string{strconv.FormatInt(max(now.Sub(rc.auth.SignedAt).Milliseconds(), 0), 10)}
+		}
 	}
 	q := rc.query
 	for _, p := range [...]string{"prefix", "delimiter", "max-keys"} {
@@ -297,7 +316,13 @@ func (s *Server) conditionContext(r *http.Request, rc *reqContext, t authzTarget
 	set("s3:VersionId", t.VersionID)
 	h := r.Header
 	set("s3:x-amz-copy-source", h.Get("x-amz-copy-source"))
-	set("s3:x-amz-metadata-directive", h.Get("x-amz-metadata-directive"))
+	if v := h.Get("x-amz-metadata-directive"); v != "" {
+		// The directive as the copy handler reads it (any case).
+		if d, err := parseDirective(h, "x-amz-metadata-directive"); err == nil {
+			v = d
+		}
+		set("s3:x-amz-metadata-directive", v)
+	}
 	if t.ObjectAttrs != nil {
 		for k, v := range t.ObjectAttrs {
 			if len(v) > 0 || k == "s3:RequestObjectTagKeys" {
@@ -305,25 +330,32 @@ func (s *Server) conditionContext(r *http.Request, rc *reqContext, t authzTarget
 			}
 		}
 	} else {
+		// Header values are trimmed exactly as the handlers trim them when
+		// storing the attributes (trimHeaderSpace), so a value the policy
+		// did not see is never stored.
 		for _, name := range [...]string{
 			"x-amz-acl", "x-amz-server-side-encryption", "x-amz-server-side-encryption-aws-kms-key-id",
-			"x-amz-storage-class", "x-amz-website-redirect-location",
+			"x-amz-storage-class",
 		} {
-			set("s3:"+name, h.Get(name))
+			set("s3:"+name, trimHeaderSpace(h.Get(name)))
 		}
-		set("s3:object-lock-mode", h.Get("x-amz-object-lock-mode"))
-		if until := h.Get("x-amz-object-lock-retain-until-date"); until != "" {
-			set("s3:object-lock-retain-until-date", until)
+		set("s3:x-amz-website-redirect-location", h.Get("x-amz-website-redirect-location"))
+		set("s3:object-lock-mode", trimHeaderSpace(h.Get("x-amz-object-lock-mode")))
+		if until := trimHeaderSpace(h.Get("x-amz-object-lock-retain-until-date")); until != "" {
+			// Any accepted format (e.g. the compact 20060102T150405Z) is
+			// reported in the RFC 3339 form Date operators understand.
 			if ut, ok := parseISOTime(until); ok {
+				until = ut.UTC().Format(time.RFC3339)
 				set("s3:object-lock-remaining-retention-days", remainingRetentionDays(ut, now))
 			}
+			set("s3:object-lock-retain-until-date", until)
 		}
-		set("s3:object-lock-legal-hold", h.Get("x-amz-object-lock-legal-hold"))
+		set("s3:object-lock-legal-hold", trimHeaderSpace(h.Get("x-amz-object-lock-legal-hold")))
 		// Request tags come from x-amz-tagging only where that header is
 		// what gets stored: not for CopyObject with the (default) COPY
 		// tagging directive, which keeps the source's tags.
 		tags := h.Get("x-amz-tagging")
-		if rc.opName == "CopyObject" && !strings.EqualFold(strings.TrimSpace(h.Get("X-Amz-Tagging-Directive")), directiveReplace) {
+		if d, _ := parseDirective(h, "X-Amz-Tagging-Directive"); rc.opName == "CopyObject" && d != directiveReplace {
 			tags = ""
 		}
 		if tags != "" {

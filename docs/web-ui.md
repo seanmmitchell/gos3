@@ -47,13 +47,24 @@ Pages are shown according to the signed-in identity's permissions (from
   links use `?key=` / `?prefix=`). The UI itself never creates such keys:
   uploads, new folders, renames and copy/move destinations are validated.
 - Copy, move and rename refuse a destination inside the source folder, and
-  ask before overwriting existing objects at the destination (checked with
-  HeadObject for 20 objects or fewer, otherwise by listing the destination
-  prefix).
-- Move, rename and the metadata editor rewrite the object, and keep a canned
-  object ACL such as `public-read` (one extra GetObjectAcl per object; custom
-  grants produce a warning). Keeping the ACL needs `s3:PutObjectAcl` where
-  the server enforces it (gos3 and AWS do).
+  ask before overwriting existing objects at the destination.
+- Uploads (including folder uploads and drag-and-drop) also ask before
+  overwriting. Both check the server, not the rows on screen: with HeadObject
+  for 20 keys or fewer, otherwise by listing the common prefix and then with
+  HeadObject for the keys the listing did not reach (up to 500). When the
+  check is incomplete (too many objects, or HeadObject denied, for example
+  with 403), the UI asks too.
+- Move, rename, restoring a version and the metadata editor rewrite the
+  object, and keep a canned object ACL such as `public-read` (one extra
+  GetObjectAcl per object; custom grants produce a warning). Keeping the ACL
+  needs `s3:PutObjectAcl` where the server enforces it (gos3 and AWS do).
+- Names are used as given: backslashes in uploaded file names stay in the
+  key (they are not turned into `/`), and leading or trailing spaces in
+  rename, copy/move destination folder and new-folder names are kept. Only
+  empty or all-blank names are rejected.
+- A non-ASCII `Content-Disposition` file name is stored in the RFC 6266 /
+  RFC 5987 form (`filename="ascii"; filename*=UTF-8''…`). Other non-ASCII
+  content in that header is rejected by the metadata editor.
 - gos3 serves objects with `Content-Security-Policy: sandbox`, so an HTML or
   SVG object opened from a gos3 bucket in a browser tab (a download or share
   link) runs no scripts (see [security.md](security.md#object-responses)).
@@ -203,7 +214,7 @@ manages from another origin must:
 | Header | Needed for |
 |---|---|
 | `ETag` | multipart uploads (otherwise the upload fails with `MissingETag`) and object details |
-| `x-amz-meta-*` | the metadata editor. If these are not exposed, existing metadata looks empty and **saving would erase it**. |
+| `x-amz-meta-*`, `Content-Disposition`, `Content-Encoding`, `Date` | the metadata editor. The UI detects hidden headers: when a cross-origin HeadObject does not show `Date` (so not every header is exposed), the object details say "Some headers are hidden" and the metadata editor refuses to save, rather than erase metadata it cannot see. |
 | `x-amz-version-id`, `x-amz-delete-marker`, `x-amz-checksum-*`, `x-amz-object-lock-*`, `Content-*`, `Last-Modified` | versions, details, checksums, retention |
 
 **gos3**: the default `cors.expose_headers` already covers all of these
@@ -219,13 +230,23 @@ gos3 serve --cors-origin https://console.example.com --cors-origin http://localh
 
 You can also change this at runtime under **Settings → CORS**. Bucket CORS
 configurations override the global policy for that bucket, so a bucket with its
-own rules must allow the UI origin too.
+own rules must allow the UI origin too. Editing metadata cross-origin needs
+every response header exposed, which only the global rule's `*` does: bucket
+rules cannot, because `ExposeHeader` wildcards are rejected (as on AWS). For
+such buckets, use the embedded UI of that server or list the headers as
+described below.
+
+New bucket CORS rules created in the UI default to `ExposeHeaders` `ETag`,
+`Content-Disposition`, `Content-Encoding`, `Content-Language`,
+`Content-Range`, `Accept-Ranges`, `x-amz-request-id`, `x-amz-version-id` and
+`x-amz-delete-marker`.
 
 **Other S3 services**: configure bucket CORS rules with the UI origin in
 `AllowedOrigins`, the methods `GET`, `PUT`, `POST`, `DELETE` and `HEAD`,
 `AllowedHeaders: ["*"]`, and the headers above in `ExposeHeaders`. AWS does not
-support wildcards like `x-amz-meta-*` there, so list the metadata names you
-use.
+support wildcards like `x-amz-meta-*` there. To enable the metadata editor,
+list `Date` together with every `x-amz-meta-*` name you use,
+`Content-Disposition` and `Content-Encoding`.
 
 `GET /_gos3/info` always sends `Access-Control-Allow-Origin: *`, so the UI can
 recognise a gos3 server, and tell "blocked by CORS" from "unreachable", before

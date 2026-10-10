@@ -50,6 +50,10 @@ import (
 //	"cfg"    configuration key -> opaque document bytes.
 //	"upl"    upload ID -> uploadRecord.
 //	"parts"  upload ID + 4-byte big-endian part number -> partRecord.
+//	"upk"    uploadOrderKey(key, initiated, upload ID) -> upload ID: the
+//	         uploads in listing order (key, initiation time, upload ID).
+//	         Created and checked against "upl" at Open, so databases
+//	         written before it existed are indexed on first use.
 //
 // Record values are encoded as one format byte followed by the encoded
 // record struct:
@@ -83,8 +87,10 @@ var (
 	subConfig   = []byte("cfg")
 	subUploads  = []byte("upl")
 	subParts    = []byte("parts")
+	// subUploadOrder is the listing-order index of uploads (uploadindex.go).
+	subUploadOrder = []byte("upk")
 
-	perBucketSubs = [][]byte{subVersions, subCurrent, subNull, subData, subConfig, subUploads, subParts}
+	perBucketSubs = [][]byte{subVersions, subCurrent, subNull, subData, subConfig, subUploads, subParts, subUploadOrder}
 
 	keyFormat = []byte("format")
 )

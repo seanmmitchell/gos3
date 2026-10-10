@@ -2,10 +2,13 @@ package memory
 
 import (
 	"context"
+	"encoding/binary"
+	"errors"
 	"fmt"
 	"slices"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/seanmmitchell/gos3/internal/storage"
 )
@@ -59,7 +62,7 @@ func (b *Backend) CreateMultipartUpload(ctx context.Context, bucketName, key str
 		},
 		parts: make(map[int]*part),
 	}
-	bk.uploads[id] = u
+	bk.addUpload(u)
 	return cloneUpload(u.info), nil
 }
 
@@ -191,19 +194,63 @@ func (b *Backend) ListMultipartUploads(ctx context.Context, bucketName string) (
 	}
 	defer bk.mu.RUnlock()
 	out := make([]storage.UploadInfo, 0, len(bk.uploads))
-	for _, u := range bk.uploads {
-		out = append(out, cloneUpload(u.info))
+	for n := bk.uploadOrder.First(); n != nil; n = n.Next() {
+		out = append(out, cloneUpload(n.val.info))
 	}
-	slices.SortFunc(out, func(a, c storage.UploadInfo) int {
-		if r := strings.Compare(a.Key, c.Key); r != 0 {
-			return r
-		}
-		if r := a.Initiated.Compare(c.Initiated); r != 0 {
-			return r
-		}
-		return strings.Compare(a.UploadID, c.UploadID)
-	})
 	return out, nil
+}
+
+// WalkMultipartUploads calls fn for the uploads with the given key prefix
+// after position after, in listing order (see storage.UploadWalker). The
+// uploads are read in batches under the bucket's read lock; fn runs with
+// no lock held.
+func (b *Backend) WalkMultipartUploads(ctx context.Context, bucketName, prefix string, after storage.UploadPosition, fn func(storage.UploadInfo) error) error {
+	if fn == nil {
+		return errors.New("memory: nil walk function")
+	}
+	start := string(appendEscapedKey(nil, prefix))
+	cursor, inclusive := uploadSeekKey(after)
+	if cursor < start {
+		cursor, inclusive = start, true
+	}
+	batch := walkMinBatch
+	for {
+		bk, err := b.rlockBucket(ctx, bucketName)
+		if err != nil {
+			return err
+		}
+		var n *slNode[*upload]
+		if inclusive {
+			n = bk.uploadOrder.SeekGE(cursor)
+		} else {
+			n = bk.uploadOrder.SeekGT(cursor)
+		}
+		items := make([]storage.UploadInfo, 0, batch)
+		done := true
+		for ; n != nil && strings.HasPrefix(n.key, start); n = n.Next() {
+			if len(items) == batch {
+				done = false
+				break
+			}
+			cursor, inclusive = n.key, false
+			if strings.HasPrefix(n.val.info.Key, prefix) {
+				items = append(items, cloneUpload(n.val.info))
+			}
+		}
+		bk.mu.RUnlock()
+		for _, it := range items {
+			if err := fn(it); err != nil {
+				if errors.Is(err, storage.ErrStopWalk) {
+					return nil
+				}
+				return err
+			}
+		}
+		if done {
+			return nil
+		}
+		batch = nextBatch(batch)
+	}
 }
 
 // CompleteMultipartUpload concatenates the listed parts into a new object
@@ -249,7 +296,7 @@ func (b *Backend) CompleteMultipartUpload(ctx context.Context, bucketName, key, 
 	if err != nil {
 		return storage.ObjectInfo{}, err
 	}
-	delete(bk.uploads, uploadID)
+	bk.removeUpload(u)
 	return info, nil
 }
 
@@ -260,9 +307,64 @@ func (b *Backend) AbortMultipartUpload(ctx context.Context, bucketName, key, upl
 		return err
 	}
 	defer bk.mu.Unlock()
-	if _, err := findUpload(bk, key, uploadID); err != nil {
+	u, err := findUpload(bk, key, uploadID)
+	if err != nil {
 		return err
 	}
-	delete(bk.uploads, uploadID)
+	bk.removeUpload(u)
 	return nil
+}
+
+// addUpload registers u (bucket lock held).
+func (bk *bucket) addUpload(u *upload) {
+	bk.uploads[u.info.UploadID] = u
+	bk.uploadOrder.Set(uploadOrderKey(u.info.Key, u.info.Initiated, u.info.UploadID), u)
+}
+
+// removeUpload unregisters u (bucket lock held).
+func (bk *bucket) removeUpload(u *upload) {
+	delete(bk.uploads, u.info.UploadID)
+	bk.uploadOrder.Delete(uploadOrderKey(u.info.Key, u.info.Initiated, u.info.UploadID))
+}
+
+// appendEscapedKey appends key with every 0x00 byte escaped as 0x00 0xFF.
+// Followed by a terminator starting with 0x00 and a byte below 0xFF, the
+// byte-wise order of escaped keys is the order of the keys and no escaped
+// key is a prefix of another key's terminated encoding.
+func appendEscapedKey(dst []byte, key string) []byte {
+	for i := 0; i < len(key); i++ {
+		dst = append(dst, key[i])
+		if key[i] == 0 {
+			dst = append(dst, 0xff)
+		}
+	}
+	return dst
+}
+
+// uploadOrderKey returns the uploadOrder key of an upload: the escaped
+// object key, the terminator 0x00 0x01, the initiation time (sign-flipped
+// big-endian Unix seconds and nanoseconds) and the upload ID, so that the
+// byte-wise order of keys is the listing order (key, Initiated, UploadID).
+func uploadOrderKey(key string, initiated time.Time, uploadID string) string {
+	b := make([]byte, 0, len(key)+14+len(uploadID))
+	b = appendEscapedKey(b, key)
+	b = append(b, 0x00, 0x01)
+	b = binary.BigEndian.AppendUint64(b, uint64(initiated.Unix())^(1<<63))
+	b = binary.BigEndian.AppendUint32(b, uint32(initiated.Nanosecond()))
+	return string(append(b, uploadID...))
+}
+
+// uploadSeekKey returns where a walk after position p starts: at the
+// returned key (inclusive) or strictly after it.
+func uploadSeekKey(p storage.UploadPosition) (key string, inclusive bool) {
+	switch {
+	case p == storage.UploadPosition{}:
+		return "", true
+	case p.AfterKey:
+		// 0x00 0x02 sorts after the terminator 0x00 0x01 of every upload of
+		// p.Key and before every escaped greater key.
+		return string(append(appendEscapedKey(nil, p.Key), 0x00, 0x02)), true
+	default:
+		return uploadOrderKey(p.Key, p.Initiated, p.UploadID), false
+	}
 }

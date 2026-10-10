@@ -178,8 +178,30 @@ See the doc comments in `storage.go`. Key points:
   and listing order.
 - Version IDs for versioned writes must be unique, URL-safe, ≤ 64 chars and
   never `null`.
+- Optional Backend extensions (`optional.go`), discovered by type
+  assertion; both built-in backends implement both:
+  - `ConditionalDeleter.DeleteObjectIf` looks up the addressed version and
+    deletes it only if a check on it passes, atomically (same transaction or
+    lock). The S3 DeleteObject/DeleteObjects `If-Match` and object lock path
+    and the lifecycle worker use it; without it the S3 layer checks just
+    before the delete and the lifecycle worker skips permanent deletes (it
+    still adds delete markers).
+  - `UploadWalker.WalkMultipartUploads` walks in-progress uploads in listing
+    order (key, Initiated, UploadID) from an `UploadPosition`, without loading
+    all of a bucket's uploads.
+  `uploads.go` builds on them: `storage.ListUploads` (S3
+  ListMultipartUploads paging: prefix, delimiter, key/upload-ID markers),
+  `storage.WalkMultipartUploads` and `storage.CountMultipartUploads`, each
+  falling back to `ListMultipartUploads` for a backend without
+  `UploadWalker`.
 - `fs` layout: `<root>/.gos3/meta.db` (bbolt: buckets, configs, object
-  versions, uploads) + `<root>/.gos3/data/<bucket-id>/<2-hex>/<random-id>` data
+  versions, uploads, and a per-bucket `upk` index of multipart uploads in
+  listing order: key, initiation time, upload ID. The index is created, and
+  checked against the upload records, at `Open`, so existing data
+  directories are indexed on first start with no schema version change.
+  Paged upload listings, the lifecycle abort pass and usage counts seek it
+  instead of decoding every upload) +
+  `<root>/.gos3/data/<bucket-id>/<2-hex>/<random-id>` data
   files (written to `<root>/.gos3/tmp/` then renamed; fsync configurable) +
   multipart parts under `<root>/.gos3/uploads/<upload-id>/<part>`. Data files
   are immutable; replaced/deleted versions are unlinked after the metadata

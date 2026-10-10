@@ -102,6 +102,15 @@ func validateObjectKey(key string) error {
 	return nil
 }
 
+// trimHeaderSpace removes the spaces and tabs around a header value (the
+// optional whitespace of HTTP, which net/http already strips from HTTP/1
+// headers). Other whitespace, such as U+00A0, is kept, so a value carrying
+// it fails validation. Header values that become object attributes are
+// trimmed with this function both when they are parsed and when they
+// become condition keys (see conditionContext): a value is stored exactly
+// as the policy saw it, or refused.
+func trimHeaderSpace(v string) string { return strings.Trim(v, " \t") }
+
 // Storage classes accepted in x-amz-storage-class (gos3 records them; all
 // data is stored identically).
 var storageClasses = map[string]bool{
@@ -114,7 +123,7 @@ var storageClasses = map[string]bool{
 // normalizeStorageClass validates a storage class header value and returns
 // the stored form ("" for STANDARD / absent).
 func normalizeStorageClass(v string) (string, error) {
-	v = strings.TrimSpace(v)
+	v = trimHeaderSpace(v)
 	if v == "" || v == "STANDARD" {
 		return "", nil
 	}
@@ -143,7 +152,7 @@ var objectCannedACLs = map[string]bool{
 // validateCannedACL validates an x-amz-acl value for an object (bucket =
 // false) or bucket and returns the stored form ("" for private / absent).
 func validateCannedACL(v string, bucket bool) (string, error) {
-	v = strings.TrimSpace(v)
+	v = trimHeaderSpace(v)
 	if v == "" || v == aclPrivate {
 		return "", nil
 	}

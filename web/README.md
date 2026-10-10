@@ -81,13 +81,16 @@ response headers the UI reads:
 | Header | Needed for |
 |---|---|
 | `ETag` | multipart uploads (else `S3Error` `MissingETag`), object details |
-| `x-amz-meta-*` | the metadata editor — if not exposed, existing metadata looks empty and **saving it would wipe it** |
+| `x-amz-meta-*`, `Content-Disposition`, `Content-Encoding`, `Date` | the metadata editor — when a cross-origin HeadObject hides `Date` (not every header exposed), details show "Some headers are hidden" and the editor refuses to save rather than wipe metadata it cannot see |
 | `x-amz-version-id`, `x-amz-delete-marker`, `x-amz-checksum-*`, `x-amz-object-lock-*`, `Content-*`, `Last-Modified` | versions, details, checksums, retention |
 
 gos3's default `cors.expose_headers` starts with `"*"` and lists these names
 explicitly, so only `cors.allowed_origins` needs the UI origin. For other S3
 services, configure the equivalent (`ExposeHeaders` in the bucket CORS rules
-for AWS; `x-amz-meta-*` wildcards are not supported there, list the names).
+for AWS; `x-amz-meta-*` wildcards are not supported there, so list `Date`
+and every metadata name to enable the metadata editor). The same applies to
+gos3 buckets with their own CORS rules, which reject `ExposeHeader`
+wildcards. See [docs/web-ui.md](../docs/web-ui.md#cors).
 `GET /_gos3/info` always sends `Access-Control-Allow-Origin: *`, so the UI
 can detect a gos3 server (and tell "CORS blocked" from "unreachable") before
 CORS is configured.

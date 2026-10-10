@@ -53,8 +53,9 @@ async function restore(v: ObjectVersion) {
   if (!props.client) return
   busyId.value = v.versionId
   try {
-    await restoreVersion(props.client, props.bucket, props.objectKey, v.versionId)
-    toast.add({ title: 'Version restored', description: 'It is now the latest version.', color: 'success', icon: 'i-lucide-circle-check' })
+    const r = await restoreVersion(props.client, props.bucket, props.objectKey, v.versionId)
+    if (r.aclReset) toast.add({ title: 'Version restored, ACL reset', description: 'It is now the latest version. Its custom ACL grants cannot be carried over: it is private now.', color: 'warning', icon: 'i-lucide-shield-alert' })
+    else toast.add({ title: 'Version restored', description: 'It is now the latest version.', color: 'success', icon: 'i-lucide-circle-check' })
     await load()
     emit('changed', {})
   } catch (e) {

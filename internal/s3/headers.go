@@ -124,14 +124,14 @@ func sseFromHeaders(h http.Header) (sse, kmsKeyID string, err error) {
 	if err := checkSSECHeaders(h); err != nil {
 		return "", "", err
 	}
-	sse = strings.TrimSpace(h.Get("X-Amz-Server-Side-Encryption"))
+	sse = trimHeaderSpace(h.Get("X-Amz-Server-Side-Encryption"))
 	switch sse {
 	case "", "AES256", "aws:kms", "aws:kms:dsse":
 	default:
 		return "", "", s3err.ErrInvalidArgument.WithMessage("The encryption method specified is not supported").
 			With("ArgumentName", "x-amz-server-side-encryption").With("ArgumentValue", sse)
 	}
-	kmsKeyID = strings.TrimSpace(h.Get("X-Amz-Server-Side-Encryption-Aws-Kms-Key-Id"))
+	kmsKeyID = trimHeaderSpace(h.Get("X-Amz-Server-Side-Encryption-Aws-Kms-Key-Id"))
 	if kmsKeyID != "" && !strings.HasPrefix(sse, "aws:kms") {
 		return "", "", s3err.ErrInvalidArgument.WithMessage("Server Side Encryption with AWS KMS managed key requires HTTP header x-amz-server-side-encryption : aws:kms").
 			With("ArgumentName", "x-amz-server-side-encryption")
@@ -155,8 +155,8 @@ func checkSSECHeaders(h http.Header) error {
 
 // objectLockFromHeaders validates the object lock headers into m.
 func (s *Server) objectLockFromHeaders(h http.Header, m *storage.ObjectMeta) error {
-	mode := strings.TrimSpace(h.Get("X-Amz-Object-Lock-Mode"))
-	until := strings.TrimSpace(h.Get("X-Amz-Object-Lock-Retain-Until-Date"))
+	mode := trimHeaderSpace(h.Get("X-Amz-Object-Lock-Mode"))
+	until := trimHeaderSpace(h.Get("X-Amz-Object-Lock-Retain-Until-Date"))
 	if (mode == "") != (until == "") {
 		return s3err.ErrInvalidArgument.WithMessage("x-amz-object-lock-retain-until-date and x-amz-object-lock-mode must both be supplied")
 	}
@@ -176,7 +176,7 @@ func (s *Server) objectLockFromHeaders(h http.Header, m *storage.ObjectMeta) err
 		}
 		m.RetentionMode, m.RetainUntil = mode, t
 	}
-	switch v := strings.TrimSpace(h.Get("X-Amz-Object-Lock-Legal-Hold")); v {
+	switch v := trimHeaderSpace(h.Get("X-Amz-Object-Lock-Legal-Hold")); v {
 	case "":
 	case "ON":
 		m.LegalHold = true
