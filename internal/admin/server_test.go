@@ -387,16 +387,19 @@ func TestConfigValidation(t *testing.T) {
 		{"cors origin port", func(s *config.Settings) { s.CORS.AllowedOrigins = []string{"https://a.com:99999"} }, "allowedOrigins[0]"},
 		{"cors origin wildcard mid", func(s *config.Settings) { s.CORS.AllowedOrigins = []string{"https://a.*.com"} }, "allowedOrigins[0]"},
 		{"cors header", func(s *config.Settings) { s.CORS.AllowedHeaders = []string{"bad header"} }, "allowedHeaders[0]"},
-		{"cors expose wildcard", func(s *config.Settings) { s.CORS.ExposeHeaders = []string{"*"} }, "exposeHeaders[0]"},
+		{"cors expose pattern", func(s *config.Settings) { s.CORS.ExposeHeaders = []string{"ETag", "x-amz-*"} }, "exposeHeaders[1]"},
 		{"cors max age", func(s *config.Settings) { s.CORS.MaxAgeSeconds = -1 }, "maxAgeSeconds"},
 		{"beacon group not multicast", func(s *config.Settings) { s.Discovery.BeaconGroup = "10.0.0.1:7373" }, "beaconGroup"},
 		{"beacon group no port", func(s *config.Settings) { s.Discovery.BeaconGroup = "239.255.73.83" }, "beaconGroup"},
 		{"beacon group bad port", func(s *config.Settings) { s.Discovery.BeaconGroup = "239.255.73.83:0" }, "beaconGroup"},
+		{"beacon group ipv6", func(s *config.Settings) { s.Discovery.BeaconGroup = "[ff02::1]:7373" }, "beaconGroup"},
 		{"beacon interval", func(s *config.Settings) { s.Discovery.BeaconInterval = 0 }, "beaconInterval"},
+		{"beacon interval high", func(s *config.Settings) { s.Discovery.BeaconInterval = 2 * time.Hour }, "beaconInterval"},
 		{"peer ttl", func(s *config.Settings) { s.Discovery.PeerTTL = -time.Second }, "peerTtl"},
 		{"seed", func(s *config.Settings) { s.Discovery.Seeds = []string{"not a url"} }, "seeds[0]"},
 		{"seed path", func(s *config.Settings) { s.Discovery.Seeds = []string{"http://h:9000/x"} }, "seeds[0]"},
 		{"dns srv", func(s *config.Settings) { s.Discovery.DNSSRV = []string{"-bad.example"} }, "dnsSrv[0]"},
+		{"dns srv too many", func(s *config.Settings) { s.Discovery.DNSSRV = make([]string, 65) }, "dnsSrv"},
 		{"max scan hosts low", func(s *config.Settings) { s.Discovery.MaxScanHosts = 0 }, "maxScanHosts"},
 		{"max scan hosts high", func(s *config.Settings) { s.Discovery.MaxScanHosts = 65537 }, "maxScanHosts"},
 		{"log level", func(s *config.Settings) { s.Logging.Level = "verbose" }, "logging.level"},
@@ -421,10 +424,28 @@ func TestConfigValidation(t *testing.T) {
 		s.PublicURL = ""
 		s.Domains = nil
 		s.Discovery.MaxScanHosts = 65536
-		s.Discovery.Seeds = []string{"https://peer.example.com:9443"}
+		s.Discovery.Seeds = []string{"https://peer.example.com:9443", "nas.local:9000"}
 		s.Discovery.DNSSRV = []string{"example.com."}
-		s.Discovery.BeaconGroup = "[ff02::1]:7373"
+		s.Discovery.BeaconGroup = "239.1.2.3:7000"
+		s.CORS.ExposeHeaders = []string{"*", "ETag", "x-amz-version-id"}
 		e.root("PUT", "/config", s).expectStatus(t, 200)
+	})
+	t.Run("defaults round trip", func(t *testing.T) {
+		// The settings a default server starts with must survive the UI's
+		// GET-then-PUT round trip (same validator on both sides).
+		s := config.SettingsFrom(config.Default())
+		e.root("PUT", "/config", s).expectStatus(t, 200)
+		var got config.Settings
+		e.root("GET", "/config", nil).json(t, &got)
+		e.root("PUT", "/config", got).expectStatus(t, 200)
+	})
+	t.Run("message names field and value", func(t *testing.T) {
+		s := defaultSettings()
+		s.Discovery.Seeds = []string{"http://ok:9000", "ftp://peer"}
+		msg := e.root("PUT", "/config", s).expectError(t, 400, codeInvalidSettings)
+		if !strings.HasPrefix(msg, "discovery.seeds[1]: ") || !strings.Contains(msg, "ftp://peer") {
+			t.Errorf("message %q", msg)
+		}
 	})
 	if got := e.settings.Get().Region; got != "us-east-1" {
 		t.Errorf("invalid settings applied: region %q", got)

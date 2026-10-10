@@ -1,0 +1,468 @@
+// Package server wires gos3 together: it opens the storage backend, system
+// state (<data>/.gos3: server-id, root credentials, iam.json,
+// settings.json), IAM, the S3 and admin API handlers, discovery, the
+// lifecycle worker and the embedded web UI, and serves them on one listener
+// with the top-level routing described in docs/ARCHITECTURE.md:
+//
+//  1. virtual-hosted-style requests (Host "<bucket>.<domain>") → S3, always;
+//  2. /_gos3/admin/v1 → admin API, /_gos3/ui/ → web UI, /_gos3/info,
+//     /_gos3/health, /_gos3/ready, /_gos3/metrics; any other /_gos3/ path →
+//     404 JSON;
+//  3. an anonymous browser GET / (Accept: text/html) → 302 to the UI;
+//  4. everything else → S3.
+//
+// Typical use (see cmd/gos3):
+//
+//	srv, err := server.New(cfg, logger, server.WithLogControl(ctl))
+//	if err != nil { ... }
+//	err = srv.Run(ctx) // returns after ctx is done and shutdown completed
+package server
+
+import (
+	"context"
+	"crypto/tls"
+	"errors"
+	"fmt"
+	"io/fs"
+	"log/slog"
+	"net"
+	"net/http"
+	"os"
+	"path/filepath"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"time"
+
+	"github.com/seanmmitchell/gos3/internal/admin"
+	"github.com/seanmmitchell/gos3/internal/auth"
+	"github.com/seanmmitchell/gos3/internal/config"
+	"github.com/seanmmitchell/gos3/internal/discovery"
+	"github.com/seanmmitchell/gos3/internal/iam"
+	"github.com/seanmmitchell/gos3/internal/lifecycle"
+	"github.com/seanmmitchell/gos3/internal/metrics"
+	"github.com/seanmmitchell/gos3/internal/s3"
+	"github.com/seanmmitchell/gos3/internal/storage"
+	fsbackend "github.com/seanmmitchell/gos3/internal/storage/fs"
+	"github.com/seanmmitchell/gos3/internal/storage/memory"
+	"github.com/seanmmitchell/gos3/internal/version"
+	"github.com/seanmmitchell/gos3/internal/webui"
+)
+
+// ServerIDFileName is the file in the system directory holding the
+// persistent server ID.
+const ServerIDFileName = "server-id"
+
+// Timeouts of the HTTP listener and the public probes. There is deliberately
+// no global read/write timeout: object transfers may legitimately take hours.
+const (
+	readHeaderTimeout = 30 * time.Second
+	idleTimeout       = 2 * time.Minute
+	maxHeaderBytes    = 1 << 20
+	readyTimeout      = 5 * time.Second
+	metricsTimeout    = 5 * time.Second
+	urlCacheTTL       = 30 * time.Second
+)
+
+// Option customizes New.
+type Option func(*options)
+
+type options struct {
+	uiFS       fs.FS
+	logControl *LogControl
+	version    string
+}
+
+// WithUIFS serves the web UI from fsys instead of the embedded build (tests,
+// or a UI built separately).
+func WithUIFS(fsys fs.FS) Option { return func(o *options) { o.uiFS = fsys } }
+
+// WithLogControl lets the server apply the logging settings (level, format)
+// to the logger at start and whenever they change through the admin API.
+// ctl must control the logger passed to New (see NewLogger).
+func WithLogControl(ctl *LogControl) Option { return func(o *options) { o.logControl = ctl } }
+
+// WithVersion overrides the version reported in /_gos3/info and the Server
+// header (default version.Short()).
+func WithVersion(v string) Option { return func(o *options) { o.version = v } }
+
+// Server is an assembled gos3 server. Create it with New, then call Run (or
+// Serve with your own listener). It is an http.Handler, so tests may also
+// drive Handler() directly.
+type Server struct {
+	cfg        config.Config
+	log        *slog.Logger
+	logControl *LogControl
+	version    string
+
+	backend     storage.Backend
+	backendName string
+	dataPath    string // absolute data directory ("" when ephemeral)
+	systemDir   string
+	iam         *iam.Manager
+	verifier    *auth.Verifier
+	metrics     *metrics.Registry
+	settings    *config.Store
+	s3          http.Handler
+	admin       http.Handler
+	ui          http.Handler // nil when the UI is disabled
+	uiBuilt     bool
+	disc        *discovery.Service
+	lifecycle   *lifecycle.Worker
+	tlsConfig   *tls.Config
+
+	serverID    string
+	startedAt   time.Time
+	credsSource string
+
+	addr     atomic.Value // string: the bound listen address once serving
+	serving  atomic.Bool
+	draining atomic.Bool
+	ready    chan struct{}
+
+	lifeCtx    context.Context // background work (discovery, lifecycle)
+	lifeCancel context.CancelFunc
+
+	urlMu      sync.Mutex
+	urlKey     string
+	urlExpires time.Time
+	urls       []string
+
+	closeOnce sync.Once
+	closeErr  error
+}
+
+// New assembles a server from a configuration loaded with config.Load. It
+// validates cfg, opens the backend and the system state and fills in root
+// credentials (config.ResolveRootCredentials), but does not listen yet.
+// Close (or Run/Serve, which close on return) releases the resources.
+// A nil logger discards logs.
+func New(cfg config.Config, logger *slog.Logger, opts ...Option) (_ *Server, err error) {
+	var o options
+	for _, opt := range opts {
+		opt(&o)
+	}
+	if logger == nil {
+		logger = slog.New(slog.DiscardHandler)
+	}
+	if o.version == "" {
+		o.version = version.Short()
+	}
+	cfg.Normalize()
+	if err := cfg.Validate(); err != nil {
+		return nil, fmt.Errorf("invalid configuration: %w", err)
+	}
+
+	s := &Server{
+		cfg:        cfg,
+		log:        logger,
+		logControl: o.logControl,
+		version:    o.version,
+		systemDir:  cfg.SystemDir(),
+		startedAt:  time.Now().UTC().Truncate(time.Second),
+		ready:      make(chan struct{}),
+	}
+	s.lifeCtx, s.lifeCancel = context.WithCancel(context.Background())
+	defer func() {
+		if err != nil {
+			_ = s.Close()
+		}
+	}()
+
+	if cfg.TLSEnabled() {
+		cert, err := tls.LoadX509KeyPair(cfg.Server.TLSCert, cfg.Server.TLSKey)
+		if err != nil {
+			return nil, fmt.Errorf("loading TLS certificate: %w", err)
+		}
+		s.tlsConfig = &tls.Config{Certificates: []tls.Certificate{cert}, MinVersion: tls.VersionTLS12}
+	}
+
+	// Storage first: the fs backend locks its directory, so a second
+	// process on the same data path fails before touching any state.
+	if err := s.openBackend(); err != nil {
+		return nil, err
+	}
+	if s.systemDir != "" {
+		if err := os.MkdirAll(s.systemDir, 0o700); err != nil {
+			return nil, fmt.Errorf("creating system directory: %w", err)
+		}
+	}
+	if s.serverID, err = loadServerID(s.systemDir, logger); err != nil {
+		return nil, err
+	}
+	s.credsSource = credentialsSource(&cfg, s.systemDir)
+	if err := config.ResolveRootCredentials(&cfg, s.systemDir, logger); err != nil {
+		return nil, err
+	}
+	s.cfg = cfg
+
+	if s.iam, err = iam.Open(iam.Options{
+		Dir:           s.systemDir,
+		RootAccessKey: cfg.Auth.RootAccessKey,
+		RootSecretKey: cfg.Auth.RootSecretKey,
+	}); err != nil {
+		return nil, fmt.Errorf("opening IAM: %w", err)
+	}
+	if s.settings, err = config.LoadStore(config.SettingsFrom(cfg), cfg.SettingsPath()); err != nil {
+		return nil, err
+	}
+	st := s.settings.Get()
+	s.logControl.Set(st.Logging.Level, st.Logging.Format)
+
+	s.verifier = auth.NewVerifier(s.iam, auth.Options{Region: st.Region, StrictRegion: cfg.Auth.StrictRegion})
+	s.metrics = metrics.NewRegistry()
+	s.s3 = s3.NewHandler(s3.Options{
+		Backend:           s.backend,
+		Verifier:          s.verifier,
+		IAM:               s.iam,
+		Metrics:           s.metrics,
+		Settings:          s.settings,
+		Logger:            logger,
+		MaxObjectSize:     cfg.Server.MaxObjectSize,
+		Version:           s.version,
+		TrustProxyHeaders: cfg.Server.TrustProxyHeaders,
+	})
+	s.disc = discovery.New(st.Discovery, s.Info, logger)
+	s.admin = s.instrumentAdmin(admin.NewHandler(admin.Deps{
+		Backend:     s.backend,
+		Verifier:    s.verifier,
+		IAM:         s.iam,
+		Metrics:     s.metrics,
+		Settings:    s.settings,
+		Discovery:   s.disc,
+		Info:        s.Info,
+		BackendName: s.backendName,
+		DataPath:    s.dataPath,
+		Logger:      logger,
+	}))
+	s.lifecycle = lifecycle.NewWorker(s.backend, lifecycle.Options{
+		Interval: time.Duration(st.Lifecycle.IntervalSeconds) * time.Second,
+		Logger:   logger.With("component", "lifecycle"),
+	})
+	s.lifecycle.Reconfigure(time.Duration(st.Lifecycle.IntervalSeconds)*time.Second, st.Lifecycle.Enabled)
+
+	if cfg.UI.Enabled {
+		fsys := o.uiFS
+		if fsys == nil {
+			fsys = webui.FS()
+		}
+		s.ui = webui.NewHandler(fsys)
+		s.uiBuilt = webui.IsBuilt(fsys)
+		if !s.uiBuilt {
+			logger.Warn("the web UI is not built into this binary; /_gos3/ui/ shows a placeholder (build with `make build`)")
+		}
+	}
+
+	s.settings.Subscribe(s.applySettings)
+	return s, nil
+}
+
+// openBackend opens the configured storage backend.
+func (s *Server) openBackend() error {
+	switch s.cfg.Storage.Backend {
+	case config.BackendMemory:
+		s.backend, s.backendName = memory.New(), config.BackendMemory
+		if s.cfg.Storage.Path != "" {
+			abs, err := filepath.Abs(s.cfg.Storage.Path)
+			if err != nil {
+				return fmt.Errorf("data path: %w", err)
+			}
+			s.dataPath = abs
+		}
+	default:
+		b, err := fsbackend.Open(s.cfg.Storage.Path, fsbackend.Options{
+			FsyncData: s.cfg.Storage.FsyncData,
+			Logger:    s.log.With("component", "storage"),
+		})
+		if err != nil {
+			return fmt.Errorf("opening storage: %w", err)
+		}
+		s.backend, s.backendName, s.dataPath = b, config.BackendFS, b.Root()
+	}
+	return nil
+}
+
+// credentialsSource predicts where config.ResolveRootCredentials takes the
+// root credentials from (one of the config.Credentials* constants).
+func credentialsSource(cfg *config.Config, systemDir string) string {
+	switch {
+	case cfg.Auth.RootAccessKey != "" || cfg.Auth.RootSecretKey != "":
+		return config.CredentialsConfigured
+	case systemDir == "":
+		return config.CredentialsEphemeral
+	}
+	if _, err := os.Stat(filepath.Join(systemDir, config.RootCredentialsFileName)); err == nil {
+		return config.CredentialsStored
+	}
+	return config.CredentialsGenerated
+}
+
+// loadServerID returns the persistent server ID from <dir>/server-id,
+// creating it on first start. With dir "" (ephemeral) a new ID is returned.
+// An unreadable ID file is replaced (with a warning) rather than fatal: the
+// ID only identifies the server to discovery peers.
+func loadServerID(dir string, log *slog.Logger) (string, error) {
+	if dir == "" {
+		return discovery.NewServerID(), nil
+	}
+	file := filepath.Join(dir, ServerIDFileName)
+	data, err := os.ReadFile(file)
+	switch {
+	case err == nil:
+		if id := strings.TrimSpace(string(data)); validServerID(id) {
+			return id, nil
+		}
+		log.Warn("server-id file is invalid, generating a new server ID", "file", file)
+	case !errors.Is(err, fs.ErrNotExist):
+		return "", fmt.Errorf("reading server ID: %w", err)
+	}
+	id := discovery.NewServerID()
+	if err := config.WriteFileAtomic(file, []byte(id+"\n"), 0o644); err != nil {
+		return "", fmt.Errorf("storing server ID: %w", err)
+	}
+	return id, nil
+}
+
+// validServerID accepts the IDs discovery accepts: 1-64 characters of
+// [A-Za-z0-9._-].
+func validServerID(id string) bool {
+	if id == "" || len(id) > 64 {
+		return false
+	}
+	for _, c := range []byte(id) {
+		if !(c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' || c >= '0' && c <= '9' || c == '.' || c == '_' || c == '-') {
+			return false
+		}
+	}
+	return true
+}
+
+// Close stops background work and releases the backend and IAM. It is
+// idempotent and is called by Run/Serve on return; call it yourself only
+// when the server was never served.
+func (s *Server) Close() error {
+	s.closeOnce.Do(func() {
+		if s.lifeCancel != nil {
+			s.lifeCancel()
+		}
+		if s.disc != nil {
+			s.disc.Stop()
+		}
+		if s.lifecycle != nil {
+			s.lifecycle.Stop()
+		}
+		var errs []error
+		if s.backend != nil {
+			if err := s.backend.Close(); err != nil {
+				errs = append(errs, fmt.Errorf("closing storage: %w", err))
+			}
+		}
+		if s.iam != nil {
+			if err := s.iam.Close(); err != nil {
+				errs = append(errs, fmt.Errorf("closing IAM: %w", err))
+			}
+		}
+		s.closeErr = errors.Join(errs...)
+	})
+	return s.closeErr
+}
+
+// Handler returns the top-level HTTP handler (the server itself).
+func (s *Server) Handler() http.Handler { return s }
+
+// Addr returns the address the server listens on once Run/Serve bound it
+// (e.g. "127.0.0.1:41234"), else "".
+func (s *Server) Addr() string {
+	a, _ := s.addr.Load().(string)
+	return a
+}
+
+// Ready is closed once the server is listening (Addr and URL are then set).
+func (s *Server) Ready() <-chan struct{} { return s.ready }
+
+// URL returns the base URL for reaching the server from this host
+// ("http://127.0.0.1:9000"; https with TLS). A wildcard listen host is
+// replaced by the loopback address. Before Run/Serve bound the listener it
+// is derived from the configured address.
+func (s *Server) URL() string {
+	addr := s.Addr()
+	if addr == "" {
+		addr = s.cfg.Server.Address
+	}
+	host, port, err := net.SplitHostPort(addr)
+	if err != nil {
+		return ""
+	}
+	if ip := net.ParseIP(host); host == "" || (ip != nil && ip.IsUnspecified()) {
+		host = "127.0.0.1"
+	}
+	return s.scheme() + "://" + net.JoinHostPort(host, port)
+}
+
+func (s *Server) scheme() string {
+	if s.tlsConfig != nil {
+		return "https"
+	}
+	return "http"
+}
+
+// RootCredentials returns the root access and secret key (configured,
+// stored or generated).
+func (s *Server) RootCredentials() (accessKey, secretKey string) {
+	return s.cfg.Auth.RootAccessKey, s.cfg.Auth.RootSecretKey
+}
+
+// CredentialsSource tells where the root credentials came from: one of
+// config.CredentialsConfigured, CredentialsStored, CredentialsGenerated or
+// CredentialsEphemeral.
+func (s *Server) CredentialsSource() string { return s.credsSource }
+
+// RootCredentialsFile returns the file holding generated root credentials
+// ("" when they are configured or ephemeral).
+func (s *Server) RootCredentialsFile() string {
+	if s.systemDir == "" || s.credsSource == config.CredentialsConfigured {
+		return ""
+	}
+	return filepath.Join(s.systemDir, config.RootCredentialsFileName)
+}
+
+// Config returns the effective static configuration, including the
+// resolved root credentials (use Redacted before printing it).
+func (s *Server) Config() config.Config { return s.cfg }
+
+// Settings returns the runtime settings store (changes are applied live).
+func (s *Server) Settings() *config.Store { return s.settings }
+
+// Discovery returns the discovery service.
+func (s *Server) Discovery() *discovery.Service { return s.disc }
+
+// Metrics returns the request metrics registry.
+func (s *Server) Metrics() *metrics.Registry { return s.metrics }
+
+// IAM returns the IAM manager.
+func (s *Server) IAM() *iam.Manager { return s.iam }
+
+// Backend returns the storage backend.
+func (s *Server) Backend() storage.Backend { return s.backend }
+
+// BackendName returns "fs" or "memory".
+func (s *Server) BackendName() string { return s.backendName }
+
+// DataPath returns the absolute data directory ("" when fully ephemeral).
+func (s *Server) DataPath() string { return s.dataPath }
+
+// ServerID returns the server's discovery ID.
+func (s *Server) ServerID() string { return s.serverID }
+
+// UIEnabled reports whether /_gos3/ui/ is served; UIBuilt whether it is a
+// real UI build (not the placeholder).
+func (s *Server) UIEnabled() bool { return s.ui != nil }
+
+// UIBuilt reports whether the served UI is a real build.
+func (s *Server) UIBuilt() bool { return s.ui != nil && s.uiBuilt }
+
+// RunLifecycleOnce runs one lifecycle pass synchronously (tests and
+// operators), independent of the lifecycle schedule and enabled flag.
+func (s *Server) RunLifecycleOnce(ctx context.Context) (lifecycle.Stats, error) {
+	return s.lifecycle.RunOnce(ctx)
+}

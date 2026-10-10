@@ -10,6 +10,8 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"regexp"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -61,9 +63,10 @@ var DefaultExposeHeaders = []string{
 	"x-amz-abort-date", "x-amz-abort-rule-id",
 }
 
-// Default returns the default configuration. Name defaults to the host name;
-// Storage.Path is filled in by Normalize (fs backend only), so that a memory
-// backend without an explicit path is fully ephemeral.
+// Default returns the default configuration. Name defaults to the host name
+// (truncated to MaxNameLen). Storage.Path is DefaultDataPath; note that Load
+// only keeps it for the fs backend: a memory backend whose path is not
+// configured explicitly is fully ephemeral.
 func Default() Config {
 	name, _ := os.Hostname()
 	if len(name) > MaxNameLen {
@@ -80,6 +83,7 @@ func Default() Config {
 		},
 		Storage: StorageConfig{
 			Backend:   BackendFS,
+			Path:      DefaultDataPath,
 			FsyncData: true,
 		},
 		UI: UIConfig{Enabled: true, RedirectRoot: true},
@@ -96,17 +100,30 @@ func Default() Config {
 	}
 }
 
-// Load returns the configuration from defaults < YAML file < environment.
-// path is the YAML file ("" = $GOS3_CONFIG, and no file when that is unset
-// too). Unknown YAML fields are rejected. The result is normalized (see
-// Normalize) but not validated: callers apply flag overrides and then call
-// Validate.
-func Load(path string) (Config, error) {
-	return load(path, os.LookupEnv)
+// Override sets one configuration key (a YAML key such as "server.address",
+// see EnvVars) to a value in environment-variable syntax. The CLI turns its
+// flags into Overrides, which Load applies last.
+type Override struct {
+	Key   string
+	Value string
 }
 
-func load(path string, lookup func(string) (string, bool)) (Config, error) {
+// Load returns the configuration from defaults < YAML file < environment
+// (GOS3_*) < overrides (CLI flags). path is the YAML file ("" =
+// $GOS3_CONFIG, and no file when that is unset too). Unknown YAML fields are
+// rejected. The result is normalized (see Normalize) but not validated:
+// call Validate before using it.
+//
+// storage.path defaults to DefaultDataPath for the fs backend only; with the
+// memory backend it stays empty (fully ephemeral) unless set explicitly.
+func Load(path string, overrides ...Override) (Config, error) {
+	return load(path, os.LookupEnv, overrides)
+}
+
+func load(path string, lookup func(string) (string, bool), overrides []Override) (Config, error) {
 	cfg := Default()
+	// Normalize fills the backend-dependent default once all layers are in.
+	cfg.Storage.Path = ""
 	if path == "" {
 		path, _ = lookup(EnvConfig)
 	}
@@ -122,6 +139,11 @@ func load(path string, lookup func(string) (string, bool)) (Config, error) {
 	if err := applyEnv(&cfg, lookup); err != nil {
 		return Config{}, fmt.Errorf("config: %w", err)
 	}
+	for _, o := range overrides {
+		if err := cfg.Set(o.Key, o.Value); err != nil {
+			return Config{}, fmt.Errorf("config: %w", err)
+		}
+	}
 	cfg.Normalize()
 	return cfg, nil
 }
@@ -135,6 +157,14 @@ func decodeYAML(data []byte, cfg *Config) error {
 		if errors.Is(err, io.EOF) {
 			return nil
 		}
+		var te *yaml.TypeError
+		if errors.As(err, &te) {
+			msgs := make([]string, len(te.Errors))
+			for i, m := range te.Errors {
+				msgs[i] = unknownFieldRe.ReplaceAllStringFunc(m, describeUnknownField)
+			}
+			return errors.New(strings.Join(msgs, "; "))
+		}
 		return err
 	}
 	var extra yaml.Node
@@ -144,9 +174,39 @@ func decodeYAML(data []byte, cfg *Config) error {
 	return nil
 }
 
-// Normalize fills derived defaults: the data path of the fs backend
-// (DefaultDataPath), the host name as server name and the default region when
-// empty, and trims list entries.
+// unknownFieldRe matches yaml.v3's KnownFields message, e.g. "field adress
+// not found in type config.ServerConfig".
+var unknownFieldRe = regexp.MustCompile(`field (\S+) not found in type (\S+)`)
+
+// yamlSections maps the Go types of Config sections to their YAML keys.
+var yamlSections = map[string]string{
+	"config.ServerConfig":    "server",
+	"config.StorageConfig":   "storage",
+	"config.AuthConfig":      "auth",
+	"config.UIConfig":        "ui",
+	"config.CORSConfig":      "cors",
+	"discovery.Config":       "discovery",
+	"config.LoggingConfig":   "logging",
+	"config.LifecycleConfig": "lifecycle",
+	"config.MetricsConfig":   "metrics",
+}
+
+// describeUnknownField rewrites an unknown-field message in terms of YAML
+// keys: `unknown key "adress" in section "server"`.
+func describeUnknownField(m string) string {
+	sub := unknownFieldRe.FindStringSubmatch(m)
+	if sec, ok := yamlSections[sub[2]]; ok {
+		return fmt.Sprintf("unknown key %q in section %q", sub[1], sec)
+	}
+	if sub[2] == "config.Config" {
+		return fmt.Sprintf("unknown top-level key %q (expected server, storage, auth, ui, cors, discovery, logging, lifecycle or metrics)", sub[1])
+	}
+	return fmt.Sprintf("unknown key %q", sub[1])
+}
+
+// Normalize fills derived defaults (the data path of the fs backend, the
+// address, region and maximum object size when empty or zero), lower-cases
+// enumerations and trims list entries, dropping empty ones.
 func (c *Config) Normalize() {
 	c.Storage.Backend = strings.ToLower(strings.TrimSpace(c.Storage.Backend))
 	if c.Storage.Backend == "" {
@@ -160,6 +220,9 @@ func (c *Config) Normalize() {
 	}
 	if c.Server.Address == "" {
 		c.Server.Address = DefaultAddress
+	}
+	if c.Server.MaxObjectSize == 0 {
+		c.Server.MaxObjectSize = DefaultMaxObjectSize
 	}
 	c.Server.Domains = trimList(c.Server.Domains)
 	c.CORS.AllowedOrigins = trimList(c.CORS.AllowedOrigins)
@@ -185,24 +248,30 @@ func trimList(in []string) []string {
 }
 
 // Validate checks the static configuration, including the runtime Settings
-// derived from it (ValidateSettings).
+// derived from it (ValidateSettings). Errors name the offending YAML key,
+// e.g. "server.address: ...".
 func (c Config) Validate() error {
-	if _, _, err := net.SplitHostPort(c.Server.Address); err != nil {
+	host, port, err := net.SplitHostPort(c.Server.Address)
+	if err != nil || strings.ContainsAny(host, "/ ") {
 		return fmt.Errorf("server.address: %q must be [host]:port (e.g. \":9000\")", c.Server.Address)
+	}
+	if n, err := strconv.Atoi(port); err != nil || n < 0 || n > 65535 {
+		return fmt.Errorf("server.address: port %q must be 0-65535", port)
 	}
 	if (c.Server.TLSCert == "") != (c.Server.TLSKey == "") {
 		return errors.New("server.tls_cert and server.tls_key must be set together")
 	}
 	if c.Server.MaxObjectSize < 0 || c.Server.MaxObjectSize > MaxMaxObjectSize {
-		return fmt.Errorf("server.max_object_size: must be between 0 (default 5 GiB) and %d bytes", MaxMaxObjectSize)
+		return fmt.Errorf("server.max_object_size: must be between 1 and %d bytes (5 TiB; 0 = default 5 GiB), got %d",
+			MaxMaxObjectSize, c.Server.MaxObjectSize)
 	}
 	if c.Server.ShutdownTimeout < 0 {
-		return errors.New("server.shutdown_timeout must not be negative")
+		return fmt.Errorf("server.shutdown_timeout: must not be negative, got %s", c.Server.ShutdownTimeout)
 	}
 	switch c.Storage.Backend {
 	case BackendFS:
 		if c.Storage.Path == "" {
-			return errors.New("storage.path is required for the fs backend")
+			return errors.New("storage.path: required for the fs backend")
 		}
 	case BackendMemory:
 	default:
@@ -211,13 +280,52 @@ func (c Config) Validate() error {
 	if err := validateRootCredentials(c.Auth.RootAccessKey, c.Auth.RootSecretKey); err != nil {
 		return err
 	}
-	if c.Lifecycle.Interval != 0 && c.Lifecycle.Interval%time.Second != 0 {
-		return errors.New("lifecycle.interval must be a whole number of seconds")
+	if iv := c.Lifecycle.Interval; iv != 0 {
+		if lo, hi := MinLifecycleSeconds*time.Second, MaxLifecycleSeconds*time.Second; iv < lo || iv > hi || iv%time.Second != 0 {
+			return fmt.Errorf("lifecycle.interval: must be a whole number of seconds between %s and %s, got %s", lo, hi, iv)
+		}
 	}
 	if err := ValidateSettings(SettingsFrom(c)); err != nil {
-		return fmt.Errorf("invalid settings: %w", err)
+		var fe *FieldError
+		if errors.As(err, &fe) {
+			return fmt.Errorf("%s: %s", yamlField(fe.Field), fe.Msg)
+		}
+		return err
 	}
 	return nil
+}
+
+// settingsYAMLKeys maps Settings JSON field paths to the YAML keys of the
+// Config fields they are derived from (see SettingsFrom). Paths that are the
+// same in both forms (e.g. "logging.level", "discovery.seeds") are absent.
+var settingsYAMLKeys = map[string]string{
+	"name":                      "server.name",
+	"region":                    "server.region",
+	"publicUrl":                 "server.public_url",
+	"domains":                   "server.domains",
+	"cors.allowedOrigins":       "cors.allowed_origins",
+	"cors.allowedHeaders":       "cors.allowed_headers",
+	"cors.exposeHeaders":        "cors.expose_headers",
+	"cors.maxAgeSeconds":        "cors.max_age_seconds",
+	"discovery.beaconGroup":     "discovery.beacon_group",
+	"discovery.beaconInterval":  "discovery.beacon_interval",
+	"discovery.peerTtl":         "discovery.peer_ttl",
+	"discovery.dnsSrv":          "discovery.dns_srv",
+	"discovery.maxScanHosts":    "discovery.max_scan_hosts",
+	"lifecycle.intervalSeconds": "lifecycle.interval",
+}
+
+// yamlField translates a FieldError path ("cors.allowedOrigins[2]") to the
+// YAML key it came from ("cors.allowed_origins[2]").
+func yamlField(field string) string {
+	base, index := field, ""
+	if i := strings.IndexByte(field, '['); i >= 0 {
+		base, index = field[:i], field[i:]
+	}
+	if k, ok := settingsYAMLKeys[base]; ok {
+		return k + index
+	}
+	return field
 }
 
 // validateRootCredentials applies iam's rules for supplied keys: both or
@@ -321,11 +429,19 @@ func (c Config) SettingsPath() string {
 // TLSEnabled reports whether the listener serves HTTPS.
 func (c Config) TLSEnabled() bool { return c.Server.TLSCert != "" }
 
-// Redacted returns a copy with secrets replaced by "<redacted>", for display.
+// RedactedValue is the placeholder Config.Redacted substitutes for secrets.
+const RedactedValue = "<redacted>"
+
+// Redacted returns a deep copy with secrets (the root secret key) replaced
+// by "<redacted>", for printing and logging.
 func (c Config) Redacted() Config {
 	if c.Auth.RootSecretKey != "" {
-		c.Auth.RootSecretKey = "<redacted>"
+		c.Auth.RootSecretKey = RedactedValue
 	}
+	c.Server.Domains = slices.Clone(c.Server.Domains)
+	c.CORS = cloneCORS(c.CORS)
+	c.Discovery.Seeds = slices.Clone(c.Discovery.Seeds)
+	c.Discovery.DNSSRV = slices.Clone(c.Discovery.DNSSRV)
 	return c
 }
 

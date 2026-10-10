@@ -207,7 +207,10 @@ func (a *api) putConfig(rc *reqCtx) (int, any, error) {
 		}
 		return 0, nil, err
 	}
-	if err := validateSettings(&in); err != nil {
+	// config.ValidateSettings is the single source of truth; Store.Update
+	// validates again, but checking first keeps the 400 independent of how
+	// the store reports errors.
+	if err := config.ValidateSettings(in); err != nil {
 		return 0, nil, errorf(http.StatusBadRequest, codeInvalidSettings, "%s", err.Error())
 	}
 	out, err := a.d.Settings.Update(func(s *config.Settings) error {

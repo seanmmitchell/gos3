@@ -5,7 +5,9 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"io/fs"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -16,8 +18,9 @@ import (
 // LoadStore returns a Store persisting to path, starting from initial with a
 // previously persisted settings.json (if any) laid over it: fields present in
 // the file win, fields missing from it (e.g. added by a newer version) keep
-// their initial value. An unreadable or invalid file is an error (the server
-// should not silently drop an operator's settings). path "" = memory only.
+// their initial value. The result must pass ValidateSettings. An unreadable,
+// corrupt or invalid file is an error naming the file (the server should not
+// silently drop an operator's settings). path "" = memory only.
 func LoadStore(initial Settings, path string) (*Store, error) {
 	s := cloneSettings(initial)
 	if path != "" {
@@ -27,17 +30,36 @@ func LoadStore(initial Settings, path string) (*Store, error) {
 		case err != nil:
 			return nil, fmt.Errorf("config: reading settings: %w", err)
 		default:
-			dec := json.NewDecoder(bytes.NewReader(data))
-			if err := dec.Decode(&s); err != nil {
-				return nil, fmt.Errorf("config: %s: %w", path, err)
+			if err := decodeSettings(data, &s); err != nil {
+				return nil, fmt.Errorf("config: settings file %s is corrupt: %v (fix or delete it)", path, err)
 			}
-			s = normalizeSettings(s)
-			if err := ValidateSettings(s); err != nil {
-				return nil, fmt.Errorf("config: %s: %w (fix or delete the file)", path, err)
+			if err := ValidateSettings(normalizeSettings(s)); err != nil {
+				return nil, fmt.Errorf("config: settings file %s is invalid: %w (fix or delete it)", path, err)
 			}
 		}
 	}
-	return NewStore(normalizeSettings(s), path), nil
+	s = normalizeSettings(s)
+	if err := ValidateSettings(s); err != nil {
+		return nil, fmt.Errorf("config: invalid settings: %w", err)
+	}
+	return NewStore(s, path), nil
+}
+
+// decodeSettings decodes one JSON object over s, rejecting trailing data.
+// Unknown fields are ignored so that a file written by a newer version can
+// still be read.
+func decodeSettings(data []byte, s *Settings) error {
+	if len(bytes.TrimSpace(data)) == 0 {
+		return errors.New("file is empty")
+	}
+	dec := json.NewDecoder(bytes.NewReader(data))
+	if err := dec.Decode(s); err != nil {
+		return err
+	}
+	if _, err := dec.Token(); !errors.Is(err, io.EOF) {
+		return errors.New("unexpected data after the JSON object")
+	}
+	return nil
 }
 
 // writeSettingsFile atomically writes s as JSON to path (mode 0600).
@@ -101,20 +123,20 @@ func syncDir(dir string) {
 	}
 }
 
-// RootCredentialsFileName is the file (in SystemDir) holding generated root
-// credentials.
+// RootCredentialsFileName is the file (in the system directory) holding
+// generated root credentials.
 const RootCredentialsFileName = "root-credentials.json"
 
-// Sources of the root credentials reported by ResolveRootCredentials.
+// Sources of the root credentials (see ResolveRootCredentials).
 const (
-	// CredentialsConfigured: set in the config file or environment.
+	// CredentialsConfigured: set in the config file, environment or flags.
 	CredentialsConfigured = "configured"
 	// CredentialsStored: generated on an earlier start and read back from
-	// <data>/.gos3/root-credentials.json.
+	// <systemDir>/root-credentials.json.
 	CredentialsStored = "stored"
 	// CredentialsGenerated: generated now and stored for later starts.
 	CredentialsGenerated = "generated"
-	// CredentialsEphemeral: generated now and not stored (no data path).
+	// CredentialsEphemeral: generated now and not stored (no system dir).
 	CredentialsEphemeral = "ephemeral"
 )
 
@@ -123,21 +145,57 @@ type rootCredentialsFile struct {
 	SecretKey string `json:"secretKey"`
 }
 
-// ResolveRootCredentials makes sure c has root credentials. Configured keys
-// are kept. Otherwise keys stored in <SystemDir>/root-credentials.json by an
-// earlier start are reused, or new random ones are generated and stored
-// there (0600) — or, without a data path, generated for this process only.
-// It returns the source (Credentials* constants) and the file path ("" when
-// not stored).
-func ResolveRootCredentials(c *Config) (source, file string, err error) {
+// ResolveRootCredentials makes sure cfg has root credentials and logs where
+// they come from. systemDir is the system state directory (normally
+// cfg.SystemDir(); "" = nothing is persisted).
+//
+//   - Configured keys are validated and kept; the secret is never logged.
+//   - Otherwise keys stored in <systemDir>/root-credentials.json by an
+//     earlier start are reused (the access key is logged at info level).
+//   - Otherwise random keys are generated (iam.GenerateAccessKey /
+//     GenerateSecretKey), stored there with mode 0600 and logged once,
+//     including the secret, as a warning.
+//   - With systemDir "" (memory backend without a data path) random keys are
+//     generated and logged as a warning on every start.
+//
+// A nil logger means slog.Default().
+func ResolveRootCredentials(cfg *Config, systemDir string, logger *slog.Logger) error {
+	if logger == nil {
+		logger = slog.Default()
+	}
+	source, file, err := resolveRootCredentials(cfg, systemDir)
+	if err != nil {
+		return err
+	}
+	ak := cfg.Auth.RootAccessKey
+	switch source {
+	case CredentialsConfigured:
+		logger.Info("root credentials: using the configured access key", "accessKey", ak)
+	case CredentialsStored:
+		logger.Info("root credentials: using the stored generated credentials", "accessKey", ak, "file", file)
+	case CredentialsGenerated:
+		logger.Warn("root credentials: none configured, generated new ones; they are logged only this once "+
+			"and stored for later starts (set GOS3_ROOT_ACCESS_KEY / GOS3_ROOT_SECRET_KEY to choose your own)",
+			"accessKey", ak, "secretKey", cfg.Auth.RootSecretKey, "file", file)
+	case CredentialsEphemeral:
+		logger.Warn("root credentials: none configured and no data directory, generated temporary ones "+
+			"valid until this process exits (set GOS3_ROOT_ACCESS_KEY / GOS3_ROOT_SECRET_KEY to choose your own)",
+			"accessKey", ak, "secretKey", cfg.Auth.RootSecretKey)
+	}
+	return nil
+}
+
+// resolveRootCredentials implements ResolveRootCredentials without logging.
+// It returns the source (Credentials* constants) and the credentials file
+// ("" when not stored).
+func resolveRootCredentials(c *Config, systemDir string) (source, file string, err error) {
 	if c.Auth.RootAccessKey != "" || c.Auth.RootSecretKey != "" {
 		if err := validateRootCredentials(c.Auth.RootAccessKey, c.Auth.RootSecretKey); err != nil {
 			return "", "", err
 		}
 		return CredentialsConfigured, "", nil
 	}
-	dir := c.SystemDir()
-	if dir == "" {
+	if systemDir == "" {
 		ak, sk, err := generateRootCredentials()
 		if err != nil {
 			return "", "", err
@@ -145,16 +203,16 @@ func ResolveRootCredentials(c *Config) (source, file string, err error) {
 		c.Auth.RootAccessKey, c.Auth.RootSecretKey = ak, sk
 		return CredentialsEphemeral, "", nil
 	}
-	file = filepath.Join(dir, RootCredentialsFileName)
+	file = filepath.Join(systemDir, RootCredentialsFileName)
 	data, err := os.ReadFile(file)
 	switch {
 	case err == nil:
 		var rc rootCredentialsFile
 		if err := json.Unmarshal(data, &rc); err != nil {
-			return "", "", fmt.Errorf("config: %s: %w", file, err)
+			return "", "", fmt.Errorf("config: root credentials file %s is corrupt: %v (delete it to generate new credentials)", file, err)
 		}
-		if err := validateRootCredentials(rc.AccessKey, rc.SecretKey); err != nil || rc.AccessKey == "" {
-			return "", "", fmt.Errorf("config: %s holds invalid credentials (delete it to generate new ones)", file)
+		if rc.AccessKey == "" || validateRootCredentials(rc.AccessKey, rc.SecretKey) != nil {
+			return "", "", fmt.Errorf("config: root credentials file %s holds invalid credentials (delete it to generate new ones)", file)
 		}
 		c.Auth.RootAccessKey, c.Auth.RootSecretKey = rc.AccessKey, rc.SecretKey
 		return CredentialsStored, file, nil
@@ -165,15 +223,14 @@ func ResolveRootCredentials(c *Config) (source, file string, err error) {
 	if err != nil {
 		return "", "", err
 	}
-	rc := rootCredentialsFile{AccessKey: ak, SecretKey: sk}
-	data, err = json.MarshalIndent(rc, "", "  ")
+	data, err = json.MarshalIndent(rootCredentialsFile{AccessKey: ak, SecretKey: sk}, "", "  ")
 	if err != nil {
 		return "", "", err
 	}
 	if err := WriteFileAtomic(file, append(data, '\n'), 0o600); err != nil {
 		return "", "", fmt.Errorf("storing generated root credentials: %w", err)
 	}
-	c.Auth.RootAccessKey, c.Auth.RootSecretKey = rc.AccessKey, rc.SecretKey
+	c.Auth.RootAccessKey, c.Auth.RootSecretKey = ak, sk
 	return CredentialsGenerated, file, nil
 }
 

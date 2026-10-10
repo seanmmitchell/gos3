@@ -9,6 +9,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/seanmmitchell/gos3/internal/config"
 	"github.com/seanmmitchell/gos3/internal/discovery"
 )
 
@@ -66,7 +67,7 @@ func (a *api) probe(rc *reqCtx) (int, any, error) {
 		return 0, nil, err
 	}
 	req.URL = strings.TrimSpace(req.URL)
-	if err := validateBaseURL(req.URL, true); err != nil {
+	if err := config.ValidateBaseURL(req.URL, true); err != nil {
 		return 0, nil, badRequest("url: %v", err)
 	}
 	if err := a.requireDiscovery(); err != nil {
@@ -147,7 +148,7 @@ func validateScanRequest(req *discovery.ScanRequest, maxHosts int) error {
 	var total uint64
 	for _, t := range req.Targets {
 		t = strings.TrimSpace(t)
-		if t == "" || len(t) > maxURLLen {
+		if t == "" || len(t) > config.MaxURLLen {
 			return badRequest("targets: empty or overlong entry")
 		}
 		n, err := scanTargetHosts(t)
@@ -193,7 +194,7 @@ func scanTargetHosts(t string) (uint64, error) {
 	if host, port, ok := strings.Cut(t, ":"); ok && port != "" && !strings.Contains(port, ":") {
 		h = host
 	}
-	if !validHostname(h) {
+	if !config.ValidHostname(h) {
 		return 0, errors.New("is not a valid CIDR, host or URL")
 	}
 	return 1, nil

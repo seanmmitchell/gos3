@@ -1,7 +1,6 @@
 package config
 
 import (
-	"errors"
 	"fmt"
 	"net"
 	"net/netip"
@@ -40,70 +39,100 @@ var (
 // digits and hyphens, e.g. "us-east-1").
 func ValidRegion(r string) bool { return regionRe.MatchString(r) }
 
+// FieldError is a settings validation error. Field is the JSON path of the
+// offending value as used by the admin API, e.g. "cors.allowedOrigins[0]" or
+// "discovery.peerTtl"; Error() renders "<field>: <message>".
+type FieldError struct {
+	Field string
+	Msg   string
+}
+
+func (e *FieldError) Error() string { return e.Field + ": " + e.Msg }
+
+func fieldErr(field, format string, args ...any) *FieldError {
+	return &FieldError{Field: field, Msg: fmt.Sprintf(format, args...)}
+}
+
 // ValidateSettings checks a full Settings document. It is the single source
 // of truth for settings validation: Store.Update, Config.Validate and the
-// admin API (PUT /config) all use it. Errors carry a precise, user-facing
-// message naming the offending field (JSON names, e.g. "cors.allowedOrigins[0]").
+// admin API (PUT /config) all use it. Errors are *FieldError values with a
+// precise, user-facing message naming the offending field (JSON names, e.g.
+// "cors.allowedOrigins[0]: ..."). Unlike the static Config, Settings carry
+// explicit values: zero "use the default" values (an empty beacon group, a
+// zero beacon interval, ...) are rejected.
 func ValidateSettings(s Settings) error {
+	if err := validateSettings(&s); err != nil {
+		return err
+	}
+	return nil
+}
+
+func validateSettings(s *Settings) *FieldError {
 	if len(s.Name) > MaxNameLen || !utf8.ValidString(s.Name) || strings.IndexFunc(s.Name, unicode.IsControl) >= 0 {
-		return fmt.Errorf("name: must be at most %d characters of printable UTF-8", MaxNameLen)
+		return fieldErr("name", "must be at most %d characters of printable UTF-8", MaxNameLen)
 	}
 	if !ValidRegion(s.Region) {
-		return fmt.Errorf("region: %q is invalid (expected lowercase letters, digits and hyphens, e.g. \"us-east-1\")", s.Region)
+		return fieldErr("region", "%q is invalid (expected lowercase letters, digits and hyphens, e.g. \"us-east-1\")", s.Region)
 	}
 	if s.PublicURL != "" {
 		if err := ValidateBaseURL(s.PublicURL, true); err != nil {
-			return fmt.Errorf("publicUrl: %v", err)
+			return fieldErr("publicUrl", "%v", err)
 		}
 	}
 	if len(s.Domains) > MaxListEntries {
-		return fmt.Errorf("domains: at most %d entries allowed", MaxListEntries)
+		return fieldErr("domains", "at most %d entries allowed", MaxListEntries)
 	}
 	for i, d := range s.Domains {
 		if !ValidHostname(d) {
-			return fmt.Errorf("domains[%d]: %q is not a valid DNS name (no scheme, port or path)", i, d)
+			return fieldErr(fmt.Sprintf("domains[%d]", i), "%q is not a valid DNS name (no scheme, port or path)", d)
 		}
 	}
 	if err := validateCORS(&s.CORS); err != nil {
-		return fmt.Errorf("cors.%v", err)
+		err.Field = "cors." + err.Field
+		return err
 	}
 	if err := validateDiscovery(&s.Discovery); err != nil {
-		return fmt.Errorf("discovery.%v", err)
+		if err.Field == "" {
+			err.Field = "discovery"
+		} else {
+			err.Field = "discovery." + err.Field
+		}
+		return err
 	}
 	if _, err := ParseLogLevel(s.Logging.Level); err != nil {
-		return fmt.Errorf("logging.level: %q is invalid (expected debug, info, warn or error)", s.Logging.Level)
+		return fieldErr("logging.level", "%q is invalid (expected debug, info, warn or error)", s.Logging.Level)
 	}
 	switch s.Logging.Format {
 	case "text", "json":
 	default:
-		return fmt.Errorf("logging.format: %q is invalid (expected text or json)", s.Logging.Format)
+		return fieldErr("logging.format", "%q is invalid (expected text or json)", s.Logging.Format)
 	}
 	if s.Lifecycle.IntervalSeconds < MinLifecycleSeconds || s.Lifecycle.IntervalSeconds > MaxLifecycleSeconds {
-		return fmt.Errorf("lifecycle.intervalSeconds: must be between %d and %d, got %d",
+		return fieldErr("lifecycle.intervalSeconds", "must be between %d and %d, got %d",
 			MinLifecycleSeconds, MaxLifecycleSeconds, s.Lifecycle.IntervalSeconds)
 	}
 	return nil
 }
 
-func validateCORS(c *CORSConfig) error {
+func validateCORS(c *CORSConfig) *FieldError {
 	if len(c.AllowedOrigins) > MaxListEntries {
-		return fmt.Errorf("allowedOrigins: at most %d entries allowed", MaxListEntries)
+		return fieldErr("allowedOrigins", "at most %d entries allowed", MaxListEntries)
 	}
 	for i, o := range c.AllowedOrigins {
 		if err := ValidateCORSOrigin(o); err != nil {
-			return fmt.Errorf("allowedOrigins[%d]: %q %v", i, o, err)
+			return fieldErr(fmt.Sprintf("allowedOrigins[%d]", i), "%q %v", o, err)
 		}
 	}
 	if len(c.AllowedHeaders) > MaxListEntries {
-		return fmt.Errorf("allowedHeaders: at most %d entries allowed", MaxListEntries)
+		return fieldErr("allowedHeaders", "at most %d entries allowed", MaxListEntries)
 	}
 	for i, h := range c.AllowedHeaders {
 		if !headerNameRe.MatchString(h) {
-			return fmt.Errorf("allowedHeaders[%d]: %q is not a valid header name or pattern", i, h)
+			return fieldErr(fmt.Sprintf("allowedHeaders[%d]", i), "%q is not a valid header name or pattern", h)
 		}
 	}
 	if len(c.ExposeHeaders) > MaxListEntries {
-		return fmt.Errorf("exposeHeaders: at most %d entries allowed", MaxListEntries)
+		return fieldErr("exposeHeaders", "at most %d entries allowed", MaxListEntries)
 	}
 	for i, h := range c.ExposeHeaders {
 		// A lone "*" is the Fetch-standard wildcard (every header, for
@@ -112,11 +141,11 @@ func validateCORS(c *CORSConfig) error {
 			continue
 		}
 		if !headerNameRe.MatchString(h) || strings.Contains(h, "*") {
-			return fmt.Errorf("exposeHeaders[%d]: %q is not a valid header name (only a lone \"*\" wildcard is allowed)", i, h)
+			return fieldErr(fmt.Sprintf("exposeHeaders[%d]", i), "%q is not a valid header name (only a lone \"*\" wildcard is allowed)", h)
 		}
 	}
 	if c.MaxAgeSeconds < 0 || c.MaxAgeSeconds > MaxCORSMaxAge {
-		return fmt.Errorf("maxAgeSeconds: must be between 0 and %d, got %d", MaxCORSMaxAge, c.MaxAgeSeconds)
+		return fieldErr("maxAgeSeconds", "must be between 0 and %d, got %d", MaxCORSMaxAge, c.MaxAgeSeconds)
 	}
 	return nil
 }
@@ -182,49 +211,54 @@ func ValidateCORSOrigin(o string) error {
 
 // validateDiscovery applies the settings rules (explicit values, no zero
 // "defaults") and then discovery's own Config.Validate, so a document that
-// passes can always be applied by discovery.Service.Reconfigure.
-func validateDiscovery(c *discovery.Config) error {
+// passes can always be applied by discovery.Service.Reconfigure. Field names
+// in the result are relative to "discovery" ("" = the whole section).
+func validateDiscovery(c *discovery.Config) *FieldError {
 	host, port, err := net.SplitHostPort(c.BeaconGroup)
 	if err != nil {
-		return fmt.Errorf("beaconGroup: %q must be host:port (e.g. %q)", c.BeaconGroup, discovery.DefaultBeaconGroup)
+		return fieldErr("beaconGroup", "%q must be host:port (e.g. %q)", c.BeaconGroup, discovery.DefaultBeaconGroup)
 	}
 	if a, err := netip.ParseAddr(host); err != nil || !a.Unmap().Is4() || !a.IsMulticast() {
-		return fmt.Errorf("beaconGroup: %q is not an IPv4 multicast address (224.0.0.0/4)", host)
+		return fieldErr("beaconGroup", "%q is not an IPv4 multicast address (224.0.0.0/4)", host)
 	}
 	if n, err := strconv.Atoi(port); err != nil || n < 1 || n > 65535 {
-		return fmt.Errorf("beaconGroup: port %q must be 1-65535", port)
+		return fieldErr("beaconGroup", "port %q must be 1-65535", port)
 	}
 	if c.BeaconInterval < discovery.MinBeaconInterval || c.BeaconInterval > discovery.MaxBeaconInterval {
-		return fmt.Errorf("beaconInterval: must be between %s and %s (nanoseconds), got %d",
-			discovery.MinBeaconInterval, discovery.MaxBeaconInterval, int64(c.BeaconInterval))
+		return fieldErr("beaconInterval", "must be between %s and %s, got %s",
+			discovery.MinBeaconInterval, discovery.MaxBeaconInterval, c.BeaconInterval)
 	}
 	if c.PeerTTL < MinPeerTTL || c.PeerTTL > MaxPeerTTL {
-		return fmt.Errorf("peerTtl: must be between %s and %s (nanoseconds), got %d",
-			MinPeerTTL, MaxPeerTTL, int64(c.PeerTTL))
+		return fieldErr("peerTtl", "must be between %s and %s, got %s",
+			MinPeerTTL, MaxPeerTTL, c.PeerTTL)
 	}
 	if len(c.Seeds) > MaxListEntries {
-		return fmt.Errorf("seeds: at most %d entries allowed", MaxListEntries)
+		return fieldErr("seeds", "at most %d entries allowed", MaxListEntries)
 	}
 	for i, s := range c.Seeds {
-		if err := ValidateBaseURL(s, false); err != nil {
-			return fmt.Errorf("seeds[%d]: %v", i, err)
+		// Like discovery.NormalizeBaseURL, a bare host[:port] means http://.
+		if !strings.Contains(s, "://") {
+			if ValidateBaseURL("http://"+s, false) != nil {
+				return fieldErr(fmt.Sprintf("seeds[%d]", i), "%q is not a base URL like \"http://host:9000\" or a host[:port]", s)
+			}
+		} else if err := ValidateBaseURL(s, false); err != nil {
+			return fieldErr(fmt.Sprintf("seeds[%d]", i), "%v", err)
 		}
 	}
 	if len(c.DNSSRV) > discovery.MaxDNSSRV {
-		return fmt.Errorf("dnsSrv: at most %d entries allowed", discovery.MaxDNSSRV)
+		return fieldErr("dnsSrv", "at most %d entries allowed", discovery.MaxDNSSRV)
 	}
 	for i, d := range c.DNSSRV {
 		if !ValidHostname(strings.TrimSuffix(d, ".")) {
-			return fmt.Errorf("dnsSrv[%d]: %q is not a valid domain name", i, d)
+			return fieldErr(fmt.Sprintf("dnsSrv[%d]", i), "%q is not a valid domain name", d)
 		}
 	}
 	if c.MaxScanHosts < 1 || c.MaxScanHosts > MaxScanHosts {
-		return fmt.Errorf("maxScanHosts: must be between 1 and %d, got %d", MaxScanHosts, c.MaxScanHosts)
+		return fieldErr("maxScanHosts", "must be between 1 and %d, got %d", MaxScanHosts, c.MaxScanHosts)
 	}
 	if err := c.Validate(); err != nil {
-		// Strip discovery's sentinel prefix; the caller adds "discovery.".
-		msg := strings.TrimPrefix(err.Error(), discovery.ErrInvalidConfig.Error()+": ")
-		return errors.New(msg)
+		// Strip discovery's sentinel prefix; the caller adds "discovery".
+		return &FieldError{Msg: strings.TrimPrefix(err.Error(), discovery.ErrInvalidConfig.Error()+": ")}
 	}
 	return nil
 }

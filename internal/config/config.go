@@ -3,6 +3,13 @@
 // Settings overlay that the admin API can change and that is persisted to
 // <data>/.gos3/settings.json (it wins over static config for its fields).
 //
+// Entry points: Load (CLI flags passed as Overrides) then Config.Validate;
+// ResolveRootCredentials fills in generated root credentials; SettingsFrom
+// derives the initial Settings and LoadStore overlays the persisted
+// settings.json. ValidateSettings is the single settings validator, shared
+// by Store.Update, Config.Validate and the admin API. EnvVars documents the
+// GOS3_* environment variables.
+//
 // CONTRACT: exported types and signatures here are fixed. Loading/persisting
 // is implemented by the integration work item (it may add files).
 package config

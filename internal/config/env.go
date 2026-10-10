@@ -14,15 +14,16 @@ const EnvConfig = "GOS3_CONFIG"
 
 // EnvVar documents one GOS3_* environment variable.
 type EnvVar struct {
-	Name string // e.g. "GOS3_ADDRESS"
-	Key  string // YAML key it overrides, e.g. "server.address"
-	Help string // value format / meaning
-	set  func(c *Config, v string) error
+	Name        string // e.g. "GOS3_ADDRESS"
+	Key         string // YAML key it overrides, e.g. "server.address" ("" for GOS3_CONFIG)
+	Description string // value format / meaning
+	set         func(c *Config, v string) error
 }
 
 // envVars is the full list of supported environment variables, in display
-// order. Lists are comma-separated; booleans accept strconv.ParseBool values
-// (1/0, true/false, t/f); durations use Go syntax ("30s", "1h").
+// order. Every configuration key has one. Lists are comma-separated;
+// booleans accept 1/0, true/false, t/f, yes/no and on/off; durations use Go
+// syntax ("30s", "1h"); sizes accept unit suffixes ("5GiB", see ParseSize).
 var envVars = []EnvVar{
 	{EnvConfig, "", "path of the YAML config file", nil},
 	{"GOS3_ADDRESS", "server.address", "listen address, [host]:port", str(func(c *Config) *string { return &c.Server.Address })},
@@ -43,7 +44,7 @@ var envVars = []EnvVar{
 	{"GOS3_ROOT_SECRET_KEY", "auth.root_secret_key", "root secret key", str(func(c *Config) *string { return &c.Auth.RootSecretKey })},
 	{"GOS3_STRICT_REGION", "auth.strict_region", "reject signatures for other regions (bool)", boolean(func(c *Config) *bool { return &c.Auth.StrictRegion })},
 	{"GOS3_UI_ENABLED", "ui.enabled", "serve the embedded web UI (bool)", boolean(func(c *Config) *bool { return &c.UI.Enabled })},
-	{"GOS3_UI_REDIRECT_ROOT", "ui.redirect_root", "redirect browsers from / to the UI (bool)", boolean(func(c *Config) *bool { return &c.UI.RedirectRoot })},
+	{"GOS3_UI_REDIRECT", "ui.redirect_root", "redirect browsers from / to the UI (bool)", boolean(func(c *Config) *bool { return &c.UI.RedirectRoot })},
 	{"GOS3_CORS_ORIGINS", "cors.allowed_origins", "allowed origins, comma-separated (\"*\" = any)", list(func(c *Config) *[]string { return &c.CORS.AllowedOrigins })},
 	{"GOS3_CORS_ALLOWED_HEADERS", "cors.allowed_headers", "allowed request headers, comma-separated", list(func(c *Config) *[]string { return &c.CORS.AllowedHeaders })},
 	{"GOS3_CORS_EXPOSE_HEADERS", "cors.expose_headers", "exposed response headers, comma-separated", list(func(c *Config) *[]string { return &c.CORS.ExposeHeaders })},
@@ -71,6 +72,35 @@ var envVars = []EnvVar{
 // EnvVars returns the documented GOS3_* environment variables.
 func EnvVars() []EnvVar { return append([]EnvVar(nil), envVars...) }
 
+// Keys returns the configuration keys accepted by Config.Set and Override
+// (the YAML keys, e.g. "server.address"), in display order.
+func Keys() []string {
+	keys := make([]string, 0, len(envVars))
+	for _, e := range envVars {
+		if e.Key != "" {
+			keys = append(keys, e.Key)
+		}
+	}
+	return keys
+}
+
+// Set sets the configuration key (a YAML key such as "server.address", or
+// the name of its GOS3_* environment variable) to value, parsed exactly like
+// the environment variable: lists are comma-separated, booleans, durations
+// and sizes are parsed (see EnvVars). The CLI uses it to apply flags.
+// Call Normalize and Validate afterwards.
+func (c *Config) Set(key, value string) error {
+	for _, e := range envVars {
+		if e.set != nil && (e.Key == key || e.Name == key) {
+			if err := e.set(c, value); err != nil {
+				return fmt.Errorf("%s: %w", e.Key, err)
+			}
+			return nil
+		}
+	}
+	return fmt.Errorf("unknown configuration key %q", key)
+}
+
 // WriteEnvTable writes the environment variable reference as an aligned
 // table (variable, YAML key, description).
 func WriteEnvTable(w io.Writer) error {
@@ -81,7 +111,7 @@ func WriteEnvTable(w io.Writer) error {
 		if key == "" {
 			key = "-"
 		}
-		fmt.Fprintf(tw, "%s\t%s\t%s\n", e.Name, key, e.Help)
+		fmt.Fprintf(tw, "%s\t%s\t%s\n", e.Name, key, e.Description)
 	}
 	return tw.Flush()
 }
@@ -114,9 +144,9 @@ func list(field func(*Config) *[]string) func(*Config, string) error {
 
 func boolean(field func(*Config) *bool) func(*Config, string) error {
 	return func(c *Config, v string) error {
-		b, err := strconv.ParseBool(strings.TrimSpace(v))
+		b, err := ParseBool(v)
 		if err != nil {
-			return fmt.Errorf("invalid boolean %q", v)
+			return err
 		}
 		*field(c) = b
 		return nil
@@ -154,6 +184,18 @@ func duration(field func(*Config) *time.Duration) func(*Config, string) error {
 		*field(c) = d
 		return nil
 	}
+}
+
+// ParseBool parses a boolean: 1/0, t/f, true/false, yes/no, y/n and on/off
+// (case-insensitive, surrounding spaces ignored).
+func ParseBool(v string) (bool, error) {
+	switch strings.ToLower(strings.TrimSpace(v)) {
+	case "1", "t", "true", "y", "yes", "on":
+		return true, nil
+	case "0", "f", "false", "n", "no", "off":
+		return false, nil
+	}
+	return false, fmt.Errorf("invalid boolean %q (expected true or false)", v)
 }
 
 // SplitList splits a comma-separated list, trimming spaces and dropping
