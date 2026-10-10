@@ -8,6 +8,7 @@
 package config
 
 import (
+	"slices"
 	"sync"
 	"time"
 
@@ -45,6 +46,11 @@ type ServerConfig struct {
 	PublicInfo bool `yaml:"public_info"`
 	// ShutdownTimeout for graceful shutdown (default 30s).
 	ShutdownTimeout time.Duration `yaml:"shutdown_timeout"`
+	// TrustProxyHeaders derives the client address (aws:SourceIp, access
+	// log) from X-Forwarded-For and aws:SecureTransport from
+	// X-Forwarded-Proto. Enable it only behind a trusted reverse proxy that
+	// overwrites these headers (default false).
+	TrustProxyHeaders bool `yaml:"trust_proxy_headers"`
 }
 
 // StorageConfig selects the backend.
@@ -53,15 +59,19 @@ type StorageConfig struct {
 	// Path is the data directory for the fs backend AND for system state
 	// (<path>/.gos3/{iam.json,settings.json,server-id}). Empty with the memory
 	// backend means fully ephemeral.
-	Path string `yaml:"path"` // default "./data"
+	Path string `yaml:"path"` // default "./data" for fs, "" (ephemeral) for memory
 	// FsyncData controls fsync of object data files on commit (default true).
 	FsyncData bool `yaml:"fsync_data"`
 }
 
 // AuthConfig holds root credentials and signature options.
 type AuthConfig struct {
-	RootAccessKey string `yaml:"root_access_key"` // env GOS3_ROOT_ACCESS_KEY; default "gos3admin"
-	RootSecretKey string `yaml:"root_secret_key"` // env GOS3_ROOT_SECRET_KEY; default "gos3admin-secret" (warned)
+	// Root credentials (env GOS3_ROOT_ACCESS_KEY / GOS3_ROOT_SECRET_KEY).
+	// When neither is set, random credentials are generated on first start
+	// and stored in <data>/.gos3/root-credentials.json (see
+	// ResolveRootCredentials).
+	RootAccessKey string `yaml:"root_access_key"`
+	RootSecretKey string `yaml:"root_secret_key"`
 	StrictRegion  bool   `yaml:"strict_region"`
 }
 
@@ -77,7 +87,7 @@ type UIConfig struct {
 type CORSConfig struct {
 	AllowedOrigins []string `yaml:"allowed_origins" json:"allowedOrigins"` // "*" allowed
 	AllowedHeaders []string `yaml:"allowed_headers" json:"allowedHeaders"` // default ["*"]
-	ExposeHeaders  []string `yaml:"expose_headers" json:"exposeHeaders"`   // default ETag, x-amz-* commonly used
+	ExposeHeaders  []string `yaml:"expose_headers" json:"exposeHeaders"`   // default "*" + ETag, x-amz-* (see DefaultExposeHeaders)
 	MaxAgeSeconds  int      `yaml:"max_age_seconds" json:"maxAgeSeconds"`  // default 3600
 }
 
@@ -126,6 +136,7 @@ type LifecycleSettings struct {
 // Store holds the current Settings and notifies subscribers on change.
 // Safe for concurrent use.
 type Store struct {
+	updateMu sync.Mutex // serializes Update (validate, persist, publish)
 	mu       sync.RWMutex
 	settings Settings
 	path     string // settings.json path ("" = not persisted)
@@ -146,24 +157,46 @@ func (s *Store) Get() Settings {
 }
 
 // Update applies fn to a copy of the settings; if fn returns nil the result is
-// validated, persisted and published to subscribers. CONTRACT: persistence +
-// validation are implemented by the integration work item.
+// validated (ValidateSettings), persisted (atomically, when the store has a
+// path) and published to subscribers. On any error the current settings are
+// left unchanged and returned together with the error. Validation errors are
+// plain readable errors; persistence errors wrap the underlying
+// *fs.PathError / syscall.Errno.
+//
+// Updates are serialized: subscribers of one update run before the next
+// update is applied, so they always observe changes in order.
 func (s *Store) Update(fn func(*Settings) error) (Settings, error) {
-	s.mu.Lock()
+	s.updateMu.Lock()
+	defer s.updateMu.Unlock()
+
+	s.mu.RLock()
 	old := cloneSettings(s.settings)
-	next := cloneSettings(s.settings)
+	s.mu.RUnlock()
+
+	next := cloneSettings(old)
 	if err := fn(&next); err != nil {
-		s.mu.Unlock()
 		return old, err
 	}
-	s.settings = next
+	if err := ValidateSettings(next); err != nil {
+		return old, err
+	}
+	if s.path != "" {
+		if err := writeSettingsFile(s.path, next); err != nil {
+			return old, err
+		}
+	}
+	s.mu.Lock()
+	s.settings = cloneSettings(next)
 	subs := append([]func(old, new Settings){}, s.subs...)
 	s.mu.Unlock()
 	for _, f := range subs {
-		f(old, cloneSettings(next))
+		f(cloneSettings(old), cloneSettings(next))
 	}
 	return cloneSettings(next), nil
 }
+
+// Path returns the settings.json path ("" when not persisted).
+func (s *Store) Path() string { return s.path }
 
 // Subscribe registers fn to be called (synchronously) after every successful Update.
 func (s *Store) Subscribe(fn func(old, new Settings)) {
@@ -172,13 +205,20 @@ func (s *Store) Subscribe(fn func(old, new Settings)) {
 	s.mu.Unlock()
 }
 
+// cloneSettings deep-copies in. Nil and empty slices are preserved as such.
 func cloneSettings(in Settings) Settings {
 	out := in
-	out.Domains = append([]string(nil), in.Domains...)
-	out.CORS.AllowedOrigins = append([]string(nil), in.CORS.AllowedOrigins...)
-	out.CORS.AllowedHeaders = append([]string(nil), in.CORS.AllowedHeaders...)
-	out.CORS.ExposeHeaders = append([]string(nil), in.CORS.ExposeHeaders...)
-	out.Discovery.Seeds = append([]string(nil), in.Discovery.Seeds...)
-	out.Discovery.DNSSRV = append([]string(nil), in.Discovery.DNSSRV...)
+	out.Domains = slices.Clone(in.Domains)
+	out.CORS = cloneCORS(in.CORS)
+	out.Discovery.Seeds = slices.Clone(in.Discovery.Seeds)
+	out.Discovery.DNSSRV = slices.Clone(in.Discovery.DNSSRV)
+	return out
+}
+
+func cloneCORS(in CORSConfig) CORSConfig {
+	out := in
+	out.AllowedOrigins = slices.Clone(in.AllowedOrigins)
+	out.AllowedHeaders = slices.Clone(in.AllowedHeaders)
+	out.ExposeHeaders = slices.Clone(in.ExposeHeaders)
 	return out
 }
