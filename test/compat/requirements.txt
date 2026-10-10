@@ -1,0 +1,13 @@
+# Pinned client stack for the gos3 Python / AWS CLI compatibility suite.
+# Installed by run.sh into a venv outside the repository.
+#
+# awscli v1 pins an exact botocore; boto3 must match the same botocore.
+awscli==1.46.1
+boto3==1.43.111
+botocore[crt]==1.43.111
+s3transfer==0.19.2
+# awscrt provides CRC32C and CRC64NVME checksums for botocore.
+awscrt==0.36.0
+pytest==9.1.1
+requests==2.34.2
+urllib3==2.8.0

@@ -47,6 +47,15 @@ const title = computed(() => {
   return `${s.done} upload${s.done === 1 ? '' : 's'} complete`
 })
 
+// The clear button first clears finished uploads and keeps failed ones for a
+// retry; once only failed uploads are left it dismisses those, so the panel
+// can always be closed.
+const hasFinished = computed(() => uploads.items.some(it => it.status === 'done' || it.status === 'canceled'))
+function clearList() {
+  if (hasFinished.value) uploads.clearFinished()
+  else uploads.clearSettled()
+}
+
 const eta = computed(() => uploadEta(stats.value.total - stats.value.loaded, stats.value.speed))
 
 // Newest first, but keep running/queued items at the top.
@@ -138,8 +147,8 @@ onBeforeUnmount(() => window.removeEventListener('beforeunload', beforeUnload))
         color="neutral"
         variant="ghost"
         icon="i-lucide-x"
-        aria-label="Clear finished uploads"
-        @click="uploads.clearFinished()"
+        :aria-label="hasFinished ? 'Clear finished uploads' : 'Dismiss failed uploads'"
+        @click="clearList"
       />
       <UButton
         size="xs"

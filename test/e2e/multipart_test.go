@@ -19,6 +19,7 @@ import (
 type onlyReader struct{ io.Reader }
 
 func TestManagerUploadDownload(t *testing.T) {
+	t.Parallel()
 	for _, e := range []*env{fsEnv, memEnv} {
 		t.Run(e.name, func(t *testing.T) {
 			c := e.root()
@@ -105,6 +106,7 @@ func TestManagerUploadDownload(t *testing.T) {
 }
 
 func TestMultipartListAbortErrors(t *testing.T) {
+	t.Parallel()
 	e := fsEnv
 	c := e.root()
 	b := e.newBucket(t)
@@ -269,6 +271,7 @@ func TestMultipartListAbortErrors(t *testing.T) {
 }
 
 func TestUploadPartCopy(t *testing.T) {
+	t.Parallel()
 	for _, e := range []*env{fsEnv, memEnv} {
 		t.Run(e.name, func(t *testing.T) {
 			c := e.root()
@@ -318,6 +321,7 @@ func TestUploadPartCopy(t *testing.T) {
 
 // TestMultipartConditionalComplete checks If-None-Match on completion.
 func TestMultipartConditionalComplete(t *testing.T) {
+	t.Parallel()
 	e := memEnv
 	c := e.root()
 	b := e.newBucket(t)

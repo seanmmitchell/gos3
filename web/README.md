@@ -22,7 +22,8 @@ pnpm build            # standalone Node server (Nitro preset node-server)
 pnpm generate         # static SPA at base '/'
 pnpm generate:embed   # static SPA at base '/_gos3/ui/' (NUXT_PUBLIC_EMBEDDED=true)
 pnpm preview          # preview the last build
-pnpm test:e2e         # Playwright smoke tests (builds the embed bundle first)
+pnpm test:e2e         # Playwright tests against mocked APIs (builds the embed bundle first)
+pnpm test:e2e:real    # Playwright end-to-end tests against real gos3 binaries (see below)
 ```
 
 `pnpm test:e2e` never downloads browsers: `playwright.config.ts` uses
@@ -240,6 +241,22 @@ layout derives breadcrumbs from these routes; override with
   `test/nuxt/common-components.test.ts`, `test/nuxt/composables.test.ts`).
   Overlays/modals are teleported; prefer testing their logic in plain modules.
 - Run one project: `pnpm vitest run --project unit` (or `nuxt`).
+- Real-server E2E: `pnpm test:e2e:real` runs the Playwright project
+  `real-server` (`test/e2e/real/*.spec.ts`) against the UI embedded in a real
+  gos3. Its setup project (`real/global.setup.ts`) rebuilds the embed bundle
+  when `app/` changed, builds `web/.e2e-cache/gos3` with `go build -overlay`
+  (the build replaces `internal/webui/dist`, which stays untouched in the
+  tree) when Go sources or the bundle are newer, and starts two instances on
+  free loopback ports: *primary* (fs backend in a temp dir, root keys
+  `e2eroot` / `e2eroot-secret-key`, discovery with scans, mDNS/beacon off,
+  CORS for `http://localhost:3000`) and *peer*, each seeded with the other.
+  The teardown project stops them (a watchdog also stops them if the run is
+  aborted). Specs use the fixtures in `real/fixtures.ts` (`signIn`, `ui()`,
+  a root-signed `api` client to verify state). Files run in parallel against
+  the shared servers, so use `uniqueName()` for buckets/users and do not
+  assert the server name. Env: `GOS3_BIN=<path>` uses a prebuilt binary,
+  `E2E_SKIP_UI_BUILD=1` skips the bundle check, `E2E_KEEP_DATA=1` keeps data
+  dirs and logs (`/tmp/gos3-e2e-*`).
 - E2E: `pnpm test:e2e` (Playwright, `test/e2e/*.spec.ts`) builds the embedded
   bundle and serves it via `test/e2e/serve.mjs`, which mocks `GET /_gos3/info`.
   Extend the mock server there if your feature needs canned API responses.

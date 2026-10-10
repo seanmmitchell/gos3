@@ -42,6 +42,7 @@ func (e *env) fetch(t *testing.T, method, rawURL string, body []byte, hdr http.H
 }
 
 func TestPresignedSDK(t *testing.T) {
+	t.Parallel()
 	for _, e := range []*env{fsEnv, memEnv} {
 		t.Run(e.name, func(t *testing.T) {
 			c := e.root()
@@ -89,6 +90,7 @@ func TestPresignedSDK(t *testing.T) {
 }
 
 func TestPresignedErrors(t *testing.T) {
+	t.Parallel()
 	e := fsEnv
 	b := e.newBucket(t)
 	e.put(t, b, "obj", []byte("x"))
@@ -141,6 +143,7 @@ func TestPresignedErrors(t *testing.T) {
 }
 
 func TestPresignedVirtualHost(t *testing.T) {
+	t.Parallel()
 	e := fsEnv
 	b := e.newBucket(t)
 	e.put(t, b, "vh/obj", []byte("virtual"))
@@ -156,6 +159,7 @@ func TestPresignedVirtualHost(t *testing.T) {
 }
 
 func TestPresignedMinio(t *testing.T) {
+	t.Parallel()
 	for _, e := range []*env{fsEnv, memEnv} {
 		t.Run(e.name, func(t *testing.T) {
 			mc := e.minioClient(t, rootCreds, false)
@@ -204,6 +208,7 @@ func (e *env) post(t *testing.T, rawURL string, body *bytes.Buffer, contentType 
 }
 
 func TestPostPolicyMinio(t *testing.T) {
+	t.Parallel()
 	for _, e := range []*env{fsEnv, memEnv} {
 		t.Run(e.name, func(t *testing.T) {
 			mc := e.minioClient(t, rootCreds, false)
@@ -277,6 +282,7 @@ func TestPostPolicyMinio(t *testing.T) {
 // checks the success_action_status/redirect variants and anonymous POSTs
 // allowed by a bucket policy.
 func TestPostPolicyRaw(t *testing.T) {
+	t.Parallel()
 	e := fsEnv
 	b := e.newBucket(t)
 	u := e.base + "/" + b

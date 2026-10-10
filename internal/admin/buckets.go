@@ -20,15 +20,15 @@ const aclPrivate = "private"
 
 // bucketSummary is the BucketSummary document of docs/admin-api.md.
 type bucketSummary struct {
-	Name       string        `json:"name"`
-	CreatedAt  time.Time     `json:"createdAt"`
-	Region     string        `json:"region"`
-	Versioning string        `json:"versioning"`
-	ObjectLock bool          `json:"objectLock"`
-	Owner      string        `json:"owner"`
-	Configs    bucketConfigs `json:"configs"`
-	Public     bool          `json:"public"`
-	Usage      *usageJSON    `json:"usage"`
+	Name       string           `json:"name"`
+	CreatedAt  time.Time        `json:"createdAt"`
+	Region     string           `json:"region"`
+	Versioning string           `json:"versioning"`
+	ObjectLock bool             `json:"objectLock"`
+	Owner      string           `json:"owner"`
+	Configs    bucketConfigs    `json:"configs"`
+	Public     bool             `json:"public"`
+	Usage      *bucketUsageJSON `json:"usage"`
 }
 
 // bucketConfigs flags which configuration documents a bucket has.
@@ -159,10 +159,10 @@ func (a *api) summarize(rc *reqCtx, info storage.BucketInfo, withUsage bool) (*b
 	}
 	s.Public = iam.IsPublicPolicy(pol) || iam.IsPublicACL(acl)
 	if withUsage {
-		u, err := a.bucketUsage(rc.ctx, info.Name)
+		u, at, err := a.bucketUsage(rc.ctx, info.Name)
 		switch {
 		case err == nil:
-			s.Usage = toUsageJSON(u)
+			s.Usage = &bucketUsageJSON{usageJSON: *toUsageJSON(u), ComputedAt: at.UTC()}
 		case errors.Is(err, storage.ErrBucketNotFound):
 			return nil, err
 		case rc.ctx.Err() != nil:

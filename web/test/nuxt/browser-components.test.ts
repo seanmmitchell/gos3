@@ -106,7 +106,9 @@ describe('BrowserUploadPanel', () => {
     await w.vm.$nextTick()
     expect(w.text()).toContain('1 upload failed')
     expect(w.find('button[aria-label="Collapse upload list"]').exists()).toBe(true)
-    uploads.clearFinished()
-    for (const it of [...uploads.items]) uploads.remove(it.id)
+    // Only failed uploads left: the clear button dismisses them, so the panel can be closed.
+    await w.find('button[aria-label="Dismiss failed uploads"]').trigger('click')
+    expect(uploads.items).toHaveLength(0)
+    expect(w.find('section[aria-label="Uploads"]').exists()).toBe(false)
   })
 })

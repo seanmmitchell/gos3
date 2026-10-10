@@ -45,6 +45,7 @@ func rootOf(e *env) auth.Credentials {
 // multipart uploads, bucket configurations, IAM users/policies/keys,
 // runtime settings, the server ID and generated root credentials survive.
 func TestRestartPersistence(t *testing.T) {
+	t.Parallel()
 	dir := t.TempDir()
 	cfg := baseConfig()
 	cfg.Storage.Backend = config.BackendFS
@@ -253,6 +254,7 @@ func TestRestartPersistence(t *testing.T) {
 // TestMemoryBackendIsEphemeral: a memory server without a data path starts
 // empty every time and keeps nothing on disk.
 func TestMemoryBackendIsEphemeral(t *testing.T) {
+	t.Parallel()
 	cfg := baseConfig()
 	cfg.Storage.Backend = config.BackendMemory
 	cfg.Storage.Path = ""
@@ -272,6 +274,7 @@ func TestMemoryBackendIsEphemeral(t *testing.T) {
 
 // TestSystemEndpoints covers /_gos3/health, /ready, /info and /metrics.
 func TestSystemEndpoints(t *testing.T) {
+	t.Parallel()
 	e := fsEnv
 	for _, p := range []string{"/_gos3/health", "/_gos3/ready"} {
 		r := e.anon(t, http.MethodGet, p, nil, nil)

@@ -61,8 +61,15 @@ func TestBuckets(t *testing.T) {
 	if u := list.Buckets[0].Usage; u == nil || u.Objects != 2 || u.Bytes != 8 || u.Versions != 2 {
 		t.Errorf("alpha usage = %+v", u)
 	}
-	if u := list.Buckets[1].Usage; u == nil || *u != (usageJSON{}) {
+	if u := list.Buckets[1].Usage; u == nil || u.usageJSON != (usageJSON{}) {
 		t.Errorf("beta usage = %+v", u)
+	}
+	// Usage says when it was computed (it is cached for usageTTL).
+	if u := list.Buckets[0].Usage; u == nil || !u.ComputedAt.Equal(e.clock.Now().UTC()) {
+		t.Errorf("alpha usage computedAt = %+v, want %v", u, e.clock.Now().UTC())
+	}
+	if !strings.Contains(string(r.body), `"computedAt":`) {
+		t.Errorf("usage without computedAt: %s", r.body)
 	}
 	e.root("GET", "/buckets?usage=maybe", nil).expectError(t, 400, codeInvalidRequest)
 

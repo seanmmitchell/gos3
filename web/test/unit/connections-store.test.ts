@@ -1,6 +1,6 @@
 import { createPinia, setActivePinia } from 'pinia'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
-import { LOCAL_STORAGE_KEY, NO_CAPABILITIES, SESSION_STORAGE_KEY, useConnectionsStore } from '~/stores/connections'
+import { CORS_BLOCKED, LOCAL_STORAGE_KEY, NO_CAPABILITIES, SESSION_STORAGE_KEY, useConnectionsStore } from '~/stores/connections'
 import { EMBEDDED_CONNECTION_ID } from '~/utils/connections'
 import { clearClientCache } from '~/utils/clients'
 import type { Info } from '~/types/admin'
@@ -262,6 +262,27 @@ describe('connections store: status', () => {
 
     vi.stubGlobal('fetch', vi.fn(() => Promise.reject(new TypeError('Failed to fetch'))))
     expect((await s.refreshStatus(c.id)).state).toBe('offline')
+  })
+
+  it('reports a reachable server whose CORS blocks signed requests as an error, not offline', async () => {
+    vi.stubGlobal('fetch', vi.fn(async (req: Request) => {
+      // /_gos3/info sends CORS * and answers; the signed whoami is blocked.
+      if (req.url.endsWith('/_gos3/info')) return new Response(JSON.stringify(INFO))
+      throw new TypeError('Failed to fetch')
+    }))
+    const s = useConnectionsStore()
+    const c = s.add({ endpoint: 'http://nas:9000', accessKeyId: 'AK', secretAccessKey: 'SK' })
+    const st = await s.refreshStatus(c.id)
+    expect(st.state).toBe('error')
+    expect(st.errorCode).toBe(CORS_BLOCKED)
+    expect(st.error).toMatch(/nas:9000 is reachable, but the browser blocked the request \(CORS\)/)
+    expect(st.info?.id).toBe(INFO.id)
+
+    // The same for a gos3 server configured as generic S3.
+    const g = s.add({ endpoint: 'http://nas2:9000', kind: 's3', accessKeyId: 'AK', secretAccessKey: 'SK' })
+    const sg = await s.refreshStatus(g.id)
+    expect(sg.state).toBe('error')
+    expect(sg.errorCode).toBe(CORS_BLOCKED)
   })
 
   it('checks generic S3 servers with ListBuckets', async () => {

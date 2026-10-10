@@ -3,8 +3,8 @@
 //
 //   primary  fs backend (temp dir), known root credentials, discovery on
 //            (allowScan, no mDNS/beacon multicast), CORS for the standalone
-//            UI origin, seeded with the peer
-//   peer     same, seeded with the primary
+//            UI origin and the peer's origin, seeded with the peer
+//   peer     same, seeded with (and allowing the origin of) the primary
 //
 // The binary is built into web/.e2e-cache/gos3 with `go build -overlay`
 // replacing internal/webui/dist by web/.output/public, so the shared
@@ -115,6 +115,11 @@ function freePort(): Promise<number> {
   })
 }
 
+/**
+ * Starts one instance. `seed` is the other instance: it is the discovery seed
+ * and its origin is allowed by CORS, because the UI embedded in one instance
+ * manages the other cross-origin (besides the standalone UI origins).
+ */
 function start(binary: string, role: string, name: string, port: number, seed: string, tmp: string): Omit<RealServer, 'id'> {
   const dataDir = join(tmp, `${role}-data`)
   mkdirSync(dataDir)
@@ -129,7 +134,7 @@ function start(binary: string, role: string, name: string, port: number, seed: s
     '--name', name,
     '--seed', seed,
     '--log-level', 'debug',
-    ...STANDALONE_ORIGINS.flatMap(o => ['--cors-origin', o])
+    ...[...STANDALONE_ORIGINS, seed].flatMap(o => ['--cors-origin', o])
   ]
   const env: NodeJS.ProcessEnv = {
     ...process.env,

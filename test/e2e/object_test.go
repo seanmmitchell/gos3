@@ -25,6 +25,7 @@ func md5Hex(b []byte) string {
 func quoted(s string) string { return `"` + s + `"` }
 
 func TestObjectPutGetHeadDelete(t *testing.T) {
+	t.Parallel()
 	for _, e := range []*env{fsEnv, memEnv} {
 		t.Run(e.name, func(t *testing.T) {
 			c := e.root()
@@ -166,6 +167,7 @@ func tagMap(ts []s3types.Tag) map[string]string {
 }
 
 func TestObjectKeyLimits(t *testing.T) {
+	t.Parallel()
 	e := fsEnv
 	b := e.newBucket(t)
 	long := strings.Repeat("k", 1024)
@@ -192,6 +194,7 @@ func TestObjectKeyLimits(t *testing.T) {
 }
 
 func TestCopyObject(t *testing.T) {
+	t.Parallel()
 	for _, e := range []*env{fsEnv, memEnv} {
 		t.Run(e.name, func(t *testing.T) {
 			c := e.root()
@@ -304,6 +307,7 @@ func TestCopyObject(t *testing.T) {
 }
 
 func TestCopyObjectVersionSource(t *testing.T) {
+	t.Parallel()
 	e := fsEnv
 	c := e.root()
 	b := e.newVersionedBucket(t)
@@ -323,6 +327,7 @@ func TestCopyObjectVersionSource(t *testing.T) {
 }
 
 func TestRanges(t *testing.T) {
+	t.Parallel()
 	for _, e := range []*env{fsEnv, memEnv} {
 		t.Run(e.name, func(t *testing.T) {
 			b := e.newBucket(t)
@@ -381,6 +386,7 @@ func TestRanges(t *testing.T) {
 }
 
 func TestConditionalGet(t *testing.T) {
+	t.Parallel()
 	e := memEnv
 	b := e.newBucket(t)
 	put := e.put(t, b, "c", []byte("conditional"))
@@ -450,6 +456,7 @@ func TestConditionalGet(t *testing.T) {
 }
 
 func TestConditionalPut(t *testing.T) {
+	t.Parallel()
 	for _, e := range []*env{fsEnv, memEnv} {
 		t.Run(e.name, func(t *testing.T) {
 			c := e.root()

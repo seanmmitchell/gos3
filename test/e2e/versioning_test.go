@@ -12,6 +12,7 @@ import (
 )
 
 func TestVersioningLifecycle(t *testing.T) {
+	t.Parallel()
 	for _, e := range []*env{fsEnv, memEnv} {
 		t.Run(e.name, func(t *testing.T) {
 			c := e.root()
@@ -149,6 +150,7 @@ func TestVersioningLifecycle(t *testing.T) {
 }
 
 func TestDeleteObjectsMixed(t *testing.T) {
+	t.Parallel()
 	for _, e := range []*env{fsEnv, memEnv} {
 		t.Run(e.name, func(t *testing.T) {
 			c := e.root()
@@ -231,6 +233,7 @@ func TestDeleteObjectsMixed(t *testing.T) {
 }
 
 func TestObjectLock(t *testing.T) {
+	t.Parallel()
 	for _, e := range []*env{fsEnv, memEnv} {
 		t.Run(e.name, func(t *testing.T) {
 			c := e.root()

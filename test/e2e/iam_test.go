@@ -31,6 +31,7 @@ func allowed(t *testing.T, err error, what string) {
 }
 
 func TestIAMBuiltinPolicies(t *testing.T) {
+	t.Parallel()
 	e := fsEnv
 	b := e.newBucket(t)
 	e.put(t, b, "existing", []byte("data"))
@@ -101,6 +102,7 @@ func (e *env) lastUserCreds(t *testing.T, c *s3.Client) auth.Credentials {
 }
 
 func TestIAMCustomPolicy(t *testing.T) {
+	t.Parallel()
 	e := memEnv
 	b := e.newBucket(t)
 	policy := `{
@@ -192,6 +194,7 @@ func TestIAMCustomPolicy(t *testing.T) {
 }
 
 func TestIAMKeysAndAdminAPI(t *testing.T) {
+	t.Parallel()
 	e := fsEnv
 	b := e.newBucket(t)
 	name := userName("keys")
@@ -284,6 +287,7 @@ func TestIAMKeysAndAdminAPI(t *testing.T) {
 // TestIAMGovernanceBypassPermission: bypassing governance retention needs
 // s3:BypassGovernanceRetention.
 func TestIAMGovernanceBypassPermission(t *testing.T) {
+	t.Parallel()
 	e := fsEnv
 	c := e.root()
 	b := bucketName(t)
@@ -308,5 +312,90 @@ func TestIAMGovernanceBypassPermission(t *testing.T) {
 		} else {
 			denied(t, err, "bypass without s3:BypassGovernanceRetention")
 		}
+	}
+}
+
+// TestBucketPolicyPrincipals grants access to specific IAM users through a
+// bucket policy (principal ARNs as the web UI templates write them) and
+// checks authenticated-read ACLs.
+func TestBucketPolicyPrincipals(t *testing.T) {
+	t.Parallel()
+	e := fsEnv
+	b := e.newBucket(t)
+	e.put(t, b, "shared/doc", []byte("shared"))
+	e.put(t, b, "authread", []byte("signed users only"), func(in *s3.PutObjectInput) { in.ACL = s3types.ObjectCannedACLAuthenticatedRead })
+	friendName, strangerName := userName("friend"), userName("stranger")
+	friend := e.s3Client(e.createUser(t, friendName))
+	stranger := e.s3Client(e.createUser(t, strangerName))
+	policy := `{"Version":"2012-10-17","Statement":[
+	  {"Effect":"Allow","Principal":{"AWS":["arn:aws:iam::000000000000:user/` + friendName + `"]},"Action":["s3:GetObject","s3:PutObject"],"Resource":"arn:aws:s3:::` + b + `/shared/*"},
+	  {"Effect":"Allow","Principal":{"AWS":"arn:aws:iam::000000000000:user/` + friendName + `"},"Action":"s3:ListBucket","Resource":"arn:aws:s3:::` + b + `"}]}`
+	_, err := e.root().PutBucketPolicy(ctx(t), &s3.PutBucketPolicyInput{Bucket: aws.String(b), Policy: aws.String(policy)})
+	must(t, err, "PutBucketPolicy")
+
+	out, err := friend.GetObject(ctx(t), &s3.GetObjectInput{Bucket: aws.String(b), Key: aws.String("shared/doc")})
+	if allowed(t, err, "friend GetObject"); err == nil {
+		readAll(t, out.Body)
+	}
+	_, err = friend.PutObject(ctx(t), &s3.PutObjectInput{Bucket: aws.String(b), Key: aws.String("shared/new"), Body: stringsReader("x")})
+	allowed(t, err, "friend PutObject")
+	_, err = friend.PutObject(ctx(t), &s3.PutObjectInput{Bucket: aws.String(b), Key: aws.String("private"), Body: stringsReader("x")})
+	denied(t, err, "friend PutObject outside the policy")
+	_, err = friend.ListObjectsV2(ctx(t), &s3.ListObjectsV2Input{Bucket: aws.String(b)})
+	allowed(t, err, "friend ListObjectsV2")
+	_, err = stranger.GetObject(ctx(t), &s3.GetObjectInput{Bucket: aws.String(b), Key: aws.String("shared/doc")})
+	denied(t, err, "stranger GetObject")
+
+	// authenticated-read: any signed identity reads, anonymous does not.
+	out, err = stranger.GetObject(ctx(t), &s3.GetObjectInput{Bucket: aws.String(b), Key: aws.String("authread")})
+	if allowed(t, err, "stranger GetObject authenticated-read"); err == nil {
+		readAll(t, out.Body)
+	}
+	if r := e.anon(t, http.MethodGet, "/"+b+"/authread", nil, nil); r.status != http.StatusForbidden {
+		t.Errorf("anonymous GET authenticated-read: %d", r.status)
+	}
+}
+
+// TestAdminForceDeleteBucket deletes a bucket with versions, delete
+// markers and pending uploads through the admin API.
+func TestAdminForceDeleteBucket(t *testing.T) {
+	t.Parallel()
+	e := memEnv
+	b := e.newVersionedBucket(t)
+	e.put(t, b, "k", []byte("1"))
+	e.put(t, b, "k", []byte("2"))
+	_, err := e.root().DeleteObject(ctx(t), &s3.DeleteObjectInput{Bucket: aws.String(b), Key: aws.String("k")})
+	must(t, err, "DeleteObject")
+	_, err = e.root().CreateMultipartUpload(ctx(t), &s3.CreateMultipartUploadInput{Bucket: aws.String(b), Key: aws.String("up")})
+	must(t, err, "CreateMultipartUpload")
+
+	var sum struct {
+		Name       string `json:"name"`
+		Versioning string `json:"versioning"`
+		Usage      *struct {
+			Versions       int64 `json:"versions"`
+			DeleteMarkers  int64 `json:"deleteMarkers"`
+			PendingUploads int64 `json:"pendingUploads"`
+		} `json:"usage"`
+	}
+	if r := e.admin(t, rootCreds, http.MethodGet, "/buckets/"+b, nil, &sum); r.status != 200 || sum.Name != b || sum.Versioning != "Enabled" ||
+		sum.Usage == nil || sum.Usage.Versions != 2 || sum.Usage.DeleteMarkers != 1 || sum.Usage.PendingUploads != 1 {
+		t.Errorf("GET /buckets/%s: %d %s", b, r.status, r.body)
+	}
+	// Without force: like S3 DeleteBucket.
+	if r := e.admin(t, rootCreds, http.MethodDelete, "/buckets/"+b, nil, nil); r.status != http.StatusConflict {
+		t.Errorf("DELETE without force: %d %s", r.status, r.body)
+	}
+	// A readwrite user lacks admin:ForceDeleteBucket.
+	rw := e.createUser(t, userName("rwforce"), "readwrite")
+	if r := e.admin(t, rw, http.MethodDelete, "/buckets/"+b+"?force=true", nil, nil); r.status != http.StatusForbidden {
+		t.Errorf("DELETE force as readwrite: %d %s", r.status, r.body)
+	}
+	if r := e.admin(t, rootCreds, http.MethodDelete, "/buckets/"+b+"?force=true", nil, nil); r.status != http.StatusNoContent {
+		t.Fatalf("DELETE force: %d %s", r.status, r.body)
+	}
+	_, err = e.root().HeadBucket(ctx(t), &s3.HeadBucketInput{Bucket: aws.String(b)})
+	if httpStatus(err) != http.StatusNotFound {
+		t.Errorf("bucket still exists: %v", err)
 	}
 }

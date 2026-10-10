@@ -33,6 +33,7 @@ func mcCredsFor(ak, sk string) *miniocreds.Credentials { return miniocreds.NewSt
 // payloads/trailers; both for single PUTs and streamed multipart uploads
 // of unknown size.
 func TestMinioStreamingUploads(t *testing.T) {
+	t.Parallel()
 	for _, e := range []*env{fsEnv, memEnv} {
 		for _, trailing := range []bool{false, true} {
 			name := e.name + map[bool]string{false: "/plain", true: "/trailing"}[trailing]
@@ -113,6 +114,7 @@ func minioChecksum(on bool) minio.ChecksumType {
 }
 
 func TestMinioOperations(t *testing.T) {
+	t.Parallel()
 	e := fsEnv
 	mc := e.minioClient(t, rootCreds, true)
 	b := bucketName(t)
@@ -218,6 +220,7 @@ func TestMinioOperations(t *testing.T) {
 
 // TestMinioErrors checks error responses as minio-go decodes them.
 func TestMinioErrors(t *testing.T) {
+	t.Parallel()
 	e := memEnv
 	mc := e.minioClient(t, rootCreds, false)
 	b := e.newBucket(t)

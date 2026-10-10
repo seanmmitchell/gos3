@@ -14,6 +14,7 @@ package auth
 import (
 	"io"
 	"net/http"
+	"sync/atomic"
 	"time"
 
 	"github.com/seanmmitchell/gos3/internal/s3err"
@@ -102,8 +103,9 @@ type Options struct {
 
 // Verifier authenticates requests.
 type Verifier struct {
-	creds CredentialProvider
-	opts  Options
+	creds  CredentialProvider
+	opts   Options
+	region atomic.Pointer[string] // current server region (see SetRegion)
 }
 
 // NewVerifier returns a Verifier backed by creds.
@@ -114,8 +116,18 @@ func NewVerifier(creds CredentialProvider, opts Options) *Verifier {
 	if opts.Now == nil {
 		opts.Now = time.Now
 	}
-	return &Verifier{creds: creds, opts: opts}
+	v := &Verifier{creds: creds, opts: opts}
+	v.SetRegion(opts.Region)
+	return v
 }
+
+// SetRegion changes the server region checked with StrictRegion (the
+// region can be changed at runtime through the settings). Safe for
+// concurrent use with Authenticate.
+func (v *Verifier) SetRegion(region string) { v.region.Store(&region) }
+
+// currentRegion returns the region set by NewVerifier or SetRegion.
+func (v *Verifier) currentRegion() string { return *v.region.Load() }
 
 // Authenticate authenticates r. Requests without any authentication
 // information yield Result{Identity: Anonymous, Method: MethodAnonymous}.

@@ -82,6 +82,8 @@ test.describe('users and a read-only identity', () => {
       const panel = p.getByRole('region', { name: 'Uploads' })
       await expect(panel).toContainText('1 upload failed')
       await expect(panel).toContainText(/access denied|not allowed/i)
+      await panel.getByRole('button', { name: 'Dismiss failed uploads' }).click()
+      await expect(panel).toBeHidden()
     } finally {
       await ctx.close()
     }

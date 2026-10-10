@@ -89,6 +89,7 @@ func checksumHeaderName(algo s3types.ChecksumAlgorithm) string {
 }
 
 func TestCRC64NVMECheckValue(t *testing.T) {
+	t.Parallel()
 	if got := binary.BigEndian.Uint64(rawChecksum(s3types.ChecksumAlgorithmCrc64nvme, []byte("123456789"))); got != 0xae8b14860a799888 {
 		t.Fatalf("CRC64NVME check value = %#x", got)
 	}
@@ -100,6 +101,7 @@ func TestCRC64NVMECheckValue(t *testing.T) {
 // aws-chunked STREAMING-UNSIGNED-PAYLOAD-TRAILER encoding with the
 // checksum in a trailer.
 func TestChecksumAlgorithms(t *testing.T) {
+	t.Parallel()
 	for _, e := range []*env{fsEnv, memEnv} {
 		t.Run(e.name, func(t *testing.T) {
 			hc, rec := e.recordingClient()
@@ -200,6 +202,7 @@ func pick(ok bool, v string) *string {
 }
 
 func TestContentMD5AndPayloadHash(t *testing.T) {
+	t.Parallel()
 	e := fsEnv
 	b := e.newBucket(t)
 	data := []byte("content md5 body")
@@ -250,6 +253,7 @@ func awsChunkedUnsigned(data []byte, chunk int, trailers ...string) []byte {
 // TestUnsignedTrailerRaw sends hand-made STREAMING-UNSIGNED-PAYLOAD-TRAILER
 // requests: a correct trailer checksum is stored; a wrong one is BadDigest.
 func TestUnsignedTrailerRaw(t *testing.T) {
+	t.Parallel()
 	e := fsEnv
 	b := e.newBucket(t)
 	data := randomData(150_000, 4)
@@ -290,6 +294,7 @@ func TestUnsignedTrailerRaw(t *testing.T) {
 // TestMultipartChecksums covers COMPOSITE and FULL_OBJECT multipart
 // checksums for every algorithm, including the invalid combinations.
 func TestMultipartChecksums(t *testing.T) {
+	t.Parallel()
 	for _, e := range []*env{fsEnv, memEnv} {
 		t.Run(e.name, func(t *testing.T) {
 			c := e.root()
@@ -406,6 +411,7 @@ func TestMultipartChecksums(t *testing.T) {
 // TestMultipartFullObjectExpectedChecksum checks that a full-object
 // checksum supplied with CompleteMultipartUpload is verified.
 func TestMultipartFullObjectExpectedChecksum(t *testing.T) {
+	t.Parallel()
 	e := fsEnv
 	c := e.root()
 	b := e.newBucket(t)

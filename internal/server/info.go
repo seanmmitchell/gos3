@@ -98,9 +98,9 @@ func (s *Server) applySettings(old, cur config.Settings) {
 		s.log.Info("settings: lifecycle worker reconfigured",
 			"enabled", cur.Lifecycle.Enabled, "interval", time.Duration(cur.Lifecycle.IntervalSeconds)*time.Second)
 	}
-	if old.Region != cur.Region && s.cfg.Auth.StrictRegion {
-		s.log.Warn("settings: region changed while auth.strict_region is set; signatures are checked against the startup region until restart",
-			"region", cur.Region)
+	if old.Region != cur.Region {
+		// With auth.strict_region, signatures must now use the new region.
+		s.verifier.SetRegion(cur.Region)
 	}
 }
 

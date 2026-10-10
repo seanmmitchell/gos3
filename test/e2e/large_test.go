@@ -73,6 +73,7 @@ const largeSize = 100 << 20
 // (non-seekable body) through the SDK over HTTPS: aws-chunked with an
 // unsigned SHA-256 trailer.
 func TestLargeStreamedObjectSDK(t *testing.T) {
+	t.Parallel()
 	if testing.Short() {
 		t.Skip("100 MiB transfer skipped in -short mode")
 	}
@@ -112,6 +113,7 @@ func TestLargeStreamedObjectSDK(t *testing.T) {
 // TestLargeStreamedObjectMinio streams 100 MiB in one PUT with minio-go's
 // signed aws-chunked encoding and a CRC32C trailer to the fs backend.
 func TestLargeStreamedObjectMinio(t *testing.T) {
+	t.Parallel()
 	if testing.Short() {
 		t.Skip("100 MiB transfer skipped in -short mode")
 	}
@@ -142,6 +144,7 @@ func TestLargeStreamedObjectMinio(t *testing.T) {
 // TestConcurrency runs many goroutines doing mixed operations on distinct
 // and shared keys and checks the results are consistent.
 func TestConcurrency(t *testing.T) {
+	t.Parallel()
 	for _, e := range []*env{fsEnv, memEnv} {
 		t.Run(e.name, func(t *testing.T) {
 			c := e.root()

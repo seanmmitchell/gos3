@@ -11,6 +11,7 @@ import TestReport from '~/components/servers/TestReport.vue'
 import PeersTable from '~/components/discovery/PeersTable.vue'
 import ScanForm from '~/components/discovery/ScanForm.vue'
 import SourceBadges from '~/components/discovery/SourceBadges.vue'
+import ConfigSummary from '~/components/discovery/ConfigSummary.vue'
 
 const INFO: Info = {
   service: 'gos3',
@@ -111,6 +112,9 @@ describe('servers components', () => {
     expect(w.text()).toContain('0.1.0')
     expect(w.find('[aria-label="Default server"]').exists()).toBe(true)
     expect(w.find(`a[href="/servers/${c.id}/buckets"]`).exists()).toBe(true)
+    const stats = w.find('[role="group"][aria-label="Statistics"]')
+    expect(stats.text()).toContain('3buckets')
+    expect(stats.text()).toContain('1.2Kobjects')
   })
 
   it('StatusCard offers sign-in without credentials', async () => {
@@ -188,5 +192,22 @@ describe('discovery components', () => {
     expect(await local.detect(true)).toBeNull()
     expect(local.available.value).toBe(false)
     expect(local.checked.value).toBe(true)
+  })
+})
+
+describe('DiscoveryConfigSummary', () => {
+  it('tells screen readers which mechanisms are off', async () => {
+    const w = await mountSuspended(ConfigSummary, {
+      props: {
+        state: {
+          enabled: true,
+          config: { enabled: true, advertise: true, mdns: false, beacon: false, beaconGroup: '239.255.73.83:7373', beaconInterval: 10e9, seeds: [], dnsSrv: [], peerTtl: 60e9, allowScan: true, maxScanHosts: 1024 },
+          self: INFO,
+          peers: []
+        }
+      }
+    })
+    const items = w.findAll('ul[aria-label="Discovery mechanisms"] li').map(li => li.text().replace(/\s+/g, ' ').trim())
+    expect(items).toEqual(['Enabled: on', 'Advertise: on', 'mDNS: off', 'Beacon: off', 'Scans allowed: on'])
   })
 })

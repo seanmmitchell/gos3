@@ -27,6 +27,8 @@ const flags = computed(() => {
       <ul class="flex flex-wrap gap-1.5" aria-label="Discovery mechanisms">
         <li v-for="f in flags" :key="f.label">
           <UBadge :label="f.label" :color="f.on ? 'success' : 'neutral'" :variant="f.on ? 'subtle' : 'outline'" :icon="f.on ? 'i-lucide-check' : 'i-lucide-x'" size="sm" />
+          <!-- The state is otherwise only shown by color and icon. -->
+          <span class="sr-only">{{ f.on ? ': on' : ': off' }}</span>
         </li>
       </ul>
       <dl class="grid grid-cols-1 gap-x-4 gap-y-2 text-sm sm:grid-cols-2">

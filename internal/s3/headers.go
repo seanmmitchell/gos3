@@ -241,7 +241,12 @@ func writeObjectHeaders(w http.ResponseWriter, info storage.ObjectInfo, versione
 	}
 	sort.Strings(names)
 	for _, k := range names {
-		h.Set(userMetaPrefix+k, info.UserMeta[k])
+		// Set the header map directly (not via h.Set) so the name keeps
+		// AWS's lowercase spelling "x-amz-meta-<name>": clients such as
+		// botocore strip the prefix case-insensitively but keep the rest
+		// verbatim, so a canonicalized "X-Amz-Meta-Color" would surface as
+		// metadata key "Color" instead of "color".
+		h[userMetaPrefix+k] = []string{info.UserMeta[k]}
 	}
 	if versioned {
 		set("X-Amz-Version-Id", info.VersionID)

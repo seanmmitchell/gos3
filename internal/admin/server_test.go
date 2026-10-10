@@ -241,6 +241,34 @@ func TestStats(t *testing.T) {
 	}
 }
 
+// The storage totals add up cached per-bucket usage, so their computedAt is
+// that of the oldest figure, not the moment they were summed.
+func TestStatsComputedAtIsOldestBucketUsage(t *testing.T) {
+	e := newEnv(t)
+	e.createBucket("one", storage.CreateBucketOptions{})
+	e.putObject("one", "a", "abc")
+	t0 := e.clock.Now().UTC()
+	e.root("GET", "/buckets?usage=true", nil).expectStatus(t, 200) // caches "one" at t0
+
+	e.clock.Advance(usageTTL / 2)
+	e.createBucket("two", storage.CreateBucketOptions{})
+	var s statsResponse
+	e.root("GET", "/stats", nil).json(t, &s)
+	if s.Storage.Buckets != 2 || s.Storage.Objects != 1 {
+		t.Fatalf("storage = %+v", s.Storage)
+	}
+	if !s.Storage.ComputedAt.Equal(t0) {
+		t.Errorf("computedAt = %v, want the cached bucket usage time %v", s.Storage.ComputedAt, t0)
+	}
+
+	// Once every per-bucket entry expired, the totals are fresh again.
+	e.clock.Advance(usageTTL + time.Second)
+	e.root("GET", "/stats", nil).json(t, &s)
+	if want := e.clock.Now().UTC(); !s.Storage.ComputedAt.Equal(want) {
+		t.Errorf("computedAt after expiry = %v, want %v", s.Storage.ComputedAt, want)
+	}
+}
+
 func TestStatsWithoutMetricsAndMemoryBackend(t *testing.T) {
 	e := newEnv(t, func(d *Deps) { d.Metrics = nil })
 	r := e.root("GET", "/stats", nil)

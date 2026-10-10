@@ -162,6 +162,19 @@ describe('UploadQueue', () => {
     expect(q.items).toHaveLength(0)
   })
 
+  it('clearSettled also dismisses failed items but keeps running ones', async () => {
+    const f = fakeClient()
+    const q = new UploadQueue()
+    q.enqueue({ client: f.client, connectionId: 'c', bucket: 'b', files: ['a', 'b'].map(k => ({ file: file(k, 1), key: k })) })
+    await tick()
+    f.calls[0]!.reject(new Error('boom'))
+    await tick()
+    q.clearSettled()
+    expect(q.items.map(i => `${i.key}:${i.status}`)).toEqual(['b:uploading'])
+    f.calls[1]!.resolve()
+    await tick()
+  })
+
   it('formats ETAs', () => {
     expect(uploadEta(0, 100)).toBe('')
     expect(uploadEta(100, 0)).toBe('')

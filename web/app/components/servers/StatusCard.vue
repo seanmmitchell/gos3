@@ -177,7 +177,7 @@ const menu = computed<DropdownMenuItem[][]>(() => [
       </div>
     </dl>
 
-    <div v-if="connected && status.state === 'online'" class="grid grid-cols-3 gap-2 rounded-md bg-elevated/50 p-2 text-center" aria-label="Statistics">
+    <div v-if="connected && status.state === 'online'" class="grid grid-cols-3 gap-2 rounded-md bg-elevated/50 p-2 text-center" role="group" aria-label="Statistics">
       <template v-if="statsLoading && !stats">
         <USkeleton v-for="i in 3" :key="i" class="mx-auto h-9 w-14" />
       </template>
@@ -187,7 +187,7 @@ const menu = computed<DropdownMenuItem[][]>(() => [
             {{ formatNumber(stats.buckets) }}
           </p>
           <p class="text-xs text-muted">
-            buckets
+            {{ stats.buckets === 1 ? 'bucket' : 'buckets' }}
           </p>
         </div>
         <div>
@@ -195,7 +195,7 @@ const menu = computed<DropdownMenuItem[][]>(() => [
             {{ stats.objects !== undefined ? formatCompact(stats.objects) : '—' }}
           </p>
           <p class="text-xs text-muted">
-            objects
+            {{ stats.objects === 1 ? 'object' : 'objects' }}
           </p>
         </div>
         <div>

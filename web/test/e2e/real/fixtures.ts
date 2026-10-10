@@ -34,7 +34,7 @@ export class ServerApi {
     return (text ? JSON.parse(text) : undefined) as T
   }
 
-  async putObject(bucket: string, key: string, body: string | Uint8Array, headers: Record<string, string> = {}): Promise<Response> {
+  async putObject(bucket: string, key: string, body: string | Uint8Array<ArrayBuffer>, headers: Record<string, string> = {}): Promise<Response> {
     const r = await this.fetch(`/${bucket}/${encodeKey(key)}`, { method: 'PUT', body, headers })
     if (!r.ok) throw new Error(`PUT ${bucket}/${key}: ${r.status} ${await r.text()}`)
     return r
@@ -90,6 +90,7 @@ export const test = base.extend<object, WorkerFixtures>({
   ui: [async ({ primary }, use) => use((path = '') => `${primary.url}/_gos3/ui/${path.replace(/^\//, '')}`), { scope: 'worker' }],
   signIn: [async ({ ui }, use) => {
     await use(async (page, opts = {}) => {
+      watchPage(page)
       const redirect = opts.redirect ?? `/servers/${THIS_SERVER}`
       await page.goto(ui(`connect?server=${THIS_SERVER}&redirect=${encodeURIComponent(redirect)}`))
       await fillSignIn(page, opts.accessKey ?? ROOT_ACCESS_KEY, opts.secretKey ?? ROOT_SECRET_KEY)
@@ -97,6 +98,22 @@ export const test = base.extend<object, WorkerFixtures>({
     })
   }, { scope: 'worker' }]
 })
+
+const watched = new WeakSet<Page>()
+/**
+ * Reports uncaught exceptions and console errors of the page on stderr (they
+ * do not fail the test, but show up in the report). Network failures that a
+ * test provokes on purpose (403/404) are logged by Chromium as console
+ * errors too, so they are not treated as failures.
+ */
+export function watchPage(page: Page): void {
+  if (watched.has(page)) return
+  watched.add(page)
+  page.on('pageerror', e => console.error(`[pageerror] ${page.url()}: ${e.message}`))
+  page.on('console', (m) => {
+    if (m.type() === 'error' && !m.text().startsWith('Failed to load resource')) console.error(`[console.error] ${page.url()}: ${m.text()}`)
+  })
+}
 
 /** Fills and submits the sign-in form currently shown. */
 export async function fillSignIn(page: Page, accessKey: string, secretKey: string): Promise<void> {
@@ -127,7 +144,7 @@ export function toast(page: Page, title: string | RegExp) {
 }
 
 /** Deterministic pseudo-random bytes (fast) of the given size. */
-export function bytes(size: number, seed = 1): Uint8Array {
+export function bytes(size: number, seed = 1): Uint8Array<ArrayBuffer> {
   const b = new Uint8Array(size)
   let x = seed >>> 0 || 1
   for (let i = 0; i < size; i++) {

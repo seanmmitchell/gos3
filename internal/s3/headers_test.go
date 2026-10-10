@@ -113,7 +113,7 @@ func TestWriteObjectHeaders(t *testing.T) {
 	h := rec.Header()
 	for k, want := range map[string]string{
 		"Content-Length": "10", "ETag": `"abc-2"`, "Last-Modified": "Sat, 03 Feb 2024 04:05:06 GMT",
-		"Content-Type": "binary/octet-stream", "X-Amz-Meta-A": "1", "X-Amz-Version-Id": "v1",
+		"Content-Type": "binary/octet-stream", "X-Amz-Version-Id": "v1",
 		"X-Amz-Tagging-Count": "1", "X-Amz-Storage-Class": "GLACIER", "X-Amz-Server-Side-Encryption": "aws:kms",
 		"X-Amz-Server-Side-Encryption-Aws-Kms-Key-Id": "kid", "X-Amz-Object-Lock-Mode": "COMPLIANCE",
 		"X-Amz-Object-Lock-Retain-Until-Date": "2030-01-01T00:00:00.000Z", "X-Amz-Object-Lock-Legal-Hold": "ON",
@@ -123,6 +123,15 @@ func TestWriteObjectHeaders(t *testing.T) {
 		if got := h.Get(k); got != want {
 			t.Errorf("%s = %q, want %q", k, got, want)
 		}
+	}
+	// User metadata keeps AWS's lowercase header spelling on the wire:
+	// botocore strips "x-amz-meta-" case-insensitively but keeps the rest
+	// verbatim, so a canonicalized "X-Amz-Meta-A" would read back as "A".
+	if got := h["x-amz-meta-a"]; len(got) != 1 || got[0] != "1" {
+		t.Errorf("x-amz-meta-a = %q (header map %v), want lowercase name with value 1", got, h)
+	}
+	if _, ok := h["X-Amz-Meta-A"]; ok {
+		t.Error("user metadata header was canonicalized to X-Amz-Meta-A")
 	}
 	rec = httptest.NewRecorder()
 	info.StorageClass = "STANDARD"

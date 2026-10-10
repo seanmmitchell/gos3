@@ -46,6 +46,26 @@ export const NO_CAPABILITIES: Capabilities = Object.freeze({
   scan: false
 })
 
+/**
+ * ConnectionStatus.errorCode when the server answers its public /_gos3/info
+ * but the browser blocks the signed API requests: the server's CORS settings
+ * do not allow this console's origin.
+ */
+export const CORS_BLOCKED = 'CorsBlocked'
+
+/** Explanation for CORS_BLOCKED, naming the origin to allow. */
+export function corsBlockedMessage(endpoint: string): string {
+  let host = endpoint
+  try {
+    host = new URL(endpoint).host
+  } catch {
+    // keep the raw endpoint
+  }
+  const origin = globalThis.location?.origin
+  const allow = origin && origin !== 'null' ? `add ${origin} to its CORS allowed origins` : 'allow this console\'s origin in its CORS settings'
+  return `${host} is reachable, but the browser blocked the request (CORS): ${allow}.`
+}
+
 interface PersistedState {
   version: 1
   activeId: string | null
@@ -451,6 +471,9 @@ export const useConnectionsStore = defineStore('connections', () => {
       } catch (e) {
         if (e instanceof AdminError) {
           if (e.status === 401) return done({ state: 'unauthorized', info, whoami: null, error: e.message, errorCode: e.code })
+          // /_gos3/info (CORS *) answered, so the server is up: a network error
+          // on the signed request is the browser blocking it (CORS).
+          if (e.isNetworkError && probe.ok) return done({ state: 'error', info, whoami: null, error: corsBlockedMessage(c.endpoint), errorCode: CORS_BLOCKED })
           if (e.isNetworkError) return done({ state: 'offline', info, whoami: null, error: e.message, errorCode: e.code })
           return done({ state: 'error', info, whoami: null, error: e.message, errorCode: e.code })
         }
@@ -467,6 +490,7 @@ export const useConnectionsStore = defineStore('connections', () => {
     } catch (e) {
       const info = await infoP
       if (e instanceof S3Error) {
+        if (e.code === 'NetworkError' && info) return done({ state: 'error', info, whoami: null, error: corsBlockedMessage(c.endpoint), errorCode: CORS_BLOCKED })
         if (e.code === 'NetworkError') return done({ state: 'offline', info, whoami: null, error: e.message, errorCode: e.code })
         if (['InvalidAccessKeyId', 'SignatureDoesNotMatch', 'InvalidToken', 'ExpiredToken', 'Unauthorized'].includes(e.code)) {
           return done({ state: 'unauthorized', info, whoami: null, error: e.message, errorCode: e.code })

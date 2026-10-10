@@ -54,6 +54,7 @@ func sortedCopy(keys []string) []string {
 }
 
 func TestNastyKeysRoundTrip(t *testing.T) {
+	t.Parallel()
 	for _, e := range []*env{fsEnv, memEnv} {
 		t.Run(e.name, func(t *testing.T) {
 			b := e.newBucket(t)
@@ -82,6 +83,7 @@ func TestNastyKeysRoundTrip(t *testing.T) {
 }
 
 func TestListObjectsV2Pagination(t *testing.T) {
+	t.Parallel()
 	e := fsEnv
 	b := e.newBucket(t)
 	populate(t, e, b, nastyKeys)
@@ -169,6 +171,7 @@ func TestListObjectsV2Pagination(t *testing.T) {
 }
 
 func TestListObjectsDelimiter(t *testing.T) {
+	t.Parallel()
 	e := memEnv
 	b := e.newBucket(t)
 	populate(t, e, b, nastyKeys)
@@ -294,6 +297,7 @@ func s3URLEncode(s string) string {
 }
 
 func TestListEncodingTypeURL(t *testing.T) {
+	t.Parallel()
 	e := fsEnv
 	b := e.newBucket(t)
 	populate(t, e, b, nastyKeys)
@@ -388,6 +392,7 @@ func TestListEncodingTypeURL(t *testing.T) {
 }
 
 func TestListObjectVersionsPagination(t *testing.T) {
+	t.Parallel()
 	for _, e := range []*env{fsEnv, memEnv} {
 		t.Run(e.name, func(t *testing.T) {
 			b := e.newVersionedBucket(t)

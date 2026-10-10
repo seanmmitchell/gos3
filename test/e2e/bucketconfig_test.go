@@ -5,6 +5,7 @@ import (
 	"net/http"
 	"reflect"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -14,6 +15,7 @@ import (
 )
 
 func TestTagging(t *testing.T) {
+	t.Parallel()
 	for _, e := range []*env{fsEnv, memEnv} {
 		t.Run(e.name, func(t *testing.T) {
 			c := e.root()
@@ -81,6 +83,7 @@ func TestTagging(t *testing.T) {
 }
 
 func TestACLs(t *testing.T) {
+	t.Parallel()
 	e := fsEnv
 	c := e.root()
 	b := e.newBucket(t)
@@ -173,6 +176,7 @@ func hasAllUsersGrant(gs []s3types.Grant, p s3types.Permission) bool {
 }
 
 func TestBucketPolicyAnonymous(t *testing.T) {
+	t.Parallel()
 	e := fsEnv
 	c := e.root()
 	b := e.newBucket(t)
@@ -280,6 +284,7 @@ func TestBucketPolicyAnonymous(t *testing.T) {
 }
 
 func TestBucketCORS(t *testing.T) {
+	t.Parallel()
 	e := fsEnv
 	c := e.root()
 	b := e.newBucket(t)
@@ -362,6 +367,7 @@ func TestBucketCORS(t *testing.T) {
 }
 
 func TestBucketConfigRoundTrips(t *testing.T) {
+	t.Parallel()
 	e := memEnv
 	c := e.root()
 	b := e.newBucket(t)
@@ -475,7 +481,15 @@ func TestBucketConfigRoundTrips(t *testing.T) {
 	}
 }
 
+// lifecycleMu serializes the tests that run lifecycle passes: a pass
+// processes every bucket of the shared server, so concurrent lifecycle
+// tests would expire each other's objects at unexpected moments.
+var lifecycleMu sync.Mutex
+
 func TestLifecycleConfigAndExpiration(t *testing.T) {
+	t.Parallel()
+	lifecycleMu.Lock()
+	defer lifecycleMu.Unlock()
 	for _, e := range []*env{fsEnv, memEnv} {
 		t.Run(e.name, func(t *testing.T) {
 			c := e.root()
@@ -569,6 +583,9 @@ func TestLifecycleConfigAndExpiration(t *testing.T) {
 // versions get a delete marker, noncurrent versions stay, and expired
 // object delete markers are removed.
 func TestLifecycleVersioned(t *testing.T) {
+	t.Parallel()
+	lifecycleMu.Lock()
+	defer lifecycleMu.Unlock()
 	e := fsEnv
 	c := e.root()
 	b := e.newVersionedBucket(t)
@@ -591,7 +608,9 @@ func TestLifecycleVersioned(t *testing.T) {
 	must(t, err, "PutBucketLifecycleConfiguration")
 	stats, err := e.srv.RunLifecycleOnce(ctx(t))
 	must(t, err, "RunLifecycleOnce")
-	if stats.Expired != 1 || stats.DeleteMarkersRemoved != 1 {
+	// Stats cover every bucket of the server; this bucket alone accounts
+	// for one expiration and one removed marker.
+	if stats.Expired < 1 || stats.DeleteMarkersRemoved < 1 {
 		t.Errorf("stats %+v", stats)
 	}
 	vs, err := c.ListObjectVersions(ctx(t), &s3.ListObjectVersionsInput{Bucket: aws.String(b)})
@@ -602,4 +621,6 @@ func TestLifecycleVersioned(t *testing.T) {
 	out, err := c.GetObject(ctx(t), &s3.GetObjectInput{Bucket: aws.String(b), Key: aws.String("doc"), VersionId: v1})
 	must(t, err, "noncurrent version still readable")
 	readAll(t, out.Body)
+	_, err = c.DeleteBucketLifecycle(ctx(t), &s3.DeleteBucketLifecycleInput{Bucket: aws.String(b)})
+	must(t, err, "DeleteBucketLifecycle")
 }

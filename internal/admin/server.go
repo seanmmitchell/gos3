@@ -61,6 +61,14 @@ type usageJSON struct {
 	PendingUploads int64 `json:"pendingUploads"`
 }
 
+// bucketUsageJSON is the usage of a BucketSummary: the counters plus when
+// they were computed (usage is cached for up to usageTTL, so a client can
+// tell how current the figures are).
+type bucketUsageJSON struct {
+	usageJSON
+	ComputedAt time.Time `json:"computedAt"`
+}
+
 func toUsageJSON(u storage.BucketUsage) *usageJSON {
 	return &usageJSON{
 		Objects:        u.Objects,
@@ -150,7 +158,10 @@ func (a *api) metricsSnapshot() metrics.Snapshot {
 }
 
 // storageTotals sums usage over all buckets (cached for usageTTL, with
-// concurrent requests sharing one computation).
+// concurrent requests sharing one computation). ComputedAt is the time of
+// the oldest per-bucket figure that went into the sum: those come from the
+// per-bucket cache, so the totals can be older than the moment they were
+// added up.
 func (a *api) storageTotals(ctx context.Context) (storageTotals, error) {
 	t, _, err := a.totals.get(ctx, "", func(ctx context.Context) (storageTotals, error) {
 		buckets, err := a.d.Backend.ListBuckets(ctx)
@@ -158,13 +169,17 @@ func (a *api) storageTotals(ctx context.Context) (storageTotals, error) {
 			return storageTotals{}, err
 		}
 		var t storageTotals
+		oldest := a.now()
 		for _, b := range buckets {
-			u, err := a.bucketUsage(ctx, b.Name)
+			u, at, err := a.bucketUsage(ctx, b.Name)
 			if errors.Is(err, storage.ErrBucketNotFound) {
 				continue // deleted concurrently
 			}
 			if err != nil {
 				return storageTotals{}, err
+			}
+			if at.Before(oldest) {
+				oldest = at
 			}
 			t.Buckets++
 			t.Objects += u.Objects
@@ -174,18 +189,18 @@ func (a *api) storageTotals(ctx context.Context) (storageTotals, error) {
 			t.DeleteMarkers += u.DeleteMarkers
 			t.PendingUploads += u.PendingUploads
 		}
-		t.ComputedAt = a.now().UTC()
+		t.ComputedAt = oldest.UTC()
 		return t, nil
 	})
 	return t, err
 }
 
-// bucketUsage returns the (cached) usage of one bucket.
-func (a *api) bucketUsage(ctx context.Context, bucket string) (storage.BucketUsage, error) {
-	u, _, err := a.usage.get(ctx, bucket, func(ctx context.Context) (storage.BucketUsage, error) {
+// bucketUsage returns the (cached) usage of one bucket and when it was
+// computed.
+func (a *api) bucketUsage(ctx context.Context, bucket string) (storage.BucketUsage, time.Time, error) {
+	return a.usage.get(ctx, bucket, func(ctx context.Context) (storage.BucketUsage, error) {
 		return storage.ComputeBucketUsage(ctx, a.d.Backend, bucket)
 	})
-	return u, err
 }
 
 // invalidateUsage forgets cached usage of bucket and the totals.

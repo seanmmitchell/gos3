@@ -120,9 +120,9 @@ func (v *Verifier) parseCredential(s string, kind authKind) (credential, error) 
 	if _, err := time.Parse(yyyymmdd, c.date); err != nil || len(c.date) != 8 {
 		return credential{}, kind.malformed(fmt.Sprintf("invalid credential date %q.", truncate(c.date, 64)))
 	}
-	if v.opts.StrictRegion && v.opts.Region != "" && c.region != v.opts.Region {
-		return credential{}, kind.malformed(fmt.Sprintf("the region '%s' is wrong; expecting '%s'", truncate(c.region, 64), v.opts.Region)).
-			With("Region", v.opts.Region)
+	if region := v.currentRegion(); v.opts.StrictRegion && region != "" && c.region != region {
+		return credential{}, kind.malformed(fmt.Sprintf("the region '%s' is wrong; expecting '%s'", truncate(c.region, 64), region)).
+			With("Region", region)
 	}
 	return c, nil
 }

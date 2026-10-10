@@ -13,6 +13,7 @@ import (
 )
 
 func TestBucketCRUD(t *testing.T) {
+	t.Parallel()
 	for _, e := range []*env{fsEnv, memEnv} {
 		t.Run(e.name, func(t *testing.T) {
 			c := e.root()
@@ -72,6 +73,7 @@ func TestBucketCRUD(t *testing.T) {
 }
 
 func TestBucketLocationConstraint(t *testing.T) {
+	t.Parallel()
 	c := fsEnv.root()
 	name := bucketName(t)
 	_, err := c.CreateBucket(ctx(t), &s3.CreateBucketInput{
@@ -92,6 +94,7 @@ func TestBucketLocationConstraint(t *testing.T) {
 }
 
 func TestBucketInvalidNames(t *testing.T) {
+	t.Parallel()
 	c := fsEnv.root()
 	for _, name := range []string{"ab", "UPPER-case", "has_underscore", "-start", "end-", "a..b", "192.168.1.1", "xn--punycode", "bucket-s3alias"} {
 		_, err := c.CreateBucket(ctx(t), &s3.CreateBucketInput{Bucket: aws.String(name)})
@@ -106,6 +109,7 @@ func TestBucketInvalidNames(t *testing.T) {
 }
 
 func TestVirtualHostAddressing(t *testing.T) {
+	t.Parallel()
 	e := fsEnv
 	vh := e.vhost(rootCreds)
 	name := bucketName(t)

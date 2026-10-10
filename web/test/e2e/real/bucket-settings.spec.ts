@@ -180,4 +180,17 @@ test.describe('bucket settings', () => {
     // IgnorePublicAcls / RestrictPublicBuckets turn anonymous access off again.
     expect((await fetch(`${primary.url}/${bucket}?list-type=2`)).status).toBe(403)
   })
+
+  test('danger zone: delete refuses a non-empty bucket, force delete removes everything', async ({ ui, api }) => {
+    await open(ui, bucket, 'danger')
+    await page.getByRole('button', { name: 'Delete bucket' }).click()
+    await confirmDialog(page, 'Delete bucket')
+    await expect(page.getByText(/not empty/i).first()).toBeVisible()
+    expect((await api.fetch(`/${bucket}`, { method: 'HEAD' })).status).toBe(200)
+
+    await page.getByRole('button', { name: 'Force delete' }).click()
+    await confirmDialog(page, 'Delete everything')
+    await expect(page).toHaveURL(/\/buckets$/)
+    expect((await api.fetch(`/${bucket}`, { method: 'HEAD' })).status).toBe(404)
+  })
 })

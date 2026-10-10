@@ -211,6 +211,13 @@ export class UploadQueue {
     }
   }
 
+  /** Removes every item that is not queued or uploading (failed ones too). */
+  clearSettled(): void {
+    for (const it of this.items.slice()) {
+      if (it.status !== 'queued' && it.status !== 'uploading') this.remove(it.id)
+    }
+  }
+
   /** Subscribes to items reaching a final state (done / error / canceled). */
   onSettled(fn: Listener): () => void {
     this.listeners.add(fn)
