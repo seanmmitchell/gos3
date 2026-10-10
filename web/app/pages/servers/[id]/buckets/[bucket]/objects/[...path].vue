@@ -34,7 +34,7 @@ const { connection, s3, requireS3 } = useConnection()
 
 const serverId = computed(() => routeParam(route.params.id))
 const bucket = computed(() => routeParam(route.params.bucket))
-const target = computed(() => parseBrowserPath(route.path))
+const target = computed(() => parseBrowserPath(route.path, route.query))
 const prefix = computed(() => target.value.prefix)
 const openKey = computed(() => (target.value.kind === 'object' ? target.value.key : ''))
 const versionIdParam = computed(() => (typeof route.query.versionId === 'string' && route.query.versionId ? route.query.versionId : undefined))

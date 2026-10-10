@@ -3,6 +3,7 @@ package discovery
 import (
 	"context"
 	"fmt"
+	"net/netip"
 	"strings"
 	"sync"
 	"time"
@@ -222,8 +223,26 @@ func (s *Service) candidate(c candidate) {
 	}
 }
 
-// bye implements sink.
-func (s *Service) bye(id string) { s.table.bye(id) }
+// bye implements sink. A bye is only believed from an address the peer is
+// known at (see peerTable.bye); otherwise the peer is re-probed soon.
+func (s *Service) bye(id string, src netip.Addr) {
+	s.table.bye(id, func(addr string) bool { return addrMatchesSource(addr, src, hostNets.isLocal) })
+}
+
+// addrMatchesSource reports whether the peer address addr (a base URL) is
+// at src: same IP, or a loopback or local address when src is this host.
+func addrMatchesSource(addr string, src netip.Addr, isLocal func(netip.Addr) bool) bool {
+	_, host, _, ok := urlHostPort(addr)
+	if !ok {
+		return false
+	}
+	ip, err := netip.ParseAddr(strings.Trim(host, "[]"))
+	if err != nil {
+		return false
+	}
+	ip, src = ip.Unmap().WithZone(""), src.Unmap().WithZone("")
+	return ip == src || (isLocal(src) && (ip.IsLoopback() || isLocal(ip)))
+}
 
 // verify probes the candidate's URLs in order; the first valid answer adds
 // (or refreshes) the peer with the candidate's source.
@@ -247,7 +266,7 @@ func (s *Service) verify(ctx context.Context, c candidate, timeout time.Duration
 		now := s.now()
 		s.table.observeInfo(info, u, c.source, now, selfID)
 		if c.id != "" && c.id != info.ID {
-			s.table.probeFailed(c.id, fmt.Sprintf("%s is served by server %s", u, info.ID), now)
+			s.table.sightingFailed(c.id, fmt.Sprintf("%s is served by server %s", u, info.ID), now)
 		}
 		return
 	}
@@ -256,7 +275,9 @@ func (s *Service) verify(ctx context.Context, c candidate, timeout time.Duration
 	}
 	now := s.now()
 	if c.id != "" {
-		s.table.probeFailed(c.id, lastErr.Error(), now)
+		// An unauthenticated sighting (anyone can announce any ID) never
+		// marks a verified peer unhealthy: its own addresses are re-probed.
+		s.table.sightingFailed(c.id, lastErr.Error(), now)
 		return
 	}
 	for _, u := range c.urls {
@@ -512,7 +533,7 @@ func (c *collector) candidate(cd candidate) {
 	c.list = append(c.list, cd)
 }
 
-func (c *collector) bye(string) {}
+func (c *collector) bye(string, netip.Addr) {}
 
 func (c *collector) candidates() []candidate {
 	c.mu.Lock()

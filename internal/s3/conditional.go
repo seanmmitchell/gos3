@@ -96,6 +96,31 @@ func trimETag(s string) string {
 	return s
 }
 
+// ifRangeAllows evaluates an If-Range header (RFC 9110 section 13.1.5)
+// against an object with the given (unquoted) ETag and last-modified time:
+// it reports whether the Range header may be honoured. A missing header
+// allows it; otherwise the validator must match exactly, using the strong
+// comparison: a weak entity tag never matches, and a date must equal the
+// object's Last-Modified (at one-second granularity). On a mismatch the
+// full object is served with 200, so a client resuming a download never
+// splices bytes of a newer version onto an older one.
+func ifRangeAllows(v, etag string, lastModified time.Time) bool {
+	v = strings.TrimSpace(v)
+	switch {
+	case v == "":
+		return true
+	case strings.HasPrefix(v, "W/"):
+		return false
+	case strings.HasPrefix(v, `"`):
+		return len(v) >= 2 && strings.HasSuffix(v, `"`) && v[1:len(v)-1] == trimETag(etag)
+	}
+	if t, err := http.ParseTime(v); err == nil {
+		return lastModified.Truncate(time.Second).Equal(t)
+	}
+	// Lenient: an unquoted entity tag.
+	return v == trimETag(etag)
+}
+
 // quoteETag returns the quoted form of an unquoted ETag.
 func quoteETag(etag string) string { return `"` + trimETag(etag) + `"` }
 

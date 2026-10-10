@@ -9,6 +9,7 @@ import (
 	"maps"
 	"os"
 	"path/filepath"
+	"runtime"
 	"slices"
 	"time"
 
@@ -292,7 +293,15 @@ func writeFileAtomic(path string, data []byte) (err error) {
 	return syncDir(dir)
 }
 
+// syncDir fsyncs a directory so a rename in it is durable. Windows cannot
+// do that: a directory handle opened with os.Open is read-only and
+// FlushFileBuffers needs write access, so Sync fails with "Access is
+// denied" (after iam.json was already replaced); NTFS journals the rename
+// itself, so it is skipped there, as the fs storage backend does.
 func syncDir(dir string) error {
+	if runtime.GOOS == "windows" {
+		return nil
+	}
 	d, err := os.Open(dir)
 	if err != nil {
 		return err

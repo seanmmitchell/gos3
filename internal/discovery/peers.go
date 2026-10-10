@@ -6,12 +6,16 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode"
 	"unicode/utf8"
 )
 
 // Bounds that keep the peer table small no matter what the network sends.
 const (
-	maxPeers            = 4096
+	maxPeers = 4096
+	// maxUnverifiedPeers bounds the entries created from sightings that no
+	// /_gos3/info probe confirmed yet (anyone on the link can announce).
+	maxUnverifiedPeers  = 256
 	maxAddressesPerPeer = 32
 	maxIDLen            = 64
 	maxFieldLen         = 256
@@ -42,7 +46,10 @@ func cleanField(s string, n int) string {
 		s = strings.ToValidUTF8(s, "�")
 	}
 	s = strings.Map(func(r rune) rune {
-		if r < 0x20 || r == 0x7f {
+		// C0, DEL and C1 controls (e.g. U+009B, an 8-bit CSI), bidi
+		// overrides and isolates, and line/paragraph separators: they
+		// would let a peer spoof names or drive the operator's terminal.
+		if unicode.IsControl(r) || unicode.Is(unicode.Bidi_Control, r) || r == '\u2028' || r == '\u2029' {
 			return -1
 		}
 		return r
@@ -107,10 +114,11 @@ type peerEntry struct {
 // concurrent use; all methods take the current time explicitly so that tests
 // can use a fake clock.
 type peerTable struct {
-	mu    sync.Mutex
-	peers map[string]*peerEntry
-	ttl   time.Duration
-	seeds map[string]struct{} // normalised seed URLs: peers seen there never expire
+	mu         sync.Mutex
+	peers      map[string]*peerEntry
+	unverified int // entries with !peer.Verified
+	ttl        time.Duration
+	seeds      map[string]struct{} // normalised seed URLs: peers seen there never expire
 }
 
 func newPeerTable(ttl time.Duration) *peerTable {
@@ -142,29 +150,57 @@ func (t *peerTable) pinnedLocked(e *peerEntry) bool {
 }
 
 // insertLocked adds a new entry, evicting the stalest non-seed entry
-// (unverified ones first) when the table is full. It reports whether the
-// entry was added.
+// (unverified ones first) when the table is full. Unverified entries are
+// further bounded by maxUnverifiedPeers: a new one replaces the stalest
+// unverified entry. It reports whether the entry was added.
 func (t *peerTable) insertLocked(id string, e *peerEntry) bool {
-	if len(t.peers) >= maxPeers {
-		var victim string
-		var victimEntry *peerEntry
-		for vid, ve := range t.peers {
-			if t.pinnedLocked(ve) || (ve.peer.Verified && !e.peer.Verified) {
-				continue
-			}
-			if victimEntry == nil ||
-				(victimEntry.peer.Verified && !ve.peer.Verified) ||
-				(victimEntry.peer.Verified == ve.peer.Verified && ve.peer.LastSeen.Before(victimEntry.peer.LastSeen)) {
-				victim, victimEntry = vid, ve
-			}
-		}
-		if victimEntry == nil {
+	if !e.peer.Verified && t.unverified >= maxUnverifiedPeers {
+		if !t.evictLocked(func(ve *peerEntry) bool { return !ve.peer.Verified }) {
 			return false
 		}
-		delete(t.peers, victim)
+	}
+	if len(t.peers) >= maxPeers {
+		if !t.evictLocked(func(ve *peerEntry) bool { return !ve.peer.Verified || e.peer.Verified }) {
+			return false
+		}
 	}
 	t.peers[id] = e
+	if !e.peer.Verified {
+		t.unverified++
+	}
 	return true
+}
+
+// evictLocked removes the stalest non-seed entry accepted by eligible,
+// preferring unverified entries. It reports whether one was removed.
+func (t *peerTable) evictLocked(eligible func(*peerEntry) bool) bool {
+	var victim string
+	var victimEntry *peerEntry
+	for vid, ve := range t.peers {
+		if t.pinnedLocked(ve) || !eligible(ve) {
+			continue
+		}
+		if victimEntry == nil ||
+			(victimEntry.peer.Verified && !ve.peer.Verified) ||
+			(victimEntry.peer.Verified == ve.peer.Verified && ve.peer.LastSeen.Before(victimEntry.peer.LastSeen)) {
+			victim, victimEntry = vid, ve
+		}
+	}
+	if victimEntry == nil {
+		return false
+	}
+	t.deleteLocked(victim)
+	return true
+}
+
+// deleteLocked removes entry id.
+func (t *peerTable) deleteLocked(id string) {
+	if e, ok := t.peers[id]; ok {
+		if !e.peer.Verified {
+			t.unverified--
+		}
+		delete(t.peers, id)
+	}
 }
 
 // observeInfo records a successful /_gos3/info probe of addr. src is added to
@@ -184,6 +220,9 @@ func (t *peerTable) observeInfo(info Info, addr string, src Source, now time.Tim
 		}
 	}
 	p := &e.peer
+	if !p.Verified {
+		t.unverified--
+	}
 	p.Name = info.Name
 	p.Version = info.Version
 	p.Region = info.Region
@@ -266,14 +305,37 @@ func (t *peerTable) probeFailed(id, errMsg string, now time.Time) {
 	}
 }
 
-// bye marks peer id unhealthy after it announced its shutdown.
-func (t *peerTable) bye(id string) {
+// sightingFailed records that the addresses of an unverified sighting of id
+// could not be verified. Sightings are not authenticated, so a verified
+// peer is left alone (it is re-probed at its own addresses); only
+// unverified entries are marked unhealthy.
+func (t *peerTable) sightingFailed(id, errMsg string, now time.Time) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	if e, ok := t.peers[id]; ok {
+	if e, ok := t.peers[id]; ok && !e.peer.Verified {
+		e.peer.Healthy = false
+		e.peer.Error = cleanField(errMsg, maxErrorLen)
+		e.lastProbe = now
+	}
+}
+
+// bye handles a shutdown announcement for peer id. It is believed (the
+// peer is marked unhealthy) only when fromPeer accepts one of the peer's
+// addresses, i.e. the datagram came from where the peer is known to be;
+// otherwise a verified peer is merely made due for a re-probe.
+func (t *peerTable) bye(id string, fromPeer func(addr string) bool) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	e, ok := t.peers[id]
+	if !ok {
+		return
+	}
+	if slices.ContainsFunc(e.peer.Addresses, fromPeer) {
 		e.peer.Healthy = false
 		e.peer.Error = "server announced shutdown"
+		return
 	}
+	e.lastProbe = time.Time{}
 }
 
 // findByAddr returns the IDs of peers observed at addr.
@@ -295,7 +357,7 @@ func (t *peerTable) expire(now time.Time) {
 	defer t.mu.Unlock()
 	for id, e := range t.peers {
 		if now.Sub(e.peer.LastSeen) > t.ttl && !t.pinnedLocked(e) {
-			delete(t.peers, id)
+			t.deleteLocked(id)
 		}
 	}
 }

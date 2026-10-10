@@ -24,6 +24,34 @@ function causeMessage(e: unknown): string {
 }
 
 /**
+ * Reads a response body as UTF-8 text, at most `limit` bytes: a body without
+ * (or with a false) Content-Length cannot make the server buffer more.
+ */
+export async function readLimited(res: Response, limit: number): Promise<string> {
+  if (!res.body) return ''
+  const reader = res.body.getReader()
+  const chunks: Uint8Array[] = []
+  let size = 0
+  for (;;) {
+    const { done, value } = await reader.read()
+    if (done) break
+    size += value.byteLength
+    if (size > limit) {
+      await reader.cancel().catch(() => {})
+      throw new ProbeError('identity document too large')
+    }
+    chunks.push(value)
+  }
+  const buf = new Uint8Array(size)
+  let off = 0
+  for (const c of chunks) {
+    buf.set(c, off)
+    off += c.byteLength
+  }
+  return new TextDecoder().decode(buf)
+}
+
+/**
  * Fetches and validates the identity document of baseUrl. Throws ProbeError
  * with a human readable message (timeout, connection error, not gos3 …).
  */
@@ -63,8 +91,9 @@ export async function fetchInfo(baseUrl: string, opts: { timeoutMs?: number, sig
     }
     let body: string
     try {
-      body = await res.text()
+      body = await readLimited(res, MAX_INFO_BYTES)
     } catch (e) {
+      if (e instanceof ProbeError) throw e
       throw new ProbeError(timedOut ? `timed out after ${timeoutMs} ms` : `read failed (${causeMessage(e)})`)
     }
     let json: unknown

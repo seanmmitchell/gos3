@@ -155,7 +155,15 @@ func parseSignedHeaders(s string, kind authKind) ([]string, map[string]bool, err
 		if !validHeaderName(name) {
 			return nil, nil, bad(fmt.Sprintf("invalid header name %q in SignedHeaders.", truncate(name, 64)))
 		}
-		set[strings.ToLower(name)] = true
+		// A repeated name would add the header's full value to the
+		// canonical request once per occurrence, letting one request of
+		// MaxHeaderBytes cost hundreds of times that in memory and in the
+		// SignatureDoesNotMatch body. Real signers never repeat a name.
+		lname := strings.ToLower(name)
+		if set[lname] {
+			return nil, nil, bad(fmt.Sprintf("header %q is listed more than once in SignedHeaders.", truncate(lname, 64)))
+		}
+		set[lname] = true
 	}
 	if !set["host"] {
 		return nil, nil, s3err.ErrAccessDenied.
@@ -237,6 +245,15 @@ func canonicalHeaders(r *http.Request, names []string, host string) string {
 			if len(vals) == 0 && len(r.TransferEncoding) > 0 {
 				vals = []string{strings.Join(r.TransferEncoding, ",")}
 			}
+		case "expect":
+			vals = headerValues(r.Header, "Expect")
+			if len(vals) == 0 && r.ProtoMajor >= 2 {
+				// Go's HTTP/2 server removes "Expect: 100-continue" from
+				// the request headers after taking over the continue
+				// handling (HTTP/1.1 keeps it); that is the only value it
+				// strips, so restore it for the signature.
+				vals = []string{"100-continue"}
+			}
 		default:
 			vals = headerValues(r.Header, name)
 		}
@@ -316,10 +333,12 @@ func hostCandidates(r *http.Request) []string {
 // comparison). On mismatch it returns the first candidate's string to sign
 // and canonical request for the error response.
 func matchSignature(in sigInput, provided string) (ok bool, sts, creq string) {
-	for _, uri := range pathCandidates(in.r) {
-		for _, host := range hostCandidates(in.r) {
+	uris := pathCandidates(in.r)
+	for _, host := range hostCandidates(in.r) {
+		headers := canonicalHeaders(in.r, in.signedNames, host)
+		for _, uri := range uris {
 			cr := buildCanonicalRequest(in.r.Method, uri, in.query,
-				canonicalHeaders(in.r, in.signedNames, host), in.signedHeaders, in.payloadHash)
+				headers, in.signedHeaders, in.payloadHash)
 			s := buildStringToSign(in.amzDate, in.scope, cr)
 			sig := hex.EncodeToString(hmacSHA256(in.key, s))
 			if hmac.Equal([]byte(sig), []byte(provided)) {
@@ -333,12 +352,17 @@ func matchSignature(in sigInput, provided string) (ok bool, sts, creq string) {
 	return false, sts, creq
 }
 
+// maxEchoedCanonical bounds the StringToSign and CanonicalRequest echoed in
+// a SignatureDoesNotMatch body: they help debug client signers, but must
+// not let a request carrying large headers amplify into a huge response.
+const maxEchoedCanonical = 16 << 10
+
 func signatureMismatch(accessKey, provided, sts, creq string) error {
 	return s3err.ErrSignatureDoesNotMatch.
 		With("AWSAccessKeyId", accessKey).
 		With("SignatureProvided", truncate(provided, 128)).
-		With("StringToSign", sts).
-		With("CanonicalRequest", creq)
+		With("StringToSign", truncate(sts, maxEchoedCanonical)).
+		With("CanonicalRequest", truncate(creq, maxEchoedCanonical))
 }
 
 // lookup resolves an access key through the credential provider.

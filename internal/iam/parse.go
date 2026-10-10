@@ -384,6 +384,13 @@ func validName(s string, max int) bool {
 	return true
 }
 
+// isDotSegment reports whether s is "." or "..". Such names are valid
+// characters-wise but cannot be addressed in a URL path (clients resolve
+// the dot segment), so a user or policy with that name could never be
+// read, changed or deleted through the admin API. They are refused when
+// creating users and policies (stored ones still load).
+func isDotSegment(s string) bool { return s == "." || s == ".." }
+
 func isAlnum(c byte) bool {
 	return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9')
 }

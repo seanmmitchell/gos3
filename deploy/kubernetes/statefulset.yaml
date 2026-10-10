@@ -32,8 +32,9 @@ spec:
           type: RuntimeDefault
       containers:
         - name: gos3
+          # No imagePullPolicy: Kubernetes pulls ":latest" on every start
+          # and a pinned tag only when it is missing.
           image: ghcr.io/seanmmitchell/gos3:latest
-          imagePullPolicy: IfNotPresent
           args: ["serve"]
           ports:
             - name: gos3
@@ -61,16 +62,21 @@ spec:
               value: http://$(POD_NAME).gos3-headless.$(POD_NAMESPACE).svc.cluster.local:9000
             - name: GOS3_DISCOVERY_DNS_SRV
               value: gos3-headless.$(POD_NAMESPACE).svc.cluster.local
+            # Root keys from the Secret gos3-root-credentials (create it
+            # yourself, see secret.example.yaml). Without it, each server
+            # generates a pair on first start and logs it once.
             - name: GOS3_ROOT_ACCESS_KEY
               valueFrom:
                 secretKeyRef:
                   name: gos3-root-credentials
                   key: access-key
+                  optional: true
             - name: GOS3_ROOT_SECRET_KEY
               valueFrom:
                 secretKeyRef:
                   name: gos3-root-credentials
                   key: secret-key
+                  optional: true
           volumeMounts:
             - name: data
               mountPath: /data

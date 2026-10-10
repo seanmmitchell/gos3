@@ -39,6 +39,11 @@ type Deps struct {
 	BackendName string
 	DataPath    string
 	Logger      *slog.Logger
+	// TrustProxyHeaders derives the aws:SourceIp and aws:SecureTransport
+	// condition keys from X-Forwarded-For / X-Forwarded-Proto
+	// (server.trust_proxy_headers), exactly like the S3 API, so one policy
+	// gives the same answer on both APIs behind a reverse proxy.
+	TrustProxyHeaders bool
 }
 
 // NewHandler returns the admin API handler. It expects full request paths

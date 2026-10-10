@@ -163,15 +163,6 @@ func isWildcardHost(host string) bool {
 	return err == nil && ip.IsUnspecified()
 }
 
-// isLoopbackHost reports whether host is a loopback IP or "localhost".
-func isLoopbackHost(host string) bool {
-	if strings.EqualFold(host, "localhost") {
-		return true
-	}
-	ip, err := netip.ParseAddr(host)
-	return err == nil && ip.IsLoopback()
-}
-
 // ipFromAddr extracts the IP of a UDP/IP net.Addr.
 func ipFromAddr(a net.Addr) (netip.Addr, bool) {
 	switch v := a.(type) {

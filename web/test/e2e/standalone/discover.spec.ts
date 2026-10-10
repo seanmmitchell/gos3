@@ -2,7 +2,26 @@
 // Node server (/api/discovery/*): a scan of 127.0.0.1 with both gos3 ports
 // finds both instances; a URL can be probed from the browser (CORS "*" on
 // /_gos3/info) or from the UI host; a found server is added in one click.
+import { request as httpRequest } from 'node:http'
 import { addServerViaUi, expect, ROOT_ACCESS_KEY, ROOT_SECRET_KEY, serverDialog, test } from './fixtures'
+
+/** POST /api/discovery/probe with explicit Host / Origin headers (DNS rebinding). */
+function probeWithHost(uiUrl: string, host: string, origin: string | undefined, target: string): Promise<{ status: number, body: string }> {
+  const u = new URL(uiUrl)
+  const body = JSON.stringify({ url: target })
+  return new Promise((resolve, reject) => {
+    const headers: Record<string, string> = { 'host': host, 'content-type': 'application/json', 'content-length': String(Buffer.byteLength(body)) }
+    if (origin) headers.origin = origin
+    const req = httpRequest({ host: '127.0.0.1', port: u.port, method: 'POST', path: '/api/discovery/probe', headers }, (res) => {
+      let text = ''
+      res.setEncoding('utf8')
+      res.on('data', (c: string) => (text += c))
+      res.on('end', () => resolve({ status: res.statusCode ?? 0, body: text }))
+    })
+    req.on('error', reject)
+    req.end(body)
+  })
+}
 
 test('the UI host offers local discovery', async ({ page, ui }) => {
   const caps = await page.request.get(ui('api/discovery/capabilities'))
@@ -16,6 +35,18 @@ test('the UI host offers local discovery', async ({ page, ui }) => {
   await expect(page.getByRole('heading', { name: 'Discover servers', level: 1 })).toBeVisible()
   await expect(page.getByRole('button', { name: 'Search local network' })).toBeVisible()
   await expect(page.getByRole('heading', { name: 'Scan from the UI host' })).toBeVisible()
+})
+
+test('rejects requests for a foreign Host (DNS rebinding) or Origin', async ({ ui, alpha }) => {
+  const port = new URL(ui()).port
+  const foreign = await probeWithHost(ui(), `attacker.example:${port}`, `http://attacker.example:${port}`, alpha.url)
+  expect(foreign.status).toBe(403)
+  expect(foreign.body).not.toContain(alpha.id)
+  const crossOrigin = await probeWithHost(ui(), `localhost:${port}`, 'http://evil.example', alpha.url)
+  expect(crossOrigin.status).toBe(403)
+  const own = await probeWithHost(ui(), `localhost:${port}`, `http://localhost:${port}`, alpha.url)
+  expect(own.status).toBe(200)
+  expect(own.body).toContain(alpha.id)
 })
 
 test('scans 127.0.0.1 from the UI host and finds both servers', async ({ page, ui, alpha, beta }) => {

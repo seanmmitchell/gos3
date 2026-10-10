@@ -91,6 +91,9 @@ VOLUME ["/data"]
 # 9000/tcp: S3 API, admin API, web UI, metrics. 7373/udp: discovery beacon;
 # 5353/udp: mDNS (both multicast, only useful on a shared L2 network).
 EXPOSE 9000/tcp 7373/udp 5353/udp
+# `gos3 healthcheck` derives the URL from GOS3_* variables (and GOS3_CONFIG),
+# not from the flags given to `serve`: set the listen address and TLS
+# through the environment (GOS3_ADDRESS, GOS3_TLS_CERT, GOS3_TLS_KEY).
 HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
     CMD ["/usr/local/bin/gos3", "healthcheck"]
 ENTRYPOINT ["/usr/local/bin/gos3"]

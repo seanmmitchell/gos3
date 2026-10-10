@@ -7,8 +7,16 @@
 //   object  /servers/:id/buckets/:bucket/objects/<key segments>       (no trailing '/')
 // Each key segment is URL-encoded on its own, so keys may contain any
 // character; '' (bucket root) is `/objects/`.
+//
+// Keys and prefixes with '.' / '..' segments ('x/../y') cannot live in the
+// path: browsers (and history.pushState) resolve dot segments, even
+// percent-encoded ones. They are carried in the query of the root route:
+//   folder  …/objects/?prefix=<prefix>
+//   object  …/objects/?key=<key>[&versionId=…]
 import type { CommonPrefix, ObjectVersion, S3Object } from '~/types/s3'
 import { baseName, parentPrefix, prefixBreadcrumbs } from '~/utils/paths'
+import { appRoutes } from '~/utils/routes'
+import { hasDotSegment } from '~/utils/s3/url'
 
 const seg = (s: string) => encodeURIComponent(s)
 
@@ -20,13 +28,14 @@ export function encodeKeyPath(key: string): string {
 /** Folder route of the object browser ('' = bucket root). */
 export function browserRoute(id: string, bucket: string, prefix = ''): string {
   const p = prefix && !prefix.endsWith('/') ? `${prefix}/` : prefix
-  return `/servers/${seg(id)}/buckets/${seg(bucket)}/objects/${encodeKeyPath(p)}`
+  const base = `/servers/${seg(id)}/buckets/${seg(bucket)}/objects/`
+  if (hasDotSegment(p)) return `${base}?prefix=${encodeURIComponent(p)}`
+  return `${base}${encodeKeyPath(p)}`
 }
 
-/** Object route (opens the details panel); same shape as appRoutes.object. */
+/** Object route (opens the details panel); see appRoutes.object. */
 export function browserObjectRoute(id: string, bucket: string, key: string, versionId?: string): string {
-  const q = versionId ? `?versionId=${encodeURIComponent(versionId)}` : ''
-  return `/servers/${seg(id)}/buckets/${seg(bucket)}/objects/${encodeKeyPath(key)}${q}`
+  return appRoutes.object(id, bucket, key, versionId)
 }
 
 export type BrowserTarget =
@@ -48,11 +57,23 @@ function safeDecode(s: string): string {
  *   '/servers/x/buckets/b/objects'            → folder ''
  *   '/servers/x/buckets/b/objects/a/b%20c/'   → folder 'a/b c/'
  *   '/servers/x/buckets/b/objects/a/f.txt'    → object 'a/f.txt' in 'a/'
+ *   '/servers/x/buckets/b/objects/' + {key: 'x/../y'} → object 'x/../y' in 'x/../'
  */
-export function parseBrowserPath(routePath: string): BrowserTarget {
+export function parseBrowserPath(routePath: string, query: Record<string, unknown> = {}): BrowserTarget {
   const m = /^\/servers\/[^/]+\/buckets\/[^/]+\/objects(?:\/(.*))?$/.exec(routePath)
   const rest = m?.[1] ?? ''
-  if (rest === '') return { kind: 'folder', prefix: '' }
+  if (rest === '') {
+    // Root route: keys / prefixes that cannot be put into the path.
+    const q = (name: string) => {
+      const v = Array.isArray(query[name]) ? (query[name] as unknown[])[0] : query[name]
+      return typeof v === 'string' ? v : ''
+    }
+    const key = q('key')
+    if (key) return { kind: 'object', key, prefix: parentPrefix(key) }
+    const prefix = q('prefix')
+    if (prefix) return { kind: 'folder', prefix: prefix.endsWith('/') ? prefix : `${prefix}/` }
+    return { kind: 'folder', prefix: '' }
+  }
   const decoded = rest.split('/').map(safeDecode).join('/')
   if (rest.endsWith('/')) return { kind: 'folder', prefix: decoded }
   return { kind: 'object', key: decoded, prefix: parentPrefix(decoded) }

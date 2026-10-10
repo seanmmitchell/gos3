@@ -93,7 +93,7 @@ import {
   parseTagging,
   parseVersioning
 } from './parsers'
-import { buildS3Url, encodeKey, encodeRfc3986, normalizeEndpoint, type Query } from './url'
+import { buildS3Url, encodeKey, encodeRfc3986, hasDotSegment, normalizeEndpoint, type Query } from './url'
 import { tryParseXml, unquoteETag } from './xml'
 
 export { S3Error } from './errors'
@@ -247,6 +247,19 @@ function abortedError(): S3Error {
   return new S3Error({ code: 'Aborted', message: 'The request was aborted.', status: 0 })
 }
 
+/** Client error code for keys a browser cannot put into a request URL (see hasDotSegment). */
+export const UNADDRESSABLE_KEY = 'UnaddressableKey'
+
+/** The error thrown for path-addressed requests on keys with '.' / '..' segments. */
+export function unaddressableKeyError(key: string): S3Error {
+  return new S3Error({
+    code: UNADDRESSABLE_KEY,
+    message: `The key “${key}” contains a “.” or “..” path segment. Browsers resolve such segments in request URLs, so the request would address a different object; it was not sent. Use an S3 client (e.g. the AWS CLI) for this object, or rename it.`,
+    status: 0,
+    details: { Key: key }
+  })
+}
+
 function isRetryable(e: unknown): boolean {
   if (!(e instanceof S3Error)) return false
   if (e.code === 'Aborted') return false
@@ -328,8 +341,12 @@ export class S3Client {
   // Low level
   // -------------------------------------------------------------------------
 
-  /** Unsigned request URL for bucket/key (+ query). */
+  /**
+   * Unsigned request URL for bucket/key (+ query). Throws UNADDRESSABLE_KEY
+   * for keys with '.' / '..' segments: the URL would address another object.
+   */
   url(bucket?: string, key?: string, query?: Query): URL {
+    if (key && hasDotSegment(key)) throw unaddressableKeyError(key)
     return buildS3Url({ endpoint: this.endpoint, forcePathStyle: this.forcePathStyle }, bucket, key, query)
   }
 
@@ -379,6 +396,8 @@ export class S3Client {
   private async xhrSend(method: 'PUT' | 'POST', url: URL, headers: Record<string, string>, body: Blob, onProgress?: ProgressCallback, signal?: AbortSignal): Promise<{ status: number, headers: Headers, body: string }> {
     if (signal?.aborted) throw abortedError()
     const req = await this.sign(url, { method, headers })
+    // The abort listener is attached below: an abort during signing would be missed.
+    if (signal?.aborted) throw abortedError()
     return new Promise((resolve, reject) => {
       const xhr = new XMLHttpRequest()
       xhr.open(method, req.url)
@@ -477,6 +496,9 @@ export class S3Client {
       signal,
       query: {
         'list-type': 2,
+        // Keys may contain characters XML 1.0 cannot carry (e.g. U+0001):
+        // ask for URL-encoded keys, as the AWS SDKs do (parsers decode them).
+        'encoding-type': 'url',
         'prefix': params.prefix,
         'delimiter': params.delimiter,
         'continuation-token': params.continuationToken,
@@ -513,6 +535,7 @@ export class S3Client {
       signal,
       query: {
         'versions': '',
+        'encoding-type': 'url',
         'prefix': params.prefix,
         'delimiter': params.delimiter,
         'key-marker': params.keyMarker,
@@ -665,7 +688,18 @@ export class S3Client {
     return { etag: r.etag, versionId: r.versionId }
   }
 
+  /**
+   * DeleteObject. Keys with '.' / '..' segments cannot be put into a URL;
+   * they are deleted with DeleteObjects (key in the request body) instead.
+   */
   async deleteObject(bucket: string, key: string, versionId?: string, opts: { bypassGovernanceRetention?: boolean, signal?: AbortSignal } = {}): Promise<DeleteObjectResult> {
+    if (hasDotSegment(key)) {
+      const r = await this.deleteObjects(bucket, [{ key, versionId }], { quiet: false, ...opts })
+      const err = r.errors[0]
+      if (err) throw new S3Error({ code: err.code, message: err.message, status: 0, details: { Key: err.key } })
+      const d = r.deleted[0]
+      return { versionId: d?.deleteMarkerVersionId ?? d?.versionId, deleteMarker: d?.deleteMarker || undefined }
+    }
     const { response } = await this.send({
       method: 'DELETE',
       bucket,
@@ -824,6 +858,7 @@ export class S3Client {
       bucket,
       query: {
         'uploads': '',
+        'encoding-type': 'url',
         'prefix': params.prefix,
         'delimiter': params.delimiter,
         'key-marker': params.keyMarker,
@@ -852,6 +887,12 @@ export class S3Client {
     const internal = new AbortController()
     const onOuterAbort = () => internal.abort()
     opts.signal?.addEventListener('abort', onOuterAbort, { once: true })
+    // Canceled while the upload was being created (before the listener existed).
+    if (opts.signal?.aborted) {
+      opts.signal.removeEventListener('abort', onOuterAbort)
+      await this.abortMultipartUpload(bucket, key, uploadId).catch(() => undefined)
+      throw abortedError()
+    }
 
     const loaded = new Array<number>(partCount).fill(0)
     const report = () => opts.onProgress?.({ loaded: loaded.reduce((a, b) => a + b, 0), total: size })

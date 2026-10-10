@@ -1,7 +1,7 @@
 // Object browser: bulk operations on objects, versions and folders (delete,
 // copy / move / rename, restore a version, sequential downloads). Written
 // against a minimal client interface so they can be unit-tested with fakes.
-import type { CopyObjectOptions, CopyObjectResult, DeleteObjectsResult, ListResult, ListObjectsV2Params, ObjectIdentifier, ObjectRef, PresignOptions } from '~/types/s3'
+import type { AccessControlPolicy, CannedACL, CopyObjectOptions, CopyObjectResult, DeleteObjectsResult, HeadResult, ListResult, ListObjectsV2Params, ObjectIdentifier, ObjectRef, PresignOptions } from '~/types/s3'
 import { attachmentDisposition, rebaseKey } from './useBrowserPaths'
 
 /** The S3Client methods used here. */
@@ -10,6 +10,8 @@ export interface BrowserOpsClient {
   deleteObjects(bucket: string, objects: ObjectIdentifier[], opts?: { quiet?: boolean, signal?: AbortSignal }): Promise<DeleteObjectsResult>
   deletePrefix(bucket: string, prefix: string, opts?: { allVersions?: boolean, signal?: AbortSignal, onProgress?: (deleted: number) => void }): Promise<DeleteObjectsResult>
   copyObject(src: ObjectRef, dst: { bucket: string, key: string }, opts?: CopyObjectOptions): Promise<CopyObjectResult>
+  /** Used to keep the ACL of moved / renamed objects (optional for fakes). */
+  getObjectAcl?(bucket: string, key: string, versionId?: string): Promise<AccessControlPolicy>
 }
 
 /** A selected row: an object (optionally one version) or a folder prefix. */
@@ -36,6 +38,8 @@ export interface OpFailure {
 export interface OpResult {
   done: number
   failures: OpFailure[]
+  /** Completed with caveats (e.g. an ACL that could not be carried over). */
+  warnings?: OpFailure[]
 }
 
 /** Lists every object key under a prefix (all pages). */
@@ -129,10 +133,100 @@ export async function planTransfer(
 }
 
 /**
+ * First plan item that would overwrite the source of another item before
+ * that item is copied (destination inside the source, e.g. folder 'x/'
+ * renamed to 'x/y/': 'x/f' → 'x/y/f' replaces 'x/y/f' before it is read).
+ */
+export function findTransferOverlap(plan: TransferPlanItem[], dstBucket: string): TransferPlanItem | undefined {
+  const sources = new Set(plan.filter(p => p.src.bucket === dstBucket).map(p => p.src.key))
+  return plan.find(p => sources.has(p.dstKey) && !(p.src.bucket === dstBucket && p.src.key === p.dstKey))
+}
+
+/** The S3Client methods used to look for existing destination objects. */
+export interface DestinationLookupClient {
+  listObjectsV2(bucket: string, params?: ListObjectsV2Params, signal?: AbortSignal): Promise<ListResult>
+  headObject(bucket: string, key: string, opts?: { versionId?: string, checksumMode?: boolean, signal?: AbortSignal }): Promise<HeadResult>
+}
+
+/** Plans up to this size are checked with one HeadObject per destination. */
+const HEAD_CHECK_LIMIT = 20
+
+function commonPrefix(keys: string[]): string {
+  if (!keys.length) return ''
+  let p = keys[0]!
+  for (const k of keys) {
+    let i = 0
+    while (i < p.length && i < k.length && p[i] === k[i]) i++
+    p = p.slice(0, i)
+    if (!p) break
+  }
+  return p
+}
+
+/**
+ * Destination keys of a plan that already exist (best effort: objects the
+ * identity may not see, or that appear meanwhile, are not reported). Small
+ * plans use HeadObject; larger ones list the destinations' common prefix
+ * (stopping after `maxListed` keys, then `complete` is false).
+ */
+export async function findExistingDestinations(
+  client: DestinationLookupClient,
+  dstBucket: string,
+  plan: TransferPlanItem[],
+  opts: { signal?: AbortSignal, maxListed?: number } = {}
+): Promise<{ existing: string[], complete: boolean }> {
+  const wanted = [...new Set(plan.map(p => p.dstKey))]
+  const existing: string[] = []
+  if (wanted.length <= HEAD_CHECK_LIMIT) {
+    let complete = true
+    await Promise.all(wanted.map(async (key) => {
+      try {
+        await client.headObject(dstBucket, key, { checksumMode: false, signal: opts.signal })
+        existing.push(key)
+      } catch (e) {
+        if (opts.signal?.aborted) throw e
+        if ((e as { status?: number })?.status !== 404) complete = false
+      }
+    }))
+    return { existing: wanted.filter(k => existing.includes(k)), complete }
+  }
+  const set = new Set(wanted)
+  const maxListed = opts.maxListed ?? Math.max(10000, wanted.length * 10)
+  let listed = 0
+  let token: string | undefined
+  for (;;) {
+    const page = await client.listObjectsV2(dstBucket, { prefix: commonPrefix(wanted) || undefined, continuationToken: token }, opts.signal)
+    for (const o of page.objects) if (set.has(o.key)) existing.push(o.key)
+    listed += page.objects.length
+    if (!page.isTruncated || !page.nextContinuationToken) return { existing, complete: true }
+    if (listed >= maxListed) return { existing, complete: false }
+    token = page.nextContinuationToken
+  }
+}
+
+/**
+ * Canned ACL to pass on the copy so the object keeps its ACL (CopyObject
+ * never copies it: the copy gets the default, private ACL). 'private' and
+ * unreadable ACLs give undefined; grants no canned ACL expresses give
+ * 'custom' (they cannot be carried over).
+ */
+export async function aclToKeep(client: Pick<BrowserOpsClient, 'getObjectAcl'>, src: ObjectRef): Promise<CannedACL | 'custom' | undefined> {
+  if (!client.getObjectAcl) return undefined
+  try {
+    const acl = await client.getObjectAcl(src.bucket, src.key, src.versionId)
+    return acl.canned === 'private' ? undefined : acl.canned
+  } catch {
+    return undefined // not supported / not allowed: keep the server default
+  }
+}
+
+/**
  * Executes a transfer plan with CopyObject (sequentially, so progress is
  * exact and the server is not flooded). With `move`, successfully copied
- * sources are deleted afterwards in batches. Copies onto themselves are
- * skipped.
+ * sources are deleted afterwards in batches, and objects keep their ACL
+ * (see aclToKeep). Copies onto themselves are skipped. Throws, before
+ * copying anything, when an item would overwrite another item's source
+ * (findTransferOverlap).
  */
 export async function runTransfer(
   client: BrowserOpsClient,
@@ -140,7 +234,11 @@ export async function runTransfer(
   dstBucket: string,
   opts: { move?: boolean, signal?: AbortSignal, onProgress?: (p: OpProgress) => void } = {}
 ): Promise<OpResult> {
-  const result: OpResult = { done: 0, failures: [] }
+  const overlap = findTransferOverlap(plan, dstBucket)
+  if (overlap) {
+    throw new Error(`“${overlap.dstKey}” is both copied and overwritten by this transfer (the destination is inside the source). Choose a destination outside the selected folders.`)
+  }
+  const result: OpResult = { done: 0, failures: [], warnings: [] }
   const copied: ObjectIdentifier[] = []
   const total = plan.length
   for (const item of plan) {
@@ -151,7 +249,9 @@ export async function runTransfer(
       continue
     }
     try {
-      await client.copyObject(item.src, { bucket: dstBucket, key: item.dstKey }, { signal: opts.signal })
+      const acl = opts.move ? await aclToKeep(client, item.src) : undefined
+      await client.copyObject(item.src, { bucket: dstBucket, key: item.dstKey }, { signal: opts.signal, acl: acl === 'custom' ? undefined : acl })
+      if (acl === 'custom') result.warnings!.push({ key: item.src.key, versionId: item.src.versionId, message: 'moved, but its custom ACL grants were not carried over (the object is private now)' })
       result.done++
       copied.push({ key: item.src.key, versionId: item.src.versionId })
     } catch (e) {

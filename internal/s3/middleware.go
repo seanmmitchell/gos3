@@ -44,6 +44,32 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		r.Body = http.NoBody
 	}
 	body := &countingBody{rc: r.Body}
+	if r.ContentLength != 0 {
+		body.ctl, body.idle = http.NewResponseController(w), s.bodyIdleTimeout
+		if r.ProtoMajor == 1 {
+			// When the handler did not read the whole body (typically an
+			// early error such as a failed authentication), net/http reads
+			// and discards up to 256 KiB of it before sending the response
+			// so that the connection can be reused, without any deadline: a
+			// client trickling its body would hold the response, the
+			// goroutine and the connection forever. Drain it here instead,
+			// within unreadBodyGrace; when that fails (or more than 256 KiB
+			// remain, or a "100 Continue" was never sent) the response says
+			// "Connection: close" and the body is abandoned. HTTP/2 does
+			// not drain unread bodies.
+			cl := r.ContentLength
+			expect := strings.EqualFold(r.Header.Get("Expect"), "100-continue")
+			rw.beforeHeader = func() {
+				if body.consumed(cl) {
+					return
+				}
+				if (expect && body.n.Load() == 0) || !body.drain(s.unreadBodyGrace, maxUnreadBodyDrain) {
+					rw.Header().Set("Connection", "close")
+					body.abandon()
+				}
+			}
+		}
+	}
 	r.Body = body
 	rc.in = body
 
@@ -67,6 +93,13 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		if status == 0 {
 			status = http.StatusOK
 		}
+		if clientAborted(r, rc) {
+			// The client went away mid-request: nobody receives the 400
+			// IncompleteBody. Record it as nginx's 499 "client closed
+			// request" so it can be told apart from client errors.
+			status = statusClientClosedRequest
+			rc.logAttrs = append(rc.logAttrs, slog.Bool("client_aborted", true))
+		}
 		if done != nil {
 			done(rc.opName, status, body.n.Load(), rw.bytes)
 		}
@@ -76,6 +109,22 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 	}()
 	s.serve(rw, r, rc)
+}
+
+// maxUnreadBodyDrain is the most of an unread request body drained to keep
+// the connection (net/http's own limit).
+const maxUnreadBodyDrain = 256 << 10
+
+// statusClientClosedRequest is the status recorded (metrics, access log)
+// for requests whose client disconnected before the request was complete.
+const statusClientClosedRequest = 499
+
+// clientAborted reports whether the request failed because the client
+// disconnected while sending its body: the body ended early
+// (IncompleteBody) and net/http has cancelled the request context, which it
+// does when the connection or stream is gone.
+func clientAborted(r *http.Request, rc *reqContext) bool {
+	return rc.errCode == s3err.ErrIncompleteBody.Code && r.Context().Err() != nil
 }
 
 // serve routes, authenticates, authorizes and dispatches one request.
@@ -309,6 +358,8 @@ type responseWriter struct {
 	status      int
 	wroteHeader bool
 	bytes       int64
+	// beforeHeader, if set, runs once before the final status is written.
+	beforeHeader func()
 }
 
 // WriteHeader records the status; 1xx informational headers pass through
@@ -323,6 +374,9 @@ func (w *responseWriter) WriteHeader(code int) {
 	}
 	w.status = code
 	w.wroteHeader = true
+	if w.beforeHeader != nil {
+		w.beforeHeader()
+	}
 	w.ResponseWriter.WriteHeader(code)
 }
 

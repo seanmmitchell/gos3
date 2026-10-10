@@ -69,9 +69,13 @@ export function previewEscapeHtml(s: string): string {
 
 function safeHref(raw: string): string | undefined {
   const href = raw.trim()
+  // URL parsers drop leading C0 controls / spaces and tabs or newlines
+  // anywhere ('\u0001javascript:…' is a javascript: URL): refuse them all.
+  // eslint-disable-next-line no-control-regex
+  if (/[\x00-\x20\x7f]/.test(href)) return undefined
   if (/^(https?:|mailto:)/i.test(href)) return href
-  // Relative links (no scheme at all).
-  if (!/^[a-z][a-z0-9+.-]*:/i.test(href) && !href.startsWith('//')) return href
+  // Relative links (no scheme at all; '\\' counts as '/' in http URLs).
+  if (!/^[a-z][a-z0-9+.-]*:/i.test(href) && !/^[/\\]{2}/.test(href)) return href
   return undefined
 }
 

@@ -381,7 +381,41 @@ func TestRanges(t *testing.T) {
 			if resp.status != 206 || resp.header.Get("Content-Length") != "2" || resp.header.Get("Content-Range") != "bytes 2-3/20" {
 				t.Errorf("HEAD range: %d %v", resp.status, resp.header)
 			}
+			// If-Range: a stale validator means the whole (current) object.
+			etag := resp.header.Get("ETag")
+			for _, v := range []struct {
+				ifRange string
+				status  int
+			}{{etag, 206}, {`"0123456789abcdef0123456789abcdef"`, 200}, {"W/" + etag, 200}} {
+				r := e.signed(t, rootCreds, http.MethodGet, "/"+b+"/r", nil, map[string]string{"Range": "bytes=0-4", "If-Range": v.ifRange})
+				if r.status != v.status {
+					t.Errorf("If-Range %s: %d, want %d", v.ifRange, r.status, v.status)
+				}
+			}
+			// partNumber=1 of a single-part object is a ranged response of
+			// the whole object.
+			out, err = e.root().GetObject(ctx(t), &s3.GetObjectInput{Bucket: aws.String(b), Key: aws.String("r"), PartNumber: aws.Int32(1)})
+			must(t, err, "GetObject partNumber=1")
+			if got := readAll(t, out.Body); string(got) != string(data) || aws.ToString(out.ContentRange) != "bytes 0-19/20" {
+				t.Errorf("partNumber=1: %q %q", got, aws.ToString(out.ContentRange))
+			}
 		})
+	}
+}
+
+// TestObjectActiveContentSandboxed: objects are served from the web UI's
+// origin, so an uploaded HTML page must not run script there.
+func TestObjectActiveContentSandboxed(t *testing.T) {
+	t.Parallel()
+	e := memEnv
+	b := e.newBucket(t)
+	e.put(t, b, "x.html", []byte("<script>alert(document.domain)</script>"), func(in *s3.PutObjectInput) {
+		in.ContentType = aws.String("text/html")
+	})
+	resp := e.signed(t, rootCreds, http.MethodGet, "/"+b+"/x.html", nil, nil)
+	if resp.status != 200 || resp.header.Get("Content-Type") != "text/html" ||
+		resp.header.Get("Content-Security-Policy") != "sandbox" || resp.header.Get("X-Content-Type-Options") != "nosniff" {
+		t.Fatalf("GET x.html: %d %v", resp.status, resp.header)
 	}
 }
 

@@ -54,7 +54,9 @@ type testEnv struct {
 type testEnvConfig struct {
 	settings config.Settings
 	tls      bool
+	http2    bool
 	opts     []func(*Options)
+	server   []func(*Server)
 }
 
 // testEnvOption customizes newTestEnv.
@@ -71,6 +73,16 @@ func withSettings(f func(*config.Settings)) testEnvOption {
 // withOptions edits the handler Options before NewHandler.
 func withOptions(f func(*Options)) testEnvOption {
 	return func(c *testEnvConfig) { c.opts = append(c.opts, f) }
+}
+
+// withHTTP2 serves over HTTPS with HTTP/2 enabled.
+func withHTTP2() testEnvOption {
+	return func(c *testEnvConfig) { c.tls, c.http2 = true, true }
+}
+
+// withServer edits the *Server (unexported knobs) before it starts serving.
+func withServer(f func(*Server)) testEnvOption {
+	return func(c *testEnvConfig) { c.server = append(c.server, f) }
 }
 
 // newTestEnv starts a test server; it is shut down by t.Cleanup.
@@ -113,12 +125,19 @@ func newTestEnv(t testing.TB, opts ...testEnvOption) *testEnv {
 		f(&o)
 	}
 	e.server = New(o)
+	for _, f := range cfg.server {
+		f(e.server)
+	}
 	e.server.handlerOverride = func(op string) handlerFunc {
 		e.mu.RLock()
 		defer e.mu.RUnlock()
 		return e.overrides[op]
 	}
-	if cfg.tls {
+	if cfg.http2 {
+		e.srv = httptest.NewUnstartedServer(e.server)
+		e.srv.EnableHTTP2 = true
+		e.srv.StartTLS()
+	} else if cfg.tls {
 		e.srv = httptest.NewTLSServer(e.server)
 	} else {
 		e.srv = httptest.NewServer(e.server)

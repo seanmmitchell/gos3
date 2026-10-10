@@ -20,6 +20,7 @@ func walkTests() []testCase {
 		{"VersionsOrder", testWalkVersionsOrder},
 		{"VersionsMarkers", testWalkVersionsMarkers},
 		{"VersionsStopAndErrors", testWalkVersionsStop},
+		{"VersionsLatestUnderMutation", testWalkVersionsLatestUnderMutation},
 	}
 }
 
@@ -306,5 +307,41 @@ func testWalkVersionsStop(e *env) {
 	}
 	if calls != 1 {
 		e.t.Errorf("WalkVersions invoked the callback %d times after an error, want 1", calls)
+	}
+}
+
+// testWalkVersionsLatestUnderMutation removes a key's delete marker (an S3
+// "undelete") right after the walk delivered it, at various positions
+// relative to the backend's internal batch boundaries. Consumers such as
+// the lifecycle worker rely on IsLatest marking at most the first entry
+// delivered for a key: a later entry of the same key must never be reported
+// as latest, or two versions of one key would both claim to be current.
+func testWalkVersionsLatestUnderMutation(e *env) {
+	for n := 0; n <= 20; n++ {
+		bucket := fmt.Sprintf("b%02d", n)
+		e.mkVersioned(bucket, storage.VersioningEnabled)
+		for i := range n {
+			e.put(bucket, fmt.Sprintf("a%02d", i), []byte("x"))
+		}
+		e.put(bucket, "k", []byte("v1"))
+		e.put(bucket, "k", []byte("v2"))
+		e.del(bucket, "k", "")
+		var got []storage.ObjectInfo
+		err := e.b.WalkVersions(e.ctx, bucket, "", "", "", func(o storage.ObjectInfo) error {
+			got = append(got, o)
+			if o.Key == "k" && o.DeleteMarker {
+				if _, err := e.b.DeleteObject(e.ctx, bucket, "k", o.VersionID); err != nil {
+					return err
+				}
+			}
+			return nil
+		})
+		e.noErr("WalkVersions", err)
+		for i, o := range got {
+			if o.IsLatest && i > 0 && got[i-1].Key == o.Key {
+				e.t.Errorf("%d filler keys: WalkVersions reported %s as latest after an earlier entry of the same key:\n%v",
+					n, refsOf([]storage.ObjectInfo{o})[0], refsOf(got))
+			}
+		}
 	}
 }

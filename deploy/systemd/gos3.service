@@ -13,6 +13,8 @@
 # environment file is read by systemd as root, so it may hold the root keys
 # with mode 0600. A YAML config (GOS3_CONFIG=/etc/gos3/config.yaml) is read
 # by the service user: keep it free of secrets and world-readable (0644).
+# The same goes for a TLS certificate; pass the TLS private key with
+# LoadCredential= (see gos3.env.example and docs/deployment.md).
 
 [Unit]
 Description=gos3 S3-compatible object storage server

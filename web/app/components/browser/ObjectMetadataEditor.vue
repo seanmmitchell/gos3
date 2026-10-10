@@ -3,7 +3,8 @@
  * Edits system headers (Content-Type, Cache-Control, Content-Disposition)
  * and user metadata (x-amz-meta-*). S3 cannot change metadata in place: the
  * object is copied onto itself with metadata directive REPLACE (in versioned
- * buckets this creates a new version).
+ * buckets this creates a new version). CopyObject does not copy the ACL, so
+ * a canned ACL (e.g. public-read) is read first and passed on.
  */
 import type { HeadResult } from '~/types/s3'
 import type { KeyValuePair } from '~/types/ui'
@@ -70,6 +71,7 @@ async function save() {
   if (h.serverSideEncryption) headers['x-amz-server-side-encryption'] = h.serverSideEncryption
   if (h.sseKmsKeyId) headers['x-amz-server-side-encryption-aws-kms-key-id'] = h.sseKmsKeyId
   try {
+    const acl = await aclToKeep(props.client, { bucket: props.bucket, key: props.objectKey })
     await props.client.copyObject(
       { bucket: props.bucket, key: props.objectKey },
       { bucket: props.bucket, key: props.objectKey },
@@ -80,10 +82,15 @@ async function save() {
         contentDisposition: contentDisposition.value.trim() || undefined,
         metadata: Object.fromEntries(meta.value.map(p => [p.key.trim().toLowerCase(), p.value])),
         storageClass: h.storageClass && h.storageClass !== 'STANDARD' ? h.storageClass : undefined,
+        acl: acl === 'custom' ? undefined : acl,
         headers
       }
     )
-    useToast().add({ title: 'Metadata saved', color: 'success', icon: 'i-lucide-circle-check' })
+    if (acl === 'custom') {
+      useToast().add({ title: 'Metadata saved, ACL reset', description: 'The object had custom ACL grants, which cannot be carried over: it is private now.', color: 'warning', icon: 'i-lucide-shield-alert' })
+    } else {
+      useToast().add({ title: 'Metadata saved', color: 'success', icon: 'i-lucide-circle-check' })
+    }
     emit('saved')
   } catch (e) {
     error.value = e

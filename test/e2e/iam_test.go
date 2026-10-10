@@ -80,6 +80,20 @@ func TestIAMBuiltinPolicies(t *testing.T) {
 	// Copy needs read access to the source.
 	_, err = wo.CopyObject(ctx(t), &s3.CopyObjectInput{Bucket: aws.String(b), Key: aws.String("wo-copy"), CopySource: aws.String(b + "/existing")})
 	denied(t, err, "writeonly CopyObject (source read)")
+	// An ACL needs s3:PutObjectAcl and tags s3:PutObjectTagging (as in
+	// AWS), so writeonly cannot publish objects or plant tags.
+	_, err = wo.PutObject(ctx(t), &s3.PutObjectInput{Bucket: aws.String(b), Key: aws.String("wo-public"), Body: stringsReader("secret"),
+		ACL: s3types.ObjectCannedACLPublicRead})
+	denied(t, err, "writeonly PutObject with x-amz-acl")
+	_, err = wo.PutObject(ctx(t), &s3.PutObjectInput{Bucket: aws.String(b), Key: aws.String("wo-tagged"), Body: stringsReader("x"),
+		Tagging: aws.String("class=public")})
+	denied(t, err, "writeonly PutObject with x-amz-tagging")
+	_, err = wo.CreateMultipartUpload(ctx(t), &s3.CreateMultipartUploadInput{Bucket: aws.String(b), Key: aws.String("wo-public-mp"),
+		ACL: s3types.ObjectCannedACLPublicRead})
+	denied(t, err, "writeonly CreateMultipartUpload with x-amz-acl")
+	if r := e.anon(t, http.MethodGet, "/"+b+"/wo-public", nil, nil); r.status != http.StatusForbidden {
+		t.Errorf("anonymous GET of an object a writer tried to publish: %d", r.status)
+	}
 
 	// readwrite: everything on objects; DeleteObjects mixed with policy deny
 	// is covered by TestIAMCustomPolicy.

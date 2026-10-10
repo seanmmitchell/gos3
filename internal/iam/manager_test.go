@@ -124,7 +124,7 @@ func TestUserCRUD(t *testing.T) {
 		t.Fatalf("no policies: %+v %v", u, err)
 	}
 
-	for _, bad := range []string{"", "root", "ROOT", "anonymous", "has space", "slash/x", strings.Repeat("a", 65), "ünïcode"} {
+	for _, bad := range []string{"", "root", "ROOT", "anonymous", "has space", "slash/x", strings.Repeat("a", 65), "ünïcode", ".", ".."} {
 		if _, err := m.CreateUser(ctx, UserSpec{Name: bad}); !errors.Is(err, ErrInvalidName) {
 			t.Errorf("CreateUser(%q) = %v, want ErrInvalidName", bad, err)
 		}
@@ -397,7 +397,7 @@ func TestPolicyCRUD(t *testing.T) {
 			t.Errorf("PutPolicy(%+v) = %v, want ErrInvalidPolicy", bad, err)
 		}
 	}
-	for _, name := range []string{"", "a b", strings.Repeat("p", 129)} {
+	for _, name := range []string{"", "a b", strings.Repeat("p", 129), ".", ".."} {
 		if _, err := m.PutPolicy(ctx, name, "", doc); !errors.Is(err, ErrInvalidName) {
 			t.Errorf("PutPolicy name %q = %v", name, err)
 		}

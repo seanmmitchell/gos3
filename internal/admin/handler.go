@@ -38,6 +38,7 @@ const (
 	codeConflict         = "Conflict"
 	codeInternalError    = "InternalError"
 	codeProbeFailed      = "ProbeFailed"
+	codeTooManyRequests  = "TooManyRequests"
 )
 
 // apiError is an error rendered as the admin JSON error envelope.
@@ -96,6 +97,7 @@ type api struct {
 
 	usage  *ttlCache[storage.BucketUsage] // per bucket
 	totals *ttlCache[storageTotals]       // key ""
+	scans  chan struct{}                  // running network scans (semaphore)
 }
 
 // usageTTL is how long computed storage usage is cached.
@@ -108,7 +110,7 @@ func newAPI(d Deps) *api {
 	if d.Backend == nil || d.Verifier == nil || d.IAM == nil || d.Settings == nil {
 		panic("admin: Deps.Backend, Verifier, IAM and Settings are required")
 	}
-	a := &api{d: d, log: d.Logger, now: time.Now}
+	a := &api{d: d, log: d.Logger, now: time.Now, scans: make(chan struct{}, maxConcurrentScans)}
 	if a.log == nil {
 		a.log = slog.Default()
 	}
@@ -127,8 +129,8 @@ func (a *api) routes() []route {
 		// Identity
 		{"GET", "/whoami", "", a.whoami},
 		{"GET", "/whoami/keys", "", a.listOwnKeys},
-		{"POST", "/whoami/keys", "", a.createOwnKey},
-		{"DELETE", "/whoami/keys/{accessKey}", "", a.deleteOwnKey},
+		{"POST", "/whoami/keys", "", a.createOwnKey},               // unless admin:CreateOwnAccessKey is denied
+		{"DELETE", "/whoami/keys/{accessKey}", "", a.deleteOwnKey}, // unless admin:DeleteOwnAccessKey is denied
 		// Server
 		{"GET", "/info", "ServerInfo", a.serverInfo},
 		{"GET", "/stats", "GetStats", a.stats},
@@ -285,19 +287,20 @@ func (a *api) authorize(rc *reqCtx, action string) iam.Decision {
 	return a.d.IAM.Authorize(rc.ctx, iam.AuthzRequest{
 		Identity:   rc.id,
 		Action:     action,
-		Conditions: requestConditions(rc.r),
+		Conditions: requestConditions(rc.r, a.d.TrustProxyHeaders),
 	})
 }
 
 // requestConditions builds the IAM condition context of a request.
-func requestConditions(r *http.Request) map[string][]string {
+// aws:SourceIp and aws:SecureTransport come from the connection or, with
+// trustProxy, from X-Forwarded-For / X-Forwarded-Proto (see ClientInfo).
+func requestConditions(r *http.Request, trustProxy bool) map[string][]string {
+	ip, secure := ClientInfo(r, trustProxy)
 	c := map[string][]string{
-		"aws:SecureTransport": {strconv.FormatBool(r.TLS != nil)},
+		"aws:SecureTransport": {strconv.FormatBool(secure)},
 	}
-	if host, _, err := net.SplitHostPort(r.RemoteAddr); err == nil {
-		c["aws:SourceIp"] = []string{host}
-	} else if r.RemoteAddr != "" {
-		c["aws:SourceIp"] = []string{r.RemoteAddr}
+	if ip != "" {
+		c["aws:SourceIp"] = []string{ip}
 	}
 	if ua := r.UserAgent(); ua != "" {
 		c["aws:UserAgent"] = []string{ua}
@@ -306,6 +309,30 @@ func requestConditions(r *http.Request) map[string][]string {
 		c["aws:Referer"] = []string{ref}
 	}
 	return c
+}
+
+// ClientInfo returns the client IP address of r and whether it reached the
+// server over TLS. With trustProxy (server.trust_proxy_headers) the first
+// valid X-Forwarded-For entry and X-Forwarded-Proto win over the connection,
+// the same rule the S3 API applies.
+func ClientInfo(r *http.Request, trustProxy bool) (ip string, secure bool) {
+	ip = r.RemoteAddr
+	if host, _, err := net.SplitHostPort(ip); err == nil {
+		ip = host
+	}
+	secure = r.TLS != nil
+	if trustProxy {
+		if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
+			first, _, _ := strings.Cut(xff, ",")
+			if a := net.ParseIP(strings.TrimSpace(first)); a != nil {
+				ip = a.String()
+			}
+		}
+		if p := r.Header.Get("X-Forwarded-Proto"); p != "" {
+			secure = strings.EqualFold(strings.TrimSpace(p), "https")
+		}
+	}
+	return ip, secure
 }
 
 func describeIdentity(id auth.Identity) string {

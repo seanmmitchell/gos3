@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/url"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -160,16 +161,139 @@ func (s *Server) isVersioned(ctx context.Context, rc *reqContext) (bool, error) 
 	return st != storage.VersioningUnversioned, err
 }
 
-// countingBody counts the bytes read from the request body.
+// countingBody wraps the request body as read from the wire: it counts the
+// bytes read and enforces read deadlines on the connection.
+//
+// net/http only bounds reading the request headers, so without deadlines a
+// client could hold a connection (and its goroutine and file descriptor)
+// forever by sending a body very slowly or not at all. While the body is
+// read, every Read re-arms a rolling idle deadline (idle); a stall fails the
+// read with os.ErrDeadlineExceeded, which handlers report as RequestTimeout
+// (as AWS does). After EOF the deadline is cleared. setLimit adds an
+// absolute deadline for work done before the client is authenticated.
 type countingBody struct {
-	rc io.ReadCloser
-	n  atomic.Int64
+	rc     io.ReadCloser
+	n      atomic.Int64
+	eof    atomic.Bool
+	failed atomic.Bool // a Read failed (timeout, disconnect, bad framing)
+	idle   time.Duration
+
+	mu      sync.Mutex
+	ctl     *http.ResponseController // nil: deadlines unsupported or disabled
+	armedAt time.Time                // when the idle deadline was last set
+	limit   time.Time                // absolute deadline (zero = none)
 }
 
 func (c *countingBody) Read(p []byte) (int, error) {
+	c.arm()
 	n, err := c.rc.Read(p)
 	c.n.Add(int64(n))
+	if err == io.EOF {
+		c.eof.Store(true)
+		c.clear()
+	} else if err != nil {
+		c.failed.Store(true)
+	}
+	// After any other error the deadline is left as is: an expired one
+	// keeps net/http from waiting for the rest of a stalled body.
 	return n, err
 }
 
 func (c *countingBody) Close() error { return c.rc.Close() }
+
+// setDeadline sets the connection read deadline; it disables deadlines
+// when the connection does not support them. c.mu must be held.
+func (c *countingBody) setDeadline(t time.Time) {
+	if c.ctl == nil {
+		return
+	}
+	if err := c.ctl.SetReadDeadline(t); err != nil {
+		c.ctl = nil
+	}
+}
+
+// arm sets the read deadline before a Read: now+idle, capped by the
+// absolute limit. Re-arming is skipped shortly (at most a second) after
+// the last one.
+func (c *countingBody) arm() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.ctl == nil || c.idle <= 0 {
+		return
+	}
+	now := time.Now()
+	if c.limit.IsZero() && !c.armedAt.IsZero() && now.Sub(c.armedAt) < min(time.Second, c.idle/8) {
+		return
+	}
+	d := now.Add(c.idle)
+	if !c.limit.IsZero() && c.limit.Before(d) {
+		d = c.limit
+	}
+	c.setDeadline(d)
+	c.armedAt = now
+}
+
+// clear removes the read deadline (the body was read to its end).
+func (c *countingBody) clear() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if !c.armedAt.IsZero() {
+		c.setDeadline(time.Time{})
+		c.armedAt = time.Time{}
+	}
+}
+
+// setLimit sets (or, with the zero time, removes) an absolute deadline for
+// reading the body. Removing it re-arms the idle deadline at once, since an
+// expiring limit could otherwise fail a later read (HTTP/2 closes the
+// stream's body when its deadline passes, even without a pending read).
+func (c *countingBody) setLimit(t time.Time) {
+	c.mu.Lock()
+	c.limit = t
+	c.armedAt = time.Time{}
+	c.mu.Unlock()
+	if t.IsZero() && !c.eof.Load() {
+		c.arm()
+	}
+}
+
+// abandon gives up on the rest of the body once the response starts: the
+// read deadline is set to now, so neither net/http's discard of the unread
+// body nor a later Read can wait for the client.
+func (c *countingBody) abandon() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.idle = 0 // no more re-arming
+	c.limit = time.Time{}
+	c.armedAt = time.Time{}
+	c.setDeadline(time.Now())
+}
+
+// drain reads and discards the rest of the body, at most max bytes and
+// within grace, and reports whether it reached EOF. It does what net/http
+// would do after the handler to keep the connection reusable, but bounded
+// in time (net/http waits without a deadline) and through Read, so the
+// deadline is cleared at EOF before net/http's background read starts.
+func (c *countingBody) drain(grace time.Duration, max int64) bool {
+	if c.failed.Load() {
+		return false
+	}
+	c.mu.Lock()
+	if c.ctl == nil {
+		c.mu.Unlock()
+		return false
+	}
+	c.idle = 0 // no re-arming: grace is the budget
+	c.limit = time.Time{}
+	c.armedAt = time.Now()
+	c.setDeadline(c.armedAt.Add(grace))
+	c.mu.Unlock()
+	_, err := io.CopyN(io.Discard, c, max+1)
+	return err == io.EOF && c.eof.Load()
+}
+
+// consumed reports whether the body of a request with the given
+// Content-Length (-1: unknown) has been read completely.
+func (c *countingBody) consumed(contentLength int64) bool {
+	return c.eof.Load() || (contentLength > 0 && c.n.Load() >= contentLength)
+}

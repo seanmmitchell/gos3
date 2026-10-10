@@ -15,6 +15,13 @@ import { fetchInfo, runPool, VERIFY_TIMEOUT_MS } from './probe'
 export const DEFAULT_WAIT_MS = 3000
 export const MIN_WAIT_MS = 500
 export const MAX_WAIT_MS = 10000
+/**
+ * Bounds on what hosts on the LAN can make one discovery collect and probe
+ * (multicast answers are unauthenticated and may be spoofed or flooded).
+ */
+export const MAX_MDNS_RECORDS = 2048
+export const MAX_BEACON_CANDIDATES = 1024
+export const MAX_VERIFY_URLS = 256
 
 /** A candidate base URL with what we know about it before verification. */
 export interface Candidate {
@@ -96,8 +103,8 @@ export async function browseMdns(waitMs: number, signal?: AbortSignal): Promise<
     })
     m.on('response', (packet) => {
       const list = [...(packet.answers ?? []), ...(packet.additionals ?? [])] as unknown as MdnsRecord[]
-      if (!list.length) return
-      records.push(...list)
+      if (!list.length || records.length >= MAX_MDNS_RECORDS) return
+      records.push(...list.slice(0, MAX_MDNS_RECORDS - records.length))
       // Ask for what is still missing (SRV/TXT of instances, A of targets).
       const missing = missingMdnsNames(records)
       const questions: { name: string, type: 'SRV' | 'TXT' | 'A' }[] = []
@@ -179,10 +186,16 @@ function closeSocket(sock: Socket | undefined): void {
 export async function queryBeacon(waitMs: number, signal?: AbortSignal, group = BEACON_GROUP, port = BEACON_PORT): Promise<MechanismResult> {
   const errors: string[] = []
   const candidates: Candidate[] = []
+  const seen = new Set<string>()
   const onMessage = (msg: Buffer, rinfo: RemoteInfo) => {
+    if (candidates.length >= MAX_BEACON_CANDIDATES) return
     const m = decodeBeacon(msg)
     if (!m || m.type !== 'announce') return
     for (const url of beaconCandidateUrls(m.urls, rinfo.address)) {
+      // Servers announce periodically: keep each (server, URL) once.
+      const k = `${m.id ?? ''}\n${url}`
+      if (seen.has(k) || candidates.length >= MAX_BEACON_CANDIDATES) continue
+      seen.add(k)
       candidates.push({ url, source: 'beacon', id: m.id, name: m.name, version: m.version, region: m.region })
     }
   }
@@ -263,16 +276,16 @@ export async function queryBeacon(waitMs: number, signal?: AbortSignal, group = 
 }
 
 /**
- * Verifies candidates (each URL once, bounded concurrency). Verified
- * identities become peers; candidates that announced an ID but could not be
- * verified are reported as unverified peers.
+ * Verifies candidates (each URL once, at most MAX_VERIFY_URLS URLs, bounded
+ * concurrency). Verified identities become peers; candidates that announced
+ * an ID but could not be verified are reported as unverified peers.
  */
-export async function verifyCandidates(candidates: readonly Candidate[], opts: { timeoutMs?: number, signal?: AbortSignal, concurrency?: number } = {}): Promise<Peer[]> {
+export async function verifyCandidates(candidates: readonly Candidate[], opts: { timeoutMs?: number, signal?: AbortSignal, concurrency?: number, maxUrls?: number } = {}): Promise<Peer[]> {
   const byUrl = new Map<string, Candidate[]>()
   for (const c of candidates) {
-    const list = byUrl.get(c.url) ?? []
-    list.push(c)
-    byUrl.set(c.url, list)
+    const list = byUrl.get(c.url)
+    if (list) list.push(c)
+    else if (byUrl.size < (opts.maxUrls ?? MAX_VERIFY_URLS)) byUrl.set(c.url, [c])
   }
   const urls = [...byUrl.keys()]
   const now = new Date()

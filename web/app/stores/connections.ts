@@ -14,6 +14,10 @@
 //   `defaultId`. It replaces the former 'gos3.defaultServer.v1' key, which is
 //   migrated on hydrate.
 // - In embedded mode the hosting gos3 server is added as 'This server'.
+// - Other tabs of the console share localStorage: their writes are merged in
+//   through the 'storage' event (syncFromStorage), so a tab never writes back
+//   a stale list over another tab's changes. The active server and secrets
+//   kept for the session stay per tab.
 //
 // The store is written with explicit imports (no Nuxt auto-imports) so it can
 // be unit-tested with plain Vitest + Pinia. Nuxt wiring lives in
@@ -141,6 +145,27 @@ export const useConnectionsStore = defineStore('connections', () => {
   let initPromise: Promise<void> | null = null
   let hydrated = false
   const inflight = new Map<string, Promise<ConnectionStatus>>()
+  /**
+   * Bumped whenever a connection's signing-relevant fields change: a status
+   * check started before is stale and must not write its result.
+   */
+  const generations = new Map<string, number>()
+  const generation = (id: string) => generations.get(id) ?? 0
+  function invalidate(id: string): void {
+    generations.set(id, generation(id) + 1)
+    inflight.delete(id)
+    delete statuses.value[id]
+    clearClientCache(id)
+  }
+  /** True when the endpoint, credentials, region or kind differ. */
+  function signingChanged(a: Connection, b: Connection): boolean {
+    return a.endpoint !== b.endpoint
+      || a.accessKeyId !== b.accessKeyId
+      || a.secretAccessKey !== b.secretAccessKey
+      || a.region !== b.region
+      || a.kind !== b.kind
+      || a.forcePathStyle !== b.forcePathStyle
+  }
 
   // -- getters -------------------------------------------------------------
 
@@ -244,6 +269,54 @@ export const useConnectionsStore = defineStore('connections', () => {
     persist()
   }
 
+  /**
+   * Merges the state another tab persisted (the 'storage' event of
+   * LOCAL_STORAGE_KEY; `raw` is the new value, read from storage when
+   * omitted). Definitions, the default server and dismissed presets are
+   * adopted; this tab keeps its active server and the secrets it holds for
+   * the session (sessionStorage is per tab) unless the access key changed.
+   */
+  function syncFromStorage(raw?: string | null): void {
+    let state: PersistedState | undefined
+    try {
+      state = raw === undefined ? readJson<PersistedState>(storage('local'), LOCAL_STORAGE_KEY) : raw ? (JSON.parse(raw) as PersistedState) : undefined
+    } catch {
+      return
+    }
+    if (!state || !Array.isArray(state.connections)) return
+    const mine = new Map(connections.value.map(c => [c.id, c]))
+    const list: Connection[] = []
+    for (const stored of state.connections) {
+      let c: Connection
+      try {
+        c = completeConnection(stored)
+      } catch {
+        continue
+      }
+      const own = mine.get(c.id)
+      if (!c.remember && own && own.accessKeyId === c.accessKeyId) c.secretAccessKey = own.secretAccessKey
+      if (own && signingChanged(own, c)) invalidate(c.id)
+      list.push(c)
+    }
+    for (const id of mine.keys()) if (!list.some(c => c.id === id)) invalidate(id)
+    connections.value = list
+    if (activeId.value && !list.some(c => c.id === activeId.value)) activeId.value = null
+    defaultId.value = typeof state.defaultId === 'string' && state.defaultId ? state.defaultId : null
+    dismissedPresets.value = Array.isArray(state.dismissedPresets) ? state.dismissedPresets : []
+  }
+
+  let listening = false
+  /** Starts merging other tabs' changes (once; browsers only). */
+  function listenForOtherTabs(): void {
+    if (listening || typeof globalThis.addEventListener !== 'function') return
+    listening = true
+    globalThis.addEventListener('storage', (e: Event) => {
+      const ev = e as StorageEvent
+      if (ev.key === LOCAL_STORAGE_KEY) syncFromStorage(ev.newValue)
+      else if (ev.key === null) syncFromStorage() // storage cleared
+    })
+  }
+
   // -- CRUD -----------------------------------------------------------------
 
   /** Adds a connection (endpoint is normalised; id generated if missing). */
@@ -262,16 +335,7 @@ export const useConnectionsStore = defineStore('connections', () => {
     const prev = connections.value[idx]!
     const next = completeConnection({ ...prev, ...patch, id })
     connections.value[idx] = next
-    if (
-      prev.endpoint !== next.endpoint
-      || prev.accessKeyId !== next.accessKeyId
-      || prev.secretAccessKey !== next.secretAccessKey
-      || prev.region !== next.region
-      || prev.kind !== next.kind
-    ) {
-      delete statuses.value[id]
-      clearClientCache(id)
-    }
+    if (signingChanged(prev, next)) invalidate(id)
     persist()
     return next
   }
@@ -281,8 +345,7 @@ export const useConnectionsStore = defineStore('connections', () => {
     if (!c) return
     connections.value = connections.value.filter(x => x.id !== id)
     if (c.source === 'preset' && !dismissedPresets.value.includes(id)) dismissedPresets.value.push(id)
-    delete statuses.value[id]
-    clearClientCache(id)
+    invalidate(id)
     if (activeId.value === id) activeId.value = null
     if (defaultId.value === id) defaultId.value = null
     persist()
@@ -457,6 +520,7 @@ export const useConnectionsStore = defineStore('connections', () => {
     if (initPromise) return initPromise
     initPromise = (async () => {
       hydrate()
+      listenForOtherTabs()
       const doFetch: FetchLike = opts.fetch ?? (req => globalThis.fetch(req))
       const baseURL = opts.baseURL ?? '/'
       const presets: ConnectionInput[] = []
@@ -498,7 +562,13 @@ export const useConnectionsStore = defineStore('connections', () => {
 
   async function check(c: Connection): Promise<ConnectionStatus> {
     const t0 = Date.now()
-    const done = (s: Partial<ConnectionStatus>) => setStatus(c.id, { error: undefined, errorCode: undefined, ...s, checkedAt: Date.now(), latencyMs: Date.now() - t0 })
+    const gen = generation(c.id)
+    const stale = () => gen !== generation(c.id) || !byId(c.id)
+    const done = (s: Partial<ConnectionStatus>) => {
+      // The connection changed (e.g. new credentials) while this check ran: drop the result.
+      if (stale()) return statusOf(c.id)
+      return setStatus(c.id, { error: undefined, errorCode: undefined, ...s, checkedAt: Date.now(), latencyMs: Date.now() - t0 })
+    }
 
     if (c.kind === 'gos3') {
       const probe = await probeServer(c.endpoint, { timeoutMs: 5000 })
@@ -513,7 +583,7 @@ export const useConnectionsStore = defineStore('connections', () => {
       }
       try {
         const whoami = await getAdminClient(c).whoami()
-        if (whoami.server?.id && c.serverId !== whoami.server.id) update(c.id, { serverId: whoami.server.id })
+        if (!stale() && whoami.server?.id && c.serverId !== whoami.server.id) update(c.id, { serverId: whoami.server.id })
         return done({ state: 'online', info: whoami.server ?? info, whoami })
       } catch (e) {
         if (e instanceof AdminError) {
@@ -557,7 +627,9 @@ export const useConnectionsStore = defineStore('connections', () => {
     const running = inflight.get(id)
     if (running) return running
     setStatus(id, { state: 'checking' })
-    const p = check(c).finally(() => inflight.delete(id))
+    const p: Promise<ConnectionStatus> = check(c).finally(() => {
+      if (inflight.get(id) === p) inflight.delete(id)
+    })
     inflight.set(id, p)
     return p
   }
@@ -585,6 +657,7 @@ export const useConnectionsStore = defineStore('connections', () => {
     initPromise = null
     hydrated = false
     inflight.clear()
+    generations.clear()
   }
 
   return {
@@ -612,6 +685,7 @@ export const useConnectionsStore = defineStore('connections', () => {
     ready,
     hydrate,
     persist,
+    syncFromStorage,
     add,
     update,
     remove,

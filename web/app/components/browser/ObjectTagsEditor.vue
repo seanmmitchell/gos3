@@ -19,18 +19,22 @@ const saving = ref(false)
 const loadError = ref<unknown>(null)
 const saveError = ref<unknown>(null)
 
+// Only the latest load may write (the key / version can change while one runs).
+let seq = 0
 async function load() {
+  const my = ++seq
   if (!props.client) return
   loading.value = true
   loadError.value = null
   try {
     const t = await props.client.getObjectTagging(props.bucket, props.objectKey, props.versionId)
+    if (my !== seq) return
     original.value = t.map(x => ({ key: x.key, value: x.value }))
     tags.value = original.value.map(x => ({ ...x }))
   } catch (e) {
-    loadError.value = e
+    if (my === seq) loadError.value = e
   } finally {
-    loading.value = false
+    if (my === seq) loading.value = false
   }
 }
 watch(() => [props.bucket, props.objectKey, props.versionId], () => void load(), { immediate: true })

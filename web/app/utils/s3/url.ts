@@ -10,6 +10,19 @@ export function encodeKey(key: string): string {
   return key.split('/').map(encodeRfc3986).join('/')
 }
 
+/**
+ * True when a key (or prefix) has a '.' or '..' path segment ('x/../y',
+ * 'a/./b', '..', 'dir/.'). Such keys are legal in S3, but the URL parser of
+ * browsers (WHATWG URL, also used by fetch and XMLHttpRequest) resolves dot
+ * segments — percent-encoded ones ('%2e%2e') included — so a request for
+ * 'x/../y' would silently address 'y'. They can only be named where the key
+ * travels outside the URL path: request bodies (DeleteObjects), the
+ * x-amz-copy-source header and query parameters.
+ */
+export function hasDotSegment(key: string): boolean {
+  return key.split('/').some(s => s === '.' || s === '..')
+}
+
 const IPV4 = /^\d{1,3}(?:\.\d{1,3}){3}$/
 
 /** True when bucket can be used as a DNS label in virtual-hosted-style URLs over TLS. */

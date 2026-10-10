@@ -207,7 +207,7 @@ func (w *partWriter) Commit(ctx context.Context, meta storage.PartMeta) (storage
 		Checksums:    maps.Clone(meta.Checksums),
 	}
 	var oldFile string
-	err := b.update(func(tx *bbolt.Tx) error {
+	indeterminate, err := b.updateFiles(func(tx *bbolt.Tx) error {
 		oldFile = ""
 		_, bb, err := loadBucketID(tx, w.bucket, w.bucketID)
 		if err != nil {
@@ -229,6 +229,13 @@ func (w *partWriter) Commit(ctx context.Context, meta storage.PartMeta) (storage
 		return putRecord(parts, pk, &rec)
 	})
 	if err != nil {
+		if indeterminate {
+			// The part record may have been persisted; recovery removes
+			// the file at the next start if it was not.
+			b.log.Warn("fs: metadata commit failed after the transaction was written; keeping its part file",
+				"upload_id", w.uploadID, "part", w.number, "err", err)
+			return storage.PartInfo{}, err
+		}
 		_ = os.Remove(path)
 		if errors.Is(err, storage.ErrUploadNotFound) || errors.Is(err, storage.ErrBucketNotFound) {
 			// The upload is gone; drop the directory we may have recreated.

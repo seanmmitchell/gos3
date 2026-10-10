@@ -82,6 +82,29 @@ func (a *api) whoami(rc *reqCtx) (int, any, error) {
 	}, nil
 }
 
+// Self-service access key actions. Unlike the other admin actions they are
+// allowed to every authenticated user by default (managing one's own keys
+// needs no grant) and refused only by an explicit Deny, e.g. of "admin:*"
+// or of the action itself: that lets operators lock a user (or a stolen key)
+// out of minting fresh keys that would survive revoking the current one.
+const (
+	actionCreateOwnKey = "admin:CreateOwnAccessKey"
+	actionDeleteOwnKey = "admin:DeleteOwnAccessKey"
+)
+
+// authorizeSelfService refuses a self-service action that a policy
+// explicitly denies to the caller.
+func (a *api) authorizeSelfService(rc *reqCtx, action string) error {
+	if rc.id.IsRoot {
+		return nil
+	}
+	if d := a.authorize(rc, action); !d.Allowed && d.ExplicitDeny {
+		return errorf(http.StatusForbidden, codeAccessDenied,
+			"%s is explicitly denied %s", describeIdentity(rc.id), action)
+	}
+	return nil
+}
+
 // selfUser returns the IAM user record of the caller (root has none).
 func (a *api) selfUser(rc *reqCtx) (iam.User, error) {
 	if rc.id.IsRoot {
@@ -115,6 +138,9 @@ func (a *api) createOwnKey(rc *reqCtx) (int, any, error) {
 	if _, err := a.selfUser(rc); err != nil {
 		return 0, nil, err
 	}
+	if err := a.authorizeSelfService(rc, actionCreateOwnKey); err != nil {
+		return 0, nil, err
+	}
 	k, err := a.d.IAM.CreateAccessKey(rc.ctx, rc.id.User, body.Description, "", "")
 	if err != nil {
 		return 0, nil, err
@@ -126,6 +152,9 @@ func (a *api) deleteOwnKey(rc *reqCtx) (int, any, error) {
 	ak := rc.r.PathValue("accessKey")
 	u, err := a.selfUser(rc)
 	if err != nil {
+		return 0, nil, err
+	}
+	if err := a.authorizeSelfService(rc, actionDeleteOwnKey); err != nil {
 		return 0, nil, err
 	}
 	owned := false

@@ -158,8 +158,10 @@ func (s *Server) handleCopyObject(w http.ResponseWriter, r *http.Request, rc *re
 	if tagDir == directiveCopy {
 		meta.Tags = maps.Clone(info.Tags)
 	}
-	if err := s.prepareNewObject(ctx, r, rc, bi, rc.key, &meta,
-		h.Get("X-Amz-Object-Lock-Legal-Hold") != "", h.Get("X-Amz-Acl"), h.Get("X-Amz-Acl") != ""); err != nil {
+	opts := headerObjectOpts(h)
+	// Tags copied from the source (COPY directive) are not request tags.
+	opts.tagsSet = tagDir == directiveReplace && len(meta.Tags) > 0
+	if err := s.prepareNewObject(ctx, r, rc, bi, rc.key, &meta, opts); err != nil {
 		return err
 	}
 	if algo == "" {
@@ -168,41 +170,59 @@ func (s *Server) handleCopyObject(w http.ResponseWriter, r *http.Request, rc *re
 	if algo == "" {
 		algo = ChecksumCRC64NVME
 	}
-	hasher := &copyHasher{md5: md5.New(), sum: newChecksumHash(algo), algo: algo}
-	data := io.TeeReader(io.LimitReader(rd, info.Size), hasher)
-	out, err := s.storeObject(ctx, rc.bucket, rc.key, data, meta, cond, func(m *storage.ObjectMeta) error {
-		if hasher.n != info.Size {
-			return io.ErrUnexpectedEOF
-		}
-		m.ETag = hex.EncodeToString(hasher.md5.Sum(nil))
-		m.Checksums = map[string]string{algo: base64.StdEncoding.EncodeToString(hasher.sum.Sum(nil))}
-		m.ChecksumType = ChecksumTypeFullObject
-		return nil
-	})
-	if err != nil {
-		return err
-	}
-
-	hdr := w.Header()
-	if bi.Versioning != storage.VersioningUnversioned {
-		hdr.Set("X-Amz-Version-Id", out.VersionID)
-	}
+	// Like AWS, a copy that takes a while answers 200 early and keeps the
+	// connection alive with whitespace (an error then comes in the 200
+	// body), so clients do not time out and retry large copies. The early
+	// headers are known now; the version ID and expiration of the new
+	// object follow as trailers in that case.
+	early := http.Header{}
 	if srcBucket.Versioning != storage.VersioningUnversioned {
-		hdr.Set("X-Amz-Copy-Source-Version-Id", info.VersionID)
+		early.Set("X-Amz-Copy-Source-Version-Id", info.VersionID)
 	}
-	setSSEHeaders(hdr, out.ObjectMeta)
-	s.setExpirationHeader(ctx, hdr, out)
-	res := copyObjectResult{
-		ETag:         quoteETag(out.ETag),
-		LastModified: formatXMLTime(out.LastModified),
-		ChecksumType: out.ChecksumType,
+	setSSEHeaders(early, meta)
+	versioned := bi.Versioning != storage.VersioningUnversioned
+	var trailers []string
+	if versioned {
+		trailers = []string{"X-Amz-Version-Id"}
 	}
-	res.ChecksumCRC32 = out.Checksums[ChecksumCRC32]
-	res.ChecksumCRC32C = out.Checksums[ChecksumCRC32C]
-	res.ChecksumCRC64NVME = out.Checksums[ChecksumCRC64NVME]
-	res.ChecksumSHA1 = out.Checksums[ChecksumSHA1]
-	res.ChecksumSHA256 = out.Checksums[ChecksumSHA256]
-	return writeXML(w, http.StatusOK, res)
+	if s.bucketLifecycle(ctx, rc.bucket) != nil {
+		trailers = append(trailers, "X-Amz-Expiration")
+	}
+	bucket, key := rc.bucket, rc.key
+	return s.respondWithKeepAlive(w, r, rc, early, trailers, func() longResult {
+		hasher := &copyHasher{md5: md5.New(), sum: newChecksumHash(algo), algo: algo}
+		// ctxReader stops the copy when the client goes away.
+		data := io.TeeReader(io.LimitReader(ctxReader{ctx, rd}, info.Size), hasher)
+		out, err := s.storeObject(ctx, bucket, key, data, meta, cond, func(m *storage.ObjectMeta) error {
+			if hasher.n != info.Size {
+				return io.ErrUnexpectedEOF
+			}
+			m.ETag = hex.EncodeToString(hasher.md5.Sum(nil))
+			m.Checksums = map[string]string{algo: base64.StdEncoding.EncodeToString(hasher.sum.Sum(nil))}
+			m.ChecksumType = ChecksumTypeFullObject
+			return nil
+		})
+		if err != nil {
+			return longResult{err: err}
+		}
+		hdr := http.Header{}
+		if versioned {
+			hdr.Set("X-Amz-Version-Id", out.VersionID)
+		}
+		setSSEHeaders(hdr, out.ObjectMeta)
+		s.setExpirationHeader(ctx, hdr, out)
+		res := copyObjectResult{
+			ETag:         quoteETag(out.ETag),
+			LastModified: formatXMLTime(out.LastModified),
+			ChecksumType: out.ChecksumType,
+		}
+		res.ChecksumCRC32 = out.Checksums[ChecksumCRC32]
+		res.ChecksumCRC32C = out.Checksums[ChecksumCRC32C]
+		res.ChecksumCRC64NVME = out.Checksums[ChecksumCRC64NVME]
+		res.ChecksumSHA1 = out.Checksums[ChecksumSHA1]
+		res.ChecksumSHA256 = out.Checksums[ChecksumSHA256]
+		return longResult{doc: res, headers: hdr}
+	})
 }
 
 // openCopySource opens the source of a copy (CopyObject, and usable by

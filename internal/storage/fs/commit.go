@@ -24,7 +24,7 @@ var errTrySolo = errors.New("fs: retry transaction alone")
 //
 // When a function fails, the shared transaction is rolled back, the failing
 // call is told to retry alone (or receives its error directly when it ran
-// alone) and the remaining calls are re-run together, mirroring
+// alone or panicked) and the remaining calls are re-run together, mirroring
 // bbolt.DB.Batch semantics without its artificial delay.
 type committer struct {
 	mu      sync.Mutex
@@ -80,7 +80,7 @@ func (c *committer) loop(db *bbolt.DB) {
 func runBatch(db *bbolt.DB, calls []*commitCall) {
 	for len(calls) > 0 {
 		failIdx := -1
-		err := db.Update(func(tx *bbolt.Tx) error {
+		err := safeUpdate(db, func(tx *bbolt.Tx) error {
 			for i, call := range calls {
 				if err := safeCall(call.fn, tx); err != nil {
 					failIdx = i
@@ -91,21 +91,41 @@ func runBatch(db *bbolt.DB, calls []*commitCall) {
 		})
 		if failIdx >= 0 {
 			failed := calls[failIdx]
-			var pe *panicError
-			if len(calls) == 1 || errors.As(err, &pe) {
-				// It ran alone (or panicked), so the error is its own.
-				failed.err <- err
-				return
-			}
 			calls = append(calls[:failIdx:failIdx], calls[failIdx+1:]...)
-			failed.err <- errTrySolo
+			var pe *panicError
+			switch {
+			case errors.As(err, &pe):
+				// A panic is the function's own fault: report it and re-run
+				// the others without it.
+				failed.err <- err
+			case len(calls) == 0:
+				// It ran alone, so the error is its own.
+				failed.err <- err
+			default:
+				failed.err <- errTrySolo
+			}
 			continue
 		}
+		// Success, a commit error or a panic outside the functions (inside
+		// bbolt itself) concerns every call of the batch.
 		for _, call := range calls {
 			call.err <- err
 		}
 		return
 	}
+}
+
+// safeUpdate is db.Update that converts a panic (e.g. from bbolt on a
+// corrupt page) into a *panicError, so that the commit goroutine survives
+// and every waiting caller is answered. bbolt rolls the transaction back
+// before the panic propagates.
+func safeUpdate(db *bbolt.DB, fn func(*bbolt.Tx) error) (err error) {
+	defer func() {
+		if p := recover(); p != nil {
+			err = &panicError{value: p}
+		}
+	}()
+	return db.Update(fn)
 }
 
 // panicError carries a panic out of the shared commit goroutine.

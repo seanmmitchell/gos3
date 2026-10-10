@@ -82,7 +82,9 @@ docker compose --profile ui up -d --build   # + the standalone web UI on :3000
 Sign in at `http://localhost:9001/_gos3/ui/` with `gos3admin` /
 `gos3admin-secret` and open **Discovery**: the nodes find each other through the
 UDP beacon, with seeds as a fallback. Remove everything with
-`docker compose down -v`.
+`docker compose down -v`. Because these demo keys are public, the ports are
+published on 127.0.0.1 only; see
+[docs/deployment.md](docs/deployment.md#docker-compose) to expose the demo.
 
 ### Standalone web UI
 
@@ -93,7 +95,9 @@ NUXT_PUBLIC_SERVERS='[{"name":"NAS","endpoint":"http://10.0.0.5:9000"}]' node .o
 
 It also runs as a container (`deploy/docker/web.Dockerfile`). The browser talks
 to each server directly, so every server must allow the UI origin via CORS
-(gos3 allows any origin by default). See [docs/web-ui.md](docs/web-ui.md).
+(gos3 allows any origin by default). Its local discovery routes only answer
+when the UI is opened via an IP address or `localhost`; add any DNS name you
+use to `GOS3_UI_ALLOWED_HOSTS`. See [docs/web-ui.md](docs/web-ui.md).
 
 ## Configuration
 
@@ -117,7 +121,7 @@ Frequently used settings:
 | Region | `--region` / `GOS3_REGION` | `us-east-1` |
 | Public URL | `--public-url` / `GOS3_PUBLIC_URL` | derived |
 | Virtual-host domains | `--domain` / `GOS3_DOMAINS` | none (path-style) |
-| TLS | `--tls-cert`, `--tls-key` | off |
+| TLS | `--tls-cert`, `--tls-key` / `GOS3_TLS_CERT`, `GOS3_TLS_KEY` | off |
 | CORS origins | `--cors-origin` / `GOS3_CORS_ORIGINS` | `*` |
 | Discovery | `--no-discovery`, `--seed` / `GOS3_DISCOVERY_*` | on |
 

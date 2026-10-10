@@ -2,12 +2,8 @@
 /** "3 minutes ago" with the absolute date as tooltip; refreshes every 30 s. */
 const props = defineProps<{ value: string | number | Date | null | undefined }>()
 
-const now = ref(Date.now())
-let timer: ReturnType<typeof setInterval> | undefined
-onMounted(() => {
-  timer = setInterval(() => (now.value = Date.now()), 30000)
-})
-onBeforeUnmount(() => clearInterval(timer))
+// One shared timer for all instances (listings render thousands of them).
+const now = useNow()
 
 const iso = computed(() => formatISO(props.value))
 const label = computed(() => formatRelativeTime(props.value, now.value))

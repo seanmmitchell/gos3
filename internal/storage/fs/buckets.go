@@ -57,7 +57,7 @@ func (b *Backend) CreateBucket(ctx context.Context, name string, opts storage.Cr
 		}
 		var id string
 		for {
-			id = randomHex(8)
+			id = randomHex(bucketIDLen / 2)
 			if tx.Bucket(bucketDataName(id)) == nil {
 				break
 			}

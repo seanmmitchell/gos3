@@ -9,6 +9,9 @@
 //	data/<bucket-id>/<2-hex>/<id>   immutable object data files
 //	tmp/                            files being written
 //	uploads/<upload-id>/<n>-<id>    multipart part data (n = part number)
+//	orphans/<run>/...               files the recovery pass found
+//	                                unreferenced, kept for a while (see
+//	                                Recovery)
 //
 // The schema of meta.db is documented in schema.go.
 //
@@ -41,11 +44,21 @@
 // # Recovery
 //
 // Open empties tmp/ synchronously and then starts a background pass that
-// removes data files and upload part files no longer referenced by the
+// collects data files and upload part files no longer referenced by the
 // metadata (left behind by crashes between the rename and the metadata
 // commit, or between the commit and the unlink), as well as directories of
 // deleted buckets and finished uploads. Files of writes in progress are
 // tracked in memory and never touched by the pass.
+//
+// The pass never deletes what it finds: it moves it to
+// orphans/<start time>-<random>/ (mirroring its path below .gos3) and
+// deletes such quarantine directories only once they are older than
+// Options.OrphanRetention. Data written after a backup of meta.db therefore
+// survives restoring that backup for a while and can be recovered by hand.
+// Entries whose names gos3 never generates (e.g. lost+found when data/ is a
+// mount point) are left alone. Open refuses to start when meta.db is missing
+// or empty while data/ or uploads/ hold files, since a fresh database would
+// make every stored object look orphaned.
 //
 // # Durability
 //
@@ -91,7 +104,14 @@ type Options struct {
 	// Logger receives recovery statistics and non-fatal errors (e.g. failed
 	// unlinks). nil discards logs.
 	Logger *slog.Logger
+	// OrphanRetention is how long the recovery pass keeps unreferenced
+	// files it moved to .gos3/orphans/ before deleting them (at a later
+	// start). Zero or negative means DefaultOrphanRetention.
+	OrphanRetention time.Duration
 }
+
+// DefaultOrphanRetention is the default of Options.OrphanRetention.
+const DefaultOrphanRetention = 7 * 24 * time.Hour
 
 // lockTimeout bounds how long Open waits for the metadata database lock.
 const lockTimeout = time.Second
@@ -108,6 +128,8 @@ type Backend struct {
 	dataDir   string
 	tmpDir    string
 	uploadDir string
+	orphanDir string
+	retention time.Duration
 	fsync     bool
 	log       *slog.Logger
 	db        *bbolt.DB
@@ -120,6 +142,11 @@ type Backend struct {
 
 	pending pendingSet
 	commits committer
+
+	// commitFault, when set (tests only), replaces the result of every
+	// successful write transaction, simulating a commit that reports an
+	// error although it reached the disk (e.g. a failed fsync).
+	commitFault func() error
 }
 
 var _ storage.Backend = (*Backend)(nil)
@@ -147,6 +174,11 @@ func Open(root string, opts Options) (*Backend, error) {
 	b.dataDir = filepath.Join(b.sysDir, "data")
 	b.tmpDir = filepath.Join(b.sysDir, "tmp")
 	b.uploadDir = filepath.Join(b.sysDir, "uploads")
+	b.orphanDir = filepath.Join(b.sysDir, "orphans")
+	b.retention = opts.OrphanRetention
+	if b.retention <= 0 {
+		b.retention = DefaultOrphanRetention
+	}
 	for _, d := range []string{b.sysDir, b.dataDir, b.tmpDir, b.uploadDir} {
 		if err := os.MkdirAll(d, dirPerm); err != nil {
 			return nil, fmt.Errorf("fs: create %s: %w", d, err)
@@ -154,6 +186,9 @@ func Open(root string, opts Options) (*Backend, error) {
 	}
 
 	dbPath := filepath.Join(b.sysDir, "meta.db")
+	if err := b.checkMetadataPresent(dbPath); err != nil {
+		return nil, err
+	}
 	db, err := bbolt.Open(dbPath, filePerm, &bbolt.Options{
 		Timeout:        lockTimeout,
 		FreelistType:   bbolt.FreelistMapType,
@@ -187,6 +222,72 @@ func Open(root string, opts Options) (*Backend, error) {
 		b.recover(ctx)
 	}()
 	return b, nil
+}
+
+// checkMetadataPresent refuses to proceed when the metadata database is
+// missing or empty (bbolt would silently create a fresh one) although the
+// data or uploads directory holds files gos3 wrote: the recovery pass would
+// then consider every object orphaned. The check runs before the database
+// lock is taken; a database that is missing or empty cannot be in use.
+func (b *Backend) checkMetadataPresent(dbPath string) error {
+	fi, err := os.Stat(dbPath)
+	switch {
+	case err == nil && fi.Size() > 0:
+		return nil
+	case err != nil && !errors.Is(err, iofs.ErrNotExist):
+		return nil // let bbolt.Open report it
+	}
+	dir, err := b.findStoredFile()
+	if err != nil {
+		return fmt.Errorf("fs: inspect %s: %w", b.sysDir, err)
+	}
+	if dir == "" {
+		return nil
+	}
+	state := "missing"
+	if fi != nil {
+		state = "empty"
+	}
+	return fmt.Errorf("fs: metadata database %s is %s but %s still holds stored data; "+
+		"refusing to start with an empty index, which would discard it. Restore meta.db "+
+		"from a backup, or move %s and %s aside to start with an empty store",
+		dbPath, state, dir, b.dataDir, b.uploadDir)
+}
+
+// findStoredFile returns the directory (data or uploads) holding at least one
+// file below a bucket or upload directory gos3 could have created, or "".
+func (b *Backend) findStoredFile() (string, error) {
+	errFound := errors.New("found")
+	for _, area := range []struct {
+		dir   string
+		valid func(string) bool
+	}{{b.dataDir, validBucketID}, {b.uploadDir, validUploadID}} {
+		entries, err := os.ReadDir(area.dir)
+		if err != nil {
+			return "", err
+		}
+		for _, e := range entries {
+			if !e.IsDir() || !area.valid(e.Name()) {
+				continue
+			}
+			err := filepath.WalkDir(filepath.Join(area.dir, e.Name()), func(_ string, d iofs.DirEntry, err error) error {
+				if err != nil {
+					return err
+				}
+				if !d.IsDir() {
+					return errFound
+				}
+				return nil
+			})
+			if errors.Is(err, errFound) {
+				return area.dir, nil
+			}
+			if err != nil {
+				return "", err
+			}
+		}
+	}
+	return "", nil
 }
 
 func (b *Backend) initSchema() error {
@@ -241,7 +342,31 @@ func (b *Backend) update(fn func(*bbolt.Tx) error) error {
 	if b.closed.Load() {
 		return ErrClosed
 	}
-	return mapDBErr(b.commits.do(b.db, fn))
+	err := b.commits.do(b.db, fn)
+	if err == nil && b.commitFault != nil {
+		err = b.commitFault()
+	}
+	return mapDBErr(err)
+}
+
+// updateFiles is update for transactions that publish files written
+// beforehand. It additionally reports whether a failure is indeterminate:
+// fn itself succeeded and the error came from committing the transaction,
+// which may nonetheless have reached the disk (bbolt can fail an fdatasync
+// after writing the meta page). The caller must then keep the new files
+// rather than delete them; the recovery pass removes them at the next start
+// if the commit was in fact lost.
+func (b *Backend) updateFiles(fn func(*bbolt.Tx) error) (indeterminate bool, err error) {
+	var fnOK bool
+	err = b.update(func(tx *bbolt.Tx) error {
+		fnOK = false
+		if err := fn(tx); err != nil {
+			return err
+		}
+		fnOK = true
+		return nil
+	})
+	return err != nil && fnOK, err
 }
 
 func mapDBErr(err error) error {

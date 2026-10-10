@@ -7,9 +7,11 @@
 #   node 2: http://localhost:9002
 #   standalone UI (profile "ui"): http://localhost:3000
 #
-# Both nodes share the root credentials below (override them with
+# The published ports listen on 127.0.0.1 only, because both nodes share
+# the well-known demo root credentials below (override them with
 # GOS3_ROOT_ACCESS_KEY / GOS3_ROOT_SECRET_KEY in the environment or an .env
-# file). They find each other through the UDP multicast beacon on the shared
+# file). To reach the demo from other machines, set your own keys AND
+# GOS3_DEMO_BIND=0.0.0.0 (or a specific host address). They find each other through the UDP multicast beacon on the shared
 # network, with static seeds as a fallback where multicast is unavailable;
 # the Discovery page of either node lists the other one. Peers are advertised
 # with their container addresses, which the host browser may not reach
@@ -45,7 +47,7 @@ services:
       GOS3_NAME: node-1
       GOS3_DISCOVERY_SEEDS: http://gos3-2:9000
     ports:
-      - "9001:9000"
+      - "${GOS3_DEMO_BIND:-127.0.0.1}:9001:9000"
     volumes:
       - gos3-1-data:/data
 
@@ -57,7 +59,7 @@ services:
       GOS3_NAME: node-2
       GOS3_DISCOVERY_SEEDS: http://gos3-1:9000
     ports:
-      - "9002:9000"
+      - "${GOS3_DEMO_BIND:-127.0.0.1}:9002:9000"
     volumes:
       - gos3-2-data:/data
 
@@ -65,6 +67,8 @@ services:
   # the published ports, so both are preset with their localhost URLs; the
   # nodes' default CORS policy (allowed_origins "*") admits the UI origin.
   # Its local discovery (beacon query / scan) runs inside the compose network.
+  # Those routes only answer when the UI is opened via an IP address or
+  # localhost; list any DNS name you open it with in GOS3_UI_ALLOWED_HOSTS.
   ui:
     profiles: [ui]
     build:
@@ -77,8 +81,9 @@ services:
       NUXT_PUBLIC_SERVERS: >-
         [{"id":"node-1","name":"node-1","endpoint":"http://localhost:9001","kind":"gos3"},
         {"id":"node-2","name":"node-2","endpoint":"http://localhost:9002","kind":"gos3"}]
+      GOS3_UI_ALLOWED_HOSTS: ${GOS3_UI_ALLOWED_HOSTS:-}
     ports:
-      - "3000:3000"
+      - "${GOS3_DEMO_BIND:-127.0.0.1}:3000:3000"
     depends_on:
       gos3-1:
         condition: service_healthy

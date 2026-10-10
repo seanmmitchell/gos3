@@ -277,6 +277,10 @@ type Backend interface {
 	//   - versionIDMarker == "": start strictly after all versions of keyMarker.
 	//   - otherwise: start with the version immediately following
 	//     versionIDMarker (older than it) within keyMarker.
+	// A walk is not a snapshot when keys change concurrently, but IsLatest
+	// is only ever set on the first entry delivered for a key (and only if
+	// it was the newest version when read), never on a later entry of the
+	// same key.
 	WalkVersions(ctx context.Context, bucket, prefix, keyMarker, versionIDMarker string, fn func(ObjectInfo) error) error
 
 	// --- Multipart uploads ---

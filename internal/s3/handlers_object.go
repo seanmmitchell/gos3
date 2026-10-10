@@ -12,6 +12,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/url"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -262,17 +263,25 @@ func (s *Server) newObjectPayload(r *http.Request, rc *reqContext, opts payloadO
 //
 //   - object lock headers require object lock on the bucket and the
 //     s3:PutObjectRetention / s3:PutObjectLegalHold permissions
-//     (legalHoldSet: a legal hold header or field was given);
+//     (o.legalHoldSet: a legal hold header or field was given);
 //   - without explicit retention, the bucket's default retention applies;
 //   - without explicit SSE, the bucket's default encryption is recorded;
-//   - a canned ACL (aclSet: given explicitly) must be allowed by the
-//     bucket's ownership controls and public access block.
+//   - a canned ACL (o.aclSet: given explicitly) requires s3:PutObjectAcl
+//     and must be allowed by the bucket's ownership controls and public
+//     access block;
+//   - tags given with the request (o.tagsSet; meta.Tags holds them)
+//     require s3:PutObjectTagging, evaluated with the
+//     s3:RequestObjectTag/<key> and s3:RequestObjectTagKeys condition keys.
+//
+// AWS requires the same extra permissions, so a principal limited to
+// s3:PutObject can neither publish objects through an ACL nor plant tags
+// that s3:ExistingObjectTag conditions rely on.
 func (s *Server) prepareNewObject(ctx context.Context, r *http.Request, rc *reqContext, bi storage.BucketInfo,
-	key string, meta *storage.ObjectMeta, legalHoldSet bool, acl string, aclSet bool) error {
+	key string, meta *storage.ObjectMeta, o newObjectOpts) error {
 	if err := requireObjectLock(*meta, bi); err != nil {
 		return err
 	}
-	if legalHoldSet && !bi.ObjectLockEnabled {
+	if o.legalHoldSet && !bi.ObjectLockEnabled {
 		return s3err.ErrInvalidRequest.WithMessage("Bucket is missing Object Lock Configuration")
 	}
 	if meta.RetentionMode != "" {
@@ -280,8 +289,26 @@ func (s *Server) prepareNewObject(ctx context.Context, r *http.Request, rc *reqC
 			return err
 		}
 	}
-	if legalHoldSet {
+	if o.legalHoldSet {
 		if err := s.authorize(r, rc, "s3:PutObjectLegalHold", bi.Name, key, ""); err != nil {
+			return err
+		}
+	}
+	if o.aclSet {
+		if err := s.authorizeTarget(ctx, r, rc, authzTarget{Action: "s3:PutObjectAcl", Bucket: bi.Name, Key: key,
+			Conditions: o.conds}); err != nil {
+			return err
+		}
+	}
+	if o.tagsSet {
+		conds := requestTagConditions(meta.Tags)
+		for k, v := range o.conds {
+			if _, ok := conds[k]; !ok {
+				conds[k] = v
+			}
+		}
+		if err := s.authorizeTarget(ctx, r, rc, authzTarget{Action: "s3:PutObjectTagging", Bucket: bi.Name, Key: key,
+			Conditions: conds}); err != nil {
 			return err
 		}
 	}
@@ -301,12 +328,53 @@ func (s *Server) prepareNewObject(ctx context.Context, r *http.Request, rc *reqC
 		}
 		meta.SSE, meta.SSEKMSKeyID = sse, kmsKey
 	}
-	if aclSet {
-		if err := s.checkObjectACLAllowed(ctx, bi.Name, acl); err != nil {
+	if o.aclSet {
+		if err := s.checkObjectACLAllowed(ctx, bi.Name, o.acl); err != nil {
 			return err
 		}
 	}
 	return nil
+}
+
+// newObjectOpts describes the request-supplied attributes of a new object
+// that need permissions beyond s3:PutObject (see prepareNewObject).
+type newObjectOpts struct {
+	legalHoldSet bool   // an object lock legal hold header or field was given
+	acl          string // the canned ACL
+	aclSet       bool   // a canned ACL was given explicitly
+	tagsSet      bool   // tags were given explicitly (they are in meta.Tags)
+	// conds are extra condition keys for the s3:PutObjectAcl and
+	// s3:PutObjectTagging checks (PostObject's form fields, which are not
+	// request headers).
+	conds map[string][]string
+}
+
+// headerObjectOpts returns the newObjectOpts of a request whose object
+// attributes come from headers (PutObject, CreateMultipartUpload; CopyObject
+// overrides tagsSet for its tagging directive).
+func headerObjectOpts(h http.Header) newObjectOpts {
+	acl := h.Get("X-Amz-Acl")
+	return newObjectOpts{
+		legalHoldSet: h.Get("X-Amz-Object-Lock-Legal-Hold") != "",
+		acl:          acl,
+		aclSet:       acl != "",
+		tagsSet:      h.Get("X-Amz-Tagging") != "",
+	}
+}
+
+// requestTagConditions returns the s3:RequestObjectTag/<key> and
+// s3:RequestObjectTagKeys condition keys for the tags of a request (an
+// empty tag set yields an empty s3:RequestObjectTagKeys).
+func requestTagConditions(tags map[string]string) map[string][]string {
+	c := make(map[string][]string, len(tags)+1)
+	keys := make([]string, 0, len(tags))
+	for k, v := range tags {
+		c["s3:RequestObjectTag/"+k] = []string{v}
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	c["s3:RequestObjectTagKeys"] = keys
+	return c
 }
 
 // checkObjectACLAllowed checks that a canned ACL may be set on an object of
@@ -501,8 +569,7 @@ func (s *Server) handlePutObject(w http.ResponseWriter, r *http.Request, rc *req
 	if err != nil {
 		return err
 	}
-	if err := s.prepareNewObject(ctx, r, rc, bi, rc.key, &meta,
-		h.Get("X-Amz-Object-Lock-Legal-Hold") != "", h.Get("X-Amz-Acl"), h.Get("X-Amz-Acl") != ""); err != nil {
+	if err := s.prepareNewObject(ctx, r, rc, bi, rc.key, &meta, headerObjectOpts(h)); err != nil {
 		return err
 	}
 	p, err := s.newObjectPayload(r, rc, payloadOptions{RequireLength: true})
@@ -624,8 +691,9 @@ func (s *Server) serveObject(w http.ResponseWriter, r *http.Request, rc *reqCont
 
 	status := http.StatusOK
 	var (
-		rng      *byteRange
-		partSums map[string]string
+		rng       *byteRange
+		partSums  map[string]string
+		emptyPart bool
 	)
 	multipart := len(info.PartSizes) > 0
 	switch {
@@ -642,26 +710,39 @@ func (s *Server) serveObject(w http.ResponseWriter, r *http.Request, rc *reqCont
 		if off < 0 || size < 0 || off+size > info.Size {
 			return errors.New("s3: stored part sizes are inconsistent with the object size")
 		}
-		status = http.StatusPartialContent
+		// A part is served like a ranged GET (206 + Content-Range); an
+		// empty part (possible as the last one) has no satisfiable range,
+		// so it is a plain empty 200 rather than a 206 without
+		// Content-Range.
 		if size > 0 {
 			rng = &byteRange{Start: off, Length: size}
+		} else {
+			emptyPart = true
 		}
 		if partNumber-1 < len(info.PartChecksums) {
 			partSums = info.PartChecksums[partNumber-1]
 		}
 	case partNumber > 1:
 		return errInvalidPartNumber.With("PartNumberRequested", strconv.Itoa(partNumber)).With("ActualPartCount", "1")
+	case partNumber == 1:
+		// The whole object is its only part; S3 answers like a ranged GET
+		// of it (part-based downloaders read the size from Content-Range).
+		if info.Size > 0 {
+			rng = &byteRange{Start: 0, Length: info.Size}
+		}
 	case partNumber == 0:
+		if !ifRangeAllows(h.Get("If-Range"), info.ETag, info.LastModified) {
+			break // the representation changed: serve all of it
+		}
 		if rng, err = parseRange(h.Get("Range"), info.Size); err != nil {
 			return err
-		}
-		if rng != nil {
-			status = http.StatusPartialContent
 		}
 	}
 
 	checksumMode := checksumModeEnabled(h)
-	whole := rng == nil && (partNumber == 0 || !multipart)
+	// The full-object checksum applies when the whole object is served,
+	// which includes part 1 of a single-part object.
+	whole := (partNumber == 0 && rng == nil) || (partNumber > 0 && !multipart)
 	writeObjectHeaders(w, info, versioned, checksumMode && whole)
 	hdr := w.Header()
 	s.setExpirationHeader(r.Context(), hdr, info)
@@ -669,17 +750,20 @@ func (s *Server) serveObject(w http.ResponseWriter, r *http.Request, rc *reqCont
 		setChecksumHeaders(hdr, partSums, "")
 	}
 	length := info.Size
-	if status == http.StatusPartialContent {
-		length = 0
-		if rng != nil {
-			length = rng.Length
-			hdr.Set("Content-Range", rng.ContentRange(info.Size))
-		}
+	switch {
+	case rng != nil:
+		status = http.StatusPartialContent
+		length = rng.Length
+		hdr.Set("Content-Range", rng.ContentRange(info.Size))
 		hdr.Set("Content-Length", strconv.FormatInt(length, 10))
+	case emptyPart:
+		length = 0
+		hdr.Set("Content-Length", "0")
 	}
 	for k, v := range overrides {
 		hdr.Set(k, v)
 	}
+	setActiveContentHeaders(hdr)
 	if !withBody || length == 0 {
 		w.WriteHeader(status)
 		return nil
@@ -703,6 +787,25 @@ func (s *Server) serveObject(w http.ResponseWriter, r *http.Request, rc *reqCont
 		panic(http.ErrAbortHandler)
 	}
 	return nil
+}
+
+// setActiveContentHeaders neutralises active content in object responses.
+// Objects are served from the same origin (scheme://host:port) as the
+// embedded web UI, so an uploaded text/html or image/svg+xml object opened
+// in a browser would otherwise run script with the UI's origin and could
+// read its stored connections and credentials. "Content-Security-Policy:
+// sandbox" gives such a document a unique opaque origin with scripts,
+// forms and plugins disabled; it does not affect images, media or
+// downloads. PDFs are exempt: browsers refuse to render them in a sandbox,
+// and their viewers never expose the page origin to the document's
+// scripts. X-Content-Type-Options: nosniff stops browsers from executing
+// objects whose stored type is not a script or style type.
+func setActiveContentHeaders(h http.Header) {
+	h.Set("X-Content-Type-Options", "nosniff")
+	mt, _, _ := strings.Cut(h.Get("Content-Type"), ";")
+	if !strings.EqualFold(strings.TrimSpace(mt), "application/pdf") {
+		h.Set("Content-Security-Policy", "sandbox")
+	}
 }
 
 // --- DeleteObject ---

@@ -18,7 +18,8 @@ import {
   planScan,
   ScanRequestError
 } from '~~/server/utils/discovery/targets'
-import { localDiscoveryEnabled } from '~~/server/utils/discovery/local'
+import { isAllowedHost, hostnameOf, allowedHostsFromEnv, rejectForeignRequest } from '~~/server/utils/discovery/http'
+import { localDiscoveryEnabled, MAX_VERIFY_URLS, verifyCandidates, type Candidate } from '~~/server/utils/discovery/local'
 
 const INFO: Info = {
   service: 'gos3',
@@ -283,5 +284,69 @@ describe('probing', () => {
     expect(localDiscoveryEnabled({})).toBe(true)
     expect(localDiscoveryEnabled({ GOS3_UI_LOCAL_DISCOVERY: 'false' })).toBe(false)
     expect(localDiscoveryEnabled({ GOS3_UI_LOCAL_DISCOVERY: 'off' })).toBe(false)
+  })
+})
+
+describe('review fixes: bounded probes', () => {
+  it('stops reading an identity document beyond 64 KiB without Content-Length', async () => {
+    let pulled = 0
+    const fetch = async () => new Response(new ReadableStream<Uint8Array>({
+      pull(ctrl) {
+        pulled++
+        ctrl.enqueue(new Uint8Array(16 * 1024).fill(0x20))
+        if (pulled > 1000) ctrl.close()
+      }
+    }))
+    await expect(fetchInfo('http://stream', { fetch, timeoutMs: 2000 })).rejects.toThrow(/too large/)
+    expect(pulled).toBeLessThan(10)
+  })
+
+  it('still accepts a chunked identity document within the limit', async () => {
+    const body = new TextEncoder().encode(JSON.stringify(INFO))
+    const fetch = async () => new Response(new ReadableStream<Uint8Array>({
+      start(ctrl) {
+        ctrl.enqueue(body.slice(0, 10))
+        ctrl.enqueue(body.slice(10))
+        ctrl.close()
+      }
+    }))
+    await expect(fetchInfo('http://chunked', { fetch })).resolves.toMatchObject({ id: INFO.id })
+  })
+
+  it('verifies at most MAX_VERIFY_URLS candidate URLs', async () => {
+    const fetch = vi.fn(async () => new Response('nope', { status: 404 }))
+    vi.stubGlobal('fetch', fetch)
+    const candidates: Candidate[] = Array.from({ length: 2000 }, (_, i) => ({ url: `http://10.${i >> 8}.${i & 255}.1:9000`, source: 'beacon', id: `id${i}` }))
+    await verifyCandidates(candidates, { timeoutMs: 100 })
+    expect(fetch).toHaveBeenCalledTimes(MAX_VERIFY_URLS)
+  })
+})
+
+describe('review fixes: DNS rebinding guard', () => {
+  it('accepts IP literals, localhost and configured names only', () => {
+    expect(hostnameOf('[::1]:3000')).toBe('::1')
+    expect(hostnameOf('UI.Example.lan.:80')).toBe('ui.example.lan')
+    for (const h of ['localhost:3000', '127.0.0.1:3000', '[::1]:3000', '192.168.1.20', 'app.localhost:3000', undefined]) expect(isAllowedHost(h, []), String(h)).toBe(true)
+    for (const h of ['attacker.example:3000', 'rebind.attacker', 'localhost.attacker.example']) expect(isAllowedHost(h, []), h).toBe(false)
+    expect(isAllowedHost('ui.example.lan:3000', ['ui.example.lan'])).toBe(true)
+    expect(isAllowedHost('anything', ['*'])).toBe(true)
+    expect(allowedHostsFromEnv({ GOS3_UI_ALLOWED_HOSTS: 'UI.example.lan, nas.local' })).toEqual(['ui.example.lan', 'nas.local'])
+  })
+
+  it('rejects foreign Host, Origin and Sec-Fetch-Site headers', () => {
+    const status: number[] = []
+    vi.stubGlobal('setResponseStatus', (_e: unknown, s: number) => status.push(s))
+    vi.stubGlobal('setResponseHeader', () => {})
+    const event = (headers: Record<string, string>) => {
+      vi.stubGlobal('getRequestHeader', (_e: unknown, name: string) => headers[name])
+      return {} as Parameters<typeof rejectForeignRequest>[0]
+    }
+    expect(rejectForeignRequest(event({ host: 'localhost:3000' }))).toBeUndefined()
+    expect(rejectForeignRequest(event({ 'host': '127.0.0.1:3000', 'origin': 'http://127.0.0.1:3000', 'sec-fetch-site': 'same-origin' }))).toBeUndefined()
+    expect(rejectForeignRequest(event({ host: 'attacker.example:3000', origin: 'http://attacker.example:3000' }))?.error.code).toBe('AccessDenied')
+    expect(rejectForeignRequest(event({ host: 'localhost:3000', origin: 'http://evil.example' }))?.error.code).toBe('AccessDenied')
+    expect(rejectForeignRequest(event({ host: 'localhost:3000', origin: 'null' }))?.error.code).toBe('AccessDenied')
+    expect(rejectForeignRequest(event({ 'host': 'localhost:3000', 'sec-fetch-site': 'cross-site' }))?.error.code).toBe('AccessDenied')
+    expect(status).toEqual([403, 403, 403, 403])
   })
 })

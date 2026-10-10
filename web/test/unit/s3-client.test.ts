@@ -1,7 +1,7 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import { choosePartSize, copySourceHeader, decodeHeaderValue, encodeHeaderValue, S3Client, S3Error } from '~/utils/s3/client'
 import { md5Base64 } from '~/utils/s3/hash'
-import { buildS3Url, encodeKey, normalizeEndpoint } from '~/utils/s3/url'
+import { buildS3Url, encodeKey, hasDotSegment, normalizeEndpoint } from '~/utils/s3/url'
 
 const MiB = 1024 * 1024
 const NS = 'xmlns="http://s3.amazonaws.com/doc/2006-03-01/"'
@@ -119,7 +119,7 @@ describe('S3Client requests', () => {
     const { client, calls } = makeClient(() => xml(`<ListBucketResult ${NS}><Name>photos</Name><Prefix>a b/</Prefix><KeyCount>0</KeyCount><MaxKeys>100</MaxKeys><IsTruncated>false</IsTruncated></ListBucketResult>`))
     const r = await client.listObjectsV2('photos', { prefix: 'a b/', delimiter: '/', maxKeys: 100, continuationToken: 'x+y=' })
     expect(r.prefix).toBe('a b/')
-    expect(calls[0]!.url).toBe('http://localhost:9000/photos/?list-type=2&prefix=a%20b%2F&delimiter=%2F&continuation-token=x%2By%3D&max-keys=100')
+    expect(calls[0]!.url).toBe('http://localhost:9000/photos/?list-type=2&encoding-type=url&prefix=a%20b%2F&delimiter=%2F&continuation-token=x%2By%3D&max-keys=100')
   })
 
   it('paginates with listObjectsV2Pages / listAllObjects', async () => {
@@ -336,5 +336,112 @@ describe('presigned URLs', () => {
     expect(url.searchParams.get('response-content-disposition')).toBe('attachment; filename="a b.txt"')
     expect(url.searchParams.get('X-Amz-Expires')).toBe('604800')
     expect(url.searchParams.get('X-Amz-Signature')).toMatch(/^[0-9a-f]{64}$/)
+  })
+})
+
+describe('keys with dot segments (review fix)', () => {
+  it('detects "." and ".." segments', () => {
+    for (const k of ['..', '.', 'x/../y', 'a/./b', 'dir/.', 'dir/..', './', 'x//../y', '../']) expect(hasDotSegment(k), k).toBe(true)
+    for (const k of ['a.b', '...', '.hidden', 'a/..b/c', 'a..', 'x/y', 'a//b']) expect(hasDotSegment(k), k).toBe(false)
+  })
+
+  it('never sends path-addressed requests for them (the URL would name another key)', async () => {
+    const { client, calls } = makeClient(() => new Response(null, { status: 200 }))
+    // The WHATWG URL parser resolves dot segments, percent-encoded ones too.
+    expect(new URL('http://h/b/x/%2e%2e/y').pathname).toBe('/b/y')
+    expect(() => client.url('b', 'x/../y')).toThrow(S3Error)
+    await expect(client.headObject('b', 'x/../y')).rejects.toMatchObject({ code: 'UnaddressableKey' })
+    await expect(client.getObjectText('b', 'a/./b')).rejects.toMatchObject({ code: 'UnaddressableKey' })
+    await expect(client.putObject('b', 'dir/./x', 'data')).rejects.toMatchObject({ code: 'UnaddressableKey' })
+    await expect(client.copyObject({ bucket: 'b', key: 'x/../y' }, { bucket: 'b', key: 'x/../y' }, { metadataDirective: 'REPLACE' })).rejects.toMatchObject({ code: 'UnaddressableKey' })
+    await expect(client.presignGetUrl('b', '..')).rejects.toMatchObject({ code: 'UnaddressableKey' })
+    await expect(client.putObjectTagging('b', 'x/../y', [])).rejects.toMatchObject({ code: 'UnaddressableKey' })
+    expect(calls).toHaveLength(0)
+  })
+
+  it('can still copy from them (x-amz-copy-source is a header)', async () => {
+    const { client, calls } = makeClient(() => xml(`<CopyObjectResult ${NS}><ETag>"e"</ETag></CopyObjectResult>`))
+    await client.copyObject({ bucket: 'b', key: 'x/../y' }, { bucket: 'b', key: 'x/y' })
+    expect(calls[0]!.url).toBe('http://localhost:9000/b/x/y')
+    expect(calls[0]!.headers['x-amz-copy-source']).toBe('b/x/../y')
+  })
+
+  it('deletes them with DeleteObjects (key in the body)', async () => {
+    const { client, calls } = makeClient(() => xml(`<DeleteResult ${NS}><Deleted><Key>x/../y</Key><DeleteMarker>true</DeleteMarker><DeleteMarkerVersionId>dm1</DeleteMarkerVersionId></Deleted></DeleteResult>`))
+    const r = await client.deleteObject('b', 'x/../y')
+    expect(calls).toHaveLength(1)
+    expect(calls[0]!.method).toBe('POST')
+    expect(calls[0]!.url).toBe('http://localhost:9000/b/?delete=')
+    expect(calls[0]!.body).toContain('<Key>x/../y</Key>')
+    expect(r).toEqual({ versionId: 'dm1', deleteMarker: true })
+  })
+
+  it('reports DeleteObjects per-key errors of a single delete as S3Error', async () => {
+    const { client } = makeClient(() => xml(`<DeleteResult ${NS}><Error><Key>..</Key><Code>AccessDenied</Code><Message>no</Message></Error></DeleteResult>`))
+    await expect(client.deleteObject('b', '..', 'v1')).rejects.toMatchObject({ code: 'AccessDenied' })
+  })
+})
+
+describe('listing encoding (review fix)', () => {
+  it('asks for URL-encoded keys in every listing', async () => {
+    const { client, calls } = makeClient((req) => {
+      const u = new URL(req.url)
+      if (u.searchParams.has('versions')) return xml(`<ListVersionsResult ${NS}><Name>b</Name><EncodingType>url</EncodingType><IsTruncated>false</IsTruncated><Version><Key>a%01b</Key><VersionId>v</VersionId><IsLatest>true</IsLatest><Size>1</Size></Version></ListVersionsResult>`)
+      if (u.searchParams.has('uploads')) return xml(`<ListMultipartUploadsResult ${NS}><Bucket>b</Bucket><EncodingType>url</EncodingType><Delimiter>%2F</Delimiter><IsTruncated>false</IsTruncated><Upload><Key>a%01b</Key><UploadId>u</UploadId></Upload><CommonPrefixes><Prefix>p%01/</Prefix></CommonPrefixes></ListMultipartUploadsResult>`)
+      return xml(`<ListBucketResult ${NS}><Name>b</Name><EncodingType>url</EncodingType><IsTruncated>false</IsTruncated><Contents><Key>a%01b+c%2B</Key><Size>1</Size></Contents></ListBucketResult>`)
+    })
+    const l = await client.listObjectsV2('b')
+    const v = await client.listObjectVersions('b')
+    const m = await client.listMultipartUploads('b')
+    for (const c of calls) expect(new URL(c.url).searchParams.get('encoding-type')).toBe('url')
+    expect(l.objects[0]!.key).toBe('a\u0001b c+')
+    expect(v.versions[0]!.key).toBe('a\u0001b')
+    expect(m.uploads[0]!.key).toBe('a\u0001b')
+    expect(m.delimiter).toBe('/')
+    expect(m.commonPrefixes[0]!.prefix).toBe('p\u0001/')
+  })
+})
+
+describe('upload cancellation races (review fix)', () => {
+  it('does not start the XHR when canceled while the request is being signed', async () => {
+    const sent: unknown[] = []
+    class FakeXHR {
+      upload: Record<string, unknown> = {}
+      open() {}
+      setRequestHeader() {}
+      getAllResponseHeaders() {
+        return 'etag: "e"'
+      }
+
+      abort() {}
+      send(body: unknown) {
+        sent.push(body)
+      }
+    }
+    vi.stubGlobal('XMLHttpRequest', FakeXHR)
+    const { client } = makeClient(() => new Response(null))
+    const ctrl = new AbortController()
+    const p = client.putObject('b', 'k', 'data', { onProgress: () => {}, signal: ctrl.signal })
+    ctrl.abort() // while sign() is awaiting WebCrypto
+    await expect(p).rejects.toMatchObject({ code: 'Aborted' })
+    expect(sent).toHaveLength(0)
+  })
+
+  it('aborts the multipart upload when canceled while it is being created', async () => {
+    const ctrl = new AbortController()
+    const { client, calls } = makeClient((req) => {
+      const u = new URL(req.url)
+      if (req.method === 'POST' && u.searchParams.has('uploads')) {
+        ctrl.abort()
+        return xml(`<InitiateMultipartUploadResult ${NS}><UploadId>UP9</UploadId></InitiateMultipartUploadResult>`)
+      }
+      if (req.method === 'PUT') return new Response(null, { status: 200, headers: { etag: '"p"' } })
+      return new Response(null, { status: 204 })
+    })
+    const file = new Blob([new Uint8Array(6 * MiB)])
+    await expect(client.uploadLarge('b', 'k', file, { partSize: 5 * MiB, signal: ctrl.signal })).rejects.toMatchObject({ code: 'Aborted' })
+    expect(calls.some(c => c.method === 'PUT')).toBe(false)
+    expect(calls.some(c => c.method === 'POST' && c.url.includes('uploadId=UP9'))).toBe(false)
+    expect(calls.some(c => c.method === 'DELETE' && c.url.includes('uploadId=UP9'))).toBe(true)
   })
 })

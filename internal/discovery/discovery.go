@@ -97,7 +97,8 @@ type Config struct {
 	Seeds []string `json:"seeds" yaml:"seeds"`
 	// DNSSRV are domains queried for _gos3._tcp.<domain> SRV records.
 	DNSSRV []string `json:"dnsSrv" yaml:"dns_srv"`
-	// PeerTTL: peers not seen for this long are dropped (default 3*BeaconInterval, min 30s).
+	// PeerTTL: peers not seen for this long are dropped (default
+	// max(3*BeaconInterval, 30s); 0 or at least MinPeerTTL).
 	PeerTTL time.Duration `json:"peerTtl" yaml:"peer_ttl"`
 	// AllowScan permits POST /discovery/scan from the admin API.
 	AllowScan bool `json:"allowScan" yaml:"allow_scan"`

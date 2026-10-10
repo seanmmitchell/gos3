@@ -7,7 +7,7 @@
 import type { DropdownMenuItem, TabsItem } from '@nuxt/ui'
 import type { BrowserObjectEntry, BrowserRowAction } from '~/composables/useBrowserPaths'
 import type { HeadResult } from '~/types/s3'
-import type { S3Client } from '~/utils/s3/client'
+import { UNADDRESSABLE_KEY, type S3Client } from '~/utils/s3/client'
 import { S3Error } from '~/utils/s3/errors'
 
 const open = defineModel<boolean>('open', { required: true })
@@ -40,6 +40,11 @@ const isDeleteMarker = ref(false)
 const tab = ref('overview')
 
 const name = computed(() => baseName(props.objectKey))
+/**
+ * The key has '.' / '..' segments: it cannot be read through a URL, but it
+ * can still be copied, moved or deleted (key in a header / request body).
+ */
+const unaddressable = computed(() => error.value instanceof S3Error && error.value.code === UNADDRESSABLE_KEY)
 const versioned = computed(() => props.versioning === 'Enabled' || props.versioning === 'Suspended')
 
 let seq = 0
@@ -206,7 +211,7 @@ function onVersionsChanged(info: { deletedVersionId?: string }) {
           @click="emit('action', 'share', entry)"
         />
         <UDropdownMenu v-if="!readOnly" :items="moreMenu" :content="{ align: 'start' }">
-          <UButton icon="i-lucide-ellipsis" label="More" size="sm" color="neutral" variant="outline" :disabled="!head && !isDeleteMarker" />
+          <UButton icon="i-lucide-ellipsis" label="More" size="sm" color="neutral" variant="outline" :disabled="!head && !isDeleteMarker && !unaddressable" />
         </UDropdownMenu>
         <UBadge v-if="versionId" color="warning" variant="subtle" class="ml-auto" :title="versionId">
           Viewing version {{ truncateMiddle(versionId, 14) }}

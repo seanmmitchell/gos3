@@ -53,3 +53,20 @@ describe('renderMarkdown', () => {
     expect(renderMarkdown('`a*b*c` and snake_case_name')).toBe('<p><code>a*b*c</code> and snake_case_name</p>')
   })
 })
+
+describe('renderMarkdown link filter (review fix)', () => {
+  it('drops links that URL parsers turn into javascript: URLs', () => {
+    for (const c of ['\u0001', '\u0008', '\u000e', '\u001f', '\u007f']) {
+      const html = renderMarkdown(`[click](${c}javascript:alert(document.domain))`)
+      expect(html, JSON.stringify(c)).not.toContain('<a')
+      // What a browser would make of the href, had it been kept.
+      if (c < ' ') expect(new URL(`${c}javascript:alert(1)`, 'http://ui.local/').protocol).toBe('javascript:')
+    }
+    expect(renderMarkdown('[x](\\\\evil.example/a)')).not.toContain('<a')
+  })
+
+  it('keeps ordinary links', () => {
+    expect(renderMarkdown('[a](https://example.com/x?y=1&z=2) [b](docs/readme.md) [c](mailto:me@example.com)'))
+      .toBe('<p><a href="https://example.com/x?y=1&amp;z=2" target="_blank" rel="noopener noreferrer nofollow">a</a> <a href="docs/readme.md" target="_blank" rel="noopener noreferrer nofollow">b</a> <a href="mailto:me@example.com" target="_blank" rel="noopener noreferrer nofollow">c</a></p>')
+  })
+})

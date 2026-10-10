@@ -39,10 +39,17 @@ The server ID is random (16 hex chars), persisted in `<data>/.gos3/server-id`
 - Service type `_gos3._tcp`, domain `local.`.
 - Instance name: server name (sanitised to `[A-Za-z0-9-]`, ≤ 50 chars) + `-` + first 6 chars of ID.
 - Port: the S3 listener port. Host: OS hostname `.local.` with all non-loopback IPs.
+  SRV/A records and the `scheme` TXT value describe the listener itself (its
+  port and scheme at the interface IPs), never `server.public_url`, which
+  may point at another host and port.
 - TXT records: `id=<id>`, `name=<name>`, `v=<version>`, `api=v1`,
   `region=<region>`, `scheme=http|https`, `info=/_gos3/info`.
 - Browsing: query every 30 s (3 s listen window). Candidate URL =
-  `<scheme>://<ip>:<port>` for each address (IPv4 preferred).
+  `<scheme>://<ip>:<port>` for each address (IPv4 preferred). Only addresses
+  on a directly connected subnet (or on this host) are probed; answers that
+  point elsewhere are ignored.
+- Peer names have control characters (C0, DEL, C1), bidi controls and line
+  or paragraph separators stripped.
 
 ## 3. UDP multicast beacon
 
@@ -73,9 +80,23 @@ or unavailable, and that the standalone UI's Node server speaks too.
 {"proto":"gos3-beacon/1","type":"bye","id":"…"}
 ```
 
-Receivers ignore their own ID. Wildcard and loopback hosts in `urls` (and an
-empty `urls`) are replaced by the datagram's source IP plus the advertised
-port. Queriers should send from an ephemeral UDP socket and listen on it for
+Receivers ignore their own ID. Because nothing in a datagram is
+authenticated, a server only ever probes the sender:
+
+- Datagrams are accepted only from senders on this host or on a directly
+  connected subnet (beacons never cross a router legitimately).
+- The host of every announced URL is replaced by the datagram's source IP,
+  keeping the scheme and port. Only a sender on this host may announce
+  loopback and local addresses, which are then kept as they are. Host names
+  in announces are never resolved. An empty `urls` means the source IP with
+  the default port.
+- Announces are rate-limited per sender: a burst of 32, then 4 per second.
+- Unicast replies to queries are sent with TTL 1.
+- A `bye` is believed only when it comes from one of the peer's known
+  addresses; otherwise a verified peer is re-probed instead of being marked
+  unhealthy.
+
+Queriers should send from an ephemeral UDP socket and listen on it for
 the unicast replies; servers do the same, so replies are never delivered to
 another process bound to the group port. Unknown JSON fields are ignored so
 later versions can add fields; everything else is strict (one JSON object,
@@ -125,13 +146,16 @@ scan. The server's own address is probed but left out of `found`.
   `scan` and `probe` (admin API probe). `verified` is false for a sighting
   that has not been confirmed through `/_gos3/info` yet; treat it as a hint.
 - `firstSeen` / `lastSeen` per peer; `healthy` reflects the latest probe. A
-  `bye` beacon or a failed probe marks the peer unhealthy; an address that now
-  answers with a different ID marks it unhealthy too.
+  `bye` beacon from one of the peer's addresses or a failed probe marks the
+  peer unhealthy; an address that now answers with a different ID marks it
+  unhealthy too. A failed probe of an unverified sighting never marks a
+  verified peer unhealthy.
 - Probes use `GET <base>/_gos3/info` with a 5 s timeout and a 64 KiB limit;
   they never use HTTP proxies or follow redirects, and HTTPS certificates are
   verified (a peer with a self-signed certificate stays unverified with a TLS
   error).
-- The table holds at most 4096 peers (unverified sightings are evicted first)
+- The table holds at most 4096 peers (unverified sightings are evicted first),
+  of which at most 256 unverified ones (a new sighting replaces the stalest),
   and at most 32 addresses per peer.
 - Verified peers are re-probed every 30 s; peers not seen (no sighting and no
   successful probe) for `peerTtl` are removed. Seeds are never removed.
@@ -146,4 +170,6 @@ scan. The server's own address is probed but left out of `found`.
   still requires credentials.
 - Scans are opt-in (`allowScan`) and require `admin:ScanNetwork`.
 - Disable all advertising with `discovery.advertise: false` or the whole
-  subsystem with `discovery.enabled: false`.
+  subsystem with `discovery.enabled: false`. `publicInfo: false` only
+  protects `/_gos3/info`: beacon and mDNS announcements still carry the ID,
+  name, version, region and URLs unless `advertise` is off too.

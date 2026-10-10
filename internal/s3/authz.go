@@ -44,6 +44,12 @@ type authzTarget struct {
 // authorizeOp authorizes the request's primary resource with the
 // operation's IAM action.
 func (s *Server) authorizeOp(ctx context.Context, r *http.Request, rc *reqContext) error {
+	return s.authorizeOpWith(ctx, r, rc, nil)
+}
+
+// authorizeOpWith is authorizeOp with extra condition keys, for handlers
+// (AuthzByHandler) whose condition keys come from the request body.
+func (s *Server) authorizeOpWith(ctx context.Context, r *http.Request, rc *reqContext, conds map[string][]string) error {
 	op := rc.op
 	v := rc.versionID()
 	t := authzTarget{
@@ -51,6 +57,7 @@ func (s *Server) authorizeOp(ctx context.Context, r *http.Request, rc *reqContex
 		VersionID:      v,
 		ObjectRead:     op.ObjectRead,
 		NoBucketLookup: op.NoBucketLookup,
+		Conditions:     conds,
 	}
 	switch op.Kind {
 	case resBucket:

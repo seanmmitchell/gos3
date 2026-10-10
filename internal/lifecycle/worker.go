@@ -579,6 +579,15 @@ func (p *pass) processKey(ctx context.Context, vs []storage.ObjectInfo) {
 		// be handled by the next pass.
 		return
 	}
+	for i := 1; i < len(vs); i++ {
+		if vs[i].IsLatest {
+			// A second "latest" entry: newer versions were removed while
+			// the walk read the key (e.g. its delete marker was deleted to
+			// restore it), so vs[1:] are not all noncurrent. Leave the key
+			// to the next pass.
+			return
+		}
+	}
 	remaining := len(vs)
 	for i := 1; i < len(vs); i++ {
 		v := &vs[i]
@@ -588,7 +597,7 @@ func (p *pass) processKey(ctx context.Context, vs []storage.ObjectInfo) {
 		if r == nil {
 			continue
 		}
-		switch p.deleteVersion(ctx, v, r, "noncurrent version expired") {
+		switch p.deleteVersion(ctx, v, false, r, "noncurrent version expired") {
 		case versionDeleted:
 			p.st.NoncurrentExpired++
 			remaining--
@@ -609,7 +618,7 @@ func (p *pass) processKey(ctx context.Context, vs []storage.ObjectInfo) {
 	if r == nil || !p.onlyVersion(ctx, cur) {
 		return
 	}
-	if p.deleteVersion(ctx, cur, r, "expired object delete marker removed") == versionDeleted {
+	if p.deleteVersion(ctx, cur, true, r, "expired object delete marker removed") == versionDeleted {
 		p.st.DeleteMarkersRemoved++
 	}
 }
@@ -678,9 +687,10 @@ const (
 )
 
 // deleteVersion permanently removes the version v after re-checking that
-// it is unchanged since the walk (in particular that a noncurrent version
-// has not become the latest) and not protected by object lock.
-func (p *pass) deleteVersion(ctx context.Context, v *storage.ObjectInfo, r *compiledRule, msg string) deleteOutcome {
+// it is unchanged since the walk, that it is (latest) or is not (!latest)
+// the key's latest version, so a noncurrent version that has become the
+// latest is never deleted, and that it is not protected by object lock.
+func (p *pass) deleteVersion(ctx context.Context, v *storage.ObjectInfo, latest bool, r *compiledRule, msg string) deleteOutcome {
 	b := p.w.backend
 	fresh, err := b.GetObjectInfo(ctx, p.bucket.Name, v.Key, v.VersionID)
 	switch {
@@ -692,7 +702,7 @@ func (p *pass) deleteVersion(ctx context.Context, v *storage.ObjectInfo, r *comp
 		}
 		return versionKept
 	}
-	if fresh.IsLatest != v.IsLatest || fresh.DeleteMarker != v.DeleteMarker || !fresh.LastModified.Equal(v.LastModified) {
+	if fresh.IsLatest != latest || v.IsLatest != latest || fresh.DeleteMarker != v.DeleteMarker || !fresh.LastModified.Equal(v.LastModified) {
 		return versionKept // changed since the walk; the next pass decides
 	}
 	if Protected(fresh, p.now) {

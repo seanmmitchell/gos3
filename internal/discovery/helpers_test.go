@@ -6,6 +6,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/netip"
 	"runtime"
 	"strings"
 	"sync"
@@ -229,7 +230,7 @@ func (r *recordSink) candidate(c candidate) {
 	r.mu.Unlock()
 }
 
-func (r *recordSink) bye(id string) {
+func (r *recordSink) bye(id string, _ netip.Addr) {
 	r.mu.Lock()
 	r.byes = append(r.byes, id)
 	r.mu.Unlock()

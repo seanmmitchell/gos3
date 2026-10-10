@@ -140,7 +140,7 @@ var opTable = []*opSpec{
 	{Name: "HeadObject", Action: "s3:GetObject", VersionAction: "s3:GetObjectVersion", Kind: resObject, ObjectRead: true, handler: (*Server).handleHeadObject},
 	{Name: "DeleteObject", Action: "s3:DeleteObject", VersionAction: "s3:DeleteObjectVersion", Kind: resObject, handler: (*Server).handleDeleteObject},
 	{Name: "GetObjectTagging", Action: "s3:GetObjectTagging", VersionAction: "s3:GetObjectVersionTagging", Kind: resObject, handler: (*Server).handleGetObjectTagging},
-	{Name: "PutObjectTagging", Action: "s3:PutObjectTagging", VersionAction: "s3:PutObjectVersionTagging", Kind: resObject, handler: (*Server).handlePutObjectTagging},
+	{Name: "PutObjectTagging", Action: "s3:PutObjectTagging", VersionAction: "s3:PutObjectVersionTagging", Kind: resObject, AuthzByHandler: true, handler: (*Server).handlePutObjectTagging},
 	{Name: "DeleteObjectTagging", Action: "s3:DeleteObjectTagging", VersionAction: "s3:DeleteObjectVersionTagging", Kind: resObject, handler: (*Server).handleDeleteObjectTagging},
 	{Name: "GetObjectAcl", Action: "s3:GetObjectAcl", VersionAction: "s3:GetObjectVersionAcl", Kind: resObject, handler: (*Server).handleGetObjectAcl},
 	{Name: "PutObjectAcl", Action: "s3:PutObjectAcl", VersionAction: "s3:PutObjectVersionAcl", Kind: resObject, handler: (*Server).handlePutObjectAcl},

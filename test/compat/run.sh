@@ -25,9 +25,15 @@ log() { printf '==> %s\n' "$*" >&2; }
 
 # --- Python environment (outside the repository) -----------------------------
 stamp="$venv/.gos3-requirements"
-if [[ ! -x "$venv/bin/python" ]] || ! cmp -s "$here/requirements.txt" "$stamp"; then
+# A venv links to its interpreter's absolute path: after a Python upgrade
+# the links dangle, and only --clear recreates them.
+if ! "$venv/bin/python" -c '' 2>/dev/null || ! cmp -s "$here/requirements.txt" "$stamp"; then
+	if [[ -e "$venv" && ! -f "$venv/pyvenv.cfg" ]]; then
+		log "$venv exists but is not a venv; refusing to clear it (set GOS3_COMPAT_VENV)"
+		exit 1
+	fi
 	log "creating venv $venv"
-	python3 -m venv "$venv"
+	python3 -m venv --clear "$venv"
 	"$venv/bin/python" -m pip install --quiet --upgrade pip
 	"$venv/bin/python" -m pip install --quiet -r "$here/requirements.txt"
 	cp "$here/requirements.txt" "$stamp"

@@ -36,6 +36,28 @@ Pages are shown according to the signed-in identity's permissions (from
 `GET /_gos3/admin/v1/whoami`). For example, Users appears only with
 `admin:CreateUser`.
 
+### Object browser notes
+
+- Listings use `encoding-type=url` (ListObjectsV2, ListObjectVersions and
+  ListMultipartUploads), so keys with any characters are shown correctly.
+- Keys with `.` or `..` path segments (for example `a/../b`, created by
+  other clients) cannot be read, previewed, downloaded, shared, tagged or
+  edited from the browser, because browsers resolve such segments in URLs.
+  The UI says so and still allows Copy, Move and Delete for them (their
+  links use `?key=` / `?prefix=`). The UI itself never creates such keys:
+  uploads, new folders, renames and copy/move destinations are validated.
+- Copy, move and rename refuse a destination inside the source folder, and
+  ask before overwriting existing objects at the destination (checked with
+  HeadObject for 20 objects or fewer, otherwise by listing the destination
+  prefix).
+- Move, rename and the metadata editor rewrite the object, and keep a canned
+  object ACL such as `public-read` (one extra GetObjectAcl per object; custom
+  grants produce a warning). Keeping the ACL needs `s3:PutObjectAcl` where
+  the server enforces it (gos3 and AWS do).
+- gos3 serves objects with `Content-Security-Policy: sandbox`, so an HTML or
+  SVG object opened from a gos3 bucket in a browser tab (a download or share
+  link) runs no scripts (see [security.md](security.md#object-responses)).
+
 ![Dashboard](screenshots/dashboard.png)
 
 ## Signing in and credentials
@@ -49,6 +71,9 @@ where `kind` is `gos3` or `s3`.
   Otherwise it is kept in `sessionStorage` and is gone when the tab closes.
   Use "remember" only on a trusted device.
 - Connections can be exported and imported as JSON, with or without secrets.
+- Several open tabs share connection changes (added, edited and removed
+  connections and remembered secrets). The active server and secrets kept
+  only for the session stay per tab.
 - Downloads and share links are presigned URLs (up to 7 days).
 
 ## Embedded mode
@@ -119,6 +144,7 @@ Other runtime variables of the Node server:
 | `NUXT_PUBLIC_SERVERS` | Preset connections (JSON array). |
 | `NUXT_PUBLIC_APP_NAME` | Display name (default `gos3`). |
 | `GOS3_UI_LOCAL_DISCOVERY` | `false` (also `0`, `off`, `no`, `disabled`) turns off the local discovery routes below. |
+| `GOS3_UI_ALLOWED_HOSTS` | Extra host names (comma separated) under which the discovery routes below answer, for example `console.example.com`. IP addresses, `localhost` and `*.localhost` are always accepted; `*` turns the check off. Set it whenever the UI is reached through a DNS name. |
 
 ### Local discovery routes
 
@@ -134,10 +160,24 @@ standalone Node server does this from the UI host:
 
 **The Node server has no authentication.** Anyone who can reach it can make it
 probe and scan, within the limits above. Bind it to a trusted interface, put it
-behind an authenticating proxy, or set `GOS3_UI_LOCAL_DISCOVERY=false`. POST
-routes require `Content-Type: application/json`, which a cross-site page cannot
-send without a CORS preflight that the server never approves, so they cannot be
-triggered by other websites.
+behind an authenticating proxy, or set `GOS3_UI_LOCAL_DISCOVERY=false`.
+
+Protection against other websites:
+
+- Against DNS rebinding (a site whose name later resolves to the UI host
+  becomes same-origin), every `/api/discovery/*` route answers 403 unless
+  the `Host` header is an IP address, `localhost` / `*.localhost`, or a name
+  listed in `GOS3_UI_ALLOWED_HOSTS` (comma separated; `*` turns the check
+  off). Opening the console through an unlisted host name hides local
+  discovery.
+- Requests with a foreign `Origin`, or with `Sec-Fetch-Site: cross-site` or
+  `same-site`, are refused too.
+- POST routes require `Content-Type: application/json`, which a cross-site
+  page cannot send without a CORS preflight that the server never approves.
+
+Probes read at most 64 KiB of an identity document (with or without
+`Content-Length`). Local discovery keeps at most 2048 mDNS records and 1024
+beacon candidates, and verifies at most 256 URLs.
 
 Multicast is often unavailable in containers (Kubernetes, Docker Desktop).
 Scans and probes still work there.

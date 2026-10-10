@@ -6,7 +6,6 @@ import (
 	"net/netip"
 	"regexp"
 	"slices"
-	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -78,28 +77,38 @@ func TestValidHostname(t *testing.T) {
 func TestBeaconCandidateURLs(t *testing.T) {
 	remote := &net.UDPAddr{IP: net.IPv4(10, 0, 0, 7), Port: 40000}
 	loop := &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 40000}
+	lan := &net.UDPAddr{IP: net.IPv4(192, 0, 2, 2), Port: 40000} // an address of this host
+	isLocal := func(ip netip.Addr) bool { return ip.IsLoopback() || ip == netip.MustParseAddr("192.0.2.2") }
 	tests := []struct {
 		name string
 		urls []string
 		src  net.Addr
 		want []string
 	}{
-		{"plain", []string{"http://10.0.0.5:9000"}, remote, []string{"http://10.0.0.5:9000"}},
-		{"dedup and normalise", []string{"http://10.0.0.5:9000/", "10.0.0.5:9000"}, remote, []string{"http://10.0.0.5:9000"}},
+		{"plain", []string{"http://10.0.0.7:9000"}, remote, []string{"http://10.0.0.7:9000"}},
+		{"dedup and normalise", []string{"http://10.0.0.7:9000/", "10.0.0.7:9000"}, remote, []string{"http://10.0.0.7:9000"}},
 		{"wildcard v4", []string{"http://0.0.0.0:9001"}, remote, []string{"http://10.0.0.7:9001"}},
 		{"wildcard v6", []string{"https://[::]:9443"}, remote, []string{"https://10.0.0.7:9443"}},
 		{"empty host", []string{"http://:9002"}, remote, []string{"http://10.0.0.7:9002"}},
 		{"loopback from remote", []string{"http://127.0.0.1:9003", "http://localhost:9003"}, remote, []string{"http://10.0.0.7:9003"}},
 		{"loopback from loopback kept", []string{"http://127.0.0.1:9003"}, loop, []string{"http://127.0.0.1:9003"}},
+		// A server bound to 127.0.0.1 on this host is heard with the
+		// interface address as the source (multicast loopback).
+		{"loopback from a local address kept", []string{"http://127.0.0.1:19402"}, lan, []string{"http://127.0.0.1:19402"}},
 		{"no urls", nil, remote, []string{"http://10.0.0.7:9000"}},
 		{"garbage only", []string{"::::", "ftp://x"}, remote, []string{"http://10.0.0.7:9000"}},
 		{"wildcard default port", []string{"https://0.0.0.0"}, remote, []string{"https://10.0.0.7:443"}},
 		{"no source", []string{"http://0.0.0.0:9000"}, nil, nil},
-		{"mixed", []string{"http://0.0.0.0:9000", "http://192.168.1.2:9000"}, remote, []string{"http://10.0.0.7:9000", "http://192.168.1.2:9000"}},
+		// The server only ever probes the sender: other hosts and names
+		// in an (unauthenticated) announce are replaced by the source IP.
+		{"other host", []string{"http://172.17.0.1:19999"}, remote, []string{"http://10.0.0.7:19999"}},
+		{"host name", []string{"https://evil.example.com:6379", "http://localhost:80"}, remote, []string{"https://10.0.0.7:6379", "http://10.0.0.7:80"}},
+		{"other host from loopback", []string{"http://10.0.0.9:6379"}, loop, []string{"http://127.0.0.1:6379"}},
+		{"mixed", []string{"http://0.0.0.0:9000", "http://192.168.1.2:9000", "http://10.0.0.7:9001"}, remote, []string{"http://10.0.0.7:9000", "http://10.0.0.7:9001"}},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got := beaconCandidateURLs(tt.urls, tt.src)
+			got := beaconCandidateURLs(tt.urls, tt.src, isLocal)
 			if !slices.Equal(got, tt.want) {
 				t.Errorf("got %q, want %q", got, tt.want)
 			}
@@ -108,9 +117,9 @@ func TestBeaconCandidateURLs(t *testing.T) {
 	// Bounded output.
 	var many []string
 	for i := range 100 {
-		many = append(many, baseURL("http", "10.1.0."+strconv.Itoa(i), 9000))
+		many = append(many, baseURL("http", "10.0.0.7", 9000+i))
 	}
-	if got := beaconCandidateURLs(many, remote); len(got) != maxBeaconURLs {
+	if got := beaconCandidateURLs(many, remote, isLocal); len(got) != maxBeaconURLs {
 		t.Errorf("got %d urls, want %d", len(got), maxBeaconURLs)
 	}
 }
@@ -232,6 +241,7 @@ func TestConfigValidate(t *testing.T) {
 		func(c *Config) { c.BeaconInterval = time.Millisecond },
 		func(c *Config) { c.BeaconInterval = 2 * time.Hour },
 		func(c *Config) { c.PeerTTL = -time.Second },
+		func(c *Config) { c.PeerTTL = 5 * time.Second }, // silently raised to 30s before
 		func(c *Config) { c.MaxScanHosts = -1 },
 		func(c *Config) { c.MaxScanHosts = MaxScanHostsLimit + 1 },
 		func(c *Config) { c.Seeds = []string{"ftp://x"} },
@@ -259,7 +269,7 @@ func TestResolveDefaults(t *testing.T) {
 	if !slices.Equal(e.seeds, []string{"http://a:1"}) || !slices.Equal(e.domains, []string{"example.com"}) {
 		t.Errorf("lists: %q %q", e.seeds, e.domains)
 	}
-	if e := resolve(Config{BeaconInterval: 2 * time.Second}); e.ttl != minPeerTTL {
+	if e := resolve(Config{BeaconInterval: 2 * time.Second}); e.ttl != MinPeerTTL {
 		t.Errorf("min ttl: %v", e.ttl)
 	}
 	if e := resolve(Config{PeerTTL: 5 * time.Minute}); e.ttl != 5*time.Minute {

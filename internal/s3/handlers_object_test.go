@@ -568,9 +568,29 @@ func TestObjectGetPartNumber(t *testing.T) {
 	objExpect(t, e.signed("GET", "/bkt/mp?partNumber=x", nil, nil), 400, "InvalidArgument")
 	objExpect(t, e.signed("GET", "/bkt/mp?partNumber=1", nil, objHdr("Range", "bytes=0-1")), 400, "InvalidRequest")
 
+	// Part 1 of a single-part object is the whole object, served like a
+	// ranged GET (206 + Content-Range, as S3 does).
 	resp = e.signed("GET", "/bkt/single?partNumber=1", nil, nil)
-	if resp.StatusCode != 200 || string(resp.Data) != string(data) {
-		t.Errorf("single part 1: %d %q", resp.StatusCode, resp.Data)
+	if resp.StatusCode != 206 || string(resp.Data) != string(data) || resp.Header.Get("Content-Range") != "bytes 0-9/10" ||
+		resp.Header.Get("Content-Length") != "10" {
+		t.Errorf("single part 1: %d %q %v", resp.StatusCode, resp.Data, resp.Header)
+	}
+	resp = e.signed("HEAD", "/bkt/single?partNumber=1", nil, nil)
+	if resp.StatusCode != 206 || resp.Header.Get("Content-Range") != "bytes 0-9/10" {
+		t.Errorf("HEAD single part 1: %d %v", resp.StatusCode, resp.Header)
+	}
+	// Empty parts and objects never produce a 206 without Content-Range.
+	e.putObject("bkt", "mp-empty-last", data[:5], storage.ObjectMeta{
+		ETag: "0123456789abcdef0123456789abcdef-2", PartSizes: []int64{5, 0},
+	})
+	e.putObject("bkt", "empty", nil, storage.ObjectMeta{})
+	for _, p := range []string{"/bkt/mp-empty-last?partNumber=2", "/bkt/empty?partNumber=1"} {
+		for _, m := range []string{"GET", "HEAD"} {
+			resp = e.signed(m, p, nil, nil)
+			if resp.StatusCode != 200 || resp.Header.Get("Content-Length") != "0" || resp.Header.Get("Content-Range") != "" || len(resp.Data) != 0 {
+				t.Errorf("%s %s: %d %v", m, p, resp.StatusCode, resp.Header)
+			}
+		}
 	}
 	objExpect(t, e.signed("GET", "/bkt/single?partNumber=2", nil, nil), 416, "InvalidPartNumber")
 

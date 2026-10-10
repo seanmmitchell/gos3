@@ -160,9 +160,7 @@ func (s *Server) handleCreateMultipartUpload(w http.ResponseWriter, r *http.Requ
 	if err != nil {
 		return err
 	}
-	acl := h.Get("X-Amz-Acl")
-	if err := s.prepareNewObject(ctx, r, rc, bi, rc.key, &meta,
-		h.Get("X-Amz-Object-Lock-Legal-Hold") != "", acl, acl != ""); err != nil {
+	if err := s.prepareNewObject(ctx, r, rc, bi, rc.key, &meta, headerObjectOpts(h)); err != nil {
 		return err
 	}
 	meta.Checksums, meta.ChecksumType = nil, ""

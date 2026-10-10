@@ -22,7 +22,7 @@ const (
 	MaxListEntries      = 256
 	MaxURLLen           = 2048
 	MaxCORSMaxAge       = 7 * 24 * 3600
-	MinPeerTTL          = time.Second
+	MinPeerTTL          = discovery.MinPeerTTL
 	MaxPeerTTL          = 7 * 24 * time.Hour
 	MaxScanHosts        = 65536
 	MinLifecycleSeconds = 60
@@ -75,7 +75,9 @@ func validateSettings(s *Settings) *FieldError {
 		return fieldErr("region", "%q is invalid (expected lowercase letters, digits and hyphens, e.g. \"us-east-1\")", s.Region)
 	}
 	if s.PublicURL != "" {
-		if err := ValidateBaseURL(s.PublicURL, true); err != nil {
+		// No path: the advertised endpoints (and SigV4, which signs the
+		// path) assume the API is at the root of the public URL.
+		if err := ValidateBaseURL(s.PublicURL, false); err != nil {
 			return fieldErr("publicUrl", "%v", err)
 		}
 	}

@@ -75,7 +75,23 @@ type Server struct {
 	// handlerOverride lets tests replace operation handlers; nil in
 	// production.
 	handlerOverride func(op string) handlerFunc
+
+	// Request body timeouts (see countingBody); tests shorten them.
+	bodyIdleTimeout     time.Duration // a stalled body read fails with RequestTimeout
+	unreadBodyGrace     time.Duration // draining a body the handler did not read
+	postPreambleTimeout time.Duration // PostObject form fields before the policy is verified
 }
+
+// Default request body timeouts. AWS answers RequestTimeout after about
+// 20 s without data; gos3 is more tolerant of slow links. The unread rest
+// of a rejected request's body and PostObject's form fields (its client is
+// not authenticated until they have been read) must arrive within a fixed
+// time.
+const (
+	defaultBodyIdleTimeout     = 60 * time.Second
+	defaultUnreadBodyGrace     = 10 * time.Second
+	defaultPostPreambleTimeout = 60 * time.Second
+)
 
 var _ http.Handler = (*Server)(nil)
 
@@ -107,6 +123,10 @@ func New(opts Options) *Server {
 		trustProxy:    opts.TrustProxyHeaders,
 		now:           opts.Now,
 		configs:       newConfigCache(defaultConfigCacheSize),
+
+		bodyIdleTimeout:     defaultBodyIdleTimeout,
+		unreadBodyGrace:     defaultUnreadBodyGrace,
+		postPreambleTimeout: defaultPostPreambleTimeout,
 	}
 	if s.settings == nil {
 		s.settings = config.NewStore(config.Settings{Region: defaultRegion}, "")

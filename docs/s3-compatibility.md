@@ -14,7 +14,7 @@ supported, operation by operation, and where gos3 differs from AWS.
 |---|---|---|
 | Path-style URLs (`http://host:9000/bucket/key`) | ✅ | Always available. Use this with clients that need it (`forcePathStyle`, `addressing_style = path`). |
 | Virtual-hosted-style URLs (`bucket.s3.example.com`) | ✅ | Needs `server.domains` and wildcard DNS (and a wildcard certificate for TLS). The longest matching domain wins; the port is ignored. |
-| Signature Version 4, `Authorization` header | ✅ | Payload as hex SHA-256 or `UNSIGNED-PAYLOAD`. Allowed clock skew is 15 minutes. Signature comparison is constant-time. |
+| Signature Version 4, `Authorization` header | ✅ | Payload as hex SHA-256 or `UNSIGNED-PAYLOAD`. Allowed clock skew is 15 minutes. Signature comparison is constant-time. `SignedHeaders` listing a header twice is rejected (`AuthorizationHeaderMalformed`, or `AuthorizationQueryParametersError` for presigned URLs). `SignatureDoesNotMatch` echoes at most 16 KiB of `StringToSign` and `CanonicalRequest`. A signed `Expect: 100-continue` header also verifies over HTTP/2 (Go's HTTP/2 server removes that header before gos3 sees it). |
 | SigV4 streaming (`aws-chunked`) | ✅ | `STREAMING-AWS4-HMAC-SHA256-PAYLOAD`, `…-PAYLOAD-TRAILER` and `STREAMING-UNSIGNED-PAYLOAD-TRAILER` (the default of current AWS SDKs). Trailing checksums are verified. AWS's 8 KiB minimum chunk size is not enforced. |
 | Presigned URLs (SigV4 query) | ✅ | `X-Amz-Expires` up to 7 days. |
 | Browser POST uploads (POST policy) | ✅ | V4 form fields, every policy condition including `content-length-range`, `${filename}`, `success_action_redirect` / `success_action_status`. |
@@ -68,18 +68,18 @@ HEAD errors have no body. Unknown query parameters are ignored, as on AWS.
 
 | Operation | Status | Notes |
 |---|---|---|
-| PutObject | ✅ | `Content-MD5`, `x-amz-checksum-*` (header or trailer), user metadata (≤ 2 KiB), `x-amz-tagging`, canned `x-amz-acl`, storage class (recorded only), object lock headers, `x-amz-website-redirect-location`, standard content headers. Conditional writes: `If-None-Match: *` and `If-Match: <etag>`, checked atomically. Size limit `server.max_object_size` (5 GiB). |
-| GetObject | ✅ | `Range` (single range), `partNumber`, conditional headers (`If-Match`, `If-None-Match`, `If-Modified-Since`, `If-Unmodified-Since`), `response-*` overrides (signed requests only), `versionId`, `x-amz-checksum-mode: ENABLED`. |
+| PutObject | ✅ | `Content-MD5`, `x-amz-checksum-*` (header or trailer), user metadata (≤ 2 KiB), `x-amz-tagging`, canned `x-amz-acl`, storage class (recorded only), object lock headers, `x-amz-website-redirect-location`, standard content headers. Conditional writes: `If-None-Match: *` and `If-Match: <etag>`, checked atomically. Size limit `server.max_object_size` (5 GiB). An ACL needs `s3:PutObjectAcl` and tags need `s3:PutObjectTagging` in addition to `s3:PutObject` (see [Authorization](#authorization)). |
+| GetObject | ✅ | `Range` (single range), `partNumber`, conditional headers (`If-Match`, `If-None-Match`, `If-Modified-Since`, `If-Unmodified-Since`, `If-Range` with a strong ETag or the exact `Last-Modified`; a mismatch serves the whole object with 200), `response-*` overrides (signed requests only), `versionId`, `x-amz-checksum-mode: ENABLED`. `partNumber=1` on a single-part object returns 206 with `Content-Range`; an empty part returns an empty 200. Responses carry `X-Content-Type-Options: nosniff` and, except for PDFs, `Content-Security-Policy: sandbox` (see [security.md](security.md#object-responses)). |
 | HeadObject | ✅ | Same as GetObject without a body. |
 | DeleteObject | ✅ | Versioning semantics (delete markers), `x-amz-bypass-governance-retention`, `If-Match`. |
 | DeleteObjects | ✅ | Up to 1000 keys, `Quiet` mode, per-key `ETag` condition, object lock checks. |
-| CopyObject | ✅ | Versioned sources, `x-amz-copy-source-if-*`, `x-amz-metadata-directive` / `x-amz-tagging-directive` (COPY / REPLACE), checksum recomputation. |
+| CopyObject | ✅ | Versioned sources, `x-amz-copy-source-if-*`, `x-amz-metadata-directive` / `x-amz-tagging-directive` (COPY / REPLACE), checksum recomputation. Like UploadPartCopy and CompleteMultipartUpload, a copy that takes longer than about 5 s sends `200` early with whitespace keep-alives and may then report an `<Error>` inside the 200 body, as AWS does; the copy stops when the client disconnects. An ACL or `REPLACE` tags need `s3:PutObjectAcl` / `s3:PutObjectTagging`. |
 | GetObjectAttributes | ✅ | ETag, Checksum, ObjectParts (paged), StorageClass, ObjectSize. |
-| Get/Put/DeleteObjectTagging | ✅ | Up to 10 tags; version-aware. |
+| Get/Put/DeleteObjectTagging | ✅ | Up to 10 tags; version-aware. PutObjectTagging evaluates `s3:RequestObjectTag/<key>` and `s3:RequestObjectTagKeys` from the XML body. |
 | Get/PutObjectAcl | 🟡 | Canned ACLs only (see bucket `?acl`). |
 | Get/PutObjectRetention | ✅ | GOVERNANCE (with bypass) and COMPLIANCE (can only be extended). |
 | Get/PutObjectLegalHold | ✅ | |
-| PostObject (browser form upload) | ✅ | See [Addressing, protocol and authentication](#addressing-protocol-and-authentication). |
+| PostObject (browser form upload) | ✅ | See [Addressing, protocol and authentication](#addressing-protocol-and-authentication). The `acl` and `tagging` fields need `s3:PutObjectAcl` / `s3:PutObjectTagging` (with the request tag condition keys from `tagging`). Form fields before the file must arrive within 60 s. |
 | RestoreObject | ❌ | There are no archive tiers. |
 | SelectObjectContent | ❌ | |
 | Server-side encryption with customer keys (SSE-C) | ❌ | Requests with SSE-C headers get `NotImplemented`. |
@@ -88,7 +88,7 @@ HEAD errors have no body. Unknown query parameters are ignored, as on AWS.
 
 | Operation | Status | Notes |
 |---|---|---|
-| CreateMultipartUpload | ✅ | Metadata, tags, ACL, storage class, object lock and SSE headers carry over to the object. `x-amz-checksum-algorithm` and `x-amz-checksum-type` (COMPOSITE / FULL_OBJECT). |
+| CreateMultipartUpload | ✅ | Metadata, tags, ACL, storage class, object lock and SSE headers carry over to the object. `x-amz-checksum-algorithm` and `x-amz-checksum-type` (COMPOSITE / FULL_OBJECT). An ACL or tags need `s3:PutObjectAcl` / `s3:PutObjectTagging`. |
 | UploadPart | ✅ | Part numbers 1–10000, parts up to 5 GiB, checksum validation. |
 | UploadPartCopy | ✅ | `x-amz-copy-source-range`, versioned sources, copy-source conditions. |
 | CompleteMultipartUpload | ✅ | Every part except the last must be at least 5 MiB. Multipart ETag `md5(part md5s)-N`. Composite or full-object checksums. `If-None-Match` / `If-Match`. Total size up to 5 TiB. Slow completions send whitespace keep-alives, as AWS does. |
@@ -124,8 +124,15 @@ ListObjectsV2, ListParts and GetObjectAttributes.
 - **Bucket policies** are evaluated together with identity policies, and an
   explicit Deny wins (except for root). Supported condition keys include
   `aws:SourceIp`, `aws:SecureTransport`, `aws:username`, `aws:CurrentTime`,
-  `s3:prefix`, `s3:delimiter`, `s3:max-keys`, `s3:x-amz-acl`, `s3:VersionId`
-  and `s3:ExistingObjectTag/<key>`.
+  `s3:prefix`, `s3:delimiter`, `s3:max-keys`, `s3:x-amz-acl`, `s3:VersionId`,
+  `s3:ExistingObjectTag/<key>`, and `s3:RequestObjectTag/<key>` /
+  `s3:RequestObjectTagKeys` (PutObject, CopyObject, CreateMultipartUpload,
+  PostObject and PutObjectTagging).
+- Writing an object with an ACL (`x-amz-acl`, or the `acl` form field of
+  PostObject) also requires `s3:PutObjectAcl`, and writing it with tags
+  (`x-amz-tagging`, CopyObject's `REPLACE` tagging directive, or the
+  `tagging` form field) also requires `s3:PutObjectTagging`, as on AWS. The
+  built-in `writeonly` policy therefore cannot upload with an ACL or tags.
 - IAM actions follow AWS (for example `s3:GetObjectVersion` when `versionId` is
   given, and `s3:ListBucket` for HeadBucket). Admin API actions are
   `admin:<Action>` on resource `arn:gos3:admin:::*` (see
@@ -156,9 +163,20 @@ ListObjectsV2, ListParts and GetObjectAttributes.
 - **Storage classes** are accepted and reported but have no effect.
 - **No replication between gos3 servers.** Every server stores its own data.
   Discovery only finds servers; it does not cluster them.
-- With slow CompleteMultipartUpload calls (over 5 s), `x-amz-version-id` and
-  `x-amz-expiration` are sent as HTTP trailers because the status line has
-  already gone out. SDKs then do not report them.
+- With slow CopyObject and CompleteMultipartUpload calls (over about 5 s),
+  `x-amz-version-id` and `x-amz-expiration` are sent as HTTP trailers because
+  the status line has already gone out. SDKs then do not report them.
+- Object keys containing characters that are invalid in XML 1.0 (C0 control
+  characters other than tab, LF and CR) appear as U+FFFD in XML responses:
+  listings without `encoding-type=url`, DeleteObjects results and the `Key`
+  element of errors. Use `encoding-type=url` for such keys (the web UI always
+  does for ListObjectsV2, ListObjectVersions and ListMultipartUploads).
+- Request bodies that send no data for 60 s fail with `400 RequestTimeout`.
+  On HTTP/1.1 the unread body of a rejected request is drained for at most
+  10 s and 256 KiB; otherwise the response carries `Connection: close`. These
+  limits are fixed.
+- An upload aborted by the client is recorded in the access log with status
+  `499` and `client_aborted=true`.
 - **Root bypasses bucket policies.** The root credentials are never subject to
   a bucket policy, so an explicit `Deny` does not lock root out (on AWS it
   applies to the account root too). Use IAM users for everyday access.

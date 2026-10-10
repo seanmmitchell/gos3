@@ -53,7 +53,14 @@ function parseCommonPrefixes(root: Element): CommonPrefix[] {
 function decoder(root: Element): (s: string | undefined) => string | undefined {
   const enc = text(root, 'EncodingType')
   if (enc !== 'url') return s => s
-  return s => (s === undefined ? s : decodeURIComponent(s.replace(/\+/g, ' ')))
+  return (s) => {
+    if (s === undefined) return s
+    try {
+      return decodeURIComponent(s.replace(/\+/g, ' '))
+    } catch {
+      return s // malformed escape (not valid UTF-8): keep the raw value
+    }
+  }
 }
 
 export function parseListBuckets(body: string): ListBucketsResult {
@@ -181,7 +188,7 @@ export function parseListMultipartUploads(body: string): ListMultipartUploadsRes
   return {
     bucket: text(root, 'Bucket') ?? '',
     prefix: optional(dec(text(root, 'Prefix'))),
-    delimiter: optional(text(root, 'Delimiter')),
+    delimiter: optional(dec(text(root, 'Delimiter'))),
     keyMarker: optional(dec(text(root, 'KeyMarker'))),
     uploadIdMarker: optional(text(root, 'UploadIdMarker')),
     nextKeyMarker: optional(dec(text(root, 'NextKeyMarker'))),
@@ -197,7 +204,7 @@ export function parseListMultipartUploads(body: string): ListMultipartUploadsRes
       owner: parseOwner(child(u, 'Owner')),
       checksumAlgorithm: optional(text(u, 'ChecksumAlgorithm'))
     })),
-    commonPrefixes: parseCommonPrefixes(root)
+    commonPrefixes: parseCommonPrefixes(root).map(p => ({ prefix: dec(p.prefix) ?? '' }))
   }
 }
 

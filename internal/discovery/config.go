@@ -23,8 +23,10 @@ const (
 	MaxBeaconInterval = time.Hour
 	// DefaultMaxScanHosts is used when Config.MaxScanHosts is 0.
 	DefaultMaxScanHosts = 1024
-	// minPeerTTL is the smallest effective peer TTL.
-	minPeerTTL = 30 * time.Second
+	// MinPeerTTL is the smallest accepted (and effective) Config.PeerTTL:
+	// verified peers are re-probed every 30 s and announce themselves
+	// every beacon interval, so a shorter TTL would drop live peers.
+	MinPeerTTL = 30 * time.Second
 )
 
 // ErrInvalidConfig is returned (wrapped) by Config.Validate.
@@ -46,8 +48,8 @@ func (c Config) Validate() error {
 	if c.BeaconInterval < 0 || (c.BeaconInterval > 0 && (c.BeaconInterval < MinBeaconInterval || c.BeaconInterval > MaxBeaconInterval)) {
 		return bad("beaconInterval must be between %s and %s (or 0 for the default)", MinBeaconInterval, MaxBeaconInterval)
 	}
-	if c.PeerTTL < 0 {
-		return bad("peerTtl must not be negative")
+	if c.PeerTTL < 0 || (c.PeerTTL > 0 && c.PeerTTL < MinPeerTTL) {
+		return bad("peerTtl must be at least %s (or 0 for the default)", MinPeerTTL)
 	}
 	if c.MaxScanHosts < 0 || c.MaxScanHosts > MaxScanHostsLimit {
 		return bad("maxScanHosts must be between 0 and %d", MaxScanHostsLimit)
@@ -120,7 +122,7 @@ func resolve(c Config) effective {
 	if e.ttl <= 0 {
 		e.ttl = 3 * e.interval
 	}
-	e.ttl = max(e.ttl, minPeerTTL)
+	e.ttl = max(e.ttl, MinPeerTTL) // the default 3×interval may be shorter
 	e.maxHosts = c.MaxScanHosts
 	if e.maxHosts <= 0 {
 		e.maxHosts = DefaultMaxScanHosts

@@ -7,7 +7,9 @@ import (
 	"log"
 	"log/slog"
 	"net"
+	"net/netip"
 	"os"
+	"slices"
 	"strings"
 	"time"
 
@@ -87,17 +89,13 @@ func buildMDNSZone(info Info) (*mdns.MDNSService, string, error) {
 	if !validID(info.ID) {
 		return nil, "", errors.New("server ID unknown")
 	}
-	base := info.Endpoints.S3
-	if base == "" && len(info.Endpoints.All) > 0 {
-		base = info.Endpoints.All[0]
-	}
-	scheme, port, ok := portOf(base)
-	if !ok {
-		return nil, "", errors.New("no S3 endpoint URL to advertise")
-	}
 	addrs := interfaceIPs(true)
 	if len(addrs) == 0 {
 		return nil, "", errors.New("no non-loopback interface address")
+	}
+	scheme, port, ok := portOf(mdnsBaseURL(info, addrs))
+	if !ok {
+		return nil, "", errors.New("no S3 endpoint URL to advertise")
 	}
 	ips := make([]net.IP, 0, len(addrs))
 	for _, a := range addrs {
@@ -124,6 +122,28 @@ func buildMDNSZone(info Info) (*mdns.MDNSService, string, error) {
 	}
 	key := fmt.Sprintf("%s|%s|%d|%v|%s", instance, host, port, addrs, strings.Join(txt, "|"))
 	return svc, key, nil
+}
+
+// mdnsBaseURL picks the endpoint whose scheme and port the mDNS records
+// advertise together with the interface addresses addrs: the first endpoint
+// served directly at one of those addresses (the listener), not
+// Endpoints.S3, which is server.public_url when one is set and may live on
+// another host and port (e.g. https on 443 at a reverse proxy). Without
+// such an endpoint it falls back to Endpoints.S3, then Endpoints.All[0].
+func mdnsBaseURL(info Info, addrs []netip.Addr) string {
+	for _, u := range append(slices.Clone(info.Endpoints.All), info.Endpoints.S3) {
+		_, host, _, ok := urlHostPort(u)
+		if !ok {
+			continue
+		}
+		if ip, err := netip.ParseAddr(strings.Trim(host, "[]")); err == nil && slices.Contains(addrs, ip.Unmap()) {
+			return u
+		}
+	}
+	if info.Endpoints.S3 != "" || len(info.Endpoints.All) == 0 {
+		return info.Endpoints.S3
+	}
+	return info.Endpoints.All[0]
 }
 
 // mdnsAdvertiser keeps an mDNS responder in sync with the server's Info.
@@ -227,7 +247,18 @@ func mdnsQuery(ctx context.Context, timeout time.Duration, logger *slog.Logger, 
 	go func() {
 		defer close(done)
 		for e := range entries {
-			if c, ok := mdnsCandidate(e, selfID); ok {
+			c, ok := mdnsCandidate(e, selfID)
+			if !ok {
+				continue
+			}
+			// Like beacons, mDNS answers are unauthenticated and
+			// link-local: only probe addresses on this host's links.
+			c.urls = slices.DeleteFunc(c.urls, func(u string) bool {
+				_, host, _, ok := urlHostPort(u)
+				ip, err := netip.ParseAddr(host)
+				return !ok || err != nil || !hostNets.onLink(ip)
+			})
+			if len(c.urls) > 0 {
 				out.candidate(c)
 			}
 		}

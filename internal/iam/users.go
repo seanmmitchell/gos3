@@ -111,6 +111,9 @@ func (m *Manager) createUser(ctx context.Context, spec UserSpec) (User, error) {
 	if !validName(spec.Name, maxUserNameLen) {
 		return User{}, wrapf(ErrInvalidName, "user names must be 1-64 characters of [A-Za-z0-9+=,.@_-]")
 	}
+	if isDotSegment(spec.Name) {
+		return User{}, wrapf(ErrInvalidName, fmt.Sprintf("user name %q is not allowed", spec.Name))
+	}
 	if err := checkDescription(spec.Description); err != nil {
 		return User{}, err
 	}
@@ -358,6 +361,9 @@ func (m *Manager) putPolicy(ctx context.Context, name, description string, doc P
 	}
 	if !validName(name, maxPolicyNameLen) {
 		return NamedPolicy{}, wrapf(ErrInvalidName, "policy names must be 1-128 characters of [A-Za-z0-9+=,.@_-]")
+	}
+	if isDotSegment(name) {
+		return NamedPolicy{}, wrapf(ErrInvalidName, fmt.Sprintf("policy name %q is not allowed", name))
 	}
 	if err := checkDescription(description); err != nil {
 		return NamedPolicy{}, err

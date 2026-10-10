@@ -88,17 +88,23 @@ func (s *Server) handleGetObjectTagging(w http.ResponseWriter, r *http.Request, 
 	return writeXML(w, http.StatusOK, taggingFromMap(info.Tags))
 }
 
-// handlePutObjectTagging implements PutObjectTagging (<= 10 tags).
+// handlePutObjectTagging implements PutObjectTagging (<= 10 tags). The op
+// is authorized here, after the (small) body is decoded, because its
+// s3:RequestObjectTag/<key> and s3:RequestObjectTagKeys condition keys come
+// from the tag set in the body, as in AWS.
 func (s *Server) handlePutObjectTagging(w http.ResponseWriter, r *http.Request, rc *reqContext) error {
-	info, versioned, err := s.subresourceTarget(w, r, rc)
-	if err != nil {
-		return err
-	}
 	var doc Tagging
 	if err := s.decodeValidatedXML(r, rc, maxSubresourceBody, &doc); err != nil {
 		return err
 	}
 	tags, err := validateObjectTags(doc.TagSet.Tags)
+	if err != nil {
+		return err
+	}
+	if err := s.authorizeOpWith(r.Context(), r, rc, requestTagConditions(tags)); err != nil {
+		return err
+	}
+	info, versioned, err := s.subresourceTarget(w, r, rc)
 	if err != nil {
 		return err
 	}

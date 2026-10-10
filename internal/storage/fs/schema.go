@@ -415,14 +415,22 @@ func validUploadID(id string) bool {
 	return isURLSafe(id)
 }
 
+// bucketIDLen is the length of bucket IDs (randomHex(8)).
+const bucketIDLen = 16
+
+// validBucketID reports whether id has the shape of a generated bucket ID.
+func validBucketID(id string) bool { return len(id) == bucketIDLen && validDataID(id) }
+
 // validDataID reports whether id is a well-formed data file ID (lowercase hex,
 // at least 3 characters).
 func validDataID(id string) bool {
-	if len(id) < 3 || len(id) > 64 {
-		return false
-	}
-	for i := 0; i < len(id); i++ {
-		c := id[i]
+	return len(id) >= 3 && len(id) <= 64 && validHex(id)
+}
+
+// validHex reports whether s consists of lowercase hex digits only.
+func validHex(s string) bool {
+	for i := 0; i < len(s); i++ {
+		c := s[i]
 		if !(c >= '0' && c <= '9' || c >= 'a' && c <= 'f') {
 			return false
 		}

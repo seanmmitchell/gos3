@@ -1,10 +1,12 @@
 // GET /api/discovery/local?wait=<ms> — mDNS browse + beacon query from the UI
 // host for `wait` ms (default 3000, 500–10000), then verification of every
 // candidate via GET /_gos3/info. Returns {peers, errors, candidates, elapsedMs}.
-import { clientAbortSignal, errorResponse } from '../../utils/discovery/http'
+import { clientAbortSignal, errorResponse, rejectForeignRequest } from '../../utils/discovery/http'
 import { DEFAULT_WAIT_MS, discoverLocal, loadMdns, localDiscoveryEnabled, MAX_WAIT_MS, MIN_WAIT_MS } from '../../utils/discovery/local'
 
 export default defineEventHandler(async (event) => {
+  const foreign = rejectForeignRequest(event)
+  if (foreign) return foreign
   if (!localDiscoveryEnabled()) return errorResponse(event, 403, 'AccessDenied', 'Local discovery is disabled on this UI server.')
   const q = getQuery(event)
   let wait = DEFAULT_WAIT_MS

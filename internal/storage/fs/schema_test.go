@@ -366,3 +366,90 @@ func TestRecordEncodingNonUTF8(t *testing.T) {
 	keys := keysOf(t, b, bkt, "", "")
 	eq(t, "walk", len(keys), 1)
 }
+
+// TestCommitterPanicInSharedBatch: a function panicking inside a shared
+// transaction must not strand the other calls of its batch.
+func TestCommitterPanicInSharedBatch(t *testing.T) {
+	b := openTest(t, "")
+	var c committer
+	release := make(chan struct{})
+	started := make(chan struct{})
+	first := make(chan error, 1)
+	go func() {
+		first <- c.do(b.db, func(*bbolt.Tx) error {
+			select {
+			case <-started:
+			default:
+				close(started)
+			}
+			<-release
+			return nil
+		})
+	}()
+	<-started // the loop is busy; the next calls queue into one batch
+
+	const n = 4
+	results := make(chan string, n)
+	for i := range n {
+		go func() {
+			defer func() {
+				if p := recover(); p != nil {
+					results <- "panic"
+				}
+			}()
+			err := c.do(b.db, func(tx *bbolt.Tx) error {
+				if i == 1 {
+					panic("kaboom")
+				}
+				bk, err := tx.CreateBucketIfNotExists([]byte("shared"))
+				if err != nil {
+					return err
+				}
+				return bk.Put([]byte{byte(i)}, []byte{1})
+			})
+			if err != nil {
+				results <- "error: " + err.Error()
+				return
+			}
+			results <- "ok"
+		}()
+	}
+	// Wait until all calls are queued behind the blocked one.
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		c.mu.Lock()
+		queued := len(c.queue)
+		c.mu.Unlock()
+		if queued == n {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("only %d calls queued", queued)
+		}
+		time.Sleep(time.Millisecond)
+	}
+	close(release)
+	if err := <-first; err != nil {
+		t.Fatal(err)
+	}
+	got := map[string]int{}
+	for range n {
+		select {
+		case r := <-results:
+			got[r]++
+		case <-time.After(5 * time.Second):
+			t.Fatalf("co-batched callers stranded after a panic; got %v", got)
+		}
+	}
+	if got["panic"] != 1 || got["ok"] != n-1 {
+		t.Fatalf("results = %v", got)
+	}
+	if err := b.db.View(func(tx *bbolt.Tx) error {
+		if k := tx.Bucket([]byte("shared")).Stats().KeyN; k != n-1 {
+			t.Errorf("committed keys = %d, want %d", k, n-1)
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+}

@@ -1,12 +1,14 @@
 // POST /api/discovery/scan — network scan from the UI host. Body and result
 // are the admin API's discovery.ScanRequest / discovery.ScanResult (timeout
 // in nanoseconds). Hosts are capped at 1024, concurrency at 64.
-import { clientAbortSignal, errorResponse, isJsonRequest, readJsonBody } from '../../utils/discovery/http'
+import { clientAbortSignal, errorResponse, isJsonRequest, readJsonBody, rejectForeignRequest } from '../../utils/discovery/http'
 import { localDiscoveryEnabled } from '../../utils/discovery/local'
 import { runScan } from '../../utils/discovery/scan'
 import { planScan, ScanRequestError, type ScanPlan } from '../../utils/discovery/targets'
 
 export default defineEventHandler(async (event) => {
+  const foreign = rejectForeignRequest(event)
+  if (foreign) return foreign
   if (!localDiscoveryEnabled()) return errorResponse(event, 403, 'AccessDenied', 'Local discovery is disabled on this UI server.')
   if (!isJsonRequest(event)) return errorResponse(event, 415, 'InvalidRequest', 'Content-Type must be application/json.')
   const body = await readJsonBody(event)

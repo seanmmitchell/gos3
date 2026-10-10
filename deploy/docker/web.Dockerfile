@@ -11,7 +11,11 @@
 # Every server the browser talks to must allow the UI origin via CORS
 # (gos3: cors.allowed_origins / GOS3_CORS_ORIGINS). The Node server has no
 # authentication; set GOS3_UI_LOCAL_DISCOVERY=false to disable its probe and
-# scan routes when it is reachable by untrusted clients. See docs/web-ui.md.
+# scan routes when it is reachable by untrusted clients. Those routes answer
+# only for requests to an IP address or localhost: add the DNS names the UI
+# is opened with to GOS3_UI_ALLOWED_HOSTS (comma separated), e.g.
+#   -e GOS3_UI_ALLOWED_HOSTS=console.example.com
+# See docs/web-ui.md.
 
 ARG NODE_VERSION=22
 

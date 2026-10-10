@@ -45,6 +45,30 @@ jobs:
       - name: End-to-end tests (race)
         run: go test -race -count=1 ./test/e2e/...
 
+  go-platforms:
+    # Release archives are published for macOS and Windows too. The code
+    # cross-compiles and vets for both, but the suites have not run on these
+    # runners yet (file locking, renaming open files and multicast differ):
+    # make the job blocking once it has passed there.
+    name: Go tests (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    continue-on-error: true
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Unit tests
+        run: go test -count=1 ./cmd/... ./internal/...
+      - name: End-to-end tests
+        run: go test -count=1 ./test/e2e/...
+
   web:
     name: Web UI (typecheck, test, build)
     runs-on: ubuntu-latest
@@ -147,12 +171,16 @@ jobs:
           go-version-file: go.mod
           cache: true
       - uses: actions/setup-python@v6
+        id: python
         with:
           python-version: "3.13"
+      # A venv links to its interpreter's absolute path, so the key includes
+      # the exact Python version: a runner image with a new 3.13.x starts a
+      # fresh venv instead of restoring one with dangling links.
       - uses: actions/cache@v4
         with:
           path: ${{ env.GOS3_COMPAT_VENV }}
-          key: compat-venv-${{ runner.os }}-py3.13-${{ hashFiles('test/compat/requirements.txt') }}
+          key: compat-venv-${{ runner.os }}-py${{ steps.python.outputs.python-version }}-${{ hashFiles('test/compat/requirements.txt') }}
       - name: Run test/compat/run.sh
         run: test/compat/run.sh
 

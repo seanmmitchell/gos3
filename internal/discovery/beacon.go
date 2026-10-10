@@ -10,8 +10,10 @@ import (
 	"log/slog"
 	"math/rand/v2"
 	"net"
+	"net/netip"
 	"net/url"
 	"slices"
+	"strings"
 	"sync"
 	"time"
 	"unicode/utf8"
@@ -165,12 +167,20 @@ func advertisedURLs(info Info) []string {
 }
 
 // beaconCandidateURLs turns the URLs of an announce received from src into
-// probe candidates. Wildcard hosts, and loopback hosts announced from a
-// non-loopback source, are replaced by the source IP (keeping scheme and
-// port). Without any usable URL the source IP with DefaultPort is used.
-func beaconCandidateURLs(urls []string, src net.Addr) []string {
-	srcIP, haveSrc := ipFromAddr(src)
-	haveSrc = haveSrc && srcIP.IsValid() && !srcIP.IsUnspecified() && !srcIP.IsMulticast()
+// probe candidates. Nothing in a datagram is authenticated, so the server
+// only ever probes the sender: every URL's host is replaced by the source IP
+// (keeping scheme and port), except that a sender on this host (isLocal)
+// may also announce loopback and local addresses, which then stay as they
+// are (a server listening on 127.0.0.1 is reachable there). Host names are
+// never resolved. Without any usable URL the source IP with DefaultPort is
+// used; without a source address there are no candidates.
+func beaconCandidateURLs(urls []string, src net.Addr, isLocal func(netip.Addr) bool) []string {
+	srcIP, ok := ipFromAddr(src)
+	if !ok || !srcIP.IsValid() || srcIP.IsUnspecified() || srcIP.IsMulticast() {
+		return nil
+	}
+	srcIP = srcIP.WithZone("")
+	srcLocal := isLocal != nil && isLocal(srcIP)
 	var out []string
 	add := func(u string) {
 		if len(out) < maxBeaconURLs && !slices.Contains(out, u) {
@@ -184,9 +194,12 @@ func beaconCandidateURLs(urls []string, src net.Addr) []string {
 		scheme, host, port, ok := "", "", "", false
 		if n, err := NormalizeBaseURL(raw); err == nil {
 			scheme, host, port, ok = urlHostPort(n)
-			if ok && !isWildcardHost(host) && !(isLoopbackHost(host) && haveSrc && !srcIP.IsLoopback()) {
-				add(n)
-				continue
+			if ip, err := netip.ParseAddr(strings.Trim(host, "[]")); ok && err == nil {
+				ip = ip.Unmap()
+				if ip == srcIP || (srcLocal && (ip.IsLoopback() || isLocal(ip))) {
+					add(n)
+					continue
+				}
 			}
 		} else if u, err := url.Parse(raw); err == nil && (u.Scheme == "http" || u.Scheme == "https") && u.Hostname() == "" {
 			// "http://:9000" – host omitted.
@@ -197,11 +210,11 @@ func beaconCandidateURLs(urls []string, src net.Addr) []string {
 				}
 			}
 		}
-		if ok && haveSrc {
+		if ok {
 			add(baseURL(scheme, srcIP.String(), effectivePort(scheme, port)))
 		}
 	}
-	if len(out) == 0 && haveSrc {
+	if len(out) == 0 {
 		add(baseURL("http", srcIP.String(), DefaultPort))
 	}
 	return out
@@ -211,8 +224,9 @@ func beaconCandidateURLs(urls []string, src net.Addr) []string {
 type sink interface {
 	// candidate reports an unverified sighting; it must not block.
 	candidate(c candidate)
-	// bye reports that peer id announced its shutdown.
-	bye(id string)
+	// bye reports that peer id announced its shutdown in a datagram from
+	// src.
+	bye(id string, src netip.Addr)
 }
 
 // beaconOptions configures a beacon runner.
@@ -238,6 +252,8 @@ type beacon struct {
 	mconn  net.PacketConn   // nil when multicast could not be joined
 	dests  func() []net.Addr
 	ifaces []net.Interface // multicast interfaces to send on
+	local  *localNets      // which senders are on this host or link
+	limit  *sourceLimiter  // announces taken per sender
 
 	sendMu   sync.Mutex
 	nonceMu  sync.Mutex
@@ -266,6 +282,8 @@ func newBeacon(o beaconOptions, uconn, mconn net.PacketConn, dests func() []net.
 		uconn:         uconn,
 		mconn:         mconn,
 		dests:         dests,
+		local:         hostNets,
+		limit:         newSourceLimiter(),
 		replySem:      make(chan struct{}, maxPendingReplies),
 	}
 }
@@ -285,6 +303,10 @@ func openBeacon(group *net.UDPAddr, o beaconOptions, multicastErr func(error)) (
 	}
 	if err := b.upc.SetMulticastLoopback(true); err != nil {
 		b.logger.Debug("beacon: enable multicast loopback", "err", err)
+	}
+	// Unicast replies to queries stay on the link too.
+	if err := b.upc.SetTTL(1); err != nil {
+		b.logger.Debug("beacon: set unicast TTL", "err", err)
 	}
 	b.ifaces = multicastInterfaces()
 	mc, joined, err := listenGroup(group, b.ifaces)
@@ -432,8 +454,17 @@ func (b *beacon) readLoop(ctx context.Context, c net.PacketConn) {
 	}
 }
 
-// handle processes one received datagram.
+// handle processes one received datagram. Datagrams from senders that are
+// neither on this host nor on a directly connected subnet are dropped: the
+// group port also receives unicast datagrams, and beacons never cross a
+// router legitimately (TTL 1).
 func (b *beacon) handle(ctx context.Context, data []byte, src net.Addr) {
+	srcIP, ok := ipFromAddr(src)
+	if !ok || !b.local.onLink(srcIP) {
+		b.logger.Debug("beacon: dropping datagram from a sender that is not on the local link", "from", addrString(src))
+		return
+	}
+	srcIP = srcIP.WithZone("")
 	m, err := decodeBeacon(data)
 	if err != nil {
 		if !errors.Is(err, errBeaconIgnored) {
@@ -447,21 +478,79 @@ func (b *beacon) handle(ctx context.Context, data []byte, src net.Addr) {
 		if m.ID == selfID {
 			return
 		}
+		if !b.limit.allow(srcIP, b.now()) {
+			b.logger.Debug("beacon: too many announces from sender, dropping", "from", addrString(src))
+			return
+		}
 		b.sink.candidate(candidate{
 			id: m.ID, name: m.Name, version: m.Version, region: m.Region,
 			source: SourceBeacon,
-			urls:   beaconCandidateURLs(m.URLs, src),
+			urls:   beaconCandidateURLs(m.URLs, src, b.local.isLocal),
 		})
 	case beaconQuery:
-		if !b.advertise || src == nil || b.ownNonce(m.Nonce) {
+		if !b.advertise || b.ownNonce(m.Nonce) {
 			return
 		}
 		b.scheduleReply(ctx, src)
 	case beaconBye:
 		if m.ID != selfID {
-			b.sink.bye(m.ID)
+			b.sink.bye(m.ID, srcIP)
 		}
 	}
+}
+
+// Per-sender announce budget: a burst of sourceBurst announces, refilled
+// at one per sourceRefill. Servers announce every beacon interval (≥ 1 s)
+// and on queries, so this only throttles floods.
+const (
+	sourceBurst      = 32
+	sourceRefill     = 250 * time.Millisecond
+	maxSourceEntries = 1024
+)
+
+// sourceLimiter is a token bucket per sender address.
+type sourceLimiter struct {
+	mu      sync.Mutex
+	buckets map[netip.Addr]*tokenBucket
+}
+
+type tokenBucket struct {
+	tokens float64
+	at     time.Time
+}
+
+func newSourceLimiter() *sourceLimiter {
+	return &sourceLimiter{buckets: make(map[netip.Addr]*tokenBucket)}
+}
+
+// allow takes one token of src's bucket.
+func (l *sourceLimiter) allow(src netip.Addr, now time.Time) bool {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	b, ok := l.buckets[src]
+	if !ok {
+		if len(l.buckets) >= maxSourceEntries {
+			for k, v := range l.buckets {
+				if now.Sub(v.at) > sourceBurst*sourceRefill {
+					delete(l.buckets, k)
+				}
+			}
+			if len(l.buckets) >= maxSourceEntries {
+				clear(l.buckets)
+			}
+		}
+		b = &tokenBucket{tokens: sourceBurst, at: now}
+		l.buckets[src] = b
+	}
+	if d := now.Sub(b.at); d > 0 {
+		b.tokens = min(sourceBurst, b.tokens+float64(d)/float64(sourceRefill))
+		b.at = now
+	}
+	if b.tokens < 1 {
+		return false
+	}
+	b.tokens--
+	return true
 }
 
 // scheduleReply answers a query with a unicast announce after a random

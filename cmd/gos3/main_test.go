@@ -278,3 +278,40 @@ func (s *syncBuffer) String() string {
 	defer s.mu.Unlock()
 	return s.b.String()
 }
+
+// TestConfigPrintAppliesSettingsFile checks that `config print` shows the
+// runtime settings saved in <data>/.gos3/settings.json, which the server
+// lays over flags and variables, and names the configured values they
+// override. Previously it printed the flag values as the effective
+// configuration.
+func TestConfigPrintAppliesSettingsFile(t *testing.T) {
+	clearEnv(t)
+	dir := t.TempDir()
+	cfg := config.Default()
+	cfg.Storage.Path = dir
+	store := config.NewStore(config.SettingsFrom(cfg), cfg.SettingsPath())
+	if _, err := store.Update(func(s *config.Settings) error {
+		s.Name = "renamed-in-ui"
+		s.Discovery.Enabled = true
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	code, out, stderr := runCmd(t, "config", "print", "--data", dir, "--no-discovery", "--name", "flagname")
+	if code != 0 {
+		t.Fatalf("exit %d: %s", code, stderr)
+	}
+	for _, want := range []string{
+		"name: renamed-in-ui",
+		"settings.json",
+		"#   server.name: flagname -> renamed-in-ui",
+		"#   discovery.enabled: false -> true",
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("output lacks %q:\n%s", want, out)
+		}
+	}
+	if strings.Contains(out, "name: flagname\n") {
+		t.Errorf("flag value printed as effective:\n%s", out)
+	}
+}

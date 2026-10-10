@@ -28,10 +28,30 @@ env:
   TAG: ${{ inputs.tag || github.ref_name }}
 
 jobs:
+  # Nothing is built or published unless the tagged commit passes the Go
+  # checks (the full matrix, including the web and Playwright suites, runs
+  # in ci.yml on every push and pull request).
+  test:
+    name: Go (vet, test, e2e)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ env.TAG }}
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          cache: true
+      - run: go vet ./...
+      - run: go test -race -count=1 ./cmd/... ./internal/...
+      - run: go test -race -count=1 ./test/e2e/...
+
   ui:
     name: Build embedded UI
     runs-on: ubuntu-latest
     timeout-minutes: 20
+    needs: test
     steps:
       - uses: actions/checkout@v5
         with:
@@ -39,11 +59,13 @@ jobs:
       - uses: actions/setup-node@v5
         with:
           node-version: ${{ env.NODE_VERSION }}
-      - name: Build (pnpm generate:embed)
+      - name: Test and build (pnpm generate:embed)
         working-directory: web
         run: |
           corepack enable
           pnpm install --frozen-lockfile
+          pnpm typecheck
+          pnpm test
           pnpm generate:embed
       - uses: actions/upload-artifact@v4
         with:
@@ -144,6 +166,8 @@ jobs:
     name: Container image (ghcr.io)
     runs-on: ubuntu-latest
     timeout-minutes: 45
+    # Only publish an image for a tag whose binaries built.
+    needs: binaries
     permissions:
       contents: read
       packages: write
@@ -170,8 +194,9 @@ jobs:
             type=semver,pattern={{version}},value=${{ env.TAG }}
             type=semver,pattern={{major}}.{{minor}},value=${{ env.TAG }}
             type=semver,pattern={{major}},value=${{ env.TAG }}
+          # A manual re-release of an older tag must not move "latest" back.
           flavor: |
-            latest=auto
+            latest=${{ github.event_name == 'push' && 'auto' || 'false' }}
       - uses: docker/build-push-action@v6
         with:
           context: .

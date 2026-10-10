@@ -110,6 +110,8 @@ type Server struct {
 	disc        *discovery.Service
 	lifecycle   *lifecycle.Worker
 	tlsConfig   *tls.Config
+	bodyIdle    time.Duration // idle read timeout of bodies sent to gos3 endpoints
+	dirLock     *os.File      // exclusive lock on <systemDir>/lock (nil when ephemeral)
 
 	serverID    string
 	startedAt   time.Time
@@ -161,6 +163,7 @@ func New(cfg config.Config, logger *slog.Logger, opts ...Option) (_ *Server, err
 		systemDir:  cfg.SystemDir(),
 		startedAt:  time.Now().UTC().Truncate(time.Second),
 		ready:      make(chan struct{}),
+		bodyIdle:   systemBodyIdleTimeout,
 	}
 	s.lifeCtx, s.lifeCancel = context.WithCancel(context.Background())
 	defer func() {
@@ -186,6 +189,12 @@ func New(cfg config.Config, logger *slog.Logger, opts ...Option) (_ *Server, err
 		if err := os.MkdirAll(s.systemDir, 0o700); err != nil {
 			return nil, fmt.Errorf("creating system directory: %w", err)
 		}
+		// The fs backend's metadata database is locked already, but the
+		// system state (iam.json, settings.json, ...) is used by every
+		// backend: lock it too.
+		if s.dirLock, err = lockSystemDir(s.systemDir); err != nil {
+			return nil, err
+		}
 	}
 	if s.serverID, err = loadServerID(s.systemDir, logger); err != nil {
 		return nil, err
@@ -207,6 +216,15 @@ func New(cfg config.Config, logger *slog.Logger, opts ...Option) (_ *Server, err
 		return nil, err
 	}
 	st := s.settings.Get()
+	// settings.json wins over the static configuration for runtime keys:
+	// say so for every value that was set explicitly (config file, GOS3_*
+	// variable or flag) and is therefore ignored.
+	for _, o := range config.PersistedOverrides(cfg, st) {
+		if o.Explicit {
+			logger.Warn("configured value overridden by settings.json (saved from the web UI or admin API); change it there or remove the key from the file",
+				"key", o.Key, "configured", o.Configured, "effective", o.Persisted, "file", cfg.SettingsPath())
+		}
+	}
 	s.logControl.Set(st.Logging.Level, st.Logging.Format)
 
 	s.verifier = auth.NewVerifier(s.iam, auth.Options{Region: st.Region, StrictRegion: cfg.Auth.StrictRegion})
@@ -234,6 +252,8 @@ func New(cfg config.Config, logger *slog.Logger, opts ...Option) (_ *Server, err
 		BackendName: s.backendName,
 		DataPath:    s.dataPath,
 		Logger:      logger,
+
+		TrustProxyHeaders: cfg.Server.TrustProxyHeaders,
 	}))
 	s.lifecycle = lifecycle.NewWorker(s.backend, lifecycle.Options{
 		Interval: time.Duration(st.Lifecycle.IntervalSeconds) * time.Second,
@@ -361,6 +381,9 @@ func (s *Server) Close() error {
 			if err := s.iam.Close(); err != nil {
 				errs = append(errs, fmt.Errorf("closing IAM: %w", err))
 			}
+		}
+		if s.dirLock != nil {
+			_ = s.dirLock.Close() // releases the lock
 		}
 		s.closeErr = errors.Join(errs...)
 	})

@@ -82,7 +82,7 @@ dev: ## run an ephemeral in-memory server for UI development (pair with `cd web 
 clean: ui-clean ## remove build output (binary, UI build) and restore the UI placeholder
 	rm -rf bin web/.output web/.nuxt
 
-docker: ## build the container image ($(IMAGE):$(VERSION)) from the Dockerfile
+docker: ## build the container image (gos3:<git version>, override IMAGE / VERSION) from the Dockerfile
 	docker build -t $(IMAGE):$(VERSION) \
 		--build-arg VERSION=$(VERSION) --build-arg COMMIT=$(COMMIT) --build-arg DATE=$(DATE) .
 
@@ -92,7 +92,7 @@ UI_IMAGE ?= gos3-ui
 
 .PHONY: docker-ui compat e2e-web demo demo-down
 
-docker-ui: ## build the standalone web UI image ($(UI_IMAGE):$(VERSION))
+docker-ui: ## build the standalone web UI image (gos3-ui:<git version>, override UI_IMAGE / VERSION)
 	docker build -f deploy/docker/web.Dockerfile -t $(UI_IMAGE):$(VERSION) .
 
 compat: ## run the boto3 / AWS CLI compatibility suite (test/compat/run.sh)
@@ -103,7 +103,7 @@ e2e-web: build ## run the Playwright suites (mocked, real server, standalone) ag
 	cd web && GOS3_BIN=$(CURDIR)/$(BIN) E2E_SKIP_UI_BUILD=1 $(PNPM) test:e2e:real
 	cd web && GOS3_BIN=$(CURDIR)/$(BIN) $(PNPM) test:e2e:standalone
 
-demo: ## start the two-node docker compose demo with the standalone UI (ports 9001, 9002, 3000)
+demo: ## start the two-node docker compose demo with the standalone UI (localhost ports 9001, 9002, 3000)
 	GOS3_VERSION=$(VERSION) docker compose --profile ui up -d --build
 
 demo-down: ## stop the docker compose demo (add -v to the command to delete its volumes)

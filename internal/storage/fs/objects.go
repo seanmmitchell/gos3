@@ -38,14 +38,16 @@ type commitReq struct {
 }
 
 // commitObject publishes a new version in one write transaction, evaluating
-// preconditions atomically. On failure the request's data file is removed;
-// on success data files of replaced versions are unlinked.
+// preconditions atomically. On failure the request's data file is removed
+// (unless the commit itself failed, in which case it may have persisted
+// anyway, see updateFiles); on success data files of replaced versions are
+// unlinked.
 func (b *Backend) commitObject(req commitReq) (storage.ObjectInfo, error) {
 	var (
 		info   storage.ObjectInfo
 		unlink []string
 	)
-	err := b.update(func(tx *bbolt.Tx) error {
+	indeterminate, err := b.updateFiles(func(tx *bbolt.Tx) error {
 		unlink = nil
 		br, bb, err := loadBucketID(tx, req.bucket, req.bucketID)
 		if err != nil {
@@ -74,7 +76,12 @@ func (b *Backend) commitObject(req commitReq) (storage.ObjectInfo, error) {
 	})
 	if err != nil {
 		if req.dataID != "" {
-			_ = os.Remove(b.dataPath(req.bucketID, req.dataID))
+			if indeterminate {
+				b.log.Warn("fs: metadata commit failed after the transaction was written; keeping its data file",
+					"bucket_id", req.bucketID, "data_id", req.dataID, "err", err)
+			} else {
+				_ = os.Remove(b.dataPath(req.bucketID, req.dataID))
+			}
 		}
 		return storage.ObjectInfo{}, err
 	}

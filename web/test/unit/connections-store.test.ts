@@ -357,3 +357,70 @@ describe('connections store: status', () => {
     expect(fetch.mock.calls.length).toBe(calls)
   })
 })
+
+describe('connections store: several tabs (review fix)', () => {
+  it('merges what another tab persisted instead of overwriting it', () => {
+    const tabA = useConnectionsStore(createPinia())
+    tabA.hydrate()
+    const one = tabA.add({ id: 'one', endpoint: 'http://one:9000', accessKeyId: 'AK1', secretAccessKey: 'S1' })
+    const tabB = useConnectionsStore(createPinia())
+    tabB.hydrate()
+    expect(tabB.byId(one.id)).toBeDefined()
+
+    tabA.add({ id: 'two', endpoint: 'http://two:9000', accessKeyId: 'AK2', secretAccessKey: 'S2', remember: true })
+    // The browser delivers a 'storage' event to tab B.
+    tabB.syncFromStorage(localStorage.getItem(LOCAL_STORAGE_KEY))
+    tabB.setActive('one')
+    expect(local().connections.map((c: { id: string }) => c.id)).toEqual(['one', 'two'])
+    expect(local().connections[1].secretAccessKey).toBe('S2')
+    expect(tabB.byId('two')?.secretAccessKey).toBe('S2')
+
+    // Removal in B reaches A; A keeps its own active server and session secret.
+    tabA.setActive('one')
+    tabB.remove('two')
+    tabA.syncFromStorage(localStorage.getItem(LOCAL_STORAGE_KEY))
+    expect(tabA.byId('two')).toBeUndefined()
+    expect(tabA.activeId).toBe('one')
+    expect(tabA.byId('one')?.secretAccessKey).toBe('S1')
+  })
+
+  it('listens for storage events after init', async () => {
+    let listener: ((e: { key: string | null, newValue: string | null }) => void) | undefined
+    vi.stubGlobal('addEventListener', (type: string, fn: typeof listener) => {
+      if (type === 'storage') listener = fn
+    })
+    const tab = useConnectionsStore(createPinia())
+    await tab.init({ skipServersJson: true })
+    expect(listener).toBeTypeOf('function')
+    const state = { version: 1, activeId: null, connections: [{ id: 'x', endpoint: 'http://x:9000', name: 'x' }], dismissedPresets: [] }
+    listener!({ key: LOCAL_STORAGE_KEY, newValue: JSON.stringify(state) })
+    expect(tab.byId('x')?.endpoint).toBe('http://x:9000')
+  })
+})
+
+describe('connections store: stale status checks (review fix)', () => {
+  it('drops the result of a check started with the previous credentials', async () => {
+    let release!: () => void
+    const gate = new Promise<void>(r => (release = r))
+    const whoami = { user: 'root', accessKey: 'good', isRoot: true, policies: ['admin'], capabilities: { ...NO_CAPABILITIES, admin: true }, server: INFO }
+    vi.stubGlobal('fetch', vi.fn(async (req: Request) => {
+      if (req.url.endsWith('/_gos3/info')) return new Response(JSON.stringify(INFO))
+      if ((req.headers.get('authorization') ?? '').includes('Credential=bad/')) {
+        await gate
+        return new Response(JSON.stringify({ error: { code: 'InvalidAccessKeyId', message: 'unknown key' } }), { status: 401 })
+      }
+      return new Response(JSON.stringify(whoami))
+    }))
+    const s = useConnectionsStore()
+    const c = s.add({ id: 'c', endpoint: 'http://nas:9000', accessKeyId: 'bad', secretAccessKey: 'SK' })
+    const old = s.refreshStatus(c.id)
+    await new Promise(r => setTimeout(r, 10)) // the old check is waiting for whoami
+    s.setCredentials(c.id, { accessKeyId: 'good', secretAccessKey: 'SK' })
+    const fresh = await s.refreshStatus(c.id)
+    expect(fresh.state).toBe('online')
+    release()
+    await old
+    expect(s.statusOf('c').state).toBe('online')
+    expect(s.statusOf('c').whoami?.accessKey).toBe('good')
+  })
+})

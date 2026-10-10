@@ -1093,3 +1093,69 @@ func TestWorkerBucketDeletedDuringPass(t *testing.T) {
 	}
 	e.expectStats(e.run(), Stats{Buckets: 1})
 }
+
+// undeleteBackend removes the delete marker of key right after a walk
+// delivered it (a client "undeleting" the key mid-walk) and then reports
+// IsLatest of the key's remaining entries from the current state, as a
+// backend that re-evaluates IsLatest per internal batch would. The walk
+// thus yields two "latest" entries for key.
+type undeleteBackend struct {
+	*clockBackend
+	key  string
+	once sync.Once
+}
+
+func (u *undeleteBackend) WalkVersions(ctx context.Context, bucket, prefix, km, vm string, fn func(storage.ObjectInfo) error) error {
+	undeleted := false
+	return u.clockBackend.WalkVersions(ctx, bucket, prefix, km, vm, func(o storage.ObjectInfo) error {
+		if undeleted && o.Key == u.key {
+			cur, err := u.clockBackend.GetObjectInfo(ctx, bucket, o.Key, "")
+			o.IsLatest = err == nil && cur.VersionID == o.VersionID
+		}
+		if err := fn(o); err != nil {
+			return err
+		}
+		if o.Key == u.key && o.DeleteMarker && o.IsLatest {
+			var err error
+			u.once.Do(func() {
+				undeleted = true
+				_, err = u.clockBackend.Backend.DeleteObject(ctx, bucket, o.Key, o.VersionID)
+			})
+			return err
+		}
+		return nil
+	})
+}
+
+// TestWorkerInconsistentWalkKeepsRestoredVersion: when a walk reports a
+// later version of a key as latest (the key changed under the walk), the
+// worker must not treat that version as noncurrent and delete it.
+func TestWorkerInconsistentWalkKeepsRestoredVersion(t *testing.T) {
+	e := newEnv(t)
+	e.bucket("b", storage.VersioningEnabled, false)
+	e.lifecycle("b", `<ID>nc</ID>`+fltAll+`<NoncurrentVersionExpiration><NoncurrentDays>1</NoncurrentDays></NoncurrentVersionExpiration>`)
+	day := 24 * time.Hour
+	v1 := e.put("b", "k", 1, base, storage.ObjectMeta{})
+	v2 := e.put("b", "k", 1, base.Add(day), storage.ObjectMeta{})
+	e.del("b", "k", base.Add(2*day))
+	e.setNow(base.Add(10 * day))
+
+	u := &undeleteBackend{clockBackend: e.b, key: "k"}
+	w := NewWorker(u, Options{Logger: slog.New(slog.DiscardHandler), Now: e.clock})
+	t.Cleanup(w.Stop)
+	st, err := w.RunOnce(e.ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	vs := e.versions("b", "k")
+	if len(vs) != 2 || vs[0].VersionID != v2.VersionID || !vs[0].IsLatest || vs[1].VersionID != v1.VersionID {
+		t.Fatalf("versions after pass = %+v (stats %+v); want restored v2 %s then v1 %s", vs, st, v2.VersionID, v1.VersionID)
+	}
+	e.expectStats(st, Stats{Buckets: 1})
+
+	// The next pass sees a consistent state and expires v1 only.
+	e.expectStats(e.run(), Stats{Buckets: 1, NoncurrentExpired: 1})
+	if vs := e.versions("b", "k"); len(vs) != 1 || vs[0].VersionID != v2.VersionID {
+		t.Fatalf("versions after second pass = %+v", vs)
+	}
+}

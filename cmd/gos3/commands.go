@@ -49,11 +49,32 @@ func cmdConfig(args []string, stdout, stderr io.Writer) error {
 		if err != nil {
 			return err
 		}
+		// The server lays the runtime settings saved from the web UI or
+		// admin API (<data>/.gos3/settings.json) over the static layers.
+		layers := "defaults < file < GOS3_* env < flags"
+		var overridden []config.SettingOverride
+		if path := cfg.SettingsPath(); path != "" && cfg.Validate() == nil {
+			if _, statErr := os.Stat(path); statErr == nil {
+				if store, err := config.LoadStore(config.SettingsFrom(cfg), path); err != nil {
+					fmt.Fprintf(stderr, "warning: %v; printing the configuration without it\n", err)
+				} else {
+					overridden = config.PersistedOverrides(cfg, store.Get())
+					config.ApplySettings(&cfg, store.Get())
+					layers += " < " + path
+				}
+			}
+		}
 		data, err := cfg.Redacted().YAML()
 		if err != nil {
 			return err
 		}
-		fmt.Fprintln(stdout, "# gos3 effective configuration (defaults < file < GOS3_* env < flags; secrets redacted)")
+		fmt.Fprintf(stdout, "# gos3 effective configuration (%s; secrets redacted)\n", layers)
+		if len(overridden) > 0 {
+			fmt.Fprintln(stdout, "# settings.json overrides these configured values (change them in the web UI or admin API):")
+			for _, o := range overridden {
+				fmt.Fprintf(stdout, "#   %s: %s -> %s\n", o.Key, o.Configured, o.Persisted)
+			}
+		}
 		if cfg.Auth.RootAccessKey == "" {
 			fmt.Fprintln(stdout, "# root credentials are not configured: generated on first start and stored in <data>/.gos3/root-credentials.json")
 		}

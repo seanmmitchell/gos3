@@ -1,5 +1,6 @@
 // Object key / prefix helpers (auto-imported by Nuxt from app/utils/).
 // Keys are '/'-delimited; a "folder" prefix always ends with '/'.
+import { hasDotSegment } from './s3/url'
 
 export interface PrefixCrumb {
   /** Display label (segment name). */
@@ -92,6 +93,9 @@ export function validateObjectKey(key: string): string | undefined {
   if (new TextEncoder().encode(key).length > 1024) return 'Key must be at most 1024 bytes'
   // eslint-disable-next-line no-control-regex
   if (/[\x00-\x08\x0b\x0c\x0e-\x1f]/.test(key)) return 'Key must not contain control characters'
+  // Browsers resolve '.' / '..' URL path segments, so such keys cannot be
+  // addressed from the UI after they are created (see hasDotSegment).
+  if (hasDotSegment(key)) return 'Key must not contain "." or ".." path segments'
   return undefined
 }
 

@@ -1,6 +1,6 @@
 // POST /api/discovery/probe {url} — fetches <url>/_gos3/info from the UI host
 // and returns the identity document (Info). 502 ProbeFailed on failure.
-import { errorResponse, isJsonRequest, readJsonBody } from '../../utils/discovery/http'
+import { errorResponse, isJsonRequest, readJsonBody, rejectForeignRequest } from '../../utils/discovery/http'
 import { localDiscoveryEnabled } from '../../utils/discovery/local'
 import { fetchInfo } from '../../utils/discovery/probe'
 import { normalizeBaseUrl, ScanRequestError } from '../../utils/discovery/targets'
@@ -8,6 +8,8 @@ import { normalizeBaseUrl, ScanRequestError } from '../../utils/discovery/target
 const PROBE_TIMEOUT_MS = 4000
 
 export default defineEventHandler(async (event) => {
+  const foreign = rejectForeignRequest(event)
+  if (foreign) return foreign
   if (!localDiscoveryEnabled()) return errorResponse(event, 403, 'AccessDenied', 'Local discovery is disabled on this UI server.')
   if (!isJsonRequest(event)) return errorResponse(event, 415, 'InvalidRequest', 'Content-Type must be application/json.')
   const body = await readJsonBody(event)

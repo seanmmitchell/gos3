@@ -91,12 +91,12 @@ func TestPeerTableMergeAndTTL(t *testing.T) {
 		t.Error("unhealthy peer should be re-probed on sighting")
 	}
 	tb.observeInfo(testInfo("p1", "real-name"), "http://10.0.0.2:9000", "", clk.Now(), "self")
-	tb.bye("p1")
+	tb.bye("p1", func(a string) bool { return a == "http://10.0.0.2:9000" })
 	p, _ = tb.get("p1")
 	if p.Healthy || p.Error == "" {
 		t.Errorf("after bye: %+v", p)
 	}
-	tb.bye("unknown") // no-op
+	tb.bye("unknown", func(string) bool { return true }) // no-op
 
 	// TTL expiry: last seen at clk.Now(); not expired at exactly TTL, expired after.
 	last := p.LastSeen
@@ -200,33 +200,51 @@ func TestPeerTableBounds(t *testing.T) {
 	if len(p.Addresses) != maxAddressesPerPeer || p.Addresses[len(p.Addresses)-1] != fmt.Sprintf("http://h%d:1", maxAddressesPerPeer+9) {
 		t.Fatalf("addresses: %d %v", len(p.Addresses), p.Addresses[len(p.Addresses)-1])
 	}
-	// Table size is bounded; unverified sightings are evicted first and
-	// cannot displace verified peers.
-	for i := range maxPeers - 1 {
+	// Unverified sightings (anyone on the link can announce any ID) are
+	// bounded separately and much lower; the stalest one makes room.
+	for i := range maxUnverifiedPeers + 10 {
 		tb.hint(candidate{id: fmt.Sprintf("u%d", i), source: SourceBeacon}, now.Add(time.Duration(i)), "")
 	}
+	if n := len(tb.snapshot("")); n != maxUnverifiedPeers+1 {
+		t.Fatalf("size %d, want %d", n, maxUnverifiedPeers+1)
+	}
+	if _, ok := tb.get("u9"); ok {
+		t.Error("stalest unverified entry not evicted")
+	}
+	if _, ok := tb.get(fmt.Sprintf("u%d", maxUnverifiedPeers+9)); !ok {
+		t.Error("newest unverified entry missing")
+	}
+	// Verified peers fill the table ("p" is one), evicting unverified
+	// entries first.
+	for i := range maxPeers - 1 {
+		if _, ok := tb.observeInfo(testInfo(fmt.Sprintf("v%d", i), "v"), "http://v:1", SourceScan, now, ""); !ok {
+			t.Fatalf("verified peer %d rejected", i)
+		}
+	}
 	if n := len(tb.snapshot("")); n != maxPeers {
 		t.Fatalf("size %d", n)
 	}
-	// A verified newcomer evicts the oldest unverified entry.
-	if _, ok := tb.observeInfo(testInfo("v", "v"), "http://v:1", SourceScan, now, ""); !ok {
-		t.Fatal("verified peer rejected")
+	if tb.unverified != 0 {
+		t.Errorf("unverified count %d", tb.unverified)
 	}
-	if _, ok := tb.get("u0"); ok {
-		t.Error("oldest unverified not evicted")
-	}
-	// Fill the rest with verified peers; then unverified newcomers are rejected.
-	for i := range maxPeers {
-		tb.observeInfo(testInfo(fmt.Sprintf("v%d", i), "v"), "http://v:1", SourceScan, now, "")
-	}
-	if n := len(tb.snapshot("")); n != maxPeers {
-		t.Fatalf("size %d", n)
-	}
+	// Then unverified newcomers are rejected.
 	if tb.hint(candidate{id: "late", source: SourceBeacon}, now, "") {
 		t.Error("unverified accepted into full verified table")
 	}
 	if _, ok := tb.get("late"); ok {
 		t.Error("unverified displaced verified peer")
+	}
+	// The unverified count follows verification and expiry.
+	tb2 := newPeerTable(time.Minute)
+	tb2.hint(candidate{id: "a", source: SourceBeacon}, now, "")
+	tb2.hint(candidate{id: "b", source: SourceBeacon}, now, "")
+	tb2.observeInfo(testInfo("a", "a"), "http://a:1", SourceBeacon, now, "")
+	if tb2.unverified != 1 {
+		t.Errorf("after verification: %d", tb2.unverified)
+	}
+	tb2.expire(now.Add(time.Hour))
+	if tb2.unverified != 0 || len(tb2.peers) != 0 {
+		t.Errorf("after expiry: %d %d", tb2.unverified, len(tb2.peers))
 	}
 }
 

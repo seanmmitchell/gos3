@@ -4,7 +4,10 @@
 // Conventions:
 // - Folder browsing:   /servers/:id/buckets/:bucket?prefix=a/b/
 // - Object details:    /servers/:id/buckets/:bucket/objects/<key segments>
+//   (keys with '.' / '..' segments: /servers/:id/buckets/:bucket/objects/?key=<key>)
 //   (catch-all param `path`; read the key back with routeParamToKey()).
+
+import { hasDotSegment } from './s3/url'
 
 const seg = (s: string) => encodeURIComponent(s)
 
@@ -36,8 +39,16 @@ export const appRoutes = {
     `/servers/${seg(id)}/buckets/${seg(bucket)}${prefix ? `?prefix=${encodeURIComponent(prefix)}` : ''}`,
   bucketSettings: (id: string, bucket: string, tab?: string) =>
     `/servers/${seg(id)}/buckets/${seg(bucket)}/settings${tab ? `?tab=${encodeURIComponent(tab)}` : ''}`,
-  object: (id: string, bucket: string, key: string, versionId?: string) =>
-    `/servers/${seg(id)}/buckets/${seg(bucket)}/objects/${key.split('/').map(seg).join('/')}${versionId ? `?versionId=${encodeURIComponent(versionId)}` : ''}`,
+  /**
+   * Object details. Keys with '.' / '..' segments go into `?key=` instead of
+   * the path, which browsers would normalise to a different key.
+   */
+  object: (id: string, bucket: string, key: string, versionId?: string) => {
+    const base = `/servers/${seg(id)}/buckets/${seg(bucket)}/objects/`
+    const v = versionId ? `versionId=${encodeURIComponent(versionId)}` : ''
+    if (hasDotSegment(key)) return `${base}?key=${encodeURIComponent(key)}${v ? `&${v}` : ''}`
+    return `${base}${key.split('/').map(seg).join('/')}${v ? `?${v}` : ''}`
+  },
   users: (id: string) => `/servers/${seg(id)}/users`,
   user: (id: string, name: string) => `/servers/${seg(id)}/users/${seg(name)}`,
   policies: (id: string) => `/servers/${seg(id)}/policies`,

@@ -53,7 +53,7 @@ Image defaults:
 
 | | |
 |---|---|
-| Entrypoint / command | `gos3` / `serve` (append flags: `docker run gos3 serve --log-format json`) |
+| Entrypoint / command | `gos3` / `serve` (append flags: `docker run gos3 serve --log-format json`; but see the health check note below) |
 | Environment | `GOS3_ADDRESS=:9000`, `GOS3_DATA=/data` |
 | Volume | `/data` (objects, metadata, IAM, settings, generated credentials) |
 | Ports | `9000/tcp` (everything); `7373/udp`, `5353/udp` (discovery multicast) |
@@ -62,6 +62,15 @@ Image defaults:
 
 Notes:
 
+- **Set the listen address and TLS through `GOS3_*` variables** (or a config
+  file via `GOS3_CONFIG`), not as `serve` flags. The health check runs
+  `gos3 healthcheck` as a separate process, which derives the URL from the
+  config file and the environment only. With `serve --address :8443` or
+  `serve --tls-cert … --tls-key …` it would keep probing
+  `http://127.0.0.1:9000` and mark the container unhealthy (which also blocks
+  `depends_on: condition: service_healthy`). Use `-e GOS3_ADDRESS=:8443`,
+  `-e GOS3_TLS_CERT=… -e GOS3_TLS_KEY=…` instead. Other flags, such as
+  `--log-format`, are fine.
 - **Bind mounts** must be writable by uid 65532:
   `install -d -o 65532 -g 65532 -m 0700 /srv/gos3`, then
   `-v /srv/gos3:/data`. Named volumes get the right owner automatically.
@@ -92,6 +101,10 @@ docker compose down -v                        # stop and delete the data volumes
 - Both nodes use the root keys `gos3admin` / `gos3admin-secret`. Override them
   with `GOS3_ROOT_ACCESS_KEY` / `GOS3_ROOT_SECRET_KEY` in your shell or an
   `.env` file.
+- Because those default keys are public, ports 9001, 9002 and 3000 are
+  published on **127.0.0.1 only**. To reach the demo from other machines, set
+  your own root keys and `GOS3_DEMO_BIND=0.0.0.0` (or one host address).
+  Docker's published ports usually bypass the host firewall.
 - The nodes find each other through the **UDP beacon** on the shared compose
   network, and each lists the other as a **seed** as a fallback. Open
   `http://localhost:9001/_gos3/ui/`, sign in and go to **Discovery**: the other
@@ -101,7 +114,10 @@ docker compose down -v                        # stop and delete the data volumes
   Desktop). Add the second node through its published port,
   `http://localhost:9002`.
 - The standalone UI is preset with both nodes (`NUXT_PUBLIC_SERVERS`), and its
-  local discovery finds them through the beacon inside the network.
+  local discovery finds them through the beacon inside the network. Local
+  discovery answers only when the UI is opened via an IP address or
+  `localhost`; if you open it through a DNS name, set
+  `GOS3_UI_ALLOWED_HOSTS=<name>` (passed through by the compose file).
 
 ## systemd
 
@@ -128,10 +144,17 @@ journalctl -u gos3 -f
   `AmbientCapabilities=CAP_NET_BIND_SERVICE` and
   `CapabilityBoundingSet=CAP_NET_BIND_SERVICE` in a drop-in
   (`systemctl edit gos3`).
-- TLS certificate and key files must be readable by the service: for
-  example, put them in `/etc/gos3` with mode 0644 for the certificate. For the
-  key, use `LoadCredential=tls.key:/etc/ssl/private/gos3.key` together with
-  `GOS3_TLS_KEY=%d/tls.key` in a drop-in.
+- TLS certificate and key files must be readable by the dynamic service
+  user: put the certificate in `/etc/gos3` with mode 0644 and set
+  `GOS3_TLS_CERT` in the env file. A private key with the usual mode 0600 is
+  not readable by that user, so pass it as a systemd credential in a drop-in
+  (`systemctl edit gos3`); `%d` does not work in the env file:
+
+  ```ini
+  [Service]
+  LoadCredential=tls.key:/etc/ssl/private/gos3.key
+  Environment=GOS3_TLS_KEY=%d/tls.key
+  ```
 - `systemctl stop gos3` sends SIGTERM: in-flight requests get
   `server.shutdown_timeout` (30 s) to finish.
 
@@ -142,10 +165,21 @@ Secret (root keys), a headless Service, a client Service and a StatefulSet,
 tied together by `kustomization.yaml`:
 
 ```sh
-# edit deploy/kubernetes/secret.example.yaml first (or create the Secret yourself)
+kubectl create namespace storage
+kubectl -n storage create secret generic gos3-root-credentials \
+  --from-literal=access-key="$(openssl rand -hex 10)" \
+  --from-literal=secret-key="$(openssl rand -hex 20)"
 kubectl apply -k deploy/kubernetes -n storage
 kubectl -n storage port-forward svc/gos3 9000:9000
 ```
+
+The kustomization does **not** include `secret.example.yaml`, so its
+placeholder keys are never deployed. Without the Secret (its references are
+optional), each server generates its own root keys on first start and logs
+them once (`kubectl -n storage logs gos3-0`); creating the Secret later takes
+effect when the pods restart. The image tag is `latest`, which Kubernetes
+pulls on every pod start; pin a release with `newTag` in
+`kustomization.yaml` for reproducible deployments.
 
 How it fits together:
 
@@ -174,6 +208,9 @@ How it fits together:
 - An Ingress in front of the Service must allow large bodies and must not
   buffer them (see the nginx settings below). The host it serves must be the
   host clients sign; set `trust_proxy_headers: true` in the ConfigMap.
+- A standalone web UI deployed next to gos3 and reached through an Ingress
+  host name needs `GOS3_UI_ALLOWED_HOSTS=<that host>` for its local discovery
+  routes (see [web-ui.md](web-ui.md#local-discovery-routes)).
 
 ## Reverse proxy
 
@@ -184,8 +221,10 @@ gos3 can sit behind nginx, Caddy, Traefik or a cloud load balancer. The rules:
    ignores `X-Forwarded-Host`. Serve gos3 at the root of a (sub)domain; a path
    prefix such as `https://example.com/s3/` does not work.
 2. **No body size limit, no request buffering, long timeouts**, for multipart
-   parts (up to 5 GiB) and large downloads. Slow CompleteMultipartUpload calls
-   are kept alive by gos3 with whitespace every 5 s.
+   parts (up to 5 GiB) and large downloads. Slow CopyObject, UploadPartCopy and
+   CompleteMultipartUpload calls are kept alive by gos3 with whitespace every
+   5 s. gos3 itself fails a request body that sends no data for 60 s
+   (`RequestTimeout`); this limit is fixed.
 3. Set `server.trust_proxy_headers: true` only when the proxy **overwrites**
    `X-Forwarded-For` and `X-Forwarded-Proto`. Then `aws:SourceIp`,
    `aws:SecureTransport` and the access log see the real client. gos3 uses the
@@ -259,13 +298,17 @@ gos3 can terminate TLS itself:
 
 ```sh
 gos3 serve --tls-cert /etc/gos3/fullchain.pem --tls-key /etc/gos3/privkey.pem
+# or: GOS3_TLS_CERT=/etc/gos3/fullchain.pem GOS3_TLS_KEY=/etc/gos3/privkey.pem gos3 serve
 ```
 
 - TLS 1.2 or later, with HTTP/2. The certificate is loaded at startup, so
   restart gos3 after renewing it (or terminate TLS at a reverse proxy that
   reloads certificates).
-- `gos3 healthcheck` follows the configuration and uses `https` (without
-  certificate verification against its own loopback address).
+- `gos3 healthcheck` follows the configuration (file and `GOS3_*`
+  environment, not the flags of the running `serve`) and uses `https`
+  (without certificate verification against its own loopback address). In
+  containers, configure TLS through the environment so the image's health
+  check sees it.
 - Discovery probes of other servers verify their certificates. A peer with a
   self-signed certificate shows up as unverified, with a TLS error.
 - For self-signed certificates, clients need the CA (for example

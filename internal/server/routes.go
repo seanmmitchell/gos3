@@ -7,8 +7,8 @@ import (
 	"errors"
 	"io"
 	"log/slog"
-	"net"
 	"net/http"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -47,11 +47,15 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	// 2. gos3's own endpoints.
 	if p := r.URL.Path; p == "/_gos3" || strings.HasPrefix(p, SystemPrefix) {
+		w, r, done := s.guardBody(w, r)
+		defer done()
 		s.serveSystem(w, r, &st)
 		return
 	}
 	// 3. A browser opening the server root lands in the UI.
 	if s.ui != nil && st.UIRedirect && isBrowserRootRequest(r) {
+		w, r, done := s.guardBody(w, r)
+		defer done()
 		w.Header().Set("Cache-Control", "no-store")
 		http.Redirect(w, r, webui.Prefix, http.StatusFound)
 		return
@@ -212,29 +216,10 @@ func (s *Server) authenticate(w http.ResponseWriter, r *http.Request) (auth.Iden
 }
 
 // requestConditions is the IAM condition context of a system endpoint
-// request.
+// request (the same client address rules as the S3 and admin APIs).
 func requestConditions(r *http.Request, trustProxy bool) map[string][]string {
-	ip := r.RemoteAddr
-	if host, _, err := net.SplitHostPort(ip); err == nil {
-		ip = host
-	}
-	secure := r.TLS != nil
-	if trustProxy {
-		if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
-			first, _, _ := strings.Cut(xff, ",")
-			if a := net.ParseIP(strings.TrimSpace(first)); a != nil {
-				ip = a.String()
-			}
-		}
-		if p := r.Header.Get("X-Forwarded-Proto"); p != "" {
-			secure = strings.EqualFold(strings.TrimSpace(p), "https")
-		}
-	}
-	sec := "false"
-	if secure {
-		sec = "true"
-	}
-	return map[string][]string{"aws:SourceIp": {ip}, "aws:SecureTransport": {sec}}
+	ip, secure := admin.ClientInfo(r, trustProxy)
+	return map[string][]string{"aws:SourceIp": {ip}, "aws:SecureTransport": {strconv.FormatBool(secure)}}
 }
 
 // instrumentAdmin records admin API requests in the metrics registry (op
@@ -276,7 +261,7 @@ func (s *Server) instrumentAdmin(h http.Handler) http.Handler {
 					slog.Int64("bytes_in", n),
 					slog.Int64("bytes_out", rec.bytes),
 					slog.Float64("duration_ms", float64(time.Since(start).Microseconds())/1000),
-					slog.String("remote", r.RemoteAddr))
+					slog.String("remote", s.clientIP(r)))
 			}
 		}()
 		h.ServeHTTP(rec, r)
@@ -285,7 +270,14 @@ func (s *Server) instrumentAdmin(h http.Handler) http.Handler {
 
 // logSystem logs a rejected system endpoint request at debug level.
 func (s *Server) logSystem(r *http.Request, status int) {
-	s.log.Debug("gos3 endpoint request", "method", r.Method, "path", r.URL.Path, "status", status, "remote", r.RemoteAddr)
+	s.log.Debug("gos3 endpoint request", "method", r.Method, "path", r.URL.Path, "status", status, "remote", s.clientIP(r))
+}
+
+// clientIP is the client address logged for a system endpoint request
+// (X-Forwarded-For with server.trust_proxy_headers).
+func (s *Server) clientIP(r *http.Request) string {
+	ip, _ := admin.ClientInfo(r, s.cfg.Server.TrustProxyHeaders)
+	return ip
 }
 
 // isVirtualHost reports whether host is "<bucket>.<domain>" for one of the

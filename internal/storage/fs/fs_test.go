@@ -10,6 +10,7 @@ import (
 	"math/rand/v2"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -139,7 +140,7 @@ func TestPersistence(t *testing.T) {
 	eq(t, "newest", versions(t, b, "ver", "k", "", "")[0].id, v3.VersionID)
 }
 
-func TestRecoveryRemovesOrphans(t *testing.T) {
+func TestRecoveryQuarantinesOrphans(t *testing.T) {
 	dir := t.TempDir()
 	b := openTest(t, dir)
 	mkBucket(t, b, "bkt", "")
@@ -163,19 +164,29 @@ func TestRecoveryRemovesOrphans(t *testing.T) {
 		if err := os.WriteFile(p, []byte("junk"), 0o600); err != nil {
 			t.Fatal(err)
 		}
-		return p
+		return rel
 	}
-	junk := []string{
+	goneUpload := newUploadID()
+	tmpJunk := []string{
 		mustWrite("tmp/w-12345"),
 		mustWrite("tmp/nested/dir/file"),
+	}
+	orphans := []string{
 		mustWrite(filepath.Join("data", bucketID, "ab", "ab"+strings.Repeat("0", 30))), // unreferenced data file
-		mustWrite(filepath.Join("data", bucketID, "stray")),                            // unexpected file
 		mustWrite(filepath.Join("data", "deadbeefdeadbeef", "00", "00ff")),             // deleted bucket
+		mustWrite(filepath.Join("uploads", goneUpload, "1-abcdef")),                    // finished upload
+		mustWrite(filepath.Join("uploads", up.UploadID, "1-0123456789abcdef")),         // unreferenced part
+	}
+	// Entries that gos3 never creates are left alone: they may be someone
+	// else's (e.g. lost+found when data/ is a mount point).
+	foreign := []string{
+		mustWrite(filepath.Join("data", bucketID, "stray")),
+		mustWrite(filepath.Join("data", bucketID, "ab", "not-a-data-file")),
 		mustWrite(filepath.Join("data", "stray")),
-		mustWrite(filepath.Join("uploads", "gone-upload", "1-abcdef")), // finished upload
-		mustWrite(filepath.Join("uploads", up.UploadID, "1-0123456789abcdef")),
+		mustWrite(filepath.Join("data", "lost+found", "#1234")),
 		mustWrite(filepath.Join("uploads", up.UploadID, "garbage")),
 		mustWrite(filepath.Join("uploads", "stray")),
+		mustWrite(filepath.Join("uploads", "lost+found", "#1234")),
 	}
 
 	var logBuf syncBuffer
@@ -187,9 +198,27 @@ func TestRecoveryRemovesOrphans(t *testing.T) {
 	// tmp/ is cleaned synchronously by Open.
 	eq(t, "tmp files right after Open", len(tmpFiles(t, b)), 0)
 	waitRecovery(t, b)
-	for _, p := range junk {
-		if _, err := os.Stat(p); !os.IsNotExist(err) {
-			t.Errorf("%s survived recovery (%v)", p, err)
+	for _, rel := range tmpJunk {
+		if _, err := os.Stat(filepath.Join(sys, rel)); !os.IsNotExist(err) {
+			t.Errorf("%s survived Open (%v)", rel, err)
+		}
+	}
+	runs, err := os.ReadDir(filepath.Join(sys, "orphans"))
+	if err != nil || len(runs) != 1 {
+		t.Fatalf("orphan runs = %v, %v", runs, err)
+	}
+	run := filepath.Join(sys, "orphans", runs[0].Name())
+	for _, rel := range orphans {
+		if _, err := os.Stat(filepath.Join(sys, rel)); !os.IsNotExist(err) {
+			t.Errorf("%s survived recovery (%v)", rel, err)
+		}
+		if _, err := os.Stat(filepath.Join(run, rel)); err != nil {
+			t.Errorf("%s not quarantined: %v", rel, err)
+		}
+	}
+	for _, rel := range foreign {
+		if _, err := os.Stat(filepath.Join(sys, rel)); err != nil {
+			t.Errorf("foreign entry %s touched: %v", rel, err)
 		}
 	}
 	if _, err := os.Stat(filepath.Join(sys, "data", "deadbeefdeadbeef")); !os.IsNotExist(err) {
@@ -206,9 +235,156 @@ func TestRecoveryRemovesOrphans(t *testing.T) {
 	}
 	eq(t, "multipart", read(t, b, "bkt", "mp", ""), "live-part")
 	logs := logBuf.String()
-	for _, want := range []string{"removed temporary files", "orphan_data_files=1", "deleted_bucket_dirs=1", "stale_upload_dirs=1", "orphan_part_files=2", "stray_entries=3"} {
+	for _, want := range []string{"removed temporary files", "orphan_data_files=1", "deleted_bucket_dirs=1",
+		"stale_upload_dirs=1", "orphan_part_files=1", "unrecognized_entries=7", "quarantine=" + run} {
 		if !strings.Contains(logs, want) {
 			t.Errorf("log lacks %q:\n%s", want, logs)
+		}
+	}
+}
+
+// TestOpenRefusesMissingMetaDB: when meta.db is lost (or truncated to
+// nothing) while object data survives, Open must refuse to start instead of
+// creating an empty database whose recovery pass would treat every object
+// as an orphan.
+func TestOpenRefusesMissingMetaDB(t *testing.T) {
+	for _, mode := range []string{"missing", "empty"} {
+		t.Run(mode, func(t *testing.T) {
+			dir := t.TempDir()
+			b := openTest(t, dir)
+			mkBucket(t, b, "photos", "")
+			for i := range 3 {
+				put(t, b, "photos", fmt.Sprint("p", i), "pixels")
+			}
+			before := dataFiles(t, b)
+			if err := b.Close(); err != nil {
+				t.Fatal(err)
+			}
+			dbPath := filepath.Join(dir, ".gos3", "meta.db")
+			if err := os.Rename(dbPath, filepath.Join(dir, "meta.db.bak")); err != nil {
+				t.Fatal(err)
+			}
+			if mode == "empty" {
+				if err := os.WriteFile(dbPath, nil, 0o600); err != nil {
+					t.Fatal(err)
+				}
+			}
+			b2, err := Open(dir, Options{})
+			if err == nil {
+				waitRecovery(t, b2)
+				_ = b2.Close()
+				t.Fatalf("Open succeeded without metadata; data files left: %d of %d",
+					len(listFiles(t, filepath.Join(dir, ".gos3", "data"))), len(before))
+			}
+			if !strings.Contains(err.Error(), "meta.db") {
+				t.Errorf("error does not name the database: %v", err)
+			}
+			eq(t, "data files", len(listFiles(t, filepath.Join(dir, ".gos3", "data"))), len(before))
+			if fi, err := os.Stat(dbPath); mode == "missing" && !os.IsNotExist(err) {
+				t.Errorf("Open created a database: %v", err)
+			} else if mode == "empty" && (err != nil || fi.Size() != 0) {
+				t.Errorf("Open modified the empty database: %v", err)
+			}
+
+			// Restoring the database makes the data available again.
+			if err := os.Rename(filepath.Join(dir, "meta.db.bak"), dbPath); err != nil {
+				t.Fatal(err)
+			}
+			b3 := openTest(t, dir)
+			waitRecovery(t, b3)
+			eq(t, "object after restore", read(t, b3, "photos", "p1", ""), "pixels")
+		})
+	}
+
+	// A fresh root whose data directory holds only foreign entries (e.g.
+	// lost+found of a mount point) still opens.
+	dir := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(dir, ".gos3", "data", "lost+found"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	b := openTest(t, dir)
+	waitRecovery(t, b)
+	if _, err := os.Stat(filepath.Join(dir, ".gos3", "data", "lost+found")); err != nil {
+		t.Errorf("lost+found removed: %v", err)
+	}
+}
+
+// TestRecoveryRolledBackMetaDB: after restoring an older meta.db, objects
+// written since the backup are no longer referenced. Recovery must not
+// destroy them; they stay recoverable in the quarantine.
+func TestRecoveryRolledBackMetaDB(t *testing.T) {
+	dir := t.TempDir()
+	b := openTest(t, dir)
+	mkBucket(t, b, "old", "")
+	put(t, b, "old", "a", "backed-up")
+	if err := b.Close(); err != nil {
+		t.Fatal(err)
+	}
+	dbPath := filepath.Join(dir, ".gos3", "meta.db")
+	backup, err := os.ReadFile(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	b = openTest(t, dir)
+	waitRecovery(t, b)
+	put(t, b, "old", "b", "newer-object")
+	mkBucket(t, b, "new", "")
+	put(t, b, "new", "c", "newer-bucket")
+	if err := b.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(dbPath, backup, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	b = openTest(t, dir)
+	waitRecovery(t, b)
+	eq(t, "backed-up object", read(t, b, "old", "a", ""), "backed-up")
+	var contents []string
+	for _, f := range listFiles(t, filepath.Join(dir, ".gos3", "orphans")) {
+		data, err := os.ReadFile(filepath.Join(dir, ".gos3", "orphans", f))
+		if err != nil {
+			t.Fatal(err)
+		}
+		contents = append(contents, string(data))
+	}
+	slices.Sort(contents)
+	eq(t, "quarantined", strings.Join(contents, ","), "newer-bucket,newer-object")
+}
+
+// TestRecoveryPurgesOldQuarantine: quarantined orphans are deleted once
+// they are older than the retention.
+func TestRecoveryPurgesOldQuarantine(t *testing.T) {
+	dir := t.TempDir()
+	b := openTest(t, dir)
+	waitRecovery(t, b)
+	if err := b.Close(); err != nil {
+		t.Fatal(err)
+	}
+	orphans := filepath.Join(dir, ".gos3", "orphans")
+	now := time.Now().UTC()
+	old := filepath.Join(orphans, now.Add(-49*time.Hour).Format(orphanRunLayout)+"-0011", "data", "x")
+	recent := filepath.Join(orphans, now.Add(-47*time.Hour).Format(orphanRunLayout)+"-0022", "data", "x")
+	other := filepath.Join(orphans, "keep-me", "x")
+	for _, p := range []string{old, recent, other} {
+		if err := os.MkdirAll(filepath.Dir(p), 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(p, []byte("x"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	b, err := Open(dir, Options{OrphanRetention: 48 * time.Hour})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { b.Close() })
+	waitRecovery(t, b)
+	if _, err := os.Stat(filepath.Dir(old)); !os.IsNotExist(err) {
+		t.Errorf("expired quarantine run kept: %v", err)
+	}
+	for _, p := range []string{recent, other} {
+		if _, err := os.Stat(p); err != nil {
+			t.Errorf("%s removed: %v", p, err)
 		}
 	}
 }

@@ -907,3 +907,48 @@ func TestWalkHugeRecords(t *testing.T) {
 	}
 	eq(t, "versions", len(versions(t, b, bkt, "", "", "")), n)
 }
+
+// TestIndeterminateCommitKeepsData: when the metadata commit reports an
+// error after the transaction function succeeded, the commit may still have
+// reached the disk, so the new data file must not be deleted (it would
+// leave the persisted version pointing at nothing).
+func TestIndeterminateCommitKeepsData(t *testing.T) {
+	b, bkt := newBucket(t, storage.VersioningUnversioned)
+	put(t, b, bkt, "k", "old")
+	boom := errors.New("fdatasync: input/output error")
+	b.commitFault = func() error { return boom }
+	if _, err := putOpts(t, b, bkt, "k", "new", storage.CommitOptions{}); !errors.Is(err, boom) {
+		t.Fatalf("put with failing commit: %v", err)
+	}
+	b.commitFault = nil
+	// Here the commit did persist: the object must be readable.
+	eq(t, "after indeterminate commit", read(t, b, bkt, "k", ""), "new")
+
+	up, err := b.CreateMultipartUpload(ctx, bkt, "mp", storage.ObjectMeta{}, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	b.commitFault = func() error { return boom }
+	w, err := b.NewPartWriter(ctx, bkt, "mp", up.UploadID, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := io.WriteString(w, "part"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := w.Commit(ctx, storage.PartMeta{ETag: md5hex("part")}); !errors.Is(err, boom) {
+		t.Fatalf("part commit: %v", err)
+	}
+	b.commitFault = nil
+	if _, err := b.CompleteMultipartUpload(ctx, bkt, "mp", up.UploadID, []int{1}, storage.ObjectMeta{}, storage.CommitOptions{}); err != nil {
+		t.Fatalf("complete: %v", err)
+	}
+	eq(t, "multipart", read(t, b, bkt, "mp", ""), "part")
+
+	// A failure of the transaction itself still removes the new file.
+	before := len(dataFiles(t, b))
+	if _, err := putOpts(t, b, bkt, "k", "x", storage.CommitOptions{IfNoneMatch: true}); !errors.Is(err, storage.ErrPreconditionFailed) {
+		t.Fatalf("conditional put: %v", err)
+	}
+	eq(t, "data files after failed precondition", len(dataFiles(t, b)), before)
+}

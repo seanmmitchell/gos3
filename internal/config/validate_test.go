@@ -47,6 +47,8 @@ func TestValidateSettings(t *testing.T) {
 		{"public url scheme", func(s *Settings) { s.PublicURL = "ftp://x" }, "publicUrl"},
 		{"public url query", func(s *Settings) { s.PublicURL = "http://x?y=1" }, "publicUrl"},
 		{"public url creds", func(s *Settings) { s.PublicURL = "http://u:p@x" }, "publicUrl"},
+		// A path was accepted, then silently dropped from every advertised endpoint.
+		{"public url path", func(s *Settings) { s.PublicURL = "https://s3.example.com/store" }, "publicUrl"},
 		{"domain", func(s *Settings) { s.Domains = []string{"s3.local", "bad domain"} }, "domains[1]"},
 		{"domain port", func(s *Settings) { s.Domains = []string{"s3.local:9000"} }, "domains[0]"},
 		{"domains too many", func(s *Settings) { s.Domains = make([]string, 257) }, "domains"},
@@ -66,6 +68,8 @@ func TestValidateSettings(t *testing.T) {
 		{"beacon interval high", func(s *Settings) { s.Discovery.BeaconInterval = 2 * time.Hour }, "discovery.beaconInterval"},
 		{"peer ttl", func(s *Settings) { s.Discovery.PeerTTL = -time.Second }, "discovery.peerTtl"},
 		{"peer ttl zero", func(s *Settings) { s.Discovery.PeerTTL = 0 }, "discovery.peerTtl"},
+		// Accepted before, but discovery silently raised it to 30s.
+		{"peer ttl below 30s", func(s *Settings) { s.Discovery.PeerTTL = 5 * time.Second }, "discovery.peerTtl"},
 		{"seed", func(s *Settings) { s.Discovery.Seeds = []string{"not a url"} }, "discovery.seeds[0]"},
 		{"seed path", func(s *Settings) { s.Discovery.Seeds = []string{"http://h:9000/x"} }, "discovery.seeds[0]"},
 		{"seed scheme", func(s *Settings) { s.Discovery.Seeds = []string{"ftp://h"} }, "discovery.seeds[0]"},

@@ -15,6 +15,7 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/seanmmitchell/gos3/internal/auth"
 	"github.com/seanmmitchell/gos3/internal/s3err"
@@ -205,6 +206,11 @@ func (s *Server) handlePostObject(w http.ResponseWriter, r *http.Request, rc *re
 	if body == nil {
 		body = r.Body
 	}
+	// Until the policy is verified the client is anonymous: bound the time
+	// it may take to send the form fields, not just the idle time.
+	if rc.in != nil {
+		rc.in.setLimit(time.Now().Add(s.postPreambleTimeout))
+	}
 	form, err := readPostForm(r, body)
 	if err != nil {
 		return err
@@ -231,6 +237,9 @@ func (s *Server) handlePostObject(w http.ResponseWriter, r *http.Request, rc *re
 	if err := auth.CheckPostPolicy(policy, pform, -1); err != nil {
 		return err
 	}
+	if rc.in != nil {
+		rc.in.setLimit(time.Time{})
+	}
 	res := *rc.auth
 	res.Identity = id
 	if policy != nil {
@@ -239,31 +248,44 @@ func (s *Server) handlePostObject(w http.ResponseWriter, r *http.Request, rc *re
 	rc.auth, rc.identity, rc.key = &res, id, key
 
 	hdr := postFieldHeaders(fields)
-	conds := map[string][]string{}
-	for _, k := range []string{"x-amz-acl", "x-amz-storage-class", "x-amz-server-side-encryption", "x-amz-website-redirect-location"} {
-		if v := hdr.Get(k); v != "" {
-			conds["s3:"+k] = []string{v}
-		}
-	}
-	if err := s.authorizeTarget(ctx, r, rc, authzTarget{Action: "s3:PutObject", Bucket: rc.bucket, Key: key, Conditions: conds}); err != nil {
-		return err
-	}
-
 	meta, err := s.objectMetaFromHeaders(hdr)
 	if err != nil {
 		return err
 	}
-	if t := fields["tagging"]; t != "" {
+	tagging := fields["tagging"]
+	if tagging != "" {
 		var doc Tagging
-		if err := decodeXML([]byte(t), &doc); err != nil {
+		if err := decodeXML([]byte(tagging), &doc); err != nil {
 			return err
 		}
 		if meta.Tags, err = validateObjectTags(doc.TagSet.Tags); err != nil {
 			return err
 		}
 	}
-	if err := s.prepareNewObject(ctx, r, rc, bi, key, &meta,
-		hdr.Get("X-Amz-Object-Lock-Legal-Hold") != "", hdr.Get("X-Amz-Acl"), hdr.Get("X-Amz-Acl") != ""); err != nil {
+
+	// The form fields stand in for the request headers that the condition
+	// context reads for other writes, including the request tags.
+	conds := map[string][]string{}
+	for _, k := range []string{"x-amz-acl", "x-amz-storage-class", "x-amz-server-side-encryption", "x-amz-website-redirect-location"} {
+		if v := hdr.Get(k); v != "" {
+			conds["s3:"+k] = []string{v}
+		}
+	}
+	putConds := maps.Clone(conds)
+	if tagging != "" {
+		maps.Copy(putConds, requestTagConditions(meta.Tags))
+	}
+	if err := s.authorizeTarget(ctx, r, rc, authzTarget{Action: "s3:PutObject", Bucket: rc.bucket, Key: key, Conditions: putConds}); err != nil {
+		return err
+	}
+	acl := hdr.Get("X-Amz-Acl")
+	if err := s.prepareNewObject(ctx, r, rc, bi, key, &meta, newObjectOpts{
+		legalHoldSet: hdr.Get("X-Amz-Object-Lock-Legal-Hold") != "",
+		acl:          acl,
+		aclSet:       acl != "",
+		tagsSet:      tagging != "",
+		conds:        conds,
+	}); err != nil {
 		return err
 	}
 

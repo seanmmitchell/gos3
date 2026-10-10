@@ -30,16 +30,20 @@ const loading = ref(false)
 const error = ref<unknown>(null)
 const busyId = ref<string | null>(null)
 
+// Only the latest load may write (the key can change while one runs).
+let seq = 0
 async function load() {
+  const my = ++seq
   if (!props.client) return
   loading.value = true
   error.value = null
   try {
-    versions.value = await props.client.listVersionsOfKey(props.bucket, props.objectKey)
+    const list = await props.client.listVersionsOfKey(props.bucket, props.objectKey)
+    if (my === seq) versions.value = list
   } catch (e) {
-    error.value = e
+    if (my === seq) error.value = e
   } finally {
-    loading.value = false
+    if (my === seq) loading.value = false
   }
 }
 watch(() => [props.bucket, props.objectKey], () => void load(), { immediate: true })

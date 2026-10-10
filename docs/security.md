@@ -32,7 +32,9 @@ the settings to review before you expose a server.
   never allows them.
 - The web UI signs requests in the browser. There are no sessions, cookies or
   passwords. A secret key the user saves with "remember" is kept in the
-  browser's `localStorage`, so use that only on trusted devices.
+  browser's `localStorage`, so use that only on trusted devices. Any script
+  running on the UI's origin could read it, which is why object responses
+  are sandboxed (see [Object responses](#object-responses)).
 
 ### Root credentials
 
@@ -58,11 +60,29 @@ stored in `<data>/.gos3/iam.json` (mode 0600). A user can have up to 10 keys,
 and keys can be deactivated. Users can list, create and delete their own keys
 through `/_gos3/admin/v1/whoami/keys`.
 
+Users may create and delete their own keys without any grant, unless a
+policy explicitly denies `admin:CreateOwnAccessKey` /
+`admin:DeleteOwnAccessKey` (a Deny of `admin:*` also matches). Deny them to
+stop a user, or a stolen key, from minting keys that would survive revoking
+the current one.
+
 Built-in policies: `admin` (everything, including the admin API), `readwrite`
 (all S3 actions), `readonly`, `writeonly`, and `diagnostics` (server info,
 stats and discovery in the admin API only). Custom policies use the IAM policy
 language; the admin API's `/authz/simulate` endpoint and the UI's policy
 simulator show which statement decides a request.
+
+Setting an ACL or tags while writing an object needs more than
+`s3:PutObject`, as on AWS: PutObject, CopyObject (with the `REPLACE` tagging
+directive), CreateMultipartUpload and PostObject also require
+`s3:PutObjectAcl` when an ACL is given (`x-amz-acl` or the `acl` form field)
+and `s3:PutObjectTagging` when tags are given (`x-amz-tagging` or the
+`tagging` form field). A principal limited to `s3:PutObject` (such as the
+built-in `writeonly` policy) can therefore neither publish an object through
+an ACL nor plant tags that `s3:ExistingObjectTag` conditions rely on. The
+`s3:RequestObjectTag/<key>` and `s3:RequestObjectTagKeys` condition keys are
+evaluated for these uploads, for PutObjectTagging (from the XML body) and for
+PostObject (from the `tagging` field).
 
 ## Data at rest
 
@@ -83,8 +103,17 @@ secret too. **gos3 does not encrypt objects.** Bucket default encryption and
 compatibility only. Use full-disk or file system encryption if you need
 encryption at rest. SSE-C is rejected (`NotImplemented`).
 
-Only one gos3 process can use a data directory at a time; a second one fails at
-startup because the metadata database is locked.
+Only one gos3 process can use a data directory at a time: every backend,
+including the memory backend with a data path, takes an exclusive lock on
+`<data>/.gos3/lock`, and a second process fails at startup with "is another
+gos3 using this data directory?". On platforms without `flock` or Windows
+file sharing the lock is a no-op.
+
+The fs backend never deletes object or part files that its metadata does not
+reference at startup; it moves them to `.gos3/orphans/` (deleted after 7
+days), so treat that directory like the rest of the data. It also refuses to
+start when `meta.db` is missing or empty while object files exist, instead
+of discarding them. See [operations.md](operations.md#the-data-directory).
 
 ## Transport
 
@@ -95,7 +124,37 @@ startup because the metadata database is locked.
   HTTP/2.
 - Behind a proxy, enable `server.trust_proxy_headers` only when the proxy
   overwrites `X-Forwarded-For` and `X-Forwarded-Proto`. Otherwise clients can
-  fake `aws:SourceIp` and `aws:SecureTransport` conditions.
+  fake `aws:SourceIp` and `aws:SecureTransport` conditions. The setting
+  applies to the S3 API and the admin API (conditions and access log alike).
+
+### Timeouts
+
+These limits are fixed (not configurable):
+
+- A request body that sends no data for 60 s fails: S3 requests with `400
+  RequestTimeout`, requests to `/_gos3/*` endpoints (admin API, UI, info)
+  with an error.
+- On HTTP/1.1, when gos3 answers before reading the request body (typically
+  an error), it drains at most 256 KiB of the unread body for at most 10 s
+  (S3 API); otherwise, and always for `/_gos3/*` endpoints, the response
+  carries `Connection: close` and the connection is closed. A client that
+  announces a body and never sends it cannot hold a connection open.
+- PostObject form fields before the file must arrive within 60 s.
+- Slow CopyObject, UploadPartCopy and CompleteMultipartUpload calls keep the
+  connection alive with whitespace (see
+  [s3-compatibility.md](s3-compatibility.md#other-differences-from-aws)).
+
+## Object responses
+
+Objects are served from the same origin (scheme, host and port) as the
+embedded web UI. An uploaded `text/html` or `image/svg+xml` object opened in a
+browser could otherwise run script with the UI's origin and read the
+connections and remembered secret keys it stores. Therefore every GetObject
+and HeadObject response carries `X-Content-Type-Options: nosniff` and, except
+for `application/pdf`, `Content-Security-Policy: sandbox`. HTML and SVG
+objects opened in a browser render without scripts, forms or same-origin
+access, so HTML applications cannot be hosted in a bucket and opened directly
+(images, media and downloads are unaffected).
 
 ## CORS
 
@@ -105,6 +164,25 @@ only make signed requests if it already has a secret key. Still, in production,
 list the origins of the web UIs you use (`cors.allowed_origins`, `--cors-origin`,
 or **Settings → CORS**). Bucket CORS configurations take precedence for their
 bucket. `/_gos3/info` always answers with `Access-Control-Allow-Origin: *`.
+
+**Known issue:** with the `*` default, objects that are anonymous only for
+some networks (a bucket policy with an `aws:SourceIp` condition, e.g. an
+intranet allow-list) can be read by scripts on *any* website that a user on
+those networks visits, because the browser makes the request from the user's
+address and the response is shared with every origin. Until this is fixed in
+the S3 CORS handling, restrict `cors.allowed_origins` (or set a bucket CORS
+configuration) on servers that use IP-based anonymous access.
+
+## Public access evaluation
+
+Block Public Access (`BlockPublicPolicy`, `RestrictPublicBuckets`),
+`GetBucketPolicyStatus` and the admin API's `public` flags treat a bucket
+policy statement that allows anonymous access as **non-public** only when a
+condition restricts it to a bounded set of sources. An `aws:SourceIp`
+condition counts as restricting only when its ranges together cover at most
+four IPv4 /8 networks and four IPv6 /32 networks (overlapping ranges are
+counted twice; `::ffff:a.b.c.d/96+n` counts as the IPv4 /n). Wider
+allow-lists, such as `fd00::/8` or many large ranges, count as public.
 
 ## Public endpoints
 
@@ -124,13 +202,21 @@ then cannot verify it.
 - mDNS and beacon announcements contain the server ID, name, version, region
   and URLs. Turn them off with `discovery.advertise: false`, or turn off
   discovery with `discovery.enabled: false` (`--no-discovery`).
+  `server.public_info: false` does not stop these announcements: also set
+  `discovery.advertise: false` to hide them.
+- Beacon datagrams are accepted only from this host or a directly connected
+  subnet, are rate-limited per sender, and can only make a server probe the
+  sender's own IP (announced host names are never resolved). mDNS answers are
+  only probed at on-link addresses. See
+  [discovery.md](discovery.md#3-udp-multicast-beacon).
 - Announcements are unauthenticated hints. A candidate becomes a peer only after
   its `/_gos3/info` was fetched, and adding a server to the UI still needs
   credentials. A malicious host on the network can still make itself appear in
   peer lists.
 - **Scans** (`POST /_gos3/admin/v1/discovery/scan`) need `admin:ScanNetwork`
   and `discovery.allow_scan: true` (the default). They are limited to
-  `max_scan_hosts` hosts (default 1024) and 5 minutes. Set `allow_scan: false`
+  `max_scan_hosts` hosts (default 1024) and 5 minutes, and at most 2 scans
+  run at once per server (`429 TooManyRequests`). Set `allow_scan: false`
   where port scanning is unwelcome.
 - **Probes** (`POST /_gos3/admin/v1/discovery/probe`) need only
   `admin:GetDiscovery`, which the `diagnostics` policy grants. They make the
@@ -140,7 +226,13 @@ then cannot verify it.
   proxies. Grant `diagnostics` only to trusted users.
 - The standalone web UI's Node server performs local discovery (mDNS, beacon,
   scans, probes) for **anyone who can reach it**, without authentication.
-  Restrict access to it, or set `GOS3_UI_LOCAL_DISCOVERY=false`.
+  Restrict access to it, or set `GOS3_UI_LOCAL_DISCOVERY=false`. Against DNS
+  rebinding and other websites, its `/api/discovery/*` routes answer 403
+  unless the `Host` is an IP address, `localhost`/`*.localhost` or a name in
+  `GOS3_UI_ALLOWED_HOSTS`, and refuse a foreign `Origin` or `Sec-Fetch-Site:
+  cross-site`/`same-site`. Its probes read at most 64 KiB of `/_gos3/info`
+  (with or without `Content-Length`); local discovery keeps at most 2048
+  mDNS records and 1024 beacon candidates and verifies at most 256 URLs.
 
 ## Admin API notes
 

@@ -9,6 +9,7 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"os"
 	"sort"
 	"strconv"
 
@@ -267,7 +268,8 @@ func mapStorageError(err error) error {
 		return s3err.ErrPreconditionFailed
 	case errors.Is(err, storage.ErrInvalidName):
 		return s3err.ErrInvalidArgument.WithMessage("The specified name is not valid.")
-	case errors.Is(err, context.DeadlineExceeded), errors.Is(err, context.Canceled):
+	case errors.Is(err, context.DeadlineExceeded), errors.Is(err, context.Canceled),
+		errors.Is(err, os.ErrDeadlineExceeded): // a stalled request body (countingBody)
 		return s3err.ErrRequestTimeout
 	case errors.As(err, &maxBytes):
 		return s3err.ErrMaxMessageLengthExceeded

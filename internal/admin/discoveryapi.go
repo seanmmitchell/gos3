@@ -21,6 +21,9 @@ const (
 	maxScanPorts       = 64
 	maxScanConcurrency = 1024
 	maxProbeTimeout    = time.Minute
+	// maxConcurrentScans bounds the network scans running at once on this
+	// server: each one may run hundreds of probe workers for minutes.
+	maxConcurrentScans = 2
 )
 
 type discoveryState struct {
@@ -97,6 +100,13 @@ func (a *api) scan(rc *reqCtx) (int, any, error) {
 	}
 	if err := validateScanRequest(&req, cfg.MaxScanHosts); err != nil {
 		return 0, nil, err
+	}
+	select {
+	case a.scans <- struct{}{}:
+		defer func() { <-a.scans }()
+	default:
+		return 0, nil, errorf(http.StatusTooManyRequests, codeTooManyRequests,
+			"%d network scans are already running on this server; retry when one has finished", maxConcurrentScans)
 	}
 	ctx, cancel := context.WithTimeout(rc.ctx, scanTimeout)
 	defer cancel()

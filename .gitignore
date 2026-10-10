@@ -1,5 +1,8 @@
 # Go
 /bin/
+# `go build ./cmd/gos3` in the repository root
+/gos3
+/gos3.exe
 /dist/
 *.test
 *.out

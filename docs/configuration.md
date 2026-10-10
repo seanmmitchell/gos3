@@ -24,7 +24,10 @@ gos3 serve -h                   # flags
 ```
 
 `gos3 config print` takes the same flags as `gos3 serve`, so you can check what
-a command line would produce. Unknown YAML keys are an error, reported with
+a command line would produce. When `<data>/.gos3/settings.json` exists, it
+lays that file over the result (defaults < file < env < flags <
+settings.json), as the server does, and lists the configured values it
+overrides. Unknown YAML keys are an error, reported with
 their line number (for example `line 3: unknown key "adress" in section "server"`).
 Validation errors name the YAML key, for example
 `cors.allowed_origins[1]: must not contain a path...`.
@@ -54,14 +57,14 @@ changed while running.
 | `server.address` | `GOS3_ADDRESS` | `--address` | `:9000` | | Listen address, `[host]:port`. Port `0` picks a free port; the banner shows the real URL. |
 | `server.name` | `GOS3_NAME` | `--name` | host name | `name` | Server name shown in the UI and announced by discovery (at most 128 printable characters). |
 | `server.region` | `GOS3_REGION` | `--region` | `us-east-1` | `region` | Region reported to clients (lowercase letters, digits and `-`). |
-| `server.public_url` | `GOS3_PUBLIC_URL` | `--public-url` | derived | `publicUrl` | Externally reachable base URL, advertised first in `/_gos3/info` and discovery. A path is allowed; credentials, a query and a fragment are not. When empty, gos3 advertises the listener port on every non-loopback address of the host. |
+| `server.public_url` | `GOS3_PUBLIC_URL` | `--public-url` | derived | `publicUrl` | Externally reachable base URL, advertised first in `/_gos3/info` and discovery. No path (a trailing `/` is allowed), credentials, query or fragment: gos3 must be at the root of the URL. When empty, gos3 advertises the listener port on every non-loopback address of the host. |
 | `server.domains` | `GOS3_DOMAINS` | `--domain` | `[]` | `domains` | Domains for virtual-hosted-style requests: Host `<bucket>.<domain>` addresses `<bucket>`. DNS names only, no scheme or port. Path-style requests always work. |
 | `server.tls_cert` | `GOS3_TLS_CERT` | `--tls-cert` | | | PEM certificate (chain) file. Set it together with `tls_key` to serve HTTPS (HTTP/2 enabled). |
 | `server.tls_key` | `GOS3_TLS_KEY` | `--tls-key` | | | PEM private key file. |
 | `server.max_object_size` | `GOS3_MAX_OBJECT_SIZE` | | `5368709120` (5 GiB) | | Largest single PUT / POST / copy, in bytes, at most 5 TiB. `0` means the default. Multipart uploads are limited by part count and size instead. |
 | `server.public_info` | `GOS3_PUBLIC_INFO` | | `true` | `publicInfo` | Serve `GET /_gos3/info` without authentication. When false, any valid signature is required. |
 | `server.shutdown_timeout` | `GOS3_SHUTDOWN_TIMEOUT` | | `30s` | | How long in-flight requests may run after SIGINT/SIGTERM before connections are closed. |
-| `server.trust_proxy_headers` | `GOS3_TRUST_PROXY_HEADERS` | | `false` | | Use `X-Forwarded-For` for the client address (`aws:SourceIp`, access log) and `X-Forwarded-Proto` for `aws:SecureTransport`. Enable it only behind a reverse proxy that overwrites these headers. |
+| `server.trust_proxy_headers` | `GOS3_TRUST_PROXY_HEADERS` | | `false` | | Use `X-Forwarded-For` for the client address (`aws:SourceIp`, access log) and `X-Forwarded-Proto` for `aws:SecureTransport`. Applies to the S3 API and to the admin API (its `aws:SourceIp` / `aws:SecureTransport` conditions and the remote address in its access log). Enable it only behind a reverse proxy that overwrites these headers. |
 
 ### `storage`
 
@@ -137,7 +140,7 @@ API). [discovery.md](discovery.md) describes the protocol.
 | `discovery.beacon_interval` | `GOS3_DISCOVERY_BEACON_INTERVAL` | | `10s` | Announce interval (±10 % jitter), 1s–1h. |
 | `discovery.seeds` | `GOS3_DISCOVERY_SEEDS` | `--seed` | `[]` | Base URLs (or bare `host[:port]`, meaning `http://`) of servers to probe on start and every 30 s. At most 256. |
 | `discovery.dns_srv` | `GOS3_DISCOVERY_DNS_SRV` | | `[]` | Domains whose `_gos3._tcp.<domain>` SRV records list servers (queried every 60 s). At most 64. |
-| `discovery.peer_ttl` | `GOS3_DISCOVERY_PEER_TTL` | | `60s` | Peers not seen for this long are dropped, 1s–7d. |
+| `discovery.peer_ttl` | `GOS3_DISCOVERY_PEER_TTL` | | `60s` | Peers not seen for this long are dropped, 30s–7d. |
 | `discovery.allow_scan` | `GOS3_DISCOVERY_ALLOW_SCAN` | | `true` | Allow network scans through the admin API (users also need `admin:ScanNetwork`). |
 | `discovery.max_scan_hosts` | `GOS3_DISCOVERY_MAX_SCAN_HOSTS` | | `1024` | Host limit per scan, 1–65536. |
 
@@ -221,6 +224,9 @@ How it behaves:
 - After the first save, changing one of these keys in YAML, the environment or
   a flag has no effect. Change it in the UI or the admin API, or stop the
   server and delete `settings.json` to go back to the static configuration.
+  At startup the server logs a warning for every explicitly configured value
+  (file, environment or flag) that `settings.json` overrides, and
+  `gos3 config print` lists them.
 - Changes apply immediately and need no restart: log level and format, the
   access log, CORS, domains, region, discovery (only the mechanisms whose
   settings changed are restarted) and the lifecycle worker. With

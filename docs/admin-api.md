@@ -15,10 +15,20 @@ Base path: `/_gos3/admin/v1` on the S3 listener. JSON in/out
   the built-in `admin` policy allows all; `diagnostics` allows `ServerInfo`,
   `GetStats`, `GetDiscovery`.
 - Endpoints marked *any* only require a valid (non-anonymous) identity.
+  `POST` and `DELETE /whoami/keys` are refused with 403 `AccessDenied` only
+  when an explicit Deny matches `admin:CreateOwnAccessKey` /
+  `admin:DeleteOwnAccessKey` (a Deny of `admin:*` matches too); no Allow is
+  needed. Use such a Deny to stop a user, or a stolen key, from minting keys
+  that would survive revoking the current one.
+- `aws:SourceIp` / `aws:SecureTransport` conditions and the remote address
+  in the admin access log use `X-Forwarded-For` / `X-Forwarded-Proto` only
+  when `server.trust_proxy_headers` is on, as for the S3 API.
 - CORS: preflight `OPTIONS` is answered without auth using the global
   `cors` settings; actual responses carry the matching CORS headers.
 - Request bodies are limited to 1 MiB and decoded strictly: unknown fields and
   trailing data are `400 InvalidRequest` (`InvalidSettings` on `PUT /config`).
+  A body that sends no data for 60 s fails; a response sent before the body
+  was read closes the connection.
 - Responses carry `Cache-Control: no-store`. Admin requests are counted in
   the metrics as op `Admin` and appear in the access log.
 
@@ -34,6 +44,7 @@ Non-2xx responses: `{"error": {"code": "<Code>", "message": "<text>"}}`.
 | 404 | `NotFound` |
 | 405 | `MethodNotAllowed` |
 | 409 | `Conflict` (exists / in use / bucket not empty) |
+| 429 | `TooManyRequests` (`POST /discovery/scan`: 2 scans are already running on this server) |
 | 500 | `InternalError` |
 | 502 | `ProbeFailed` (`POST /discovery/probe`: the target did not answer as a gos3 server) |
 | 503 | `InternalError` (request canceled or timed out) |
@@ -45,8 +56,8 @@ Non-2xx responses: `{"error": {"code": "<Code>", "message": "<text>"}}`.
 |---|---|---|---|
 | GET | `/whoami` | *any* | `WhoAmI` |
 | GET | `/whoami/keys` | *any* | `{"keys": AccessKey[]}` (own keys, no secrets) |
-| POST | `/whoami/keys` | *any* | body `{"description"?}` → 201 `AccessKey` (with `secretKey`). Not for root. |
-| DELETE | `/whoami/keys/{accessKey}` | *any* | 204 (own keys only; cannot delete the key used to sign this request) |
+| POST | `/whoami/keys` | *any* unless `admin:CreateOwnAccessKey` is denied | body `{"description"?}` → 201 `AccessKey` (with `secretKey`). Not for root. |
+| DELETE | `/whoami/keys/{accessKey}` | *any* unless `admin:DeleteOwnAccessKey` is denied | 204 (own keys only; cannot delete the key used to sign this request) |
 
 ```jsonc
 // WhoAmI
@@ -118,13 +129,14 @@ Non-2xx responses: `{"error": {"code": "<Code>", "message": "<text>"}}`.
 400 `InvalidSettings` message names the field, e.g.
 `discovery.seeds[1]: "ftp://x" must be an absolute http:// or https:// URL`.
 Rules: `region` lowercase letters/digits/`-`; `name` ≤ 128 printable
-characters (empty allowed); `publicUrl` empty or an absolute http(s) URL (a
-path is allowed; no credentials, query or fragment); `domains` DNS names
+characters (empty allowed); `publicUrl` empty or an absolute http(s) URL
+without a path (a trailing `/` is allowed; no credentials, query or
+fragment); `domains` DNS names
 without scheme or port; CORS origins `*`, `scheme://host[:port]` or
 `scheme://*.domain[:port]` (no path); `exposeHeaders` header names or a lone
 `*` (no partial patterns like `x-amz-*`); `maxAgeSeconds` 0–604800;
 `beaconGroup` an **IPv4** multicast `ip:port`; `beaconInterval` 1 s–1 h;
-`peerTtl` 1 s–7 d; `seeds` http(s) base URLs without a path, or a bare
+`peerTtl` 30 s–7 d; `seeds` http(s) base URLs without a path, or a bare
 `host[:port]` (meaning `http://`), at most 256; `dnsSrv` domain names, at
 most 64; `maxScanHosts` 1–65536; `logging.level` `debug|info|warn|error`;
 `logging.format` `text|json`; `lifecycle.intervalSeconds` 60–31536000; other
@@ -136,7 +148,7 @@ environment and flags for these fields.
 | Method | Path | Action | Response |
 |---|---|---|---|
 | GET | `/users` | ListUsers | `{"users": iam.User[]}` |
-| POST | `/users` | CreateUser | body `iam.UserSpec` (+ optional `"createKey": true`) → 201 `{"user": User, "key"?: AccessKey}` |
+| POST | `/users` | CreateUser | body `iam.UserSpec` (+ optional `"createKey": true`) → 201 `{"user": User, "key"?: AccessKey}`; the names `.` and `..` are 400 `InvalidName` |
 | GET | `/users/{name}` | GetUser | `iam.User` |
 | PATCH | `/users/{name}` | UpdateUser | body `iam.UserUpdate` → `iam.User` |
 | DELETE | `/users/{name}` | DeleteUser | 204 |
@@ -149,7 +161,7 @@ environment and flags for these fields.
 |---|---|---|---|
 | GET | `/policies` | ListPolicies | `{"policies": iam.NamedPolicy[]}` |
 | GET | `/policies/{name}` | GetPolicy | `iam.NamedPolicy` |
-| PUT | `/policies/{name}` | PutPolicy | body `{"description"?, "document": PolicyDocument}` → `iam.NamedPolicy` |
+| PUT | `/policies/{name}` | PutPolicy | body `{"description"?, "document": PolicyDocument}` → `iam.NamedPolicy` (creating a policy named `.` or `..` is 400 `InvalidName`) |
 | DELETE | `/policies/{name}` | DeletePolicy | 204 (409 if attached, 400 if builtin) |
 | POST | `/authz/simulate` | SimulatePolicy | body `{"user": "alice" \| "root" \| "" (anonymous), "action": "s3:GetObject", "bucket": "b", "key": "k", "conditions"?: {"aws:SourceIp": "10.0.0.1" \| ["…"]}}` → `{"allowed": bool, "explicitDeny": bool, "reason": "…"}` (bucket policy and bucket ACL of `bucket` are included; 404 for an unknown user or bucket) |
 
@@ -175,7 +187,7 @@ environment and flags for these fields.
 |---|---|---|---|
 | GET | `/discovery` | GetDiscovery | `{"enabled": bool, "config": discovery.Config, "self": Info, "peers": discovery.Peer[]}` |
 | POST | `/discovery/probe` | GetDiscovery | body `{"url": "http://host:9000"}` → `discovery.Peer` (502 `ProbeFailed` with message on failure) |
-| POST | `/discovery/scan` | ScanNetwork | body `discovery.ScanRequest` → `discovery.ScanResult` (403 when `allowScan` is false; 400 when the targets expand to more than `maxScanHosts` hosts, or for more than 256 targets, more than 64 ports, a port outside 1–65535, a scheme other than http/https, a `timeout` outside 0–60 s or `concurrency` outside 0–1024; the whole scan is bounded by 5 minutes) |
+| POST | `/discovery/scan` | ScanNetwork | body `discovery.ScanRequest` → `discovery.ScanResult` (403 when `allowScan` is false; 400 when the targets expand to more than `maxScanHosts` hosts, or for more than 256 targets, more than 64 ports, a port outside 1–65535, a scheme other than http/https, a `timeout` outside 0–60 s or `concurrency` outside 0–1024; 429 `TooManyRequests` while 2 scans are already running on the server; the whole scan is bounded by 5 minutes) |
 
 ## Public endpoints (no `/admin/v1` prefix; served by `internal/server`)
 

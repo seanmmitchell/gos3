@@ -73,7 +73,9 @@ gos3 logs to stderr with Go's `log/slog`, as `text` (default) or `json`
 - **Access log**: one line per request (S3 and admin) with `request_id`, `op`,
   `method`, `path`, `status`, `bytes_in`, `bytes_out`, `duration_ms`,
   `remote`, `bucket`, `key`, `auth` (signing method), `user` and `access_key`,
-  and `error` (the S3 error code).
+  and `error` (the S3 error code). An upload the client aborted is logged with
+  status `499` (nginx's "client closed request") and `client_aborted=true`;
+  the metrics currently count it in the `4xx` class.
   It is logged at info level when `logging.access_log` is true (the default),
   otherwise at debug level. Query strings are never logged.
 - The lifecycle worker logs every action at info level, and failures at warn
@@ -89,6 +91,8 @@ gos3 logs to stderr with Go's `log/slog`, as `text` (default) or `json`
     ├── data/<bucket-id>/<xx>/…  object data files, immutable (fs backend)
     ├── uploads/<upload-id>/…    multipart parts in progress (fs backend)
     ├── tmp/                     files being written (cleaned at startup)
+    ├── orphans/<time>-<id>/     unreferenced files moved aside at startup (fs backend)
+    ├── lock                     held by the running server
     ├── iam.json                 IAM users, keys, policies        (secret)
     ├── root-credentials.json    generated root keys, if any      (secret)
     ├── settings.json            runtime settings, after the first change
@@ -97,9 +101,29 @@ gos3 logs to stderr with Go's `log/slog`, as `text` (default) or `json`
 
 With the memory backend and a data path, only the system files (`iam.json`,
 `settings.json`, `server-id`, `root-credentials.json`) are kept; objects live in
-memory. `meta.db` is locked while gos3 runs, so a second process cannot open
-the same directory. At startup the fs backend removes leftover temporary files
-and data files that no metadata references (left behind by a crash).
+memory. Every backend takes an exclusive lock on `.gos3/lock` while it runs
+(and the fs backend also locks `meta.db`), so a second process using the same
+directory fails at startup with "is another gos3 using this data
+directory?". On platforms without `flock` or Windows file sharing the lock is
+a no-op.
+
+At startup the fs backend removes leftover temporary files from `tmp/`. Data
+files, part files, bucket directories and upload directories that no
+metadata references (left behind by a crash, or written after the backup a
+restored `meta.db` came from) are **not** deleted: they are moved to
+`.gos3/orphans/<UTC yyyymmddThhmmssZ>-<8 hex>/`, keeping their path relative
+to `.gos3`, and a warning `recovery moved unreferenced files to the
+quarantine` names the directory and the counts. A quarantine directory is
+deleted at a later start once it is older than 7 days. If a move fails (for
+example when `data/` is on another file system), the entry is left where it
+is. Entries whose names gos3 never generates (such as `lost+found` when
+`.gos3/data` is a mount point) are left alone and counted as
+`unrecognized_entries`.
+
+The fs backend refuses to start when `meta.db` is missing or empty while
+`data/` or `uploads/` still contain object or part files: starting would
+discard the index of every stored object. Restore `meta.db` from a backup, or
+move `data/` and `uploads/` aside to start with an empty store.
 
 ## Backups
 
@@ -117,13 +141,18 @@ systemctl start gos3
 To avoid downtime, take a crash-consistent snapshot of the file system (ZFS,
 LVM or btrfs snapshot, or a cloud volume snapshot) and copy from it. gos3 treats
 a snapshot like a power loss: committed objects are intact (with
-`fsync_data: true`), and orphaned files are cleaned up at the next start. Do
+`fsync_data: true`), and orphaned files are moved to `.gos3/orphans/` at the
+next start. Do
 not copy a live directory with `cp` or `rsync` without a snapshot: `meta.db`
 can end up inconsistent with the data files.
 
 Restore by stopping gos3, replacing the directory contents (keep the owner and
 mode 0700) and starting it again. The restored server keeps its server ID,
-IAM users and settings.
+IAM users and settings. If you restore only an older `meta.db` over newer
+data, objects written after that backup are not destroyed: they land in
+`.gos3/orphans/` and can be recovered by hand until the retention (7 days)
+expires. Never delete `meta.db` to get past a "locked by another process"
+error: stop the other process instead.
 
 **2. Object-level copy (portable).** Mirror buckets with any S3 tool, for
 example `rclone sync gos3:bucket backup:bucket` or
@@ -146,6 +175,10 @@ The worker applies bucket lifecycle rules (`PutBucketLifecycleConfiguration`):
 - Filters: prefix, tags (`And`), `ObjectSizeGreaterThan` / `ObjectSizeLessThan`.
 - Transition rules are stored but not executed.
 - Objects under object lock retention or legal hold are never removed.
+- A key that changes during a pass (for example a delete marker removed
+  mid-pass, so the walk reports more than one latest version) is skipped
+  until the next pass. A noncurrent version is deleted only if it is still
+  noncurrent when it is re-checked just before the delete.
 
 Expiration times follow AWS: an object becomes eligible at the next 00:00 UTC
 after `LastModified + Days`. A pass starts at startup and then repeats
@@ -184,7 +217,9 @@ settings in `settings.json` and IAM data in `iam.json` are kept across upgrades.
 | `RequestTimeTooSkewed` | The client's clock is off by more than 15 minutes. |
 | Web UI: `NetworkError` or "blocked by CORS" | The server's `cors.allowed_origins` does not include the UI origin; see [web-ui.md](web-ui.md#cors). |
 | Web UI: multipart upload fails with `MissingETag` | `ETag` is not in the exposed CORS headers (other S3 services). |
-| Startup: `metadata database … is locked by another process` | Another gos3 uses the data directory. |
+| Startup: `… is in use (is another gos3 using this data directory?)` or `metadata database … is locked by another process` | Another gos3 uses the data directory. Stop it; do not delete `meta.db`. |
+| Startup: `refusing to start with an empty index` | `meta.db` is missing or empty but object files exist; restore `meta.db` from a backup, or move `data/` and `uploads/` aside. |
+| Startup warning: `recovery moved unreferenced files to the quarantine` | Files no metadata references were moved to `.gos3/orphans/`; inspect them if objects are missing. |
 | Startup: `settings.json: …` | The runtime settings file is corrupt or invalid; fix or remove it. |
 | Peers show `unverified` with a TLS error | The peer uses a certificate that this server does not trust. |
 | Configuration changes have no effect | `settings.json` overrides them for runtime keys; see [configuration.md](configuration.md#runtime-settings-settingsjson). |

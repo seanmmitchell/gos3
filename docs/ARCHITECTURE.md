@@ -183,15 +183,35 @@ See the doc comments in `storage.go`. Key points:
   files (written to `<root>/.gos3/tmp/` then renamed; fsync configurable) +
   multipart parts under `<root>/.gos3/uploads/<upload-id>/<part>`. Data files
   are immutable; replaced/deleted versions are unlinked after the metadata
-  transaction commits (open readers keep working on POSIX). Startup cleans
-  `tmp/` and orphaned data files.
+  transaction commits (open readers keep working on POSIX). If the commit
+  reports an error after the transaction itself succeeded (e.g. an fsync
+  error), the new data or part file is kept rather than deleted, because the
+  commit may have persisted; the client still gets an error.
+- `fs` recovery (startup): cleans `tmp/`; unreferenced data files, part
+  files, bucket directories and upload directories are **moved**, not
+  deleted, to `<root>/.gos3/orphans/<UTC yyyymmddThhmmssZ>-<8 hex>/`
+  (keeping their path relative to `.gos3`), and a quarantine directory is
+  deleted at a later start once older than `fs.Options.OrphanRetention`
+  (default `fs.DefaultOrphanRetention`, 7 days; not exposed in the config
+  file). A failed move leaves the entry in place. Entries with names gos3
+  never generates (e.g. `lost+found`) are left alone. The pass logs a Warn
+  `recovery moved unreferenced files to the quarantine` with the path and the
+  counts (`unrecognized_entries`, `purged_quarantine_dirs`, ...). `Open`
+  refuses to start when `meta.db` is missing or empty while `data/` or
+  `uploads/` still hold object or part files.
+- `WalkVersions` sets `IsLatest` only on the first entry delivered for a key,
+  never on a later entry of the same key, even if the key changes during the
+  walk (both backends). The lifecycle worker skips a key whose walk reports
+  more than one latest version until the next pass.
 - `memory` keeps everything in maps guarded by RW mutexes.
 - `list.go` turns `WalkObjects`/`WalkVersions` into S3 listings (prefix,
   delimiter grouping, markers, truncation). When a common prefix `p` is found
   it restarts the walk after `p + "\xff"` (UTF-8 never contains 0xFF) so huge
   "directories" are skipped in O(log n) per prefix.
 
-System state lives in `<data>/.gos3/`: `iam.json`, `settings.json` (written on
+System state lives in `<data>/.gos3/`: `lock` (an exclusive lock held by the
+running server, whatever the backend; a no-op on platforms without
+`flock`/Windows sharing), `iam.json`, `settings.json` (written on
 the first runtime settings update, then it wins over file/env/flags for the
 Settings fields), `server-id`, and `root-credentials.json` (only when root
 keys were generated). With the memory backend this needs `storage.path`;

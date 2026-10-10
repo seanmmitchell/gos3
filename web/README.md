@@ -109,7 +109,17 @@ and hides the feature.
 - Errors use the admin envelope `{"error": {"code", "message"}}`.
 - POSTs require `Content-Type: application/json` (415 otherwise). A
   cross-site page cannot send that without a CORS preflight, which this
-  server never approves, so this doubles as CSRF protection.
+  server never approves.
+- Against DNS rebinding (a site whose name later resolves to the UI host
+  becomes same-origin), every route answers 403 unless the `Host` header is
+  an IP address, `localhost` / `*.localhost`, or a name listed in
+  **`GOS3_UI_ALLOWED_HOSTS`** (comma separated; `*` turns the check off).
+  Requests with a foreign `Origin` or `Sec-Fetch-Site: cross-site` /
+  `same-site` are refused too. Opening the console via another host name
+  without listing it hides local discovery.
+- Probes read at most 64 KiB of an identity document (with or without
+  `Content-Length`); local discovery keeps at most 2048 mDNS records and
+  1024 beacon candidates, and verifies at most 256 URLs.
 - The Node server has **no authentication**: anyone who can reach it can make
   it probe and scan (bounded as above). Bind it to a trusted interface, or
   turn them off with **`GOS3_UI_LOCAL_DISCOVERY=false`** (also `0`, `off`,

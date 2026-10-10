@@ -1,15 +1,30 @@
 # kubectl apply -k deploy/kubernetes   (add -n <namespace> or set namespace below)
 #
-# secret.example.yaml holds placeholder root keys: edit it, or remove it from
-# the list and create the Secret yourself (see the file).
+# Root credentials are NOT part of this kustomization, so the repository's
+# example keys can never be deployed by accident. Either create the Secret
+# first (see secret.example.yaml):
+#
+#   kubectl create secret generic gos3-root-credentials \
+#     --from-literal=access-key=... --from-literal=secret-key=...
+#
+# or apply without it: each server then generates its own root keys on first
+# start and logs them once (kubectl logs gos3-0). A secretGenerator reading
+# a git-ignored env file works too:
+#
+#   secretGenerator:
+#     - name: gos3-root-credentials
+#       envs: [root-credentials.env]   # access-key=... / secret-key=...
+#       options:
+#         disableNameSuffixHash: true
 apiVersion: kustomize.config.k8s.io/v1beta1
 kind: Kustomization
 # namespace: gos3
 resources:
   - configmap.yaml
-  - secret.example.yaml
   - service.yaml
   - statefulset.yaml
 images:
   - name: ghcr.io/seanmmitchell/gos3
+    # Pin a release (e.g. newTag: "1.2.3") for reproducible deployments.
+    # "latest" is pulled again whenever a pod starts.
     newTag: latest

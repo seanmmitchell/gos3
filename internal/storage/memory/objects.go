@@ -445,10 +445,16 @@ func (b *Backend) WalkVersions(ctx context.Context, bucketName, prefix, keyMarke
 	// Position: either strictly after all versions of key (below == 0) or
 	// at the versions of key whose stamp is < below. inclusive means "seek
 	// to the first key >= key" (initial position at the prefix).
+	//
+	// midKey is set when a batch ended inside the versions of key: the
+	// newest of them was already delivered, so none of the remaining ones
+	// is reported as latest even if newer versions were deleted meanwhile
+	// (IsLatest marks at most the first entry delivered for a key).
 	var (
 		key       string
 		below     uint64
 		inclusive bool
+		midKey    bool
 	)
 	switch {
 	case keyMarker == "" || keyMarker < prefix:
@@ -508,19 +514,21 @@ func (b *Backend) WalkVersions(ctx context.Context, bucketName, prefix, keyMarke
 			}
 			vs := n.val.versions
 			top := len(vs) - 1
+			continued := false
 			if below != 0 && n.key == key {
 				// Only versions strictly older than the marker.
 				top = sort.Search(len(vs), func(i int) bool { return vs[i].stamp >= below }) - 1
+				continued = midKey
 			}
 			for j := top; j >= 0; j-- {
-				items = append(items, vs[j].info(bk.info.Name, n.key, j == len(vs)-1))
+				items = append(items, vs[j].info(bk.info.Name, n.key, !continued && j == len(vs)-1))
 				if len(items) == batch && j > 0 {
-					key, below, inclusive = n.key, vs[j].stamp, false
+					key, below, inclusive, midKey = n.key, vs[j].stamp, false, true
 					done = false
 					break scan
 				}
 			}
-			key, below, inclusive = n.key, 0, false
+			key, below, inclusive, midKey = n.key, 0, false, false
 		}
 		bk.mu.RUnlock()
 
