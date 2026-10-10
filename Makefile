@@ -28,7 +28,7 @@ DEV_UI_ORIGIN  ?= http://localhost:3000
 .PHONY: help build build-go ui ui-clean test test-go test-web e2e lint fmt dev clean docker
 
 help: ## show this help
-	@grep -hE '^[a-zA-Z_-]+:.*## ' $(MAKEFILE_LIST) | awk 'BEGIN {FS = ":.*## "}; {printf "  \033[36m%-10s\033[0m %s\n", $$1, $$2}'
+	@grep -hE '^[a-zA-Z0-9_-]+:.*## ' $(MAKEFILE_LIST) | awk 'BEGIN {FS = ":.*## "}; {printf "  \033[36m%-10s\033[0m %s\n", $$1, $$2}'
 
 build: ui build-go ## build the web UI and the gos3 binary with the UI embedded (bin/gos3)
 
@@ -82,6 +82,29 @@ dev: ## run an ephemeral in-memory server for UI development (pair with `cd web 
 clean: ui-clean ## remove build output (binary, UI build) and restore the UI placeholder
 	rm -rf bin web/.output web/.nuxt
 
-docker: ## build the container image ($(IMAGE):$(VERSION)); needs a Dockerfile
+docker: ## build the container image ($(IMAGE):$(VERSION)) from the Dockerfile
 	docker build -t $(IMAGE):$(VERSION) \
 		--build-arg VERSION=$(VERSION) --build-arg COMMIT=$(COMMIT) --build-arg DATE=$(DATE) .
+
+# --- additional targets (docs, deployment, compatibility) ---------------------
+
+UI_IMAGE ?= gos3-ui
+
+.PHONY: docker-ui compat e2e-web demo demo-down
+
+docker-ui: ## build the standalone web UI image ($(UI_IMAGE):$(VERSION))
+	docker build -f deploy/docker/web.Dockerfile -t $(UI_IMAGE):$(VERSION) .
+
+compat: ## run the boto3 / AWS CLI compatibility suite (test/compat/run.sh)
+	test/compat/run.sh
+
+e2e-web: build ## run the Playwright suites (mocked, real server, standalone) against bin/gos3
+	cd web && $(PNPM) test:e2e
+	cd web && GOS3_BIN=$(CURDIR)/$(BIN) E2E_SKIP_UI_BUILD=1 $(PNPM) test:e2e:real
+	cd web && GOS3_BIN=$(CURDIR)/$(BIN) $(PNPM) test:e2e:standalone
+
+demo: ## start the two-node docker compose demo with the standalone UI (ports 9001, 9002, 3000)
+	GOS3_VERSION=$(VERSION) docker compose --profile ui up -d --build
+
+demo-down: ## stop the docker compose demo (add -v to the command to delete its volumes)
+	docker compose --profile ui down

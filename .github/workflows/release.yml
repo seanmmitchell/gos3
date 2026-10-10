@@ -1,0 +1,189 @@
+name: Release
+
+# Push a tag like v1.2.3 to build the binaries (with the web UI embedded),
+# publish a GitHub release with checksums, and push a multi-arch image to
+# ghcr.io/<owner>/<repo>.
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing tag to (re)release, e.g. v1.2.3
+        required: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  NODE_VERSION: "22"
+  CI: "true"
+  NUXT_TELEMETRY_DISABLED: "1"
+  COREPACK_ENABLE_DOWNLOAD_PROMPT: "0"
+  TAG: ${{ inputs.tag || github.ref_name }}
+
+jobs:
+  ui:
+    name: Build embedded UI
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ env.TAG }}
+      - uses: actions/setup-node@v5
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+      - name: Build (pnpm generate:embed)
+        working-directory: web
+        run: |
+          corepack enable
+          pnpm install --frozen-lockfile
+          pnpm generate:embed
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ui-embed
+          path: web/.output/public/
+          retention-days: 3
+
+  binaries:
+    name: gos3 ${{ matrix.goos }}/${{ matrix.goarch }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    needs: ui
+    strategy:
+      fail-fast: true
+      matrix:
+        goos: [linux, darwin, windows]
+        goarch: [amd64, arm64]
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ env.TAG }}
+          fetch-depth: 0
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          cache: true
+      - uses: actions/download-artifact@v5
+        with:
+          name: ui-embed
+          path: ui-embed
+      - name: Embed the UI
+        # Same steps as `make ui`: replace the placeholder with the build.
+        run: |
+          dist=internal/webui/dist
+          find "$dist" -mindepth 1 -maxdepth 1 ! -name .keep -exec rm -rf {} +
+          cp -R ui-embed/. "$dist/"
+          test -f "$dist/index.html" || cp "$dist/200.html" "$dist/index.html"
+      - name: Build
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          CGO_ENABLED: "0"
+        run: |
+          pkg=github.com/seanmmitchell/gos3/internal/version
+          commit="$(git rev-parse --short=12 HEAD)"
+          date="$(git log -1 --format=%cI HEAD)"
+          ext=""; [ "$GOOS" = windows ] && ext=".exe"
+          name="gos3_${TAG#v}_${GOOS}_${GOARCH}"
+          mkdir -p "build/$name" dist
+          go build -trimpath \
+            -ldflags "-s -w -X $pkg.Version=$TAG -X $pkg.Commit=$commit -X $pkg.Date=$date" \
+            -o "build/$name/gos3$ext" ./cmd/gos3
+          cp LICENSE README.md "build/$name/"
+          if [ "$GOOS" = windows ]; then
+            (cd build && zip -qr "../dist/$name.zip" "$name")
+          else
+            tar -C build -czf "dist/$name.tar.gz" "$name"
+          fi
+          ls -l dist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: bin-${{ matrix.goos }}-${{ matrix.goarch }}
+          path: dist/*
+          retention-days: 3
+
+  release:
+    name: GitHub release
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    needs: binaries
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v5
+        with:
+          pattern: bin-*
+          path: dist
+          merge-multiple: true
+      - name: Checksums
+        working-directory: dist
+        run: |
+          sha256sum gos3_* > checksums.txt
+          cat checksums.txt
+      - name: Create or update the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          prerelease=""
+          case "$TAG" in *-*) prerelease="--prerelease" ;; esac
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" dist/* --clobber
+          else
+            gh release create "$TAG" dist/* --verify-tag --title "gos3 $TAG" --generate-notes $prerelease
+          fi
+
+  image:
+    name: Container image (ghcr.io)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ env.TAG }}
+      - name: Build metadata
+        id: vars
+        run: |
+          echo "commit=$(git rev-parse --short=12 HEAD)" >> "$GITHUB_OUTPUT"
+          echo "date=$(git log -1 --format=%cI HEAD)" >> "$GITHUB_OUTPUT"
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/${{ github.repository }}
+          tags: |
+            type=semver,pattern={{version}},value=${{ env.TAG }}
+            type=semver,pattern={{major}}.{{minor}},value=${{ env.TAG }}
+            type=semver,pattern={{major}},value=${{ env.TAG }}
+          flavor: |
+            latest=auto
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          build-args: |
+            VERSION=${{ env.TAG }}
+            COMMIT=${{ steps.vars.outputs.commit }}
+            DATE=${{ steps.vars.outputs.date }}
+          cache-from: type=gha,scope=gos3-release
+          cache-to: type=gha,mode=max,scope=gos3-release
+          provenance: true
+          sbom: true

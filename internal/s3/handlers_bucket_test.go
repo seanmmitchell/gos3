@@ -1449,3 +1449,35 @@ func TestListObjectsAuthz(t *testing.T) {
 		t.Errorf("public listing: %s", resp.Data)
 	}
 }
+
+// TestListObjectVersionsNamespace checks that <Version> and <DeleteMarker>
+// stay in the S3 namespace: an xmlns="" on them would hide the entries from
+// namespace-aware XML parsers.
+func TestListObjectVersionsNamespace(t *testing.T) {
+	e := newTestEnv(t)
+	e.createBucket("verns")
+	bktVersioned(t, e, "verns")
+	e.putObject("verns", "k", []byte("1"), storage.ObjectMeta{})
+	bktExpect(t, e.signed(http.MethodDelete, "/verns/k", nil, nil), 204, "")
+	resp := e.signed(http.MethodGet, "/verns?versions", nil, nil)
+	bktExpect(t, resp, 200, "")
+	if strings.Contains(string(resp.Data), `xmlns=""`) {
+		t.Errorf("response leaves the S3 namespace: %s", resp.Data)
+	}
+	type entry struct {
+		Key       string `xml:"http://s3.amazonaws.com/doc/2006-03-01/ Key"`
+		VersionID string `xml:"http://s3.amazonaws.com/doc/2006-03-01/ VersionId"`
+	}
+	var res struct {
+		XMLName       xml.Name `xml:"http://s3.amazonaws.com/doc/2006-03-01/ ListVersionsResult"`
+		Versions      []entry  `xml:"http://s3.amazonaws.com/doc/2006-03-01/ Version"`
+		DeleteMarkers []entry  `xml:"http://s3.amazonaws.com/doc/2006-03-01/ DeleteMarker"`
+	}
+	if err := xml.Unmarshal(resp.Data, &res); err != nil {
+		t.Fatal(err)
+	}
+	if len(res.Versions) != 1 || res.Versions[0].Key != "k" || res.Versions[0].VersionID == "" ||
+		len(res.DeleteMarkers) != 1 || res.DeleteMarkers[0].Key != "k" {
+		t.Errorf("namespace-aware parse = %+v; body %s", res, resp.Data)
+	}
+}

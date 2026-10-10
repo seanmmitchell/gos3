@@ -81,3 +81,61 @@ func TestAbortDateHeaders(t *testing.T) {
 		t.Errorf("unmatched upload: %d abort date %q", other.StatusCode, other.Header.Get("X-Amz-Abort-Date"))
 	}
 }
+
+// TestExpirationHeaderCopyAndComplete: CopyObject and
+// CompleteMultipartUpload report x-amz-expiration for the new object, as
+// S3 does; after keep-alive whitespace it arrives as a trailer.
+func TestExpirationHeaderCopyAndComplete(t *testing.T) {
+	mpSetKeepAlive(t, 20*time.Millisecond, 10*time.Millisecond)
+	slow := &mpSlowBackend{}
+	e := newTestEnv(t, withOptions(func(o *Options) {
+		slow.Backend = o.Backend
+		o.Backend = slow
+	}))
+	e.createBucket("bkt")
+	e.putBucketConfig("bkt", storage.ConfigLifecycle, `<LifecycleConfiguration xmlns="http://s3.amazonaws.com/doc/2006-03-01/">`+
+		`<Rule><ID>tmp</ID><Filter><Prefix>tmp/</Prefix></Filter><Status>Enabled</Status><Expiration><Date>2030-01-02T00:00:00.000Z</Date></Expiration></Rule>`+
+		`</LifecycleConfiguration>`)
+	const want = `expiry-date="Wed, 02 Jan 2030 00:00:00 GMT", rule-id="tmp"`
+	e.signed("PUT", "/bkt/src", []byte("x"), nil)
+
+	t.Run("copy", func(t *testing.T) {
+		r := e.signed("PUT", "/bkt/tmp/copy", nil, http.Header{"X-Amz-Copy-Source": {"/bkt/src"}})
+		if r.StatusCode != 200 || r.Header.Get("X-Amz-Expiration") != want {
+			t.Errorf("CopyObject: %d x-amz-expiration %q", r.StatusCode, r.Header.Get("X-Amz-Expiration"))
+		}
+		r = e.signed("PUT", "/bkt/copy", nil, http.Header{"X-Amz-Copy-Source": {"/bkt/src"}})
+		if r.StatusCode != 200 || r.Header.Get("X-Amz-Expiration") != "" {
+			t.Errorf("CopyObject outside the rule: %d x-amz-expiration %q", r.StatusCode, r.Header.Get("X-Amz-Expiration"))
+		}
+	})
+	complete := func(t *testing.T, key string) *testResponse {
+		t.Helper()
+		id := mpRawCreate(t, e, "bkt", key, nil)
+		pr := e.signed(http.MethodPut, mpPath("bkt", key, mpQuery("uploadId", id, "partNumber", "1")), []byte("payload"), nil)
+		r := e.signed(http.MethodPost, mpPath("bkt", key, mpQuery("uploadId", id)), mpCompleteBody("1", pr.Header.Get("ETag")), nil)
+		if r.StatusCode != 200 || !strings.Contains(string(r.Data), "<CompleteMultipartUploadResult") {
+			t.Fatalf("CompleteMultipartUpload: %d %s", r.StatusCode, r.Data)
+		}
+		return r
+	}
+	t.Run("complete", func(t *testing.T) {
+		if r := complete(t, "tmp/mp"); r.Header.Get("X-Amz-Expiration") != want {
+			t.Errorf("x-amz-expiration %q", r.Header.Get("X-Amz-Expiration"))
+		}
+		if r := complete(t, "mp"); r.Header.Get("X-Amz-Expiration") != "" || r.Trailer.Get("X-Amz-Expiration") != "" {
+			t.Errorf("outside the rule: x-amz-expiration %q", r.Header.Get("X-Amz-Expiration"))
+		}
+	})
+	t.Run("complete keep-alive", func(t *testing.T) {
+		slow.delay = 150 * time.Millisecond
+		defer func() { slow.delay = 0 }()
+		r := complete(t, "tmp/slow")
+		if !strings.HasPrefix(strings.TrimPrefix(string(r.Data), xmlHeader), " ") {
+			t.Fatalf("no keep-alive whitespace: %q", r.Data)
+		}
+		if got := r.Trailer.Get("X-Amz-Expiration"); got != want {
+			t.Errorf("x-amz-expiration trailer %q (trailers %v)", got, r.Trailer)
+		}
+	})
+}

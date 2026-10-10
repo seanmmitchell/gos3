@@ -97,7 +97,7 @@ type Options struct {
 const lockTimeout = time.Second
 
 const (
-	dirPerm  = 0o750
+	dirPerm  = 0o700 // the system directory holds credentials and metadata
 	filePerm = 0o600
 )
 

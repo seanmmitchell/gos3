@@ -417,7 +417,13 @@ func (b *Backend) completeOnce(ctx context.Context, bucket, key, uploadID string
 	if err := b.begin(ctx); err != nil {
 		return storage.ObjectInfo{}, err
 	}
+	if opts.PartETags != nil && len(opts.PartETags) != len(partNumbers) {
+		return storage.ObjectInfo{}, fmt.Errorf("fs: %d part ETags for %d parts", len(opts.PartETags), len(partNumbers))
+	}
 	// Resolve the parts and fail fast on preconditions before copying data.
+	// The part ETags are checked here; the commit below re-checks that every
+	// part is still the same file, so a part replaced in between makes the
+	// next attempt see (and reject) its new ETag.
 	var (
 		bucketID string
 		files    []string
@@ -434,7 +440,7 @@ func (b *Backend) completeOnce(ctx context.Context, bucket, key, uploadID string
 		}
 		bucketID = br.ID
 		parts := bb.Bucket(subParts)
-		for _, n := range partNumbers {
+		for i, n := range partNumbers {
 			var v []byte
 			if n >= 1 && n <= maxPartNumber {
 				v = parts.Get(partKey(uploadID, n))
@@ -448,6 +454,10 @@ func (b *Backend) completeOnce(ctx context.Context, bucket, key, uploadID string
 			}
 			if _, ok := parsePartFileName(rec.File); !ok {
 				return fmt.Errorf("%w: invalid part file name", errCorrupt)
+			}
+			if opts.PartETags != nil && rec.ETag != opts.PartETags[i] {
+				return fmt.Errorf("%w: part %d of upload %q was replaced (ETag %q, want %q)",
+					storage.ErrPartNotFound, n, uploadID, rec.ETag, opts.PartETags[i])
 			}
 			files = append(files, rec.File)
 			sizes = append(sizes, rec.Size)

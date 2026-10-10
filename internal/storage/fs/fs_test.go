@@ -31,6 +31,23 @@ func TestOpenErrors(t *testing.T) {
 	}
 }
 
+// TestSystemDirPermissions: the system directory and its subdirectories
+// are private to the server's user (they hold metadata, and the server
+// keeps root credentials next to them).
+func TestSystemDirPermissions(t *testing.T) {
+	dir := t.TempDir()
+	b := openTest(t, dir)
+	for _, d := range []string{b.sysDir, b.dataDir, b.tmpDir, b.uploadDir} {
+		st, err := os.Stat(d)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if perm := st.Mode().Perm(); perm&0o077 != 0 {
+			t.Errorf("%s mode %v, want no group/other access", d, perm)
+		}
+	}
+}
+
 func TestOpenLockedFailsFast(t *testing.T) {
 	dir := t.TempDir()
 	b := openTest(t, dir)

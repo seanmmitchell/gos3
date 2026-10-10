@@ -14,6 +14,12 @@ coverage.*
 !/internal/webui/dist/.keep
 !/internal/webui/dist/index.html
 
+# Python (test/compat; its venv normally lives outside the repo)
+__pycache__/
+*.py[cod]
+.venv/
+.pytest_cache/
+
 # web
 node_modules/
 web/.nuxt/

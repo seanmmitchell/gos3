@@ -17,6 +17,10 @@ Base path: `/_gos3/admin/v1` on the S3 listener. JSON in/out
 - Endpoints marked *any* only require a valid (non-anonymous) identity.
 - CORS: preflight `OPTIONS` is answered without auth using the global
   `cors` settings; actual responses carry the matching CORS headers.
+- Request bodies are limited to 1 MiB and decoded strictly: unknown fields and
+  trailing data are `400 InvalidRequest` (`InvalidSettings` on `PUT /config`).
+- Responses carry `Cache-Control: no-store`. Admin requests are counted in
+  the metrics as op `Admin` and appear in the access log.
 
 ## Errors
 
@@ -25,12 +29,14 @@ Non-2xx responses: `{"error": {"code": "<Code>", "message": "<text>"}}`.
 | HTTP | code |
 |---|---|
 | 400 | `InvalidRequest`, `InvalidName`, `InvalidPolicy`, `InvalidSettings` |
-| 401 | `Unauthenticated` (anonymous or bad signature — message carries the S3 error code, e.g. `SignatureDoesNotMatch`) |
+| 401 | `Unauthenticated` (anonymous or bad signature — message is `<S3Code>: <text>`, e.g. `SignatureDoesNotMatch: ...`, `AccessDenied: anonymous requests are not allowed; ...`) |
 | 403 | `AccessDenied` |
 | 404 | `NotFound` |
 | 405 | `MethodNotAllowed` |
 | 409 | `Conflict` (exists / in use / bucket not empty) |
 | 500 | `InternalError` |
+| 502 | `ProbeFailed` (`POST /discovery/probe`: the target did not answer as a gos3 server) |
+| 503 | `InternalError` (request canceled or timed out) |
 
 ## Endpoints
 
@@ -95,7 +101,9 @@ Non-2xx responses: `{"error": {"code": "<Code>", "message": "<text>"}}`.
 {
   "name": "gos3-1", "region": "us-east-1", "publicUrl": "http://10.0.0.5:9000",
   "domains": ["s3.local"], "publicInfo": true, "uiRedirect": true,
-  "cors": { "allowedOrigins": ["*"], "allowedHeaders": ["*"], "exposeHeaders": ["ETag"], "maxAgeSeconds": 3600 },
+  "cors": { "allowedOrigins": ["*"], "allowedHeaders": ["*"],
+            "exposeHeaders": ["*", "ETag", "Content-Length", "x-amz-version-id", "…"], // default: "*" + the S3 response headers
+            "maxAgeSeconds": 3600 },
   "discovery": { "enabled": true, "advertise": true, "mdns": true, "beacon": true,
                  "beaconGroup": "239.255.73.83:7373", "beaconInterval": 10000000000,
                  "seeds": [], "dnsSrv": [], "peerTtl": 60000000000,
@@ -105,6 +113,24 @@ Non-2xx responses: `{"error": {"code": "<Code>", "message": "<text>"}}`.
   "metricsPublic": false
 }
 ```
+
+`PUT /config` validates the whole document (`config.ValidateSettings`); the
+400 `InvalidSettings` message names the field, e.g.
+`discovery.seeds[1]: "ftp://x" must be an absolute http:// or https:// URL`.
+Rules: `region` lowercase letters/digits/`-`; `name` ≤ 128 printable
+characters (empty allowed); `publicUrl` empty or an absolute http(s) URL (a
+path is allowed; no credentials, query or fragment); `domains` DNS names
+without scheme or port; CORS origins `*`, `scheme://host[:port]` or
+`scheme://*.domain[:port]` (no path); `exposeHeaders` header names or a lone
+`*` (no partial patterns like `x-amz-*`); `maxAgeSeconds` 0–604800;
+`beaconGroup` an **IPv4** multicast `ip:port`; `beaconInterval` 1 s–1 h;
+`peerTtl` 1 s–7 d; `seeds` http(s) base URLs without a path, or a bare
+`host[:port]` (meaning `http://`), at most 256; `dnsSrv` domain names, at
+most 64; `maxScanHosts` 1–65536; `logging.level` `debug|info|warn|error`;
+`logging.format` `text|json`; `lifecycle.intervalSeconds` 60–31536000; other
+lists at most 256 entries. Changes apply immediately and are persisted to
+`<data>/.gos3/settings.json`, which from then on overrides the YAML file,
+environment and flags for these fields.
 
 ### Users & access keys
 | Method | Path | Action | Response |
@@ -125,7 +151,7 @@ Non-2xx responses: `{"error": {"code": "<Code>", "message": "<text>"}}`.
 | GET | `/policies/{name}` | GetPolicy | `iam.NamedPolicy` |
 | PUT | `/policies/{name}` | PutPolicy | body `{"description"?, "document": PolicyDocument}` → `iam.NamedPolicy` |
 | DELETE | `/policies/{name}` | DeletePolicy | 204 (409 if attached, 400 if builtin) |
-| POST | `/authz/simulate` | SimulatePolicy | body `{"user": "alice" \| "" (anonymous), "action": "s3:GetObject", "bucket": "b", "key": "k", "conditions"?: {…}}` → `iam.Decision` (bucket policy of `bucket` is included) |
+| POST | `/authz/simulate` | SimulatePolicy | body `{"user": "alice" \| "root" \| "" (anonymous), "action": "s3:GetObject", "bucket": "b", "key": "k", "conditions"?: {"aws:SourceIp": "10.0.0.1" \| ["…"]}}` → `{"allowed": bool, "explicitDeny": bool, "reason": "…"}` (bucket policy and bucket ACL of `bucket` are included; 404 for an unknown user or bucket) |
 
 ### Buckets (management helpers; regular bucket ops use the S3 API)
 | Method | Path | Action | Response |
@@ -149,13 +175,16 @@ Non-2xx responses: `{"error": {"code": "<Code>", "message": "<text>"}}`.
 |---|---|---|---|
 | GET | `/discovery` | GetDiscovery | `{"enabled": bool, "config": discovery.Config, "self": Info, "peers": discovery.Peer[]}` |
 | POST | `/discovery/probe` | GetDiscovery | body `{"url": "http://host:9000"}` → `discovery.Peer` (502 `ProbeFailed` with message on failure) |
-| POST | `/discovery/scan` | ScanNetwork | body `discovery.ScanRequest` → `discovery.ScanResult` (403 when `allowScan` is false; 400 if too many hosts) |
+| POST | `/discovery/scan` | ScanNetwork | body `discovery.ScanRequest` → `discovery.ScanResult` (403 when `allowScan` is false; 400 when the targets expand to more than `maxScanHosts` hosts, or for more than 256 targets, more than 64 ports, a port outside 1–65535, a scheme other than http/https, a `timeout` outside 0–60 s or `concurrency` outside 0–1024; the whole scan is bounded by 5 minutes) |
 
 ## Public endpoints (no `/admin/v1` prefix; served by `internal/server`)
 
 | Method | Path | Auth | Response |
 |---|---|---|---|
-| GET | `/_gos3/info` | none if `publicInfo`, else any | `discovery.Info`, `Access-Control-Allow-Origin: *` |
+| GET | `/_gos3/info` | none if `publicInfo`, else any | `discovery.Info`, `Access-Control-Allow-Origin: *` (also on 401; `OPTIONS` answered with 204) |
 | GET | `/_gos3/health` | none | `{"status":"ok"}` |
-| GET | `/_gos3/ready` | none | `{"status":"ok"}` or 503 `{"status":"unavailable","error":"…"}` |
-| GET | `/_gos3/metrics` | none if `metricsPublic`, else admin:GetStats | Prometheus text |
+| GET | `/_gos3/ready` | none | `{"status":"ok"}` or 503 `{"status":"unavailable","error":"…"}` (also while shutting down) |
+| GET | `/_gos3/metrics` | none if `metricsPublic`, else admin:GetStats | Prometheus text; 401/403 JSON errors; 404 when `metrics.enabled` is false |
+
+Any other `/_gos3/*` path is a JSON 404 `{"error":{"code":"NotFound",…}}`. See
+[operations.md](operations.md#metrics) for the metric names.

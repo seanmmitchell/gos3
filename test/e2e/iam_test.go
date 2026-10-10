@@ -1,3 +1,5 @@
+//lint:file-ignore SA1019 feature/s3/manager is deprecated upstream, but its successor (transfermanager) would bump the core SDK modules; it is test-only and still exercises the same wire behaviour.
+
 package e2e
 
 import (

@@ -2,6 +2,8 @@ module github.com/seanmmitchell/gos3
 
 go 1.25.0
 
+toolchain go1.26.9
+
 require (
 	github.com/aws/aws-sdk-go-v2 v1.47.2
 	github.com/aws/aws-sdk-go-v2/credentials v1.20.8

@@ -77,16 +77,21 @@ type listVersionsResult struct {
 	IsTruncated         bool     `xml:"IsTruncated"`
 	EncodingType        string   `xml:"EncodingType,omitempty"`
 	// Entries holds <Version> and <DeleteMarker> elements interleaved in
-	// listing order (the element name comes from each entry's XMLName).
+	// listing order (each entry's MarshalXML picks the element name).
 	Entries        []listVersionEntry
 	CommonPrefixes []listCommonPrefix `xml:"CommonPrefixes"`
 }
 
-// listVersionEntry is a <Version> or <DeleteMarker> element; XMLName
+// listVersionEntry is a <Version> or <DeleteMarker> element; element
 // selects which. Delete markers carry no ETag, checksum, Size or
 // StorageClass.
 type listVersionEntry struct {
-	XMLName           xml.Name
+	element string // "Version" or "DeleteMarker"
+	listVersionFields
+}
+
+// listVersionFields are the children of a listVersionEntry element.
+type listVersionFields struct {
 	Key               string   `xml:"Key"`
 	VersionID         string   `xml:"VersionId"`
 	IsLatest          bool     `xml:"IsLatest"`
@@ -97,6 +102,14 @@ type listVersionEntry struct {
 	Size              *int64   `xml:"Size,omitempty"`
 	StorageClass      string   `xml:"StorageClass,omitempty"`
 	Owner             *Owner   `xml:"Owner,omitempty"`
+}
+
+// MarshalXML writes the entry as <Version> or <DeleteMarker> in the
+// enclosing S3 namespace. A dynamic XMLName field would make encoding/xml
+// emit xmlns="" on the element, moving it and its children out of the S3
+// namespace for namespace-aware parsers.
+func (e listVersionEntry) MarshalXML(enc *xml.Encoder, _ xml.StartElement) error {
+	return enc.EncodeElement(e.listVersionFields, xml.StartElement{Name: xml.Name{Local: e.element}})
 }
 
 // objectListParams holds the parameters shared by the three listings.
@@ -368,18 +381,18 @@ func (p objectListParams) versionEntry(v *storage.ObjectInfo, owner *Owner) list
 	if vid == "" {
 		vid = storage.NullVersionID
 	}
-	e := listVersionEntry{
+	e := listVersionEntry{listVersionFields: listVersionFields{
 		Key:          p.enc(v.Key),
 		VersionID:    vid,
 		IsLatest:     v.IsLatest,
 		LastModified: formatXMLTime(v.LastModified),
 		Owner:        owner,
-	}
+	}}
 	if v.DeleteMarker {
-		e.XMLName = xml.Name{Local: "DeleteMarker"}
+		e.element = "DeleteMarker"
 		return e
 	}
-	e.XMLName = xml.Name{Local: "Version"}
+	e.element = "Version"
 	e.ETag = quoteETag(v.ETag)
 	e.ChecksumAlgorithm, e.ChecksumType = listingChecksums(v.ObjectMeta)
 	size := v.Size

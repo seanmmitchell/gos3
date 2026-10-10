@@ -10,7 +10,7 @@ import { defineConfig, devices } from '@playwright/test'
 // - project "real-server": test/e2e/real/*.spec.ts drive the UI embedded in a
 //   real gos3 binary. Its setup project (real/global.setup.ts) builds the
 //   binary and starts two gos3 instances; the teardown project stops them.
-//   Run with `pnpm test:e2e:real` (= playwright test --project real-server).
+//   Run with `pnpm test:e2e:real` (= playwright test --project=real-server).
 // - project "standalone": test/e2e/standalone/*.spec.ts drive the standalone
 //   UI (`pnpm build` → node .output/server/index.mjs, built into
 //   .e2e-cache/) against two real gos3 binaries, cross-origin (CORS). Its

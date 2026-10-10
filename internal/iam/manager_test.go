@@ -474,7 +474,8 @@ func TestContextCancellation(t *testing.T) {
 	if _, err := m.ListUsers(ctx); !errors.Is(err, context.Canceled) {
 		t.Fatalf("ListUsers: %v", err)
 	}
-	if _, err := m.ListUsers(nil); err != nil { //nolint:staticcheck // nil context tolerated
+	//lint:ignore SA1012 deliberately checks that a nil context is tolerated
+	if _, err := m.ListUsers(nil); err != nil {
 		t.Fatalf("nil ctx: %v", err)
 	}
 }

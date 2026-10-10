@@ -24,7 +24,7 @@ discovery of gos3 servers on the network.
 
 | Path | Purpose | Owner work item |
 |---|---|---|
-| `cmd/gos3/` | CLI entrypoint (`serve`, `version`, `config print`, `keys gen`) | integration |
+| `cmd/gos3/` | CLI entrypoint (`serve`, `version`, `config print\|init\|env`, `discover`, `keygen` (alias `keys gen`), `healthcheck`) | integration |
 | `internal/server/` | wires everything, top-level mux, public endpoints, TLS, shutdown | integration |
 | `internal/config/` | config types (contract) + loading (file/env/flags) + settings persistence | integration |
 | `internal/webui/` | `embed` of the built UI (`dist/`), SPA fallback handler | integration |
@@ -42,7 +42,9 @@ discovery of gos3 servers on the network.
 | `internal/discovery/` | mDNS, beacon, seeds, DNS SRV, scan, peer table | discovery |
 | `web/` | Nuxt 4 web UI | ui-* |
 | `test/e2e/` | end-to-end tests with aws-sdk-go-v2 + minio-go against a real server | integration |
+| `test/compat/` | boto3 / AWS CLI compatibility suite against a real binary (`run.sh`) | compat |
 | `docs/` | architecture, admin API, discovery protocol, user docs | all |
+| `Dockerfile`, `docker-compose.yml`, `deploy/`, `.github/` | container image, compose demo, systemd/Kubernetes, CI and release workflows | devops-docs |
 
 Exported names in contract files (files whose package comment says
 CONTRACT) are fixed: implement them, don't rename/re-shape them. Additive
@@ -59,8 +61,8 @@ One listener (default `:9000`, optional TLS) serves everything:
    - `/_gos3/admin/v1/...` → admin API
    - `/_gos3/ui/...` → embedded web UI (SPA, `index.html`/`200.html` fallback)
    - `/_gos3/info` → public `discovery.Info` JSON (CORS `*`; requires auth when `publicInfo` is false)
-   - `/_gos3/health` (liveness) and `/_gos3/ready` (backend reachable) → `{"status":"ok"}`
-   - `/_gos3/metrics` → Prometheus text (admin:GetStats unless `metrics.public`)
+   - `/_gos3/health` (liveness) and `/_gos3/ready` (backend reachable within 5 s; 503 while shutting down) → `{"status":"ok"}`
+   - `/_gos3/metrics` → Prometheus text (admin:GetStats unless `metrics.public`; 404 when `metrics.enabled` is false)
    - anything else → 404 JSON
 3. Anonymous browser `GET /` with `Accept: text/html` and UI redirect enabled → 302 to `/_gos3/ui/`.
 4. Everything else → **S3 handler**.
@@ -145,6 +147,10 @@ Unknown subresources → `NotImplemented`. Unsupported method for a resource →
    `s3:x-amz-acl`, `s3:VersionId`, `aws:username`, `aws:CurrentTime`, …).
    Handlers that touch a second resource (CopyObject/UploadPartCopy source,
    DeleteObjects per key) call the core's authorize helper themselves.
+   `aws:SourceIp` / `aws:SecureTransport` come from `RemoteAddr` / TLS, or
+   from the first `X-Forwarded-For` entry and `X-Forwarded-Proto` when
+   `server.trust_proxy_headers` is set. PublicAccessBlock and
+   ObjectOwnership (BucketOwnerEnforced disables ACLs) are applied here too.
 6. Dispatch to the handler with a per-request context struct (bucket, key, op,
    auth result, identity, request id, versioning status cache, …).
 
@@ -185,8 +191,12 @@ See the doc comments in `storage.go`. Key points:
   it restarts the walk after `p + "\xff"` (UTF-8 never contains 0xFF) so huge
   "directories" are skipped in O(log n) per prefix.
 
-System state lives in `<data>/.gos3/`: `iam.json`, `settings.json`, `server-id`.
-Bucket names cannot start with `.`, so no clash.
+System state lives in `<data>/.gos3/`: `iam.json`, `settings.json` (written on
+the first runtime settings update, then it wins over file/env/flags for the
+Settings fields), `server-id`, and `root-credentials.json` (only when root
+keys were generated). With the memory backend this needs `storage.path`;
+without it the server is fully ephemeral. Bucket names cannot start with `.`,
+so no clash.
 
 ## Auth & IAM
 
@@ -197,7 +207,9 @@ Bucket names cannot start with `.`, so no clash.
   checksums). Clock skew ≤ 15 min. Any credential-scope region is accepted
   unless `StrictRegion`. Constant-time signature compare.
 - SigV2 is not supported (AccessDenied with an explanatory message).
-- Root credentials come from config; IAM users/keys/policies are stored in
+- Root credentials come from config (`GOS3_ROOT_ACCESS_KEY` /
+  `GOS3_ROOT_SECRET_KEY`) or are generated on first start and stored in
+  `<data>/.gos3/root-credentials.json`; IAM users/keys/policies are stored in
   `iam.json`. Built-in policies: `admin`, `readwrite`, `readonly`,
   `writeonly`, `diagnostics`. Custom policies use the IAM policy language
   (Allow/Deny, Action/NotAction with wildcards, Resource/NotResource ARNs with
@@ -259,4 +271,6 @@ seeds, DNS SRV and active scans; every candidate is verified by fetching
   `github.com/hashicorp/mdns`, `gopkg.in/yaml.v3`, and for tests only
   `github.com/aws/aws-sdk-go-v2/...` and `github.com/minio/minio-go/v7`.
 - Tests: `go test ./internal/<pkg>/...` for your package; `-race` must pass.
-- `make build` (UI + binary), `make ui`, `make test`, `make dev`, `make docker`.
+- `make build` (UI + binary), `make ui`, `make test`, `make e2e`, `make e2e-web`,
+  `make compat`, `make dev`, `make docker`. User documentation: `README.md` and
+  `docs/{configuration,deployment,operations,security,s3-compatibility,web-ui}.md`.

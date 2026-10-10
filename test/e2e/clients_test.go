@@ -12,7 +12,6 @@ import (
 	"io"
 	"net/http"
 	"net/url"
-	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -438,13 +437,6 @@ func (rt *recordingTransport) last(method string) sentRequest {
 		}
 	}
 	return sentRequest{header: http.Header{}}
-}
-
-// all returns every recorded request.
-func (rt *recordingTransport) all() []sentRequest {
-	rt.mu.Lock()
-	defer rt.mu.Unlock()
-	return slices.Clone(rt.reqs)
 }
 
 // recordingClient returns an http.Client like e.httpc that records requests.

@@ -191,6 +191,7 @@ func (s *Server) handleCopyObject(w http.ResponseWriter, r *http.Request, rc *re
 		hdr.Set("X-Amz-Copy-Source-Version-Id", info.VersionID)
 	}
 	setSSEHeaders(hdr, out.ObjectMeta)
+	s.setExpirationHeader(ctx, hdr, out)
 	res := copyObjectResult{
 		ETag:         quoteETag(out.ETag),
 		LastModified: formatXMLTime(out.LastModified),

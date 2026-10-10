@@ -222,10 +222,17 @@ func (b *Backend) CompleteMultipartUpload(ctx context.Context, bucketName, key, 
 	}
 	var total int64
 	parts := make([]*part, 0, len(partNumbers))
-	for _, n := range partNumbers {
+	if opts.PartETags != nil && len(opts.PartETags) != len(partNumbers) {
+		return storage.ObjectInfo{}, fmt.Errorf("memory: %d part ETags for %d parts", len(opts.PartETags), len(partNumbers))
+	}
+	for i, n := range partNumbers {
 		p, ok := u.parts[n]
 		if !ok {
 			return storage.ObjectInfo{}, fmt.Errorf("%w: part %d of upload %q", storage.ErrPartNotFound, n, uploadID)
+		}
+		if opts.PartETags != nil && p.info.ETag != opts.PartETags[i] {
+			return storage.ObjectInfo{}, fmt.Errorf("%w: part %d of upload %q was replaced (ETag %q, want %q)",
+				storage.ErrPartNotFound, n, uploadID, p.info.ETag, opts.PartETags[i])
 		}
 		parts = append(parts, p)
 		total += int64(len(p.data))

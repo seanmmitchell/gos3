@@ -477,6 +477,7 @@ func objectLocation(r *http.Request, rc *reqContext) string {
 // request: the parts to concatenate and the final object metadata.
 type completionPlan struct {
 	partNumbers []int
+	partETags   []string // the validated ETag of each part, for the backend to re-check
 	meta        storage.ObjectMeta
 	size        int64
 }
@@ -555,6 +556,7 @@ func planCompletion(up storage.UploadInfo, req *completeMultipartUpload, nums []
 	if err != nil {
 		return plan, err
 	}
+	plan.partETags = etags
 
 	meta := up.Meta
 	meta.ETag = etag
@@ -735,12 +737,22 @@ func (s *Server) handleCompleteMultipartUpload(w http.ResponseWriter, r *http.Re
 		return err
 	}
 
+	// The backend re-checks the part ETags atomically with the commit, so a
+	// part replaced after the checks above gives InvalidPart instead of an
+	// object whose data does not match its ETag and checksums.
+	cond.PartETags = plan.partETags
+
 	versioned := bi.Versioning != storage.VersioningUnversioned
 	early := http.Header{}
 	setSSEHeaders(early, plan.meta)
 	var trailers []string
 	if versioned {
 		trailers = []string{"X-Amz-Version-Id"}
+	}
+	// x-amz-expiration depends on the completed object, so it is a trailer
+	// too when keep-alive whitespace has already started the response.
+	if s.bucketLifecycle(ctx, rc.bucket) != nil {
+		trailers = append(trailers, "X-Amz-Expiration")
 	}
 	location := objectLocation(r, rc)
 	bucket, key := rc.bucket, rc.key
@@ -770,6 +782,7 @@ func (s *Server) handleCompleteMultipartUpload(w http.ResponseWriter, r *http.Re
 		if versioned {
 			hdr.Set("X-Amz-Version-Id", info.VersionID)
 		}
+		s.setExpirationHeader(workCtx, hdr, info)
 		return longResult{doc: res, headers: hdr}
 	})
 }

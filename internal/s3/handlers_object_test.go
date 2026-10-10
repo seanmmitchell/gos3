@@ -10,6 +10,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"reflect"
 	"strconv"
 	"strings"
 	"sync"
@@ -380,7 +381,7 @@ func TestObjectPutObjectLock(t *testing.T) {
 	e.putBucketConfig("lock", storage.ConfigObjectLock, `<ObjectLockConfiguration xmlns="http://s3.amazonaws.com/doc/2006-03-01/"><ObjectLockEnabled>Enabled</ObjectLockEnabled><Rule><DefaultRetention><Mode>COMPLIANCE</Mode><Days>2</Days></DefaultRetention></Rule></ObjectLockConfiguration>`)
 	objExpect(t, e.signed("PUT", "/lock/d", []byte("x"), nil), 200, "")
 	info = objGetInfo(t, e, "lock", "d", "")
-	if info.RetentionMode != "COMPLIANCE" || info.RetainUntil.Sub(time.Now()) < 47*time.Hour || info.RetainUntil.Sub(time.Now()) > 49*time.Hour {
+	if info.RetentionMode != "COMPLIANCE" || time.Until(info.RetainUntil) < 47*time.Hour || time.Until(info.RetainUntil) > 49*time.Hour {
 		t.Errorf("default retention %s %v", info.RetentionMode, info.RetainUntil)
 	}
 	// Explicit headers win over the default.
@@ -972,7 +973,7 @@ func TestParseWriteConditions(t *testing.T) {
 		{objHdr("If-Match", "a", "If-None-Match", "*"), storage.CommitOptions{}, "NotImplemented"},
 	} {
 		got, err := parseWriteConditions(tc.hdr)
-		if codeOf(err) != tc.code || (err == nil && got != tc.want) {
+		if codeOf(err) != tc.code || (err == nil && !reflect.DeepEqual(got, tc.want)) {
 			t.Errorf("%v: %+v %v", tc.hdr, got, err)
 		}
 	}

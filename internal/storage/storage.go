@@ -142,6 +142,12 @@ type CommitOptions struct {
 	// IfMatch: when non-empty the commit fails with ErrPreconditionFailed unless
 	// the current object exists and its ETag equals IfMatch (unquoted).
 	IfMatch string
+	// PartETags is used by CompleteMultipartUpload only. When non-nil it holds
+	// one unquoted ETag per listed part number (same order); the completion
+	// fails with ErrPartNotFound if a part's current ETag differs, i.e. the
+	// part was replaced after the caller validated it. The check is atomic
+	// with the commit.
+	PartETags []string
 }
 
 // ObjectWriter streams the data of a new object version. Nothing becomes

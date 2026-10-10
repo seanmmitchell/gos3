@@ -49,7 +49,12 @@ The server ID is random (16 hex chars), persisted in `<data>/.gos3/server-id`
 Lightweight, dependency-free protocol that also works where mDNS is blocked
 or unavailable, and that the standalone UI's Node server speaks too.
 
-- Group `239.255.73.83`, port `7373` (configurable `beaconGroup`), multicast TTL 1, loopback enabled.
+- Group `239.255.73.83`, port `7373` (configurable `beaconGroup`; must be an
+  IPv4 multicast address), multicast TTL 1, loopback enabled. Joined on every
+  multicast-capable interface; if multicast is unavailable the server logs
+  once and keeps running without it.
+- `beaconInterval` is 1 s – 1 h (default 10 s). Each server sends one query
+  when it starts, so it learns about running peers immediately.
 - Messages are UTF-8 JSON, one per datagram, ≤ 1400 bytes, field `proto` = `"gos3-beacon/1"`.
   Unknown `proto`/`type` values are ignored.
 
@@ -68,19 +73,33 @@ or unavailable, and that the standalone UI's Node server speaks too.
 {"proto":"gos3-beacon/1","type":"bye","id":"…"}
 ```
 
-Receivers ignore their own ID. If `urls` is empty or only contains wildcard
-hosts, the datagram's source IP plus the advertised port is used.
+Receivers ignore their own ID. Wildcard and loopback hosts in `urls` (and an
+empty `urls`) are replaced by the datagram's source IP plus the advertised
+port. Queriers should send from an ephemeral UDP socket and listen on it for
+the unicast replies; servers do the same, so replies are never delivered to
+another process bound to the group port. Unknown JSON fields are ignored so
+later versions can add fields; everything else is strict (one JSON object,
+valid UTF-8, ≤ 1400 bytes, exact `proto`, known `type`).
 
 ## 4. Static seeds
 
-`discovery.seeds` is a list of base URLs (`http://host:9000`). Each is probed
-on start and every 30 s.
+`discovery.seeds` is a list of base URLs (`http://host:9000`; a bare
+`host[:port]` means `http://host[:port]`, and no default port is added). Each
+is probed on start and every 30 s; peers found this way have source `static`.
+A seed that has never answered has no server ID yet, so it does not appear in
+the peer table until its first successful probe.
 
 ## 5. DNS SRV
 
-For each domain in `discovery.dnsSrv`, resolve `_gos3._tcp.<domain>` SRV
-records every 60 s; each target/port becomes a candidate (`https` when port is 443,
-else `http`).
+For each domain in `discovery.dnsSrv` (at most 64), resolve
+`_gos3._tcp.<domain>` SRV records every 60 s; each target/port becomes a
+candidate (`https` when port is 443, else `http`); source `dns`.
+
+In Kubernetes, a headless Service whose port is **named `gos3`** (protocol TCP)
+publishes exactly these records:
+`_gos3._tcp.<service>.<namespace>.svc.cluster.local` → one target per ready
+pod. Set `dnsSrv` to `<service>.<namespace>.svc.cluster.local` (see
+`deploy/kubernetes/`).
 
 ## 6. Active scan (on demand)
 
@@ -90,9 +109,30 @@ addresses skipped for /0–/30), host names, or base URLs — × `ports` ×
 `schemes`, and probes `/_gos3/info` with `concurrency` workers and a per-probe
 `timeout`. Found servers are added with source `scan`.
 
+Target forms: a value containing `://` is a base URL probed as is (ports and
+schemes ignored); a value containing `/` is a CIDR; anything else is a host
+name or IP, optionally with `:port` (bracket IPv6 addresses when giving a
+port). Defaults: ports `[9000]`, schemes `["http"]`, `timeout` 1.5 s per
+probe (nanoseconds in JSON; clamped to 10 ms – 30 s), `concurrency` 64
+(at most 512 workers are used). Limits of the admin API endpoint: at most 256
+targets, 64 ports, `maxScanHosts` hosts (default 1024, at most 65536),
+`timeout` ≤ 60 s and `concurrency` ≤ 1024 in the request, and 5 minutes per
+scan. The server's own address is probed but left out of `found`.
+
 ## Peer lifecycle
 
-- `firstSeen` / `lastSeen` per peer; `healthy` reflects the latest probe.
+- `sources` is the union of `mdns`, `beacon`, `static` (seeds), `dns`,
+  `scan` and `probe` (admin API probe). `verified` is false for a sighting
+  that has not been confirmed through `/_gos3/info` yet; treat it as a hint.
+- `firstSeen` / `lastSeen` per peer; `healthy` reflects the latest probe. A
+  `bye` beacon or a failed probe marks the peer unhealthy; an address that now
+  answers with a different ID marks it unhealthy too.
+- Probes use `GET <base>/_gos3/info` with a 5 s timeout and a 64 KiB limit;
+  they never use HTTP proxies or follow redirects, and HTTPS certificates are
+  verified (a peer with a self-signed certificate stays unverified with a TLS
+  error).
+- The table holds at most 4096 peers (unverified sightings are evicted first)
+  and at most 32 addresses per peer.
 - Verified peers are re-probed every 30 s; peers not seen (no sighting and no
   successful probe) for `peerTtl` are removed. Seeds are never removed.
 - `GET /_gos3/admin/v1/discovery` exposes the peer table to the UI, which

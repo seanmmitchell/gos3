@@ -1,0 +1,43 @@
+# Headless Service: stable DNS names for every pod
+# (gos3-0.gos3-headless.<namespace>.svc.cluster.local) and, because the port
+# is named "gos3", the SRV records _gos3._tcp.gos3-headless.<namespace>.svc.cluster.local
+# that gos3 discovery resolves (discovery.dns_srv). Each pod is listed once
+# it is ready.
+apiVersion: v1
+kind: Service
+metadata:
+  name: gos3-headless
+  labels:
+    app.kubernetes.io/name: gos3
+spec:
+  clusterIP: None
+  selector:
+    app.kubernetes.io/name: gos3
+  ports:
+    - name: gos3
+      port: 9000
+      targetPort: gos3
+      protocol: TCP
+---
+# Client-facing Service for the S3 API, admin API and web UI.
+#
+# gos3 servers do NOT replicate or share data: every replica of the
+# StatefulSet is an independent server with its own buckets. This Service
+# therefore targets exactly one pod (gos3-0). With more replicas, create one
+# such Service (or Ingress backend) per pod, changing the pod-name selector.
+apiVersion: v1
+kind: Service
+metadata:
+  name: gos3
+  labels:
+    app.kubernetes.io/name: gos3
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: gos3
+    statefulset.kubernetes.io/pod-name: gos3-0
+  ports:
+    - name: gos3
+      port: 9000
+      targetPort: gos3
+      protocol: TCP

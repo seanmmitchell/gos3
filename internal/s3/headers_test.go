@@ -127,6 +127,7 @@ func TestWriteObjectHeaders(t *testing.T) {
 	// User metadata keeps AWS's lowercase header spelling on the wire:
 	// botocore strips "x-amz-meta-" case-insensitively but keeps the rest
 	// verbatim, so a canonicalized "X-Amz-Meta-A" would read back as "A".
+	//lint:ignore SA1008 the non-canonical key is exactly what is being asserted
 	if got := h["x-amz-meta-a"]; len(got) != 1 || got[0] != "1" {
 		t.Errorf("x-amz-meta-a = %q (header map %v), want lowercase name with value 1", got, h)
 	}

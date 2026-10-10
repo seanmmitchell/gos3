@@ -155,7 +155,7 @@ func putObject(ctx context.Context, b storage.Backend, bucket, key string, data 
 		}
 		if err != nil {
 			_ = w.Abort()
-			return storage.ObjectInfo{}, fmt.Errorf("Write: %w", err)
+			return storage.ObjectInfo{}, fmt.Errorf("write: %w", err)
 		}
 	}
 	info, err := w.Commit(ctx, meta, opts)
@@ -384,7 +384,7 @@ func uploadPart(ctx context.Context, b storage.Backend, bucket, key, uploadID st
 	if len(data) > 0 {
 		if _, err := w.Write(data); err != nil {
 			_ = w.Abort()
-			return storage.PartInfo{}, fmt.Errorf("Write: %w", err)
+			return storage.PartInfo{}, fmt.Errorf("write: %w", err)
 		}
 	}
 	info, err := w.Commit(ctx, meta)

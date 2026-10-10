@@ -293,7 +293,8 @@ func TestConfigCache(t *testing.T) {
 		v, _ := c.get(bucket, "k", []byte(raw), parse)
 		return v
 	}
-	if get("a", "1") != "1!" || get("a", "1") != "1!" || parses != 1 {
+	first, second := get("a", "1"), get("a", "1") // the second call must hit the cache
+	if first != "1!" || second != "1!" || parses != 1 {
 		t.Fatalf("cache miss: %d", parses)
 	}
 	if get("a", "2") != "2!" || parses != 2 {

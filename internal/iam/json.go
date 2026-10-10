@@ -9,6 +9,9 @@ import (
 )
 
 // errPrincipal is returned by Principal.UnmarshalJSON for unsupported shapes.
+// The text is AWS's MalformedPolicy message and reaches clients verbatim.
+//
+//lint:ignore ST1005 matches the AWS error message clients see
 var errPrincipal = errors.New("Invalid principal in policy")
 
 // UnmarshalJSON accepts a JSON string, an array of strings, or null. Number

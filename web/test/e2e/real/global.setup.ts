@@ -14,7 +14,7 @@
 // `make build`); E2E_SKIP_UI_BUILD=1 skips the `pnpm generate:embed` freshness
 // check.
 import { spawn, spawnSync } from 'node:child_process'
-import { existsSync, mkdirSync, mkdtempSync, readdirSync, renameSync, statSync, writeFileSync } from 'node:fs'
+import { mkdirSync, mkdtempSync, readdirSync, readFileSync, renameSync, statSync, writeFileSync } from 'node:fs'
 import { createServer } from 'node:net'
 import { tmpdir } from 'node:os'
 import { join, relative } from 'node:path'
@@ -64,12 +64,27 @@ function run(cmd: string, args: string[], opts: { cwd: string, env?: NodeJS.Proc
 }
 
 /** Rebuilds the embedded UI (base /_gos3/ui/) when app sources are newer than the build. */
+/**
+ * Reports whether UI_BUILD holds an embedded build (base /_gos3/ui/). A plain
+ * `pnpm build` or `pnpm generate` also writes web/.output/public, with base
+ * "/", and must not be overlaid into the binary however fresh it is.
+ */
+function isEmbedBuild(): boolean {
+  try {
+    return readFileSync(join(UI_BUILD, 'index.html'), 'utf8').includes('/_gos3/ui/_nuxt/')
+  }
+  catch {
+    return false
+  }
+}
+
 function ensureUiBuild() {
-  if (process.env.E2E_SKIP_UI_BUILD === '1' && existsSync(join(UI_BUILD, 'index.html'))) return
+  if (process.env.E2E_SKIP_UI_BUILD === '1' && isEmbedBuild()) return
   const src = newestMtime([join(WEB_DIR, 'app'), join(WEB_DIR, 'public'), join(WEB_DIR, 'nuxt.config.ts'), join(WEB_DIR, 'package.json')])
   const built = Math.min(mtime(join(UI_BUILD, 'index.html')), mtime(join(UI_BUILD, '200.html')) || Infinity)
-  if (built > src) return
+  if (built > src && isEmbedBuild()) return
   run('pnpm', ['generate:embed'], { cwd: WEB_DIR })
+  if (!isEmbedBuild()) throw new Error(`${UI_BUILD}/index.html does not reference /_gos3/ui/_nuxt/ after pnpm generate:embed`)
 }
 
 /** Builds (or reuses) the gos3 binary embedding UI_BUILD; returns its path. */

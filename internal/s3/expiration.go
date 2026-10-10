@@ -32,9 +32,9 @@ func (s *Server) bucketLifecycle(ctx context.Context, bucket string) *lifecycle.
 
 // setExpirationHeader sets x-amz-expiration (expiry-date and rule-id) when
 // an enabled lifecycle Expiration rule (Days or Date) of the bucket applies
-// to info, as S3 does on PutObject, GetObject and HeadObject. Only current
-// versions get the header (noncurrent versions and delete markers expire by
-// other rules).
+// to info, as S3 does on PutObject, CopyObject, CompleteMultipartUpload,
+// GetObject and HeadObject. Only current versions get the header
+// (noncurrent versions and delete markers expire by other rules).
 func (s *Server) setExpirationHeader(ctx context.Context, h http.Header, info storage.ObjectInfo) {
 	if info.DeleteMarker || !info.IsLatest {
 		return

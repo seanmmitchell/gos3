@@ -23,6 +23,7 @@ func multipartTests() []testCase {
 		{"CompleteAll", testMultipartCompleteAll},
 		{"CompleteSubsetAndOrder", testMultipartCompleteSubset},
 		{"CompleteMissingPart", testMultipartCompleteMissingPart},
+		{"CompleteChecksPartETags", testMultipartCompletePartETags},
 		{"CompleteLarge", testMultipartCompleteLarge},
 		{"CompleteEmptyPart", testMultipartCompleteEmptyPart},
 		{"UploadGoneAfterCompleteOrAbort", testMultipartGone},
@@ -402,6 +403,32 @@ func testMultipartCompleteMissingPart(e *env) {
 	// Retrying with the right list succeeds.
 	e.complete("b", "k", u.UploadID, []int{1, 3}, completeMeta(storage.ObjectMeta{}, []byte("one"), []byte("three")))
 	e.wantContent("b", "k", "", []byte("onethree"))
+}
+
+// testMultipartCompletePartETags: with CommitOptions.PartETags the
+// completion fails with ErrPartNotFound when a part no longer has the ETag
+// the caller validated (it was replaced in between), and publishes nothing.
+func testMultipartCompletePartETags(e *env) {
+	e.mkBucket("b")
+	u := e.createUpload("b", "k", storage.ObjectMeta{})
+	one := e.part("b", "k", u.UploadID, 1, []byte("one"))
+	two := e.part("b", "k", u.UploadID, 2, []byte("two"))
+	// Part 2 is replaced after the caller listed it.
+	e.part("b", "k", u.UploadID, 2, []byte("TWO"))
+	meta := completeMeta(storage.ObjectMeta{}, []byte("one"), []byte("two"))
+	_, err := e.b.CompleteMultipartUpload(e.ctx, "b", "k", u.UploadID, []int{1, 2}, meta,
+		storage.CommitOptions{PartETags: []string{one.ETag, two.ETag}})
+	e.wantErr("CompleteMultipartUpload with a replaced part", err, storage.ErrPartNotFound)
+	_, err = e.b.GetObjectInfo(e.ctx, "b", "k", "")
+	e.wantErr("GetObjectInfo after a failed completion", err, storage.ErrObjectNotFound)
+	if _, err := e.b.ListParts(e.ctx, "b", "k", u.UploadID); err != nil {
+		e.t.Fatalf("upload gone after a failed completion: %v", err)
+	}
+	// With the current ETags it succeeds.
+	_, err = e.b.CompleteMultipartUpload(e.ctx, "b", "k", u.UploadID, []int{1, 2}, completeMeta(storage.ObjectMeta{}, []byte("one"), []byte("TWO")),
+		storage.CommitOptions{PartETags: []string{one.ETag, etagOf([]byte("TWO"))}})
+	e.noErr("CompleteMultipartUpload with the current part ETags", err)
+	e.wantContent("b", "k", "", []byte("oneTWO"))
 }
 
 func testMultipartCompleteLarge(e *env) {
