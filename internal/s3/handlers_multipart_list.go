@@ -6,7 +6,6 @@ import (
 	"encoding/xml"
 	"math"
 	"net/http"
-	"strings"
 
 	"github.com/seanmmitchell/gos3/internal/storage"
 )
@@ -145,107 +144,12 @@ type uploadCommonPrefix struct {
 	Prefix string `xml:"Prefix"`
 }
 
-// uploadListParams are the ListMultipartUploads query parameters.
-type uploadListParams struct {
-	prefix, delimiter, keyMarker, uploadIDMarker string
-	maxUploads                                   int
-}
-
-// uploadListing is a page of in-progress uploads and common prefixes.
-type uploadListing struct {
-	uploads                           []storage.UploadInfo
-	prefixes                          []string
-	truncated                         bool
-	nextKeyMarker, nextUploadIDMarker string
-}
-
-// listUploads pages through uploads (sorted by key, then initiation, as
-// storage.Backend.ListMultipartUploads returns them) with S3 semantics:
-//
-//   - only keys with the prefix are listed; with a delimiter, keys whose
-//     remainder after the prefix contains it roll up into one common
-//     prefix each (counting as one entry toward maxUploads);
-//   - key-marker alone starts after every upload of that key; with
-//     upload-id-marker the uploads of key-marker following that upload
-//     are included too (those with a greater upload ID when the marker
-//     upload no longer exists); upload-id-marker without key-marker is
-//     ignored; a key-marker equal to one of the listing's common prefixes
-//     skips everything under it;
-//   - when truncated, the next markers identify the last entry returned
-//     (a common prefix has an empty upload ID marker).
-func listUploads(all []storage.UploadInfo, p uploadListParams) uploadListing {
-	var out uploadListing
-	if p.maxUploads <= 0 {
-		return out
-	}
-	skipUnder := ""
-	if cp, ok := storage.CommonPrefix(p.keyMarker, p.prefix, p.delimiter); ok && cp == p.keyMarker {
-		skipUnder = p.keyMarker
-	}
-	markerFound := false
-	if p.keyMarker != "" && p.uploadIDMarker != "" {
-		for _, u := range all {
-			if u.Key == p.keyMarker && u.UploadID == p.uploadIDMarker {
-				markerFound = true
-				break
-			}
-		}
-	}
-	pastMarker := false
-	lastCP := ""
-	count := 0
-	for _, u := range all {
-		if !strings.HasPrefix(u.Key, p.prefix) {
-			continue
-		}
-		if p.keyMarker != "" {
-			if skipUnder != "" && strings.HasPrefix(u.Key, skipUnder) {
-				continue
-			}
-			if u.Key < p.keyMarker {
-				continue
-			}
-			if u.Key == p.keyMarker {
-				if p.uploadIDMarker == "" {
-					continue
-				}
-				if markerFound {
-					if !pastMarker {
-						pastMarker = u.UploadID == p.uploadIDMarker
-						continue
-					}
-				} else if u.UploadID <= p.uploadIDMarker {
-					continue
-				}
-			}
-		}
-		cp, isCP := storage.CommonPrefix(u.Key, p.prefix, p.delimiter)
-		if isCP && cp == lastCP {
-			continue
-		}
-		if count == p.maxUploads {
-			out.truncated = true
-			break
-		}
-		count++
-		if isCP {
-			out.prefixes = append(out.prefixes, cp)
-			lastCP = cp
-			out.nextKeyMarker, out.nextUploadIDMarker = cp, ""
-			continue
-		}
-		out.uploads = append(out.uploads, u)
-		out.nextKeyMarker, out.nextUploadIDMarker = u.Key, u.UploadID
-	}
-	if !out.truncated {
-		out.nextKeyMarker, out.nextUploadIDMarker = "", ""
-	}
-	return out
-}
-
 // handleListMultipartUploads implements ListMultipartUploads (prefix,
 // delimiter, key-marker, upload-id-marker, max-uploads <= 1000,
-// encoding-type=url; see listUploads for the paging rules).
+// encoding-type=url; see storage.ListUploads for the paging rules). A page
+// is read through the backend's upload walker when it has one, so it costs
+// time proportional to max-uploads rather than to the bucket's pending
+// uploads.
 func (s *Server) handleListMultipartUploads(w http.ResponseWriter, r *http.Request, rc *reqContext) error {
 	ctx := r.Context()
 	q := rc.query
@@ -261,38 +165,37 @@ func (s *Server) handleListMultipartUploads(w http.ResponseWriter, r *http.Reque
 	if err != nil {
 		return err
 	}
-	p := uploadListParams{
-		prefix:         q.Get("prefix"),
-		delimiter:      q.Get("delimiter"),
-		keyMarker:      q.Get("key-marker"),
-		uploadIDMarker: q.Get("upload-id-marker"),
-		maxUploads:     maxUploads,
+	p := storage.UploadListParams{
+		Prefix:         q.Get("prefix"),
+		Delimiter:      q.Get("delimiter"),
+		KeyMarker:      q.Get("key-marker"),
+		UploadIDMarker: q.Get("upload-id-marker"),
+		MaxUploads:     maxUploads,
 	}
-	if p.keyMarker == "" {
-		p.uploadIDMarker = ""
+	if p.KeyMarker == "" {
+		p.UploadIDMarker = ""
 	}
-	all, err := s.backend.ListMultipartUploads(ctx, rc.bucket)
+	page, err := storage.ListUploads(ctx, s.backend, rc.bucket, p)
 	if err != nil {
 		return bucketError(err, rc.bucket)
 	}
-	page := listUploads(all, p)
 
 	res := listMultipartUploadsResult{
 		Bucket:             rc.bucket,
-		KeyMarker:          maybeURLEncode(p.keyMarker, enc),
-		UploadIDMarker:     p.uploadIDMarker,
-		NextKeyMarker:      maybeURLEncode(page.nextKeyMarker, enc),
-		NextUploadIDMarker: page.nextUploadIDMarker,
-		Delimiter:          maybeURLEncode(p.delimiter, enc),
-		Prefix:             maybeURLEncode(p.prefix, enc),
+		KeyMarker:          maybeURLEncode(p.KeyMarker, enc),
+		UploadIDMarker:     p.UploadIDMarker,
+		NextKeyMarker:      maybeURLEncode(page.NextKeyMarker, enc),
+		NextUploadIDMarker: page.NextUploadIDMarker,
+		Delimiter:          maybeURLEncode(p.Delimiter, enc),
+		Prefix:             maybeURLEncode(p.Prefix, enc),
 		MaxUploads:         maxUploads,
-		IsTruncated:        page.truncated,
+		IsTruncated:        page.IsTruncated,
 	}
 	if enc {
 		res.EncodingType = "url"
 	}
 	owner := ownerFor(bi.Owner)
-	for _, u := range page.uploads {
+	for _, u := range page.Uploads {
 		algo, typ := uploadChecksum(u.Meta)
 		res.Uploads = append(res.Uploads, listedUpload{
 			Key:               maybeURLEncode(u.Key, enc),
@@ -305,7 +208,7 @@ func (s *Server) handleListMultipartUploads(w http.ResponseWriter, r *http.Reque
 			ChecksumType:      typ,
 		})
 	}
-	for _, cp := range page.prefixes {
+	for _, cp := range page.CommonPrefixes {
 		res.CommonPrefixes = append(res.CommonPrefixes, uploadCommonPrefix{Prefix: maybeURLEncode(cp, enc)})
 	}
 	return writeXML(w, http.StatusOK, res)

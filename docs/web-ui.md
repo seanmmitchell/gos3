@@ -34,7 +34,11 @@ the internet.
 
 Pages are shown according to the signed-in identity's permissions (from
 `GET /_gos3/admin/v1/whoami`). For example, Users appears only with
-`admin:CreateUser`.
+`admin:CreateUser`. Creating a user with policies also needs `admin:UpdateUser`,
+and with an initial access key (the create form's "Create an access key
+now" option, on by default) also `admin:CreateAccessKey`. A role with only
+`admin:CreateUser` gets a 403 from the create form unless it selects no
+policies and clears that option.
 
 ### Object browser notes
 

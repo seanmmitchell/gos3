@@ -131,7 +131,8 @@ ListObjectsV2, ListParts and GetObjectAttributes.
   `aws:PrincipalType`, `aws:CurrentTime`, `aws:EpochTime`, `aws:UserAgent`,
   `aws:Referer`, `s3:prefix`, `s3:delimiter`, `s3:max-keys`, `s3:VersionId`,
   `s3:ExistingObjectTag/<key>`, `s3:x-amz-copy-source`,
-  `s3:x-amz-metadata-directive`, and the object-attribute keys `s3:x-amz-acl`,
+  `s3:x-amz-metadata-directive`, `s3:if-none-match`, `s3:if-match`,
+  `s3:ObjectCreationOperation`, and the object-attribute keys `s3:x-amz-acl`,
   `s3:x-amz-server-side-encryption`,
   `s3:x-amz-server-side-encryption-aws-kms-key-id`, `s3:x-amz-storage-class`,
   `s3:x-amz-website-redirect-location`, `s3:object-lock-mode`,
@@ -152,17 +153,49 @@ ListObjectsV2, ListParts and GetObjectAttributes.
   - `s3:TlsVersion`: `1.2` or `1.3`, only when TLS terminates at gos3. Behind
     a TLS-terminating proxy the key is absent.
 
+  The request keys are:
+  - `s3:if-none-match` and `s3:if-match`: the `If-None-Match` / `If-Match`
+    headers, trimmed of surrounding whitespace, for PutObject, CopyObject and
+    CompleteMultipartUpload only; absent when the header is not sent.
+  - `s3:ObjectCreationOperation`: `true` for PutObject, CopyObject,
+    PostObject and CompleteMultipartUpload, `false` for
+    CreateMultipartUpload, UploadPart and UploadPartCopy, and absent for
+    every other operation. Together with `s3:if-none-match` this makes AWS's
+    "require `If-None-Match` on object creation" bucket policy work (deny
+    when `s3:ObjectCreationOperation` is `true` and `s3:if-none-match` is
+    `Null`).
+  - `s3:x-amz-copy-source`: set for CopyObject and UploadPartCopy only, from
+    the parsed `x-amz-copy-source` header: the decoded `bucket/key`, plus
+    `?versionId=<id>` when a version is named. It is provided as two values,
+    `bucket/key…` and `/bucket/key…`, so a `StringLike` Deny written in
+    either spelling matches whatever leading slash or percent-encoding the
+    client used, and `StringNotLike` is satisfied by either. Write keys
+    decoded in policies (`src/my dir/*`, not `src/my%20dir/*`). Nothing is
+    set when the header is invalid; such requests fail with
+    `InvalidArgument` anyway.
+  - `s3:x-amz-metadata-directive`: set for CopyObject only (upper-cased, see
+    below).
+
+  `s3:x-amz-copy-source` and `s3:x-amz-metadata-directive` are never set for
+  PostObject or any other non-copy operation, even when the request carries
+  those headers.
+
   `s3:x-amz-grant-read`, `-write`, `-read-acp`, `-write-acp` and
   `-full-control` are set only from AccessControlPolicy bodies (see below),
   since `x-amz-grant-*` headers are not supported. Keys gos3 never sets (for
-  example `aws:SourceVpce`, `aws:SourceVpc`, `aws:PrincipalOrgID`) are
-  absent: positive operators on them evaluate to false, so `Allow`
-  statements using them never grant and `Deny` statements using them never
-  apply (use `…IfExists` or `Null` deliberately).
+  example `aws:SourceVpce`, `aws:SourceVpc`, `aws:PrincipalOrgID`,
+  `aws:PrincipalArn` and `aws:PrincipalAccount`) are absent: positive
+  operators on them evaluate to false, so `Allow` statements using them
+  never grant and `Deny` statements using them never apply (use
+  `…IfExists` or `Null` deliberately). gos3 has no account ID, so restrict
+  principals with the `Principal` / `NotPrincipal` element (which accepts
+  `arn:aws:iam::<any account>:user/<name>`) rather than with
+  `aws:PrincipalArn` or `aws:PrincipalAccount` conditions.
 - **Where the object-attribute keys come from**, per operation:
   - PutObject, CreateMultipartUpload and CopyObject: the request headers.
   - PostObject: the normalised form fields; the POST's own headers are
-    ignored.
+    ignored (so `s3:x-amz-copy-source` and `s3:x-amz-metadata-directive` are
+    never set for it).
   - PutObjectAcl and PutBucketAcl: the `x-amz-acl` header, or the
     AccessControlPolicy body. A body is evaluated with `s3:x-amz-acl` set to
     the equivalent canned ACL (`private` when nothing is granted) and

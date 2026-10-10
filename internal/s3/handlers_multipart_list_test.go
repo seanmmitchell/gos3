@@ -3,10 +3,12 @@ package s3
 import (
 	"context"
 	"encoding/xml"
+	"errors"
 	"fmt"
 	"net/http"
 	"reflect"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -15,6 +17,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/s3/types"
 
 	"github.com/seanmmitchell/gos3/internal/storage"
+	"github.com/seanmmitchell/gos3/internal/storage/memory"
 )
 
 func TestListPartsPaging(t *testing.T) {
@@ -140,7 +143,7 @@ func TestListPartsInitiatorIAMUser(t *testing.T) {
 type mpUploadKey struct{ key, id string }
 
 func TestListMultipartUploadsPaging(t *testing.T) {
-	e := newTestEnv(t)
+	e, _ := newWalkOnlyEnv(t)
 	e.createBucket("mp")
 	c := e.client
 	ctx := context.Background()
@@ -259,56 +262,68 @@ func TestListMultipartUploadsEncodingAndChecksum(t *testing.T) {
 	}
 }
 
-func TestListUploadsUnit(t *testing.T) {
-	mk := func(spec ...string) []storage.UploadInfo {
-		var out []storage.UploadInfo
-		for _, s := range spec {
-			k, id, _ := strings.Cut(s, "#")
-			out = append(out, storage.UploadInfo{Key: k, UploadID: id})
+// walkOnlyBackend is a memory backend whose ListMultipartUploads (the
+// whole-bucket listing) fails, and whose upload walker counts the uploads
+// it yields: ListMultipartUploads must page through the walker.
+type walkOnlyBackend struct {
+	*memory.Backend
+	yielded atomic.Int64
+}
+
+func (b *walkOnlyBackend) ListMultipartUploads(context.Context, string) ([]storage.UploadInfo, error) {
+	return nil, errors.New("walkOnlyBackend: whole-bucket upload listing used")
+}
+
+func (b *walkOnlyBackend) WalkMultipartUploads(ctx context.Context, bucket, prefix string, after storage.UploadPosition, fn func(storage.UploadInfo) error) error {
+	return b.Backend.WalkMultipartUploads(ctx, bucket, prefix, after, func(u storage.UploadInfo) error {
+		b.yielded.Add(1)
+		return fn(u)
+	})
+}
+
+// newWalkOnlyEnv is a test env whose server uses a walkOnlyBackend over
+// e.backend.
+func newWalkOnlyEnv(t *testing.T) (*testEnv, *walkOnlyBackend) {
+	wb := &walkOnlyBackend{}
+	e := newTestEnv(t, withOptions(func(o *Options) {
+		wb.Backend = o.Backend.(*memory.Backend)
+		o.Backend = wb
+	}))
+	return e, wb
+}
+
+// TestListMultipartUploadsCostsAPage: a ListMultipartUploads page reads
+// O(max-uploads) uploads, however many are pending in the bucket.
+func TestListMultipartUploadsCostsAPage(t *testing.T) {
+	e, wb := newWalkOnlyEnv(t)
+	e.createBucket("mp")
+	ctx := context.Background()
+	var last storage.UploadInfo
+	for i := range 3000 {
+		u, err := e.backend.CreateMultipartUpload(ctx, "mp", fmt.Sprintf("dir%d/k%04d", i%3, i), storage.ObjectMeta{}, "")
+		if err != nil {
+			t.Fatal(err)
 		}
-		return out
+		last = u
 	}
-	all := mk("a/1#u1", "a/2#u2", "b#u5", "b#u3", "b#u9", "c#u4", "d/e/f#u6", "d/g#u7", "e#u8")
-	ids := func(l uploadListing) string {
-		var parts []string
-		for _, u := range l.uploads {
-			parts = append(parts, u.Key+"#"+u.UploadID)
+	for _, q := range []string{
+		"max-uploads=1",
+		"max-uploads=5&key-marker=" + last.Key + "&upload-id-marker=" + last.UploadID,
+		"max-uploads=5&key-marker=dir1/k2000",
+		"max-uploads=2&delimiter=/",
+		"max-uploads=3&prefix=dir2/",
+	} {
+		wb.yielded.Store(0)
+		resp := e.signed(http.MethodGet, "/mp?uploads&"+q, nil, nil)
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("%s: %d %s", q, resp.StatusCode, resp.Data)
 		}
-		for _, p := range l.prefixes {
-			parts = append(parts, "P:"+p)
+		if n := wb.yielded.Load(); n > 20 {
+			t.Errorf("%s: read %d uploads for one page", q, n)
 		}
-		return strings.Join(parts, ",")
-	}
-	tests := []struct {
-		name          string
-		p             uploadListParams
-		want          string
-		truncated     bool
-		nextKey, next string
-	}{
-		{"all", uploadListParams{maxUploads: 1000}, "a/1#u1,a/2#u2,b#u5,b#u3,b#u9,c#u4,d/e/f#u6,d/g#u7,e#u8", false, "", ""},
-		{"max zero", uploadListParams{maxUploads: 0}, "", false, "", ""},
-		{"truncated", uploadListParams{maxUploads: 3}, "a/1#u1,a/2#u2,b#u5", true, "b", "u5"},
-		{"prefix", uploadListParams{prefix: "d/", maxUploads: 10}, "d/e/f#u6,d/g#u7", false, "", ""},
-		{"delimiter", uploadListParams{delimiter: "/", maxUploads: 10}, "b#u5,b#u3,b#u9,c#u4,e#u8,P:a/,P:d/", false, "", ""},
-		{"delimiter truncated on prefix", uploadListParams{delimiter: "/", maxUploads: 1}, "P:a/", true, "a/", ""},
-		{"marker is common prefix", uploadListParams{delimiter: "/", keyMarker: "a/", maxUploads: 10}, "b#u5,b#u3,b#u9,c#u4,e#u8,P:d/", false, "", ""},
-		{"prefix and delimiter", uploadListParams{prefix: "d/", delimiter: "/", maxUploads: 10}, "d/g#u7,P:d/e/", false, "", ""},
-		{"key marker", uploadListParams{keyMarker: "b", maxUploads: 10}, "c#u4,d/e/f#u6,d/g#u7,e#u8", false, "", ""},
-		{"key marker between keys", uploadListParams{keyMarker: "a/3", maxUploads: 10}, "b#u5,b#u3,b#u9,c#u4,d/e/f#u6,d/g#u7,e#u8", false, "", ""},
-		{"upload id marker found", uploadListParams{keyMarker: "b", uploadIDMarker: "u5", maxUploads: 10}, "b#u3,b#u9,c#u4,d/e/f#u6,d/g#u7,e#u8", false, "", ""},
-		{"upload id marker last", uploadListParams{keyMarker: "b", uploadIDMarker: "u9", maxUploads: 10}, "c#u4,d/e/f#u6,d/g#u7,e#u8", false, "", ""},
-		{"upload id marker gone", uploadListParams{keyMarker: "b", uploadIDMarker: "u4", maxUploads: 10}, "b#u5,b#u9,c#u4,d/e/f#u6,d/g#u7,e#u8", false, "", ""},
-		{"page ends mid key", uploadListParams{keyMarker: "b", uploadIDMarker: "u5", maxUploads: 1}, "b#u3", true, "b", "u3"},
-		{"past the end", uploadListParams{keyMarker: "z", maxUploads: 10}, "", false, "", ""},
-	}
-	for _, tc := range tests {
-		t.Run(tc.name, func(t *testing.T) {
-			got := listUploads(all, tc.p)
-			if ids(got) != tc.want || got.truncated != tc.truncated || got.nextKeyMarker != tc.nextKey || got.nextUploadIDMarker != tc.next {
-				t.Fatalf("got %q truncated=%v next=%q/%q", ids(got), got.truncated, got.nextKeyMarker, got.nextUploadIDMarker)
-			}
-		})
+		if !strings.Contains(q, "upload-id-marker") && !strings.Contains(string(resp.Data), "<Upload>") && !strings.Contains(string(resp.Data), "<CommonPrefixes>") {
+			t.Errorf("%s: empty page %s", q, resp.Data)
+		}
 	}
 }
 

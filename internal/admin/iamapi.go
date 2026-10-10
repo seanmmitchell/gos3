@@ -39,6 +39,20 @@ func (a *api) createUser(rc *reqCtx) (int, any, error) {
 	if err := rc.decodeBody(&req, false); err != nil {
 		return 0, nil, err
 	}
+	// The body can also attach policies and mint a key; those are gated by
+	// their own actions on the other routes, so check them here as well,
+	// before anything is created. Otherwise admin:CreateUser alone would be
+	// equivalent to admin:* (create a user with "admin" and take its key).
+	if len(req.Policies) > 0 {
+		if err := a.requireAction(rc, "admin:UpdateUser"); err != nil {
+			return 0, nil, err
+		}
+	}
+	if req.CreateKey {
+		if err := a.requireAction(rc, "admin:CreateAccessKey"); err != nil {
+			return 0, nil, err
+		}
+	}
 	u, err := a.d.IAM.CreateUser(rc.ctx, req.UserSpec)
 	if err != nil {
 		return 0, nil, err

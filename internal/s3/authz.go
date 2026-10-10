@@ -315,13 +315,36 @@ func (s *Server) conditionContext(r *http.Request, rc *reqContext, t authzTarget
 	}
 	set("s3:VersionId", t.VersionID)
 	h := r.Header
-	set("s3:x-amz-copy-source", h.Get("x-amz-copy-source"))
-	if v := h.Get("x-amz-metadata-directive"); v != "" {
-		// The directive as the copy handler reads it (any case).
-		if d, err := parseDirective(h, "x-amz-metadata-directive"); err == nil {
-			v = d
+	switch rc.opName {
+	case "CopyObject", "UploadPartCopy":
+		// Only the copy operations read x-amz-copy-source: on any other
+		// operation (PostObject in particular) the header is ignored and
+		// must not satisfy a copy-source condition.
+		if src, err := parseCopySource(h.Get("X-Amz-Copy-Source")); err == nil {
+			c["s3:x-amz-copy-source"] = copySourceConditionValues(src)
 		}
-		set("s3:x-amz-metadata-directive", v)
+		if rc.opName == "CopyObject" {
+			if v := h.Get("x-amz-metadata-directive"); v != "" {
+				// The directive as the copy handler reads it (any case).
+				if d, err := parseDirective(h, "x-amz-metadata-directive"); err == nil {
+					v = d
+				}
+				set("s3:x-amz-metadata-directive", v)
+			}
+		}
+	}
+	switch rc.opName {
+	case "PutObject", "CopyObject", "CompleteMultipartUpload":
+		// The conditional write headers, as parseWriteConditions reads
+		// them (so AWS's "require If-None-Match" policies work).
+		set("s3:if-none-match", strings.TrimSpace(h.Get("If-None-Match")))
+		set("s3:if-match", strings.TrimSpace(h.Get("If-Match")))
+	}
+	switch rc.opName {
+	case "PutObject", "CopyObject", "PostObject", "CompleteMultipartUpload":
+		c["s3:ObjectCreationOperation"] = []string{"true"}
+	case "CreateMultipartUpload", "UploadPart", "UploadPartCopy":
+		c["s3:ObjectCreationOperation"] = []string{"false"}
 	}
 	if t.ObjectAttrs != nil {
 		for k, v := range t.ObjectAttrs {
@@ -375,6 +398,20 @@ func (s *Server) conditionContext(r *http.Request, rc *reqContext, t authzTarget
 		c[k] = v
 	}
 	return c
+}
+
+// copySourceConditionValues is s3:x-amz-copy-source for a parsed copy
+// source: the decoded "bucket/key" (with "?versionId=<id>" when a version
+// is named) in both the slash-less and the leading-slash spelling AWS
+// examples use, so a StringLike Deny written either way matches whatever
+// encoding or leading slash the request used, and a negated operator is
+// satisfied by either spelling.
+func copySourceConditionValues(src copySource) []string {
+	v := src.Bucket + "/" + src.Key
+	if src.VersionID != "" {
+		v += "?versionId=" + src.VersionID
+	}
+	return []string{v, "/" + v}
 }
 
 // objectAttrConditions returns the condition keys describing the

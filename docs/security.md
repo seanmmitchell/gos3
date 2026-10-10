@@ -66,6 +66,14 @@ policy explicitly denies `admin:CreateOwnAccessKey` /
 stop a user, or a stolen key, from minting keys that would survive revoking
 the current one.
 
+Creating a user through the admin API needs `admin:CreateUser`; creating it
+with policies attached also needs `admin:UpdateUser`, and with an initial
+access key (`"createKey": true`) also `admin:CreateAccessKey`, the same
+actions that gate those steps on their own routes. A role with only
+`admin:CreateUser` can therefore create users without policies or keys, but
+cannot create a user with the `admin` policy and take its key, so it is not
+equivalent to `admin:*`.
+
 Built-in policies: `admin` (everything, including the admin API), `readwrite`
 (all S3 actions), `readonly`, `writeonly`, and `diagnostics` (server info,
 stats and discovery in the admin API only). Custom policies use the IAM policy

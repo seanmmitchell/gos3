@@ -167,7 +167,7 @@ environment and flags for these fields.
 | Method | Path | Action | Response |
 |---|---|---|---|
 | GET | `/users` | ListUsers | `{"users": iam.User[]}` |
-| POST | `/users` | CreateUser | body `iam.UserSpec` (+ optional `"createKey": true`) → 201 `{"user": User, "key"?: AccessKey}`; the names `.` and `..` are 400 `InvalidName` |
+| POST | `/users` | CreateUser | body `iam.UserSpec` (+ optional `"createKey": true`) → 201 `{"user": User, "key"?: AccessKey}`; the names `.` and `..` are 400 `InvalidName`. A non-empty `"policies"` also requires `admin:UpdateUser`, and `"createKey": true` also requires `admin:CreateAccessKey`; both are checked before anything is created (otherwise 403 `AccessDenied`) |
 | GET | `/users/{name}` | GetUser | `iam.User` |
 | PATCH | `/users/{name}` | UpdateUser | body `iam.UserUpdate` → `iam.User` |
 | DELETE | `/users/{name}` | DeleteUser | 204 |

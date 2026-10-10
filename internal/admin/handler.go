@@ -291,6 +291,17 @@ func (a *api) authorize(rc *reqCtx, action string) iam.Decision {
 	})
 }
 
+// requireAction returns a 403 AccessDenied error unless the caller is
+// allowed action. Handlers use it for actions beyond the route's own, e.g.
+// when one request body also does what another route gates separately.
+func (a *api) requireAction(rc *reqCtx, action string) error {
+	if !a.authorize(rc, action).Allowed {
+		return errorf(http.StatusForbidden, codeAccessDenied,
+			"%s is not allowed to perform %s", describeIdentity(rc.id), action)
+	}
+	return nil
+}
+
 // requestConditions builds the IAM condition context of a request.
 // aws:SourceIp and aws:SecureTransport come from the connection or, with
 // trustProxy, from X-Forwarded-For / X-Forwarded-Proto (see ClientInfo).
