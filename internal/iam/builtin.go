@@ -71,6 +71,8 @@ var builtinPolicies = map[string]*NamedPolicy{
 		Name:        PolicyDiagnostics,
 		Description: "View server information, statistics and discovery state.",
 		Builtin:     true,
+		// Read-only on purpose: admin:ProbeNetwork and admin:ScanNetwork
+		// make the server open outbound connections and are not granted.
 		Document: PolicyDocument{
 			Version: PolicyVersion2012,
 			Statement: []Statement{{
