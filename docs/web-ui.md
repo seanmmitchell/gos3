@@ -11,7 +11,7 @@ bucket and object features. It runs in two modes built from the same code in
 | Build | `make build` (or `cd web && pnpm generate:embed`, then `make build-go`) | `cd web && pnpm build`, or `docker build -f deploy/docker/web.Dockerfile .` |
 | Default connection | The hosting gos3 server, detected automatically | None; add servers or ship presets |
 | CORS needed | No for the hosting server (same origin); yes for other servers it manages | Yes, for every server |
-| Local discovery (mDNS, beacon, scan from the UI host) | No (needs the Node server) | Yes |
+| Local discovery (mDNS, beacon, scan from the UI host) | No (needs the Node server) | Optional, off by default (`GOS3_UI_LOCAL_DISCOVERY=true`) |
 | Presets | `servers.json` baked in at build time | `NUXT_PUBLIC_SERVERS` at runtime, or `servers.json` at build time |
 
 The UI works offline: fonts and icons are bundled, and it loads nothing from
@@ -158,28 +158,49 @@ Other runtime variables of the Node server:
 | `HOST`, `PORT` (or `NITRO_HOST`, `NITRO_PORT`) | Listen address (default port 3000). |
 | `NUXT_PUBLIC_SERVERS` | Preset connections (JSON array). |
 | `NUXT_PUBLIC_APP_NAME` | Display name (default `gos3`). |
-| `GOS3_UI_LOCAL_DISCOVERY` | `false` (also `0`, `off`, `no`, `disabled`) turns off the local discovery routes below. |
+| `GOS3_UI_LOCAL_DISCOVERY` | `true` (also `1`, `on`, `yes`, `enabled`) turns on the local discovery routes below. They are off when it is unset or has any other value. |
 | `GOS3_UI_ALLOWED_HOSTS` | Extra host names (comma separated) under which the discovery routes below answer, for example `console.example.com`. IP addresses, `localhost` and `*.localhost` are always accepted as `Host`. A listed name is also accepted as the host name of the browser's `Origin` (any port), which matters behind a reverse proxy that rewrites `Host`. `*` only turns the `Host` check off; it does not accept any `Origin`. Set it whenever the UI is reached through a DNS name. |
 
 ### Local discovery routes
 
 Browsers cannot send mDNS or multicast packets or scan networks, so the
-standalone Node server does this from the UI host:
+standalone Node server can do this from the UI host. **These routes are off
+unless `GOS3_UI_LOCAL_DISCOVERY=true`.** While they are off, `capabilities`
+reports `localDiscovery: false` (the Discover page says local discovery is
+turned off and still probes from the browser), and `local`, `scan` and
+`probe` answer `403 AccessDenied`.
 
 | Route | Purpose |
 |---|---|
 | `GET /api/discovery/capabilities` | `{localDiscovery, mdns, beacon, scan, maxScanHosts}`. The UI hides local discovery when this route is missing (embedded mode). |
 | `GET /api/discovery/local?wait=<ms>` | mDNS browse (`_gos3._tcp`) plus a beacon query (`239.255.73.83:7373`), then verification through `/_gos3/info`. `wait` is 500–10000 ms (default 3000). |
 | `POST /api/discovery/scan` | Scans CIDRs, hosts or URLs (an admin API `ScanRequest`): at most 1024 hosts, 64 ports, 4096 probes and concurrency 64. |
-| `POST /api/discovery/probe` | `{"url": "http://host:9000"}` → that server's `Info`, or 502 `ProbeFailed`. |
+| `POST /api/discovery/probe` | `{"url": "http://host:9000"}` → that server's `Info`, or 502 `ProbeFailed` with a coarse reason: `unreachable`, `timed out`, `HTTP <status>`, `authentication required`, `not a gos3 server` or `address not allowed`. |
 
-**The Node server has no authentication.** Anyone who can reach it can make it
-probe and scan, within the limits above. Bind it to a trusted interface, put it
-behind an authenticating proxy, or set `GOS3_UI_LOCAL_DISCOVERY=false`.
+**The Node server has no authentication.** With local discovery on, anyone
+who can reach it can make it probe and scan, within the limits below. Turn it
+on only where every client is trusted: bind the server to a trusted interface
+(the compose demo publishes it on `127.0.0.1`) or put it behind an
+authenticating proxy.
 
-Each UI server runs at most 2 `POST /api/discovery/scan` and 4
-`GET /api/discovery/local` requests at once; further requests get
-`429 TooManyRequests` (the admin API error envelope) with `Retry-After: 5`.
+Each UI server runs at most 2 `POST /api/discovery/scan`, 4
+`GET /api/discovery/local` and 8 `POST /api/discovery/probe` requests at once;
+further requests get `429 TooManyRequests` (the admin API error envelope) with
+`Retry-After: 5`. Scans and probes take their slot before the request body is
+read. Request bodies are capped at 8 KiB for probes and 64 KiB for scans:
+a larger `Content-Length`, or a streamed body that grows past the cap, gets
+`413` and the connection is closed; a body that does not arrive within 10
+seconds gets `408`, invalid JSON `400`.
+
+Probes, scans and the verification of discovered candidates never connect to
+cloud metadata addresses (`169.254.169.254`, `169.254.170.2`,
+`169.254.170.23`, `fd00:ec2::254`, `100.100.100.200`), unspecified
+(`0.0.0.0/8`, `::`), multicast or broadcast addresses, including their
+IPv4-mapped IPv6 forms. IP literals are refused up front (a probe or an
+explicit scan target answers `400`; such addresses inside a CIDR are
+skipped), and host names are checked against every address they resolve to
+when the connection is made, so DNS rebinding cannot bypass the check.
+Loopback, private ranges and other link-local addresses stay allowed.
 
 Protection against other websites:
 
@@ -201,7 +222,7 @@ Protection against other websites:
   page cannot send without a CORS preflight that the server never approves.
 
 Probes read at most 64 KiB of an identity document (with or without
-`Content-Length`). Local discovery keeps at most 2048 mDNS records and 1024
+`Content-Length`), and never follow redirects or use proxies. Local discovery keeps at most 2048 mDNS records and 1024
 beacon candidates, and verifies at most 256 URLs.
 
 Multicast is often unavailable in containers (Kubernetes, Docker Desktop).

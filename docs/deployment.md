@@ -91,7 +91,10 @@ Notes:
   version, edit the tag and the digest of the `FROM` line together.
 
 The standalone web UI has its own image, `deploy/docker/web.Dockerfile`
-(`make docker-ui`); see [web-ui.md](web-ui.md#standalone-mode).
+(`make docker-ui`); see [web-ui.md](web-ui.md#standalone-mode). Its local
+discovery routes are off unless you set `GOS3_UI_LOCAL_DISCOVERY=true`; do
+that only where every client that can reach the container is trusted (for
+example `-p 127.0.0.1:3000:3000`).
 
 ## Docker Compose
 
@@ -119,9 +122,12 @@ docker compose down -v                        # stop and delete the data volumes
   Desktop). Add the second node through its published port,
   `http://localhost:9002`.
 - The standalone UI is preset with both nodes (`NUXT_PUBLIC_SERVERS`), and its
-  local discovery finds them through the beacon inside the network. Local
-  discovery answers only when the UI is opened via an IP address or
-  `localhost`; if you open it through a DNS name, set
+  local discovery finds them through the beacon inside the network. The
+  compose file turns local discovery on (`GOS3_UI_LOCAL_DISCOVERY`, default
+  `true` there, off in the image) because the UI is published on
+  `127.0.0.1`; set `GOS3_UI_LOCAL_DISCOVERY=false` if you change
+  `GOS3_DEMO_BIND`. Local discovery answers only when the UI is opened via an
+  IP address or `localhost`; if you open it through a DNS name, set
   `GOS3_UI_ALLOWED_HOSTS=<name>` (passed through by the compose file).
 
 ## systemd
@@ -213,9 +219,12 @@ How it fits together:
 - An Ingress in front of the Service must allow large bodies and must not
   buffer them (see the nginx settings below). The host it serves must be the
   host clients sign; set `trust_proxy_headers: true` in the ConfigMap.
-- A standalone web UI deployed next to gos3 and reached through an Ingress
-  host name needs `GOS3_UI_ALLOWED_HOSTS=<that host>` for its local discovery
-  routes (see [web-ui.md](web-ui.md#local-discovery-routes)).
+- A standalone web UI deployed next to gos3 keeps its local discovery
+  routes off unless `GOS3_UI_LOCAL_DISCOVERY=true`; leave them off when the
+  UI is reachable through an Ingress, since they have no authentication.
+  If you do enable them, a UI reached through an Ingress host name also
+  needs `GOS3_UI_ALLOWED_HOSTS=<that host>` (see
+  [web-ui.md](web-ui.md#local-discovery-routes)).
 
 ## Reverse proxy
 

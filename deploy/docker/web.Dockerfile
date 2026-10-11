@@ -1,8 +1,8 @@
 # syntax=docker/dockerfile:1@sha256:4edf897a3ffa55b89f906fc8cc78afdb3f1834cc9c7083565e611a8a7d5fe99e
 #
 # Standalone gos3 web UI (Nuxt node-server build). It manages any number of
-# gos3 / S3 servers and adds local discovery routes (mDNS, beacon, scan) that
-# run on the UI host. Build from the repository root:
+# gos3 / S3 servers and has optional local discovery routes (mDNS, beacon,
+# scan) that run on the UI host. Build from the repository root:
 #
 #   docker build -f deploy/docker/web.Dockerfile -t gos3-ui .
 #   docker run -p 3000:3000 \
@@ -10,11 +10,14 @@
 #
 # Every server the browser talks to must allow the UI origin via CORS
 # (gos3: cors.allowed_origins / GOS3_CORS_ORIGINS). The Node server has no
-# authentication; set GOS3_UI_LOCAL_DISCOVERY=false to disable its probe and
-# scan routes when it is reachable by untrusted clients. Those routes answer
-# only for requests to an IP address or localhost: add the DNS names the UI
-# is opened with to GOS3_UI_ALLOWED_HOSTS (comma separated), e.g.
-#   -e GOS3_UI_ALLOWED_HOSTS=console.example.com
+# authentication, so its local discovery routes (probe, scan, mDNS/beacon)
+# are OFF by default: anyone who can reach them could make the UI host
+# probe its networks. Turn them on only where every client is trusted (for
+# example a port published on 127.0.0.1):
+#   docker run -p 127.0.0.1:3000:3000 -e GOS3_UI_LOCAL_DISCOVERY=true gos3-ui
+# They answer only for requests to an IP address or localhost: add the DNS
+# names the UI is opened with to GOS3_UI_ALLOWED_HOSTS (comma separated),
+# e.g. -e GOS3_UI_ALLOWED_HOSTS=console.example.com
 # See docs/web-ui.md.
 
 # Base images are pinned by digest; Dependabot proposes updates. Change the

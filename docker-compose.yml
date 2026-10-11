@@ -67,8 +67,12 @@ services:
   # the published ports, so both are preset with their localhost URLs; the
   # nodes' default CORS policy (allowed_origins "*") admits the UI origin.
   # Its local discovery (beacon query / scan) runs inside the compose network.
-  # Those routes only answer when the UI is opened via an IP address or
-  # localhost; list any DNS name you open it with in GOS3_UI_ALLOWED_HOSTS.
+  # It is off by default in the image (the Node server has no
+  # authentication) and turned on here because the port is published on
+  # 127.0.0.1 only; set GOS3_UI_LOCAL_DISCOVERY=false when you change
+  # GOS3_DEMO_BIND. Those routes only answer when the UI is opened via an IP
+  # address or localhost; list any DNS name you open it with in
+  # GOS3_UI_ALLOWED_HOSTS.
   ui:
     profiles: [ui]
     build:
@@ -81,6 +85,7 @@ services:
       NUXT_PUBLIC_SERVERS: >-
         [{"id":"node-1","name":"node-1","endpoint":"http://localhost:9001","kind":"gos3"},
         {"id":"node-2","name":"node-2","endpoint":"http://localhost:9002","kind":"gos3"}]
+      GOS3_UI_LOCAL_DISCOVERY: ${GOS3_UI_LOCAL_DISCOVERY:-true}
       GOS3_UI_ALLOWED_HOSTS: ${GOS3_UI_ALLOWED_HOSTS:-}
     ports:
       - "${GOS3_DEMO_BIND:-127.0.0.1}:3000:3000"
