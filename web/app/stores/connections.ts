@@ -14,6 +14,9 @@
 //   `defaultId`. It replaces the former 'gos3.defaultServer.v1' key, which is
 //   migrated on hydrate.
 // - In embedded mode the hosting gos3 server is added as 'This server'.
+// - Imports never point a stored secret at another endpoint, never change
+//   embedded/preset connections and never set `remember`
+//   (planConnectionImport in ~/utils/connections).
 // - Other tabs of the console share localStorage: their writes are merged in
 //   through the 'storage' event (syncFromStorage), so a tab never writes back
 //   a stale list over another tab's changes. The active server and secrets
@@ -33,7 +36,9 @@ import {
   EMBEDDED_CONNECTION_ID,
   endpointSlug,
   hasCredentials,
+  type ImportPlan,
   parseConnectionList,
+  planConnectionImport,
   sameEndpoint
 } from '~/utils/connections'
 import { S3Error } from '~/utils/s3/errors'
@@ -53,7 +58,9 @@ export const NO_CAPABILITIES: Capabilities = Object.freeze({
   managePolicies: false,
   manageBuckets: false,
   discovery: false,
-  scan: false
+  scan: false,
+  probe: false,
+  createOwnKeys: false
 })
 
 /**
@@ -406,33 +413,28 @@ export const useConnectionsStore = defineStore('connections', () => {
   }
 
   /**
+   * What importJson(json) would do, without changing anything (the import
+   * preview). Throws SyntaxError on invalid JSON.
+   */
+  function planImport(json: string | unknown): ImportPlan {
+    return planConnectionImport(connections.value, parseConnectionList(json))
+  }
+
+  /**
    * Imports connections from JSON (export file, array, or {servers}). Entries
    * matching an existing connection (same id, or same endpoint + access key)
-   * update it; others are added. Throws SyntaxError on invalid JSON.
+   * update it, others are added; see planConnectionImport for the rules that
+   * keep an import from redirecting stored credentials or changing
+   * embedded/preset connections. Throws SyntaxError on invalid JSON.
    */
   function importJson(json: string | unknown): { added: number, updated: number, skipped: number } {
-    const items = parseConnectionList(json)
-    let added = 0
-    let updated = 0
-    for (const item of items) {
-      const existing = (item.id ? byId(item.id) : undefined)
-        ?? connections.value.find(c => sameEndpoint(c.endpoint, item.endpoint) && (!item.accessKeyId || c.accessKeyId === item.accessKeyId))
-      const clean: ConnectionInput = { ...item, source: item.source === 'discovered' ? 'discovered' : 'user' }
-      if (existing) {
-        const patch: Partial<Connection> = {}
-        for (const [k, v] of Object.entries(clean)) {
-          if (k === 'id' || k === 'source' || v === undefined) continue
-          ;(patch as Record<string, unknown>)[k] = v
-        }
-        update(existing.id, patch)
-        updated++
-      } else {
-        connections.value.push(completeConnection(clean))
-        added++
-      }
+    const plan = planImport(json)
+    for (const step of plan.steps) {
+      if (step.action === 'add') connections.value.push(completeConnection(step.input))
+      else if (step.action === 'update') update(step.target.id, step.patch)
     }
     persist()
-    return { added, updated, skipped: 0 }
+    return { added: plan.added, updated: plan.updated, skipped: plan.skipped }
   }
 
   // -- presets & embedded ---------------------------------------------------
@@ -695,6 +697,7 @@ export const useConnectionsStore = defineStore('connections', () => {
     clearCredentials,
     exportData,
     exportJson,
+    planImport,
     importJson,
     applyPresets,
     applyEmbedded,

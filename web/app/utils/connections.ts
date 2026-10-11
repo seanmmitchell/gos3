@@ -120,3 +120,141 @@ export function sameEndpoint(a: string, b: string): boolean {
     return false
   }
 }
+
+// -- import planning ----------------------------------------------------------
+
+/** Connections an import may never change (they come from the environment). */
+export function isProtectedConnection(c: Pick<Connection, 'source'>): boolean {
+  return c.source === 'embedded' || c.source === 'preset'
+}
+
+/** IDs an imported entry may not claim: the embedded server and deterministic preset IDs. */
+function isReservedId(id: string): boolean {
+  return id === EMBEDDED_CONNECTION_ID || id.startsWith('preset-')
+}
+
+/** Fields an import may change on an existing connection (endpoint and kind never). */
+export type ImportField = 'name' | 'region' | 'accessKeyId' | 'secretAccessKey' | 'forcePathStyle' | 'serverId' | 'color'
+
+const IMPORT_FIELDS: readonly ImportField[] = ['name', 'region', 'accessKeyId', 'secretAccessKey', 'forcePathStyle', 'serverId', 'color']
+
+/** One field an import changes. Secret values are never included (only 'set' / 'none'). */
+export interface ImportFieldChange {
+  field: ImportField
+  from: string
+  to: string
+}
+
+/** Why an entry that matched an existing connection was added as a new one. */
+export type ImportAddReason = 'retarget' | 'protected'
+
+/**
+ * What importing one entry does:
+ * - add: a new connection. `instead` is set when the entry matched an
+ *   existing connection that is left untouched because the entry points
+ *   elsewhere (other endpoint or kind): 'retarget' for a user connection,
+ *   'protected' for an embedded/preset one. The new connection gets a fresh
+ *   ID and only the credentials the file itself holds.
+ * - update: applies `patch` (described by `changes`) to `target`, whose
+ *   endpoint and kind stay the same.
+ * - skip: `target` is an embedded/preset connection ('protected'), or the
+ *   entry would not change anything ('unchanged').
+ */
+export type ImportStep =
+  | { action: 'add', input: ConnectionInput & { id: string }, instead?: { of: Connection, reason: ImportAddReason } }
+  | { action: 'update', target: Connection, patch: Partial<Omit<Connection, 'id'>>, changes: ImportFieldChange[] }
+  | { action: 'skip', target: Connection, reason: 'protected' | 'unchanged' }
+
+export interface ImportPlan {
+  steps: ImportStep[]
+  added: number
+  updated: number
+  skipped: number
+}
+
+function displayValue(field: ImportField, v: unknown): string {
+  if (field === 'secretAccessKey') return v ? 'set' : 'none'
+  if (v === undefined || v === '') return '—'
+  return String(v)
+}
+
+/**
+ * Plans importing `items` into `existing` without changing anything (the
+ * import preview and the store's importJson share it). An entry matches an
+ * existing connection by ID, or by endpoint when the access keys agree.
+ * Entries are planned in order, each against the result of the previous ones.
+ *
+ * Imported data must never redirect credentials the user already stored, so:
+ * - an entry that would change a match's normalized endpoint or kind is added
+ *   as a separate connection (fresh ID, only the file's own credentials); the
+ *   existing connection keeps its endpoint and secret. Updating it with the
+ *   credentials cleared was the alternative; a new entry is clearer because
+ *   the connection the user trusts stays exactly as it was, and a familiar
+ *   name never asks for credentials on behalf of an unfamiliar host.
+ * - embedded and preset connections are never modified: a matching entry for
+ *   another endpoint or kind is added as a new connection, otherwise it is
+ *   skipped. New entries never claim their reserved IDs.
+ * - when an entry changes the access key ID without giving a secret, the
+ *   stored secret (which belongs to the old key) is cleared.
+ * - `remember` is ignored: only the user decides whether a secret is written
+ *   to localStorage (imported connections start session-only).
+ * Region and path style may change: requests still go to the same host
+ * (virtual-hosted style only prefixes it with the bucket name) and SigV4
+ * signatures are bound to that host.
+ */
+export function planConnectionImport(existing: readonly Connection[], items: readonly ConnectionInput[]): ImportPlan {
+  const work = [...existing]
+  const steps: ImportStep[] = []
+  const freshId = () => {
+    let id = newConnectionId()
+    while (work.some(c => c.id === id)) id = newConnectionId()
+    return id
+  }
+  const add = (input: ConnectionInput, instead?: { of: Connection, reason: ImportAddReason }) => {
+    const id = !instead && input.id && !isReservedId(input.id) ? input.id : freshId()
+    const step: ImportStep = { action: 'add', input: { ...input, id }, ...(instead ? { instead } : {}) }
+    steps.push(step)
+    work.push(completeConnection(step.input))
+  }
+
+  for (const item of items) {
+    const { remember: _remember, ...rest } = item
+    const clean: ConnectionInput = { ...rest, source: item.source === 'discovered' ? 'discovered' : 'user' }
+    const byEndpoint = work.filter(c => sameEndpoint(c.endpoint, item.endpoint) && (!item.accessKeyId || c.accessKeyId === item.accessKeyId))
+    const target = (item.id ? work.find(c => c.id === item.id) : undefined)
+      ?? byEndpoint.find(c => !item.kind || c.kind === item.kind)
+      ?? byEndpoint[0]
+    if (!target) {
+      add(clean)
+      continue
+    }
+    const prot = isProtectedConnection(target)
+    if (!sameEndpoint(target.endpoint, item.endpoint) || (item.kind !== undefined && item.kind !== target.kind)) {
+      add(clean, { of: target, reason: prot ? 'protected' : 'retarget' })
+      continue
+    }
+    if (prot) {
+      steps.push({ action: 'skip', target, reason: 'protected' })
+      continue
+    }
+    const patch: Partial<Omit<Connection, 'id'>> = {}
+    const changes: ImportFieldChange[] = []
+    const set = (field: ImportField, v: unknown) => {
+      ;(patch as Record<string, unknown>)[field] = v
+      changes.push({ field, from: displayValue(field, target[field]), to: displayValue(field, v) })
+    }
+    for (const field of IMPORT_FIELDS) {
+      const v = clean[field]
+      if (v !== undefined && v !== target[field]) set(field, v)
+    }
+    if (patch.accessKeyId !== undefined && clean.secretAccessKey === undefined && target.secretAccessKey) set('secretAccessKey', '')
+    if (!changes.length) {
+      steps.push({ action: 'skip', target, reason: 'unchanged' })
+      continue
+    }
+    steps.push({ action: 'update', target, patch, changes })
+    work[work.indexOf(target)] = completeConnection({ ...target, ...patch, id: target.id })
+  }
+  const count = (a: ImportStep['action']) => steps.filter(s => s.action === a).length
+  return { steps, added: count('add'), updated: count('update'), skipped: count('skip') }
+}

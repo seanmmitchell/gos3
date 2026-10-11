@@ -203,6 +203,150 @@ describe('connections store: import / export', () => {
   })
 })
 
+describe('connections store: import never redirects stored credentials', () => {
+  const noFetch = () => Promise.reject(new TypeError('offline'))
+  const importOf = (...connections: unknown[]) => JSON.stringify({ type: 'gos3-connections', version: 1, connections })
+
+  it('adds an entry that would move a connection to another endpoint as a separate server', () => {
+    const s = useConnectionsStore()
+    const nas = s.add({ id: 'nas', name: 'NAS', endpoint: 'http://10.0.0.5:9000', accessKeyId: 'AK', secretAccessKey: 'SECRET', color: 'sky' })
+    const plan = s.planImport(importOf({ id: 'nas', endpoint: 'http://attacker:9000' }))
+    expect(plan).toMatchObject({ added: 1, updated: 0, skipped: 0 })
+    expect(plan.steps[0]).toMatchObject({ action: 'add', instead: { of: { id: 'nas' }, reason: 'retarget' } })
+
+    expect(s.importJson(importOf({ id: 'nas', endpoint: 'http://attacker:9000' }))).toEqual({ added: 1, updated: 0, skipped: 0 })
+    expect(s.byId('nas')).toEqual(nas)
+    const added = s.findByEndpoint('http://attacker:9000')!
+    expect(added.id).not.toBe('nas')
+    expect(added).toMatchObject({ accessKeyId: '', secretAccessKey: '', source: 'user' })
+    expect(s.hasCredentials(added)).toBe(false)
+  })
+
+  it('treats a kind change like an endpoint change', () => {
+    const s = useConnectionsStore()
+    s.add({ id: 'nas', name: 'NAS', endpoint: 'http://nas:9000', kind: 'gos3', accessKeyId: 'AK', secretAccessKey: 'SK' })
+    // matched by id
+    expect(s.importJson(importOf({ id: 'nas', endpoint: 'http://nas:9000', kind: 's3' }))).toMatchObject({ added: 1, updated: 0 })
+    // matched by endpoint (no access key in the file)
+    expect(s.importJson(importOf({ endpoint: 'http://nas:9000', kind: 's3', name: 'other' }))).toMatchObject({ added: 0, updated: 1 })
+    expect(s.byId('nas')).toMatchObject({ kind: 'gos3', accessKeyId: 'AK', secretAccessKey: 'SK', name: 'NAS' })
+    expect(s.connections.filter(c => c.kind === 's3')).toHaveLength(1)
+    expect(s.connections.find(c => c.kind === 's3')).toMatchObject({ name: 'other', secretAccessKey: '' })
+  })
+
+  it('keeps the file\'s own credentials on a connection added instead of a retarget', () => {
+    const s = useConnectionsStore()
+    s.add({ id: 'nas', endpoint: 'http://nas:9000', accessKeyId: 'AK', secretAccessKey: 'SK' })
+    s.importJson(importOf({ id: 'nas', endpoint: 'http://nas2:9000', accessKeyId: 'AK2', secretAccessKey: 'SK2' }))
+    expect(s.findByEndpoint('http://nas2:9000')).toMatchObject({ accessKeyId: 'AK2', secretAccessKey: 'SK2' })
+    expect(s.byId('nas')).toMatchObject({ endpoint: 'http://nas:9000', secretAccessKey: 'SK' })
+  })
+
+  it('never changes the embedded connection', async () => {
+    const fetch = vi.fn(async (req: Request) => req.url === 'http://nas:9000/_gos3/info'
+      ? new Response(JSON.stringify(INFO), { headers: { 'content-type': 'application/json' } })
+      : new Response('', { status: 404 }))
+    const s = useConnectionsStore()
+    await s.init({ baseURL: '/_gos3/ui/', origin: 'http://nas:9000', fetch })
+    s.setCredentials(EMBEDDED_CONNECTION_ID, { accessKeyId: 'AK', secretAccessKey: 'SK' })
+    const before = { ...s.byId(EMBEDDED_CONNECTION_ID)! }
+
+    // same endpoint: skipped, even with other credentials or names
+    const same = importOf({ id: EMBEDDED_CONNECTION_ID, endpoint: 'http://nas:9000', name: 'Renamed', accessKeyId: 'X', secretAccessKey: 'Y', region: 'ap-south-1' })
+    expect(s.planImport(same).steps[0]).toMatchObject({ action: 'skip', reason: 'protected' })
+    expect(s.importJson(same)).toEqual({ added: 0, updated: 0, skipped: 1 })
+    // matched by endpoint + access key
+    expect(s.importJson(importOf({ endpoint: 'http://NAS:9000/', accessKeyId: 'AK', name: 'Renamed' }))).toEqual({ added: 0, updated: 0, skipped: 1 })
+    expect(s.byId(EMBEDDED_CONNECTION_ID)).toEqual(before)
+
+    // another endpoint: added as a new user connection with a fresh id
+    const other = importOf({ id: EMBEDDED_CONNECTION_ID, source: 'embedded', endpoint: 'http://elsewhere:9000' })
+    expect(s.planImport(other).steps[0]).toMatchObject({ action: 'add', instead: { reason: 'protected' } })
+    expect(s.importJson(other)).toMatchObject({ added: 1 })
+    expect(s.byId(EMBEDDED_CONNECTION_ID)).toEqual(before)
+    const added = s.findByEndpoint('http://elsewhere:9000')!
+    expect(added).toMatchObject({ source: 'user', secretAccessKey: '' })
+    expect(added.id).not.toBe(EMBEDDED_CONNECTION_ID)
+  })
+
+  it('never changes preset connections', async () => {
+    const s = useConnectionsStore()
+    await s.init({ presets: [{ endpoint: 'http://10.0.0.5:9000', name: 'NAS' }], skipServersJson: true, fetch: noFetch })
+    s.setCredentials('preset-10-0-0-5-9000', { accessKeyId: 'AK', secretAccessKey: 'SK' })
+    const before = { ...s.byId('preset-10-0-0-5-9000')! }
+    expect(s.importJson(importOf({ id: 'preset-10-0-0-5-9000', endpoint: 'http://attacker:9000', remember: true }))).toMatchObject({ added: 1, updated: 0 })
+    expect(s.importJson(importOf({ endpoint: 'http://10.0.0.5:9000', name: 'Mine', forcePathStyle: false }))).toEqual({ added: 0, updated: 0, skipped: 1 })
+    expect(s.byId('preset-10-0-0-5-9000')).toEqual(before)
+    expect(s.findByEndpoint('http://attacker:9000')).toMatchObject({ source: 'user', remember: false, secretAccessKey: '' })
+  })
+
+  it('does not let new entries claim reserved ids', () => {
+    const s = useConnectionsStore()
+    s.importJson(importOf({ id: EMBEDDED_CONNECTION_ID, endpoint: 'http://a:1' }, { id: 'preset-b-2', endpoint: 'http://b:2' }, { id: 'mine', endpoint: 'http://c:3' }))
+    expect(s.byId(EMBEDDED_CONNECTION_ID)).toBeUndefined()
+    expect(s.byId('preset-b-2')).toBeUndefined()
+    expect(s.byId('mine')?.endpoint).toBe('http://c:3')
+    expect(s.connections).toHaveLength(3)
+  })
+
+  it('updates fields of a match on the same endpoint and describes the changes without secrets', () => {
+    const s = useConnectionsStore()
+    s.add({ id: 'nas', name: 'NAS', endpoint: 'http://nas:9000', region: 'us-east-1', accessKeyId: 'AK', secretAccessKey: 'OLDSECRET' })
+    const json = importOf({ id: 'nas', endpoint: 'http://NAS:9000/', name: 'NAS 2', region: 'eu-west-1', secretAccessKey: 'NEWSECRET', forcePathStyle: false })
+    const step = s.planImport(json).steps[0]!
+    expect(step.action).toBe('update')
+    if (step.action !== 'update') return
+    expect(step.changes).toEqual([
+      { field: 'name', from: 'NAS', to: 'NAS 2' },
+      { field: 'region', from: 'us-east-1', to: 'eu-west-1' },
+      { field: 'secretAccessKey', from: 'set', to: 'set' },
+      { field: 'forcePathStyle', from: 'true', to: 'false' }
+    ])
+    expect(JSON.stringify(step.changes)).not.toContain('SECRET')
+    expect(s.importJson(json)).toEqual({ added: 0, updated: 1, skipped: 0 })
+    expect(s.byId('nas')).toMatchObject({ name: 'NAS 2', endpoint: 'http://nas:9000', region: 'eu-west-1', secretAccessKey: 'NEWSECRET', forcePathStyle: false, accessKeyId: 'AK' })
+  })
+
+  it('clears the stored secret when the access key changes without a new secret', () => {
+    const s = useConnectionsStore()
+    s.add({ id: 'nas', endpoint: 'http://nas:9000', accessKeyId: 'AK', secretAccessKey: 'SK' })
+    const plan = s.planImport(importOf({ id: 'nas', endpoint: 'http://nas:9000', accessKeyId: 'AK2' }))
+    expect(plan.steps[0]).toMatchObject({ action: 'update', changes: [{ field: 'accessKeyId', from: 'AK', to: 'AK2' }, { field: 'secretAccessKey', from: 'set', to: 'none' }] })
+    s.importJson(importOf({ id: 'nas', endpoint: 'http://nas:9000', accessKeyId: 'AK2' }))
+    expect(s.byId('nas')).toMatchObject({ accessKeyId: 'AK2', secretAccessKey: '' })
+  })
+
+  it('ignores remember from imported data', () => {
+    const s = useConnectionsStore()
+    s.add({ id: 'nas', endpoint: 'http://nas:9000', accessKeyId: 'AK', secretAccessKey: 'SESSIONONLY' })
+    expect(s.importJson(importOf({ id: 'nas', endpoint: 'http://nas:9000', remember: true }))).toEqual({ added: 0, updated: 0, skipped: 1 })
+    s.importJson(importOf({ endpoint: 'http://new:9000', accessKeyId: 'X', secretAccessKey: 'FROMFILE', remember: true }))
+    expect(s.byId('nas')?.remember).toBe(false)
+    expect(s.findByEndpoint('http://new:9000')?.remember).toBe(false)
+    const stored = localStorage.getItem(LOCAL_STORAGE_KEY)!
+    expect(stored).not.toContain('SESSIONONLY')
+    expect(stored).not.toContain('FROMFILE')
+  })
+
+  it('skips entries that change nothing and plans entries in order', () => {
+    const s = useConnectionsStore()
+    s.add({ id: 'nas', name: 'NAS', endpoint: 'http://nas:9000' })
+    const plan = s.planImport(importOf(
+      { id: 'nas', name: 'NAS', endpoint: 'http://nas:9000' },
+      { id: 'x', name: 'X', endpoint: 'http://x:1', source: 'discovered' },
+      { id: 'x', name: 'X 2', endpoint: 'http://x:1' }
+    ))
+    expect(plan.steps.map(st => st.action)).toEqual(['skip', 'add', 'update'])
+    expect(plan.steps[0]).toMatchObject({ reason: 'unchanged' })
+    expect(s.connections).toHaveLength(1) // planning changes nothing
+    expect(s.importJson(importOf(
+      { id: 'x', name: 'X', endpoint: 'http://x:1', source: 'discovered' },
+      { id: 'x', name: 'X 2', endpoint: 'http://x:1' }
+    ))).toEqual({ added: 1, updated: 1, skipped: 0 })
+    expect(s.byId('x')).toMatchObject({ name: 'X 2', source: 'discovered' })
+  })
+})
+
 describe('connections store: presets & embedded', () => {
   const noFetch = () => Promise.reject(new TypeError('offline'))
 
