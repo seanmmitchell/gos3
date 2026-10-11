@@ -95,9 +95,11 @@ NUXT_PUBLIC_SERVERS='[{"name":"NAS","endpoint":"http://10.0.0.5:9000"}]' node .o
 
 It also runs as a container (`deploy/docker/web.Dockerfile`). The browser talks
 to each server directly, so every server must allow the UI origin via CORS
-(gos3 allows any origin by default). Its local discovery routes only answer
-when the UI is opened via an IP address or `localhost`; add any DNS name you
-use to `GOS3_UI_ALLOWED_HOSTS`. See [docs/web-ui.md](docs/web-ui.md).
+(gos3 allows any origin by default). Its local discovery routes (mDNS,
+beacon, scans) are off unless you set `GOS3_UI_LOCAL_DISCOVERY=true`; even
+then they only answer when the UI is opened via an IP address or `localhost`
+(add any DNS name you use to `GOS3_UI_ALLOWED_HOSTS`). See
+[docs/web-ui.md](docs/web-ui.md).
 
 ## Configuration
 
@@ -301,7 +303,8 @@ specified in [docs/discovery.md](docs/discovery.md).
   the LAN. Turn this off with `discovery.advertise: false` or
   `--no-discovery`. Network scans need `admin:ScanNetwork` and can be disabled
   with `discovery.allow_scan: false`. The standalone UI's Node server performs
-  local discovery for anyone who can reach it.
+  local discovery only when `GOS3_UI_LOCAL_DISCOVERY=true`, and then for
+  anyone who can reach it.
 - **No encryption at rest**: server-side encryption headers are accepted for
   compatibility only. Use disk encryption.
 
