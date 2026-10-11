@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/seanmmitchell/gos3/internal/auth"
+	"github.com/seanmmitchell/gos3/internal/clientip"
 	"github.com/seanmmitchell/gos3/internal/config"
 	"github.com/seanmmitchell/gos3/internal/iam"
 	"github.com/seanmmitchell/gos3/internal/metrics"
@@ -36,11 +37,11 @@ type Options struct {
 	// Version is the gos3 version reported in the Server header.
 	Version string
 
-	// TrustProxyHeaders makes the handler derive the client address
-	// (aws:SourceIp, access log) from the first X-Forwarded-For entry and
-	// aws:SecureTransport from X-Forwarded-Proto. Enable it only behind a
-	// trusted reverse proxy that overwrites these headers.
-	TrustProxyHeaders bool
+	// ClientIP derives the client address (aws:SourceIp, access log) and
+	// aws:SecureTransport, honouring X-Forwarded-For / X-Forwarded-Proto
+	// from trusted reverse proxies (server.trust_proxy_headers and
+	// server.trusted_proxies). The zero value ignores those headers.
+	ClientIP clientip.Resolver
 	// Now overrides the clock (tests). Defaults to time.Now.
 	Now func() time.Time
 }
@@ -62,7 +63,7 @@ type Server struct {
 	log           *slog.Logger
 	maxObjectSize int64
 	serverHeader  string
-	trustProxy    bool
+	clientIP      clientip.Resolver
 	now           func() time.Time
 	// hostSeed makes x-amz-id-2 values unique per server instance.
 	hostSeed [16]byte
@@ -120,7 +121,7 @@ func New(opts Options) *Server {
 		log:           opts.Logger,
 		maxObjectSize: opts.MaxObjectSize,
 		serverHeader:  "gos3",
-		trustProxy:    opts.TrustProxyHeaders,
+		clientIP:      opts.ClientIP,
 		now:           opts.Now,
 		configs:       newConfigCache(defaultConfigCacheSize),
 

@@ -148,8 +148,10 @@ Unknown subresources → `NotImplemented`. Unsupported method for a resource →
    Handlers that touch a second resource (CopyObject/UploadPartCopy source,
    DeleteObjects per key) call the core's authorize helper themselves.
    `aws:SourceIp` / `aws:SecureTransport` come from `RemoteAddr` / TLS, or
-   from the first `X-Forwarded-For` entry and `X-Forwarded-Proto` when
-   `server.trust_proxy_headers` is set. PublicAccessBlock and
+   from `X-Forwarded-For` (rightmost entry that is not a trusted proxy) and
+   the last `X-Forwarded-Proto` value when `server.trust_proxy_headers` is
+   set and the peer is in `server.trusted_proxies` (package `clientip`,
+   shared with the admin API). PublicAccessBlock and
    ObjectOwnership (BucketOwnerEnforced disables ACLs) are applied here too.
 6. Dispatch to the handler with a per-request context struct (bucket, key, op,
    auth result, identity, request id, versioning status cache, …).

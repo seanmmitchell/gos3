@@ -55,9 +55,16 @@ type ServerConfig struct {
 	ShutdownTimeout time.Duration `yaml:"shutdown_timeout"`
 	// TrustProxyHeaders derives the client address (aws:SourceIp, access
 	// log) from X-Forwarded-For and aws:SecureTransport from
-	// X-Forwarded-Proto. Enable it only behind a trusted reverse proxy that
-	// overwrites these headers (default false).
+	// X-Forwarded-Proto. Enable it only behind a reverse proxy (default
+	// false). See package clientip for the exact rules.
 	TrustProxyHeaders bool `yaml:"trust_proxy_headers"`
+	// TrustedProxies lists the reverse proxies (CIDR prefixes or single IP
+	// addresses) whose forwarding headers are honoured with
+	// TrustProxyHeaders: requests from other addresses are taken at face
+	// value, and X-Forwarded-For is walked from the right past these
+	// addresses to find the client. Empty: any peer is trusted and the
+	// rightmost X-Forwarded-For entry is the client (a single proxy).
+	TrustedProxies []string `yaml:"trusted_proxies"`
 }
 
 // StorageConfig selects the backend.

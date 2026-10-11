@@ -64,7 +64,8 @@ changed while running.
 | `server.max_object_size` | `GOS3_MAX_OBJECT_SIZE` | | `5368709120` (5 GiB) | | Largest single PUT / POST / copy, in bytes, at most 5 TiB. `0` means the default. Multipart uploads are limited by part count and size instead. |
 | `server.public_info` | `GOS3_PUBLIC_INFO` | | `true` | `publicInfo` | Serve `GET /_gos3/info` without authentication. When false, any valid signature is required. |
 | `server.shutdown_timeout` | `GOS3_SHUTDOWN_TIMEOUT` | | `30s` | | How long in-flight requests may run after SIGINT/SIGTERM before connections are closed. |
-| `server.trust_proxy_headers` | `GOS3_TRUST_PROXY_HEADERS` | | `false` | | Use `X-Forwarded-For` for the client address (`aws:SourceIp`, access log) and `X-Forwarded-Proto` for `aws:SecureTransport`. Applies to the S3 API and to the admin API (its `aws:SourceIp` / `aws:SecureTransport` conditions and the remote address in its access log). Enable it only behind a reverse proxy that overwrites these headers. |
+| `server.trust_proxy_headers` | `GOS3_TRUST_PROXY_HEADERS` | | `false` | | Use `X-Forwarded-For` for the client address (`aws:SourceIp`, access logs) and `X-Forwarded-Proto` for `aws:SecureTransport`, on the S3 API, the admin API and the `/_gos3/*` system endpoints. The client is the rightmost `X-Forwarded-For` entry (all header lines) that is not in `server.trusted_proxies`; the last `X-Forwarded-Proto` value counts. Enable it only behind a reverse proxy; see [deployment.md](deployment.md#reverse-proxy). |
+| `server.trusted_proxies` | `GOS3_SERVER_TRUSTED_PROXIES` | | `[]` | | Reverse proxies (CIDR prefixes such as `10.0.0.0/8` or single addresses such as `192.0.2.10`, IPv4 or IPv6) whose forwarding headers are honoured when `trust_proxy_headers` is on. Requests whose peer address is not in the list are taken at face value. `X-Forwarded-For` is walked from the right past these addresses: the first other entry is the client; an invalid entry stops the walk at the last trusted hop (or the peer address). Empty: every peer is trusted and the rightmost entry is the client, which is right only for a single proxy that gos3 can be reached through exclusively. An invalid entry is a configuration error. The variable takes a comma-separated list. |
 
 ### `storage`
 
@@ -184,7 +185,8 @@ server:
   name: nas
   public_url: https://s3.example.com
   domains: [s3.example.com]
-  trust_proxy_headers: true      # behind a reverse proxy
+  trust_proxy_headers: true      # behind a reverse proxy ...
+  trusted_proxies: [10.0.0.5]    # ... at this address
 storage:
   backend: fs
   path: /srv/gos3
