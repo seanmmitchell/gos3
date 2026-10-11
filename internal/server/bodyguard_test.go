@@ -128,7 +128,9 @@ func TestStalledBodyIdleTimeout(t *testing.T) {
 		t.Fatal(err)
 	}
 	req.Header.Set("Content-Type", "application/json")
-	if err := auth.SignRequest(req, rootCreds, "us-east-1", "s3", "UNSIGNED-PAYLOAD", time.Now()); err != nil {
+	// "" signs the body's SHA-256: the admin API refuses unsigned bodies
+	// before reading them, which would skip the stalled read under test.
+	if err := auth.SignRequest(req, rootCreds, "us-east-1", "s3", "", time.Now()); err != nil {
 		t.Fatal(err)
 	}
 	var buf bytes.Buffer
