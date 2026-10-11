@@ -252,25 +252,6 @@ func TestStripAWSChunked(t *testing.T) {
 	}
 }
 
-func TestClientInfo(t *testing.T) {
-	s := New(Options{Backend: memory.New()})
-	r := httptest.NewRequest("GET", "/", nil)
-	r.RemoteAddr = "10.1.2.3:5555"
-	r.Header.Set("X-Forwarded-For", "203.0.113.9, 10.0.0.1")
-	r.Header.Set("X-Forwarded-Proto", "https")
-	if ip, sec := s.clientInfo(r); ip != "10.1.2.3" || sec {
-		t.Fatalf("untrusted: %s %v", ip, sec)
-	}
-	s.trustProxy = true
-	if ip, sec := s.clientInfo(r); ip != "203.0.113.9" || !sec {
-		t.Fatalf("trusted: %s %v", ip, sec)
-	}
-	r.Header.Set("X-Forwarded-For", "garbage")
-	if ip, _ := s.clientInfo(r); ip != "10.1.2.3" {
-		t.Fatalf("garbage xff: %s", ip)
-	}
-}
-
 func TestNewDefaults(t *testing.T) {
 	s := New(Options{Backend: memory.New()})
 	if s.MaxObjectSize() != DefaultMaxObjectSize || s.region() != "us-east-1" || s.serverHeader != "gos3" {

@@ -6,9 +6,13 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/seanmmitchell/gos3/internal/clientip"
 )
 
-func withTrustProxy() envOption { return func(d *Deps) { d.TrustProxyHeaders = true } }
+func withTrustProxy(proxies ...string) envOption {
+	return func(d *Deps) { d.TrustProxyHeaders = clientip.New(true, mustParsePrefixes(proxies)) }
+}
 
 // putPolicy stores a policy document through the API as root.
 func (e *testEnv) putPolicy(name string, statements ...map[string]any) {
@@ -38,7 +42,7 @@ func TestTrustProxyHeadersConditions(t *testing.T) {
 		e := newEnv(t, withTrustProxy())
 		policy(e)
 		ops := e.addUser("ops", "office-only")
-		e.do(&ops, "GET", Prefix+"/info", nil, withHeader("X-Forwarded-For", "203.0.113.7, 10.0.0.2")).expectStatus(t, 200)
+		e.do(&ops, "GET", Prefix+"/info", nil, withHeader("X-Forwarded-For", "10.0.0.2, 203.0.113.7")).expectStatus(t, 200)
 		e.do(&ops, "GET", Prefix+"/info", nil, withHeader("X-Forwarded-For", "198.51.100.1")).expectError(t, 403, codeAccessDenied)
 		e.do(&ops, "GET", Prefix+"/info", nil).expectError(t, 403, codeAccessDenied)
 		e.do(&ops, "GET", Prefix+"/stats", nil, withHeader("X-Forwarded-Proto", "https")).expectStatus(t, 200)

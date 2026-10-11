@@ -8,7 +8,6 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
-	"net"
 	"net/http"
 	"path"
 	"strconv"
@@ -16,6 +15,7 @@ import (
 	"time"
 
 	"github.com/seanmmitchell/gos3/internal/auth"
+	"github.com/seanmmitchell/gos3/internal/clientip"
 	"github.com/seanmmitchell/gos3/internal/discovery"
 	"github.com/seanmmitchell/gos3/internal/iam"
 	"github.com/seanmmitchell/gos3/internal/s3err"
@@ -303,10 +303,10 @@ func (a *api) requireAction(rc *reqCtx, action string) error {
 }
 
 // requestConditions builds the IAM condition context of a request.
-// aws:SourceIp and aws:SecureTransport come from the connection or, with
-// trustProxy, from X-Forwarded-For / X-Forwarded-Proto (see ClientInfo).
-func requestConditions(r *http.Request, trustProxy bool) map[string][]string {
-	ip, secure := ClientInfo(r, trustProxy)
+// aws:SourceIp and aws:SecureTransport come from the connection or, behind a
+// trusted proxy, from X-Forwarded-For / X-Forwarded-Proto (see ClientInfo).
+func requestConditions(r *http.Request, proxy clientip.Resolver) map[string][]string {
+	ip, secure := ClientInfo(r, proxy)
 	c := map[string][]string{
 		"aws:SecureTransport": {strconv.FormatBool(secure)},
 	}
@@ -323,27 +323,11 @@ func requestConditions(r *http.Request, trustProxy bool) map[string][]string {
 }
 
 // ClientInfo returns the client IP address of r and whether it reached the
-// server over TLS. With trustProxy (server.trust_proxy_headers) the first
-// valid X-Forwarded-For entry and X-Forwarded-Proto win over the connection,
-// the same rule the S3 API applies.
-func ClientInfo(r *http.Request, trustProxy bool) (ip string, secure bool) {
-	ip = r.RemoteAddr
-	if host, _, err := net.SplitHostPort(ip); err == nil {
-		ip = host
-	}
-	secure = r.TLS != nil
-	if trustProxy {
-		if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
-			first, _, _ := strings.Cut(xff, ",")
-			if a := net.ParseIP(strings.TrimSpace(first)); a != nil {
-				ip = a.String()
-			}
-		}
-		if p := r.Header.Get("X-Forwarded-Proto"); p != "" {
-			secure = strings.EqualFold(strings.TrimSpace(p), "https")
-		}
-	}
-	return ip, secure
+// server over TLS, honouring X-Forwarded-For / X-Forwarded-Proto from the
+// trusted proxies of proxy: the same rule the S3 API applies (see package
+// clientip).
+func ClientInfo(r *http.Request, proxy clientip.Resolver) (ip string, secure bool) {
+	return proxy.ClientInfo(r)
 }
 
 func describeIdentity(id auth.Identity) string {

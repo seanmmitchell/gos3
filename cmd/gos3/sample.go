@@ -33,9 +33,16 @@ server:
   public_info: true
   # Time allowed for in-flight requests on shutdown.
   shutdown_timeout: 30s
-  # Trust X-Forwarded-For / X-Forwarded-Proto (only behind a reverse proxy
-  # that overwrites them).
+  # Trust X-Forwarded-For / X-Forwarded-Proto (only behind a reverse proxy).
+  # The client is the rightmost X-Forwarded-For entry that is not one of
+  # trusted_proxies; the last X-Forwarded-Proto value decides aws:SecureTransport.
   trust_proxy_headers: false
+  # Addresses (CIDRs or IPs) of the reverse proxies in front of gos3. With
+  # trust_proxy_headers, requests from other addresses are taken at face
+  # value. Empty: any peer is trusted and the rightmost entry is the client
+  # (fine for a single proxy that gos3 alone can be reached through).
+  # trusted_proxies: ["10.0.0.0/8", "192.0.2.10"]
+  trusted_proxies: []
 
 storage:
   # fs (files under path) or memory (lost on exit).

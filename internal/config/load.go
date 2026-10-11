@@ -18,6 +18,7 @@ import (
 
 	"gopkg.in/yaml.v3"
 
+	"github.com/seanmmitchell/gos3/internal/clientip"
 	"github.com/seanmmitchell/gos3/internal/discovery"
 )
 
@@ -225,6 +226,7 @@ func (c *Config) Normalize() {
 		c.Server.MaxObjectSize = DefaultMaxObjectSize
 	}
 	c.Server.Domains = trimList(c.Server.Domains)
+	c.Server.TrustedProxies = trimList(c.Server.TrustedProxies)
 	c.CORS.AllowedOrigins = trimList(c.CORS.AllowedOrigins)
 	c.CORS.AllowedHeaders = trimList(c.CORS.AllowedHeaders)
 	c.CORS.ExposeHeaders = trimList(c.CORS.ExposeHeaders)
@@ -267,6 +269,12 @@ func (c Config) Validate() error {
 	}
 	if c.Server.ShutdownTimeout < 0 {
 		return fmt.Errorf("server.shutdown_timeout: must not be negative, got %s", c.Server.ShutdownTimeout)
+	}
+	if len(c.Server.TrustedProxies) > MaxListEntries {
+		return fmt.Errorf("server.trusted_proxies: at most %d entries allowed", MaxListEntries)
+	}
+	if _, err := clientip.ParsePrefixes(c.Server.TrustedProxies); err != nil {
+		return fmt.Errorf("server.trusted_proxies%w", err)
 	}
 	switch c.Storage.Backend {
 	case BackendFS:
@@ -426,6 +434,17 @@ func (c Config) SettingsPath() string {
 	return ""
 }
 
+// ClientIP returns the client address resolver configured by
+// server.trust_proxy_headers and server.trusted_proxies. It fails only for
+// a configuration that does not pass Validate.
+func (c Config) ClientIP() (clientip.Resolver, error) {
+	proxies, err := clientip.ParsePrefixes(c.Server.TrustedProxies)
+	if err != nil {
+		return clientip.Resolver{}, fmt.Errorf("server.trusted_proxies%w", err)
+	}
+	return clientip.New(c.Server.TrustProxyHeaders, proxies), nil
+}
+
 // TLSEnabled reports whether the listener serves HTTPS.
 func (c Config) TLSEnabled() bool { return c.Server.TLSCert != "" }
 
@@ -439,6 +458,7 @@ func (c Config) Redacted() Config {
 		c.Auth.RootSecretKey = RedactedValue
 	}
 	c.Server.Domains = slices.Clone(c.Server.Domains)
+	c.Server.TrustedProxies = slices.Clone(c.Server.TrustedProxies)
 	c.CORS = cloneCORS(c.CORS)
 	c.Discovery.Seeds = slices.Clone(c.Discovery.Seeds)
 	c.Discovery.DNSSRV = slices.Clone(c.Discovery.DNSSRV)
