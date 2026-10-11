@@ -3,7 +3,7 @@
 // so obvious mistakes are flagged before saving) and name validation.
 //
 // File name starts with "-" so Nuxt does not register it as a component.
-import type { PolicyDocument, PolicyStatement } from '~/types/admin'
+import type { PolicyDocument, PolicyStatement, SimulateRequest } from '~/types/admin'
 
 export const POLICY_VERSION = '2012-10-17'
 
@@ -491,6 +491,37 @@ export const SIMULATOR_ACTIONS: readonly string[] = [
   's3:PutBucketAcl',
   ...ADMIN_ACTIONS
 ]
+
+/**
+ * Builds the POST /authz/simulate body from the simulator inputs. Admin
+ * actions are evaluated against an admin resource and S3 actions against
+ * bucket/key, and the server rejects the other combination (400), so only
+ * the inputs matching the action are sent: admin actions get `resource`
+ * (omitted for the service level) and never bucket/key; S3 actions get
+ * bucket/key and never `resource`.
+ */
+export function buildSimulateRequest(input: {
+  user: string
+  action: string
+  bucket?: string
+  key?: string
+  resource?: string
+  conditions?: Record<string, string[]>
+}): SimulateRequest {
+  const action = input.action.trim()
+  const req: SimulateRequest = { user: input.user, action }
+  if (isAdminAction(action)) {
+    const resource = adminRequestResource(input.resource ?? '')
+    if (resource) req.resource = resource
+  } else {
+    const bucket = input.bucket?.trim()
+    const key = input.key?.trim()
+    if (bucket) req.bucket = bucket
+    if (key) req.key = key
+  }
+  if (input.conditions && Object.keys(input.conditions).length) req.conditions = input.conditions
+  return req
+}
 
 /**
  * Parses simulator conditions from "key=value[,value]" lines into the

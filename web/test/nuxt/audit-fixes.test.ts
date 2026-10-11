@@ -126,6 +126,20 @@ describe('SimulatorPanel (admin resources)', () => {
     expect(w.text()).toContain('helper → admin:UpdateUser on arn:gos3:admin:::user/team-a')
   })
 
+  it('sends bucket/key and no resource for s3 actions', async () => {
+    const { seen } = fakeServer({ ...NO_CAPABILITIES, admin: true, manageUsers: true })
+    await connect()
+    const w = await mountSuspended(SimulatorPanel, { props: { fixedUser: 'helper' } })
+    const vm = w.vm as unknown as { action: string, resource: string }
+    vm.resource = 'arn:gos3:admin:::user/stale' // left over from an admin action
+    await w.find('input[placeholder="photos"]').setValue('photos')
+    await w.find('input[placeholder="2024/cat.jpg"]').setValue('cat.jpg')
+    await w.find('form').trigger('submit')
+    await vi.waitFor(() => expect(w.text()).toContain('Allowed'))
+    const sent = JSON.parse(seen.find(s => s.path.endsWith('/authz/simulate'))!.body) as Record<string, unknown>
+    expect(sent).toEqual({ user: 'helper', action: 's3:GetObject', bucket: 'photos', key: 'cat.jpg' })
+  })
+
   it('offers the new admin actions', async () => {
     fakeServer({ ...NO_CAPABILITIES, admin: true })
     await connect()
