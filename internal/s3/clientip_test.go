@@ -42,8 +42,11 @@ func TestClientInfo(t *testing.T) {
 // appendingProxy starts a reverse proxy in front of target that appends the
 // peer address to X-Forwarded-For and "http" to X-Forwarded-Proto, like
 // nginx with $proxy_add_x_forwarded_for (and many load balancers). When
-// localAddr is set, the proxy connects to target from that address.
-func appendingProxy(t *testing.T, target string, localAddr string) *httptest.Server {
+// clientAddr is set, the proxy sees every request as coming from that
+// address (a client on another host); otherwise from the real peer. The
+// proxy always reaches target from 127.0.0.1: only that loopback address
+// exists on every platform (macOS has no 127.0.0.2).
+func appendingProxy(t *testing.T, target string, clientAddr string) *httptest.Server {
 	t.Helper()
 	u, err := url.Parse(target)
 	if err != nil {
@@ -55,11 +58,14 @@ func appendingProxy(t *testing.T, target string, localAddr string) *httptest.Ser
 		director(r)
 		r.Header.Add("X-Forwarded-Proto", "http")
 	}
-	if localAddr != "" {
-		d := &net.Dialer{LocalAddr: &net.TCPAddr{IP: net.ParseIP(localAddr)}}
-		rp.Transport = &http.Transport{DialContext: d.DialContext}
+	var h http.Handler = rp
+	if clientAddr != "" {
+		h = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			r.RemoteAddr = net.JoinHostPort(clientAddr, "40000")
+			rp.ServeHTTP(w, r)
+		})
 	}
-	srv := httptest.NewServer(rp)
+	srv := httptest.NewServer(h)
 	t.Cleanup(srv.Close)
 	return srv
 }
@@ -78,7 +84,9 @@ func TestSourceIpThroughAppendingProxy(t *testing.T) {
 		{"Effect":"Allow","Principal":"*","Action":"s3:GetObject","Resource":"arn:aws:s3:::intra/tls/*",
 		 "Condition":{"Bool":{"aws:SecureTransport":"true"}}},
 		{"Effect":"Allow","Principal":"*","Action":"s3:GetObject","Resource":"arn:aws:s3:::intra/local/*",
-		 "Condition":{"IpAddress":{"aws:SourceIp":"127.0.0.1/32"}}}]}`
+		 "Condition":{"IpAddress":{"aws:SourceIp":"127.0.0.1/32"}}},
+		{"Effect":"Allow","Principal":"*","Action":"s3:GetObject","Resource":"arn:aws:s3:::intra/remote/*",
+		 "Condition":{"IpAddress":{"aws:SourceIp":"192.0.2.50/32"}}}]}`
 	get := func(t *testing.T, base, path string, hdr http.Header) int {
 		t.Helper()
 		req, err := http.NewRequest("GET", base+path, nil)
@@ -106,7 +114,7 @@ func TestSourceIpThroughAppendingProxy(t *testing.T) {
 		}))
 		requireAuthz(t, e)
 		e.createBucket("intra")
-		for _, k := range []string{"office/k", "tls/k", "local/k"} {
+		for _, k := range []string{"office/k", "tls/k", "local/k", "remote/k"} {
 			e.putObject("intra", k, []byte("secret"), storage.ObjectMeta{})
 		}
 		e.putBucketConfig("intra", storage.ConfigPolicy, policy)
@@ -130,22 +138,34 @@ func TestSourceIpThroughAppendingProxy(t *testing.T) {
 		}
 	})
 	t.Run("proxy listed in trusted_proxies", func(t *testing.T) {
-		// The proxy reaches gos3 from 127.0.0.2; clients come from
-		// 127.0.0.1, which is not a trusted proxy.
-		e := setup(t, "127.0.0.2")
-		proxy := appendingProxy(t, e.srv.URL, "127.0.0.2")
+		// The proxy reaches gos3 from 127.0.0.1, a trusted proxy; its
+		// client is at 192.0.2.50. The proxy forwards
+		// "X-Forwarded-For: 10.1.2.3, 192.0.2.50".
+		e := setup(t, "127.0.0.1")
+		proxy := appendingProxy(t, e.srv.URL, "192.0.2.50")
 		if code := get(t, proxy.URL, "/intra/office/k", spoof); code != 403 {
 			t.Errorf("spoofed X-Forwarded-For through the proxy: %d, want 403", code)
 		}
-		if code := get(t, proxy.URL, "/intra/local/k", spoof); code != 200 {
+		if code := get(t, proxy.URL, "/intra/remote/k", spoof); code != 200 {
 			t.Errorf("real client address: %d, want 200", code)
 		}
-		// Direct requests (not from the proxy) are taken at face value.
+		// The proxy's own (trusted) address is not the client.
+		if code := get(t, proxy.URL, "/intra/local/k", spoof); code != 403 {
+			t.Errorf("trusted proxy address taken as the client: %d, want 403", code)
+		}
+	})
+	t.Run("untrusted peer", func(t *testing.T) {
+		// Only 192.0.2.1 is a trusted proxy: requests from 127.0.0.1 are
+		// taken at face value, whatever headers they carry.
+		e := setup(t, "192.0.2.1")
 		if code := get(t, e.srv.URL, "/intra/office/k", spoof); code != 403 {
 			t.Errorf("spoofed headers from an untrusted peer: %d, want 403", code)
 		}
 		if code := get(t, e.srv.URL, "/intra/tls/k", spoof); code != 403 {
 			t.Errorf("spoofed X-Forwarded-Proto from an untrusted peer: %d, want 403", code)
+		}
+		if code := get(t, e.srv.URL, "/intra/local/k", spoof); code != 200 {
+			t.Errorf("peer address: %d, want 200", code)
 		}
 	})
 }
