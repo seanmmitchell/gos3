@@ -308,14 +308,37 @@ then cannot verify it.
 
 ## Dependencies
 
-Go dependencies are scanned with `govulncheck` in CI. The web UI's npm
-lockfile pins patched versions of transitive dependencies through
-`pnpm.overrides` in `web/package.json` (for example `simple-git`, pulled in
-by Nuxt devtools, which gos3 disables). Two advisories have no upstream fix
-yet and only affect build and development tooling: `node-forge` (Nitro's dev
-server, `listhen`) and `braces` (file globbing during builds). Neither is part
-of the embedded UI, which is static files, nor of the standalone UI server
-bundle (`web/.output/server`).
+The shipped `gos3` binary links six third-party Go modules: `go.etcd.io/bbolt`,
+`github.com/hashicorp/mdns`, `github.com/miekg/dns`, `golang.org/x/net`,
+`golang.org/x/sys` and `gopkg.in/yaml.v3` (`go version -m bin/gos3` lists
+them). Everything else in `go.mod` is used by tests only.
+
+Supply-chain rules:
+
+- **Release cooldown.** New versions are adopted only once they are at least
+  7 days old, which gives the ecosystem time to catch malicious or broken
+  releases. The web UI enforces this with pnpm's `minimumReleaseAge` in
+  `web/pnpm-workspace.yaml` (an exception needs an entry in
+  `minimumReleaseAgeExclude`, reserved for security fixes), and Dependabot
+  applies the same cooldown to update pull requests for npm, Go modules,
+  GitHub Actions and container images. Go test dependencies are pinned to
+  releases that were at least two weeks old when chosen.
+- **Small module graph.** `github.com/minio/minio-go/v7` (a test-only client)
+  stays on v7.1.x: v7.2 and later declare their linter toolchain as module
+  requirements, which would add about 200 modules to gos3's module graph.
+- **Patched transitive packages.** `pnpm.overrides` in
+  `web/pnpm-workspace.yaml` forces patched versions where a dependency lags
+  behind (for example `simple-git`, pulled in by Nuxt devtools, which gos3
+  disables).
+- **Install scripts.** Only the packages listed in `onlyBuiltDependencies`
+  may run install scripts.
+- **Scanning.** CI runs `govulncheck`; `pnpm audit` covers the web UI.
+
+Known open advisories, both without an upstream fix and both limited to Nuxt's
+build and development tooling: `node-forge` (Nitro's dev server, `listhen`)
+and `braces` (file globbing during builds, via `globby` → `micromatch`).
+Neither is part of the embedded UI, which is static files, nor of the
+standalone UI server bundle (`web/.output/server`).
 
 ## Reporting vulnerabilities
 

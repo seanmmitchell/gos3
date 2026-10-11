@@ -29,7 +29,7 @@ RUN corepack enable
 WORKDIR /src/web
 # Dependencies first (cached until the lockfile changes). `pnpm fetch` only
 # needs the lockfile; the offline install below links from the store.
-COPY web/package.json web/pnpm-lock.yaml ./
+COPY web/package.json web/pnpm-lock.yaml web/pnpm-workspace.yaml ./
 RUN --mount=type=cache,id=gos3-pnpm,target=/pnpm/store \
     pnpm config set store-dir /pnpm/store && \
     pnpm fetch --frozen-lockfile

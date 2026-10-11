@@ -1,0 +1,26 @@
+# pnpm settings for the web UI (a single package, not a workspace).
+
+# Supply-chain cooldown: only resolve package versions that were published at
+# least 7 days ago (value in minutes). Malicious or broken releases are
+# usually caught and pulled within days, and dependency scanners (Socket)
+# flag versions younger than a week. Raise a dependency past the cooldown
+# only for a security fix, via minimumReleaseAgeExclude below.
+minimumReleaseAge: 10080
+minimumReleaseAgeExclude: []
+
+# Patched versions of vulnerable transitive dependencies.
+overrides:
+  # Nuxt devtools (disabled in nuxt.config.ts) pulls simple-git:
+  # GHSA-x6jw-m9v5-85vh, GHSA-858h-whjf-mvg5, GHSA-v5rq-49vh-5v5c.
+  simple-git: ^4.0.2
+  '@simple-git/argv-parser': ^2.0.1
+  # esbuild dev-server file read, via @nuxt/fonts.
+  fontless>esbuild: ^0.28.1
+
+# Only these packages may run install scripts.
+onlyBuiltDependencies:
+  - esbuild
+  - '@parcel/watcher'
+  - vue-demi
+  - '@tailwindcss/oxide'
+  - unrs-resolver

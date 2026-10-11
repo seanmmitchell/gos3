@@ -1,12 +1,45 @@
-# Keeps the GitHub Actions and container base images of the workflows and
-# Dockerfiles current (weekly pull requests).
+# Weekly update pull requests for GitHub Actions, container base images, Go
+# modules and the web UI's npm packages.
+#
+# Every ecosystem waits 7 days after a release before proposing it (the same
+# supply-chain cooldown web/pnpm-workspace.yaml enforces with
+# minimumReleaseAge), so freshly published, possibly malicious or broken
+# versions are never picked up automatically. Security updates are not
+# delayed by the cooldown.
 version: 2
 updates:
   - package-ecosystem: github-actions
     directory: /
     schedule:
       interval: weekly
+    cooldown:
+      default-days: 7
   - package-ecosystem: docker
     directories: ["/", "/deploy/docker"]
     schedule:
       interval: weekly
+    cooldown:
+      default-days: 7
+  - package-ecosystem: gomod
+    directory: /
+    schedule:
+      interval: weekly
+    cooldown:
+      default-days: 7
+    groups:
+      go-test-clients:
+        patterns: ["github.com/aws/*", "github.com/minio/*"]
+    ignore:
+      # v7.2+ declares its linter toolchain as module requirements, which adds
+      # ~200 modules to gos3's module graph; minio-go is a test-only client.
+      - dependency-name: github.com/minio/minio-go/v7
+        versions: [">= 7.2.0"]
+  - package-ecosystem: npm
+    directory: /web
+    schedule:
+      interval: weekly
+    cooldown:
+      default-days: 7
+    groups:
+      nuxt:
+        patterns: ["nuxt", "@nuxt/*", "vue", "vue-router", "vite", "vitest"]
