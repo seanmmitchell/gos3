@@ -83,6 +83,7 @@ LABEL org.opencontainers.image.title="gos3" \
       org.opencontainers.image.source="https://github.com/seanmmitchell/gos3"
 COPY --from=build /out/gos3 /usr/local/bin/gos3
 COPY --from=build --chown=65532:65532 /out/data /data
+COPY LICENSE THIRD_PARTY_NOTICES /usr/share/doc/gos3/
 # Every config key has a GOS3_* variable (`gos3 config env`). Root keys:
 # set GOS3_ROOT_ACCESS_KEY / GOS3_ROOT_SECRET_KEY, or let gos3 generate a
 # pair on first start (printed in the log, stored in /data/.gos3).

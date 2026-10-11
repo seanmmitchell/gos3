@@ -25,7 +25,7 @@ DEV_ADDRESS    ?= :9000
 DEV_UI_ORIGIN  ?= http://localhost:3000
 
 .DEFAULT_GOAL := build
-.PHONY: help build build-go ui ui-clean test test-go test-web e2e lint fmt dev clean docker
+.PHONY: help build build-go ui ui-clean notices test test-go test-web e2e lint fmt dev clean docker
 
 help: ## show this help
 	@grep -hE '^[a-zA-Z0-9_-]+:.*## ' $(MAKEFILE_LIST) | awk 'BEGIN {FS = ":.*## "}; {printf "  \033[36m%-10s\033[0m %s\n", $$1, $$2}'
@@ -49,6 +49,13 @@ ui-clean: ## restore the committed placeholder in internal/webui/dist
 	find $(UI_DIST) -mindepth 1 -maxdepth 1 ! -name .keep -exec rm -rf {} +
 	cp $(UI_PLACEHOLDER) $(UI_DIST)/index.html
 	touch $(UI_DIST)/.keep
+
+# Both web UI builds record the npm packages they ship in web/.notices
+# (web/modules/third-party-notices.ts); the generator adds the Go modules
+# linked into gos3. CI fails when the committed file is out of date.
+notices: ## regenerate THIRD_PARTY_NOTICES (builds both web UI variants first)
+	cd web && $(PNPM) install --frozen-lockfile && $(PNPM) build && $(PNPM) generate:embed
+	$(GO) run ./internal/tools/notices
 
 test: test-go test-web ## run all Go and web unit tests
 
