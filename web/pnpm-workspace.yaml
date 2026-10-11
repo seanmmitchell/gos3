@@ -25,6 +25,11 @@ overrides:
   shell-quote: 1.11.0
   # GHSA-68fv-2mgg-jv7q: event-loop DoS, via postcss. Oldest fixed release.
   source-map-js: 1.2.2
+  # WebAssembly fallbacks, loaded only when the native binary is missing (a
+  # platform without a prebuilt one). Removed to keep unused code out of the
+  # dependency tree; every supported platform has the native package.
+  '@tailwindcss/oxide-wasm32-wasi': '-'
+  '@parcel/watcher-wasm': '-'
 
 # Only these packages may run install scripts.
 onlyBuiltDependencies:

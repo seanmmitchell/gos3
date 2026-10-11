@@ -54,7 +54,7 @@ pnpm screenshots      # regenerate docs/screenshots/*.png (see Screenshots)
 Use the pnpm version pinned in `packageManager` (corepack or pnpm's own
 version switching selects it). `pnpm-workspace.yaml` holds the pnpm settings:
 a 14-day release cooldown (`minimumReleaseAge`), overrides that force patched
-transitive packages, and the allowlist of packages that may run install
+transitive packages or remove unused WebAssembly fallbacks, and the allowlist of packages that may run install
 scripts. When an install fails with `ERR_PNPM_NO_MATURE_MATCHING_VERSION`, lower
 the dependency's version range instead of excluding it from the cooldown;
 exclusions are for security fixes only (see `docs/security.md`).

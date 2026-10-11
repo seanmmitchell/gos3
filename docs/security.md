@@ -328,10 +328,14 @@ Supply-chain rules:
 - **Small module graph.** `github.com/minio/minio-go/v7` (a test-only client)
   stays on v7.1.x: v7.2 and later declare their linter toolchain as module
   requirements, which would add about 200 modules to gos3's module graph.
-- **Patched transitive packages.** `pnpm.overrides` in
-  `web/pnpm-workspace.yaml` forces patched versions where a dependency lags
-  behind (for example `simple-git`, pulled in by Nuxt devtools, which gos3
-  disables).
+- **Patched transitive packages.** `overrides` in `web/pnpm-workspace.yaml`
+  forces patched versions where a dependency lags behind (for example
+  `simple-git`, pulled in by Nuxt devtools, which gos3 disables).
+- **No unused fallbacks.** The same `overrides` remove the WebAssembly
+  fallbacks of Tailwind's and Parcel's native binaries
+  (`@tailwindcss/oxide-wasm32-wasi`, `@parcel/watcher-wasm`). They load only
+  on platforms without a prebuilt native package, which gos3 does not
+  support.
 - **Install scripts.** Only the packages listed in `onlyBuiltDependencies`
   may run install scripts.
 - **Scanning.** CI runs `govulncheck`; `pnpm audit` covers the web UI.
