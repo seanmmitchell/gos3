@@ -1,6 +1,7 @@
 // Route-level tests for the standalone /api/discovery/* Nitro handlers (review
 // round 2): reverse-proxy Origin handling and global concurrency limits.
 import { EventEmitter } from 'node:events'
+import { PassThrough } from 'node:stream'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { isListedOrigin, localSlots, MAX_CONCURRENT_LOCAL, MAX_CONCURRENT_SCANS, rejectForeignRequest, scanSlots, Slots } from '~~/server/utils/discovery/http'
 
@@ -29,15 +30,18 @@ interface FakeEvent {
   headers: Record<string, string>
   status: number
   resHeaders: Record<string, string>
-  node: { res: EventEmitter & { writableEnded: boolean } }
+  node: { req: PassThrough, res: EventEmitter & { writableEnded: boolean } }
 }
 
-function fakeEvent(headers: Record<string, string>): FakeEvent {
+/** A request event; `body` (JSON-encoded) is the complete request body. */
+function fakeEvent(headers: Record<string, string>, body?: unknown): FakeEvent {
   const res = Object.assign(new EventEmitter(), { writableEnded: false })
-  return { headers, status: 200, resHeaders: {}, node: { res } }
+  const req = new PassThrough()
+  req.end(body === undefined ? undefined : JSON.stringify(body))
+  return { headers, status: 200, resHeaders: {}, node: { req, res } }
 }
 
-function stubH3(body?: unknown) {
+function stubH3() {
   vi.stubGlobal('defineEventHandler', (h: Handler) => h)
   vi.stubGlobal('getRequestHeader', (e: FakeEvent, name: string) => e.headers[name])
   vi.stubGlobal('setResponseStatus', (e: FakeEvent, s: number) => {
@@ -46,7 +50,6 @@ function stubH3(body?: unknown) {
   vi.stubGlobal('setResponseHeader', (e: FakeEvent, k: string, v: string) => {
     e.resHeaders[k] = v
   })
-  vi.stubGlobal('readBody', async () => body)
   vi.stubGlobal('getQuery', () => ({}))
 }
 
@@ -94,10 +97,12 @@ describe('review round 2: Origin behind a Host-rewriting reverse proxy', () => {
 describe('review round 2: global concurrency limits', () => {
   beforeEach(() => {
     scanGate.waiters.length = 0
+    vi.stubEnv('GOS3_UI_LOCAL_DISCOVERY', 'true')
   })
 
   afterEach(() => {
     for (const w of scanGate.waiters.splice(0)) w()
+    vi.unstubAllEnvs()
   })
 
   it('Slots hands out at most size slots and releases idempotently', () => {
@@ -114,9 +119,9 @@ describe('review round 2: global concurrency limits', () => {
   })
 
   it('POST /api/discovery/scan answers 429 beyond MAX_CONCURRENT_SCANS and frees slots when scans end', async () => {
-    stubH3({ targets: ['10.0.0.1'], ports: [9000] })
+    stubH3()
     const handler = (await import('~~/server/api/discovery/scan.post')).default as unknown as Handler
-    const req = () => fakeEvent({ 'host': 'localhost:3000', 'content-type': 'application/json' })
+    const req = () => fakeEvent({ 'host': 'localhost:3000', 'content-type': 'application/json' }, { targets: ['10.0.0.1'], ports: [9000] })
 
     const running = Array.from({ length: MAX_CONCURRENT_SCANS }, () => handler(req()))
     await settle()

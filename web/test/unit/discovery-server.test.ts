@@ -241,17 +241,17 @@ describe('probing', () => {
     })
     await expect(fetchInfo('http://ok:9000', { fetch })).resolves.toMatchObject({ id: INFO.id })
     expect(fetch).toHaveBeenCalledWith('http://ok:9000/_gos3/info', expect.anything())
-    await expect(fetchInfo('http://html', { fetch })).rejects.toThrow(/invalid identity/)
-    await expect(fetchInfo('http://auth', { fetch })).rejects.toThrow(/authentication/)
-    await expect(fetchInfo('http://missing', { fetch })).rejects.toThrow(/no \/_gos3\/info/)
-    await expect(fetchInfo('http://down', { fetch })).rejects.toThrow(/ECONNREFUSED/)
+    await expect(fetchInfo('http://html', { fetch })).rejects.toThrow('not a gos3 server')
+    await expect(fetchInfo('http://auth', { fetch })).rejects.toThrow('authentication required')
+    await expect(fetchInfo('http://missing', { fetch })).rejects.toThrow('not a gos3 server')
+    await expect(fetchInfo('http://down', { fetch })).rejects.toThrow('unreachable')
   })
 
   it('times out', async () => {
     const fetch = (_u: string, init?: RequestInit) => new Promise<Response>((_, reject) => {
       init?.signal?.addEventListener('abort', () => reject(new DOMException('aborted', 'AbortError')))
     })
-    await expect(fetchInfo('http://slow', { fetch, timeoutMs: 20 })).rejects.toThrow(/timed out after 20 ms/)
+    await expect(fetchInfo('http://slow', { fetch, timeoutMs: 20 })).rejects.toThrow('timed out')
   })
 
   it('runs a bounded pool in order', async () => {
@@ -280,8 +280,9 @@ describe('probing', () => {
     expect(r.elapsed).toMatch(/^\d+(\.\d+)?m?s$/)
   })
 
-  it('can be disabled by environment', () => {
-    expect(localDiscoveryEnabled({})).toBe(true)
+  it('is off unless enabled by environment', () => {
+    expect(localDiscoveryEnabled({})).toBe(false)
+    expect(localDiscoveryEnabled({ GOS3_UI_LOCAL_DISCOVERY: 'true' })).toBe(true)
     expect(localDiscoveryEnabled({ GOS3_UI_LOCAL_DISCOVERY: 'false' })).toBe(false)
     expect(localDiscoveryEnabled({ GOS3_UI_LOCAL_DISCOVERY: 'off' })).toBe(false)
   })
@@ -297,7 +298,7 @@ describe('review fixes: bounded probes', () => {
         if (pulled > 1000) ctrl.close()
       }
     }))
-    await expect(fetchInfo('http://stream', { fetch, timeoutMs: 2000 })).rejects.toThrow(/too large/)
+    await expect(fetchInfo('http://stream', { fetch, timeoutMs: 2000 })).rejects.toThrow('not a gos3 server')
     expect(pulled).toBeLessThan(10)
   })
 
@@ -315,9 +316,8 @@ describe('review fixes: bounded probes', () => {
 
   it('verifies at most MAX_VERIFY_URLS candidate URLs', async () => {
     const fetch = vi.fn(async () => new Response('nope', { status: 404 }))
-    vi.stubGlobal('fetch', fetch)
     const candidates: Candidate[] = Array.from({ length: 2000 }, (_, i) => ({ url: `http://10.${i >> 8}.${i & 255}.1:9000`, source: 'beacon', id: `id${i}` }))
-    await verifyCandidates(candidates, { timeoutMs: 100 })
+    await verifyCandidates(candidates, { timeoutMs: 100, fetch })
     expect(fetch).toHaveBeenCalledTimes(MAX_VERIFY_URLS)
   })
 })

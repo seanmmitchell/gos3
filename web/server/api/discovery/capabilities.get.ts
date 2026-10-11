@@ -1,6 +1,8 @@
 // GET /api/discovery/capabilities — tells the UI that local discovery from
 // the UI host is available (standalone Node server only; the static/embedded
-// build has no server routes, so the UI hides the feature there).
+// build has no server routes, so the UI hides the feature there). It always
+// answers, with `localDiscovery: false` unless GOS3_UI_LOCAL_DISCOVERY is
+// true (the container health check uses it).
 import { rejectForeignRequest, type ErrorEnvelope } from '../../utils/discovery/http'
 import { loadMdns, localDiscoveryEnabled } from '../../utils/discovery/local'
 import { MAX_SCAN_HOSTS } from '../../utils/discovery/targets'
