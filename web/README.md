@@ -244,6 +244,8 @@ app/
                           useConfirm, useBreadcrumbs
   components/common/      shared building blocks (prefix `Common`)
   components/layout/      AppLogo, ServerSwitcher, IdentityMenu (prefix `Layout`)
+modules/third-party-notices.ts  records the npm packages each production build ships in
+                          .notices/ (input of `make notices`, see docs/security.md)
 server/                   Nitro routes for standalone local discovery (servers & discovery agent)
 test/unit/                Vitest "unit" project (node env + DOMParser/Storage from test/setup.ts)
 test/nuxt/                Vitest "nuxt" project (@nuxt/test-utils, components & composables)

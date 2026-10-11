@@ -49,6 +49,7 @@ ENV NODE_ENV=production \
 WORKDIR /app
 # The Nitro output is self-contained (traced node_modules included).
 COPY --from=build --chown=node:node /src/web/.output ./.output
+COPY LICENSE THIRD_PARTY_NOTICES /usr/share/doc/gos3-ui/
 USER node
 EXPOSE 3000/tcp
 HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \

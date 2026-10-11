@@ -388,4 +388,9 @@ archives and a multi-arch image on `ghcr.io` (`release.yml`).
 
 ## License
 
-MIT; see [LICENSE](LICENSE).
+MIT; see [LICENSE](LICENSE). The licenses of the third-party code that gos3
+and the standalone web UI include are reproduced in
+[THIRD_PARTY_NOTICES](THIRD_PARTY_NOTICES). The file ships in the release
+archives and in both container images (`/usr/share/doc/gos3/` and
+`/usr/share/doc/gos3-ui/`). Regenerate it with `make notices` after changing
+dependencies; CI fails when it is out of date.

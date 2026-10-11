@@ -83,6 +83,11 @@ jobs:
       - uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5.0.0
         with:
           node-version: ${{ env.NODE_VERSION }}
+      # For the THIRD_PARTY_NOTICES check (internal/tools/notices).
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
+        with:
+          go-version-file: go.mod
+          cache: true
       - name: Enable pnpm (corepack)
         run: |
           corepack enable
@@ -100,6 +105,10 @@ jobs:
         run: pnpm build
       - name: Embedded build
         run: pnpm generate:embed
+      # Both builds above record the npm packages they ship in web/.notices.
+      - name: THIRD_PARTY_NOTICES is up to date
+        working-directory: .
+        run: go run ./internal/tools/notices -check
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: ui-embed

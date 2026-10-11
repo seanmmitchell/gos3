@@ -470,6 +470,15 @@ Supply-chain rules:
 - **Install scripts.** Only the packages listed in `onlyBuiltDependencies`
   may run install scripts.
 - **Scanning.** CI runs `govulncheck`; `pnpm audit` covers the web UI.
+- **License notices.** `THIRD_PARTY_NOTICES` reproduces the licenses of
+  everything gos3 ships: the Go standard library, the Go modules linked into
+  the binary on every release platform, and the npm packages that the web UI
+  builds bundle (recorded during the build by
+  `web/modules/third-party-notices.ts`). `make notices` regenerates it. CI
+  fails when it is out of date, for example when a dependency update adds a
+  package or changes a license text, so run `make notices` on such a pull
+  request. A shipped package without a license file needs its upstream text in
+  `internal/tools/notices/fallback/`.
 
 Known open advisories, both without an upstream fix and both limited to Nuxt's
 build and development tooling: `node-forge` (Nitro's dev server, `listhen`)

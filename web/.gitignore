@@ -5,6 +5,8 @@ node_modules/
 .data/
 dist
 *.tsbuildinfo
+# shipped-package records of the last builds (modules/third-party-notices.ts)
+.notices/
 test-results/
 playwright-report/
 
