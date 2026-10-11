@@ -27,6 +27,7 @@ type capabilities struct {
 	ViewStats      bool `json:"viewStats"`      // admin:GetStats
 	ManageConfig   bool `json:"manageConfig"`   // admin:UpdateConfig
 	ManageUsers    bool `json:"manageUsers"`    // admin:CreateUser
+	ListUsers      bool `json:"listUsers"`      // admin:ListUsers (also granted to delegated user managers)
 	ManagePolicies bool `json:"managePolicies"` // admin:PutPolicy
 	ManageBuckets  bool `json:"manageBuckets"`  // admin:ForceDeleteBucket
 	Discovery      bool `json:"discovery"`      // admin:GetDiscovery
@@ -77,6 +78,7 @@ func (a *api) whoami(rc *reqCtx) (int, any, error) {
 			ViewStats:      allowed["GetStats"],
 			ManageConfig:   allowed["UpdateConfig"],
 			ManageUsers:    allowed["CreateUser"],
+			ListUsers:      allowed["ListUsers"],
 			ManagePolicies: allowed["PutPolicy"],
 			ManageBuckets:  allowed["ForceDeleteBucket"],
 			Discovery:      allowed["GetDiscovery"],

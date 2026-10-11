@@ -289,6 +289,24 @@ describe('connections store: import never redirects stored credentials', () => {
     expect(s.connections).toHaveLength(3)
   })
 
+  it('keeps a secret replaced by an import out of localStorage', () => {
+    const s = useConnectionsStore()
+    s.add({ id: 'nas', endpoint: 'http://nas:9000', accessKeyId: 'AK', secretAccessKey: 'MINE', remember: true })
+    const json = importOf({ id: 'nas', endpoint: 'http://nas:9000', secretAccessKey: 'IMPORTED', remember: true })
+    const step = s.planImport(json).steps[0]!
+    expect(step.action).toBe('update')
+    if (step.action !== 'update') return
+    expect(step.changes).toContainEqual({ field: 'remember', from: 'on', to: 'off' })
+    s.importJson(json)
+    expect(s.byId('nas')).toMatchObject({ secretAccessKey: 'IMPORTED', remember: false })
+    expect(localStorage.getItem(LOCAL_STORAGE_KEY)).not.toContain('IMPORTED')
+    expect(session()).toEqual({ nas: { secretAccessKey: 'IMPORTED' } })
+    // An import that leaves the secret alone keeps "remember".
+    s.update('nas', { remember: true })
+    s.importJson(importOf({ id: 'nas', endpoint: 'http://nas:9000', name: 'Renamed' }))
+    expect(s.byId('nas')).toMatchObject({ name: 'Renamed', remember: true, secretAccessKey: 'IMPORTED' })
+  })
+
   it('updates fields of a match on the same endpoint and describes the changes without secrets', () => {
     const s = useConnectionsStore()
     s.add({ id: 'nas', name: 'NAS', endpoint: 'http://nas:9000', region: 'us-east-1', accessKeyId: 'AK', secretAccessKey: 'OLDSECRET' })

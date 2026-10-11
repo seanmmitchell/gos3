@@ -3,6 +3,7 @@ import type { Capabilities, MinuteBucket, OpStats } from '~/types/admin'
 import {
   BUCKET_TABS,
   canCreateOwnKeys,
+  canListUsers,
   canForceDeleteBucket,
   canManageOwnKeys,
   canProbe,
@@ -59,9 +60,21 @@ describe('capability gating', () => {
   it('shows user management or self-service keys', () => {
     expect(usersPageMode('gos3', caps({ manageUsers: true }))).toBe('manage')
     expect(usersPageMode('gos3', NO_CAPS)).toBe('self')
+    // A delegated manager (user actions scoped to some users) lists users
+    // without service-level admin:CreateUser.
+    expect(usersPageMode('gos3', caps({ listUsers: true }))).toBe('manage')
     expect(canManageOwnKeys('gos3', true, true)).toBe(false)
     expect(canManageOwnKeys('gos3', false, true)).toBe(true)
     expect(canManageOwnKeys('gos3', false, false)).toBe(false)
+  })
+
+  it('lists users with admin:ListUsers, falling back to manageUsers on older servers', () => {
+    expect(canListUsers(caps({ listUsers: true }))).toBe(true)
+    expect(canListUsers(caps({ listUsers: false, manageUsers: true }))).toBe(false)
+    const { listUsers: _omit, ...older } = caps({ manageUsers: true })
+    expect(canListUsers(older)).toBe(true)
+    expect(canListUsers({ ...older, manageUsers: false })).toBe(false)
+    expect(canListUsers(null)).toBe(false)
   })
 
   it('distinguishes manage / readonly / unavailable for policies and settings', () => {

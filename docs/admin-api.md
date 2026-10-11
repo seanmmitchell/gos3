@@ -118,6 +118,7 @@ Non-2xx responses: `{"error": {"code": "<Code>", "message": "<text>"}}`.
     "viewStats": false,       // admin:GetStats
     "manageConfig": false,    // admin:UpdateConfig
     "manageUsers": false,     // admin:CreateUser
+    "listUsers": false,       // admin:ListUsers (true for delegated user managers too)
     "managePolicies": false,  // admin:PutPolicy
     "manageBuckets": false,   // admin:ForceDeleteBucket
     "discovery": false,       // admin:GetDiscovery

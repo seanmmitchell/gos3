@@ -64,7 +64,9 @@ policies and clears that option.
   these forms and the `admin:PolicyName` condition key (the policies a
   CreateUser / UpdateUser request attaches), and the "Manage some users"
   template scopes user management to a name pattern and to a list of
-  attachable policies. For an admin action the simulator asks for an admin
+  attachable policies. Such a delegated manager still gets the Users page
+  (it lists all users; actions on users outside the pattern are refused by
+  the server and shown as errors). For an admin action the simulator asks for an admin
   resource instead of a bucket and key (empty = service level).
 
 ### Object browser notes
@@ -128,7 +130,8 @@ where `kind` is `gos3` or `s3`.
   for the same server are skipped), and imported entries cannot take their
   IDs. Changing the access key without a new secret clears the stored
   secret, and `remember` in a file is ignored: imported secrets stay in
-  `sessionStorage` until you turn "remember" on.
+  `sessionStorage` until you turn "remember" on (an import that replaces
+  the secret of a remembered connection turns "remember" off).
 - Several open tabs share connection changes (added, edited and removed
   connections and remembered secrets). The active server and secrets kept
   only for the session stay per tab.

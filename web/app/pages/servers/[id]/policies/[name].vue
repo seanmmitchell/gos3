@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import type { NamedPolicy } from '~/types/admin'
 import { AdminError } from '~/utils/admin/client'
-import { canSimulate, identityPending, policiesPageMode } from '~/components/admin/-capabilities'
+import { canListUsers, canSimulate, identityPending, policiesPageMode } from '~/components/admin/-capabilities'
 
 /**
  * Policy detail: built-in policies are read-only; custom policies are
@@ -25,7 +25,7 @@ const simulate = computed(() => canSimulate(connection.value?.kind, capabilities
 
 const policy = useLoader(() => requireAdmin().getPolicy(name.value), { immediate: false })
 const all = useLoader(() => requireAdmin().listPolicies().catch(() => []), { immediate: false, initial: [] })
-const users = useLoader(() => (capabilities.value.manageUsers ? requireAdmin().listUsers() : Promise.resolve([])).catch(() => []), { immediate: false, initial: [] })
+const users = useLoader(() => (canListUsers(capabilities.value) ? requireAdmin().listUsers() : Promise.resolve([])).catch(() => []), { immediate: false, initial: [] })
 
 watch([mode, id, name], ([m]) => {
   if (m !== 'unavailable') {
@@ -136,7 +136,7 @@ onBeforeRouteLeave(async () => {
               Attached to
             </h2>
           </template>
-          <p v-if="!capabilities.manageUsers" class="text-sm text-muted">
+          <p v-if="!canListUsers(capabilities)" class="text-sm text-muted">
             Listing users requires admin:ListUsers.
           </p>
           <p v-else-if="!attachedUsers.length" class="text-sm text-muted">

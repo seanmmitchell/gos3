@@ -30,6 +30,15 @@ func TestScopedUserAdmin(t *testing.T) {
 	bob := e.addUser("bob")
 	boss := e.addUser("boss", iam.PolicyAdmin)
 
+	t.Run("whoami", func(t *testing.T) {
+		// Creating users is scoped, so manageUsers (service level) is
+		// false; listUsers tells the UI to show the users page anyway.
+		var w whoAmI
+		e.do(&help, "GET", Prefix+"/whoami", nil).json(t, &w)
+		if c := w.Capabilities; !c.ListUsers || c.ManageUsers || !c.Admin {
+			t.Errorf("capabilities = %+v, want listUsers and admin without manageUsers", c)
+		}
+	})
 	t.Run("in scope", func(t *testing.T) {
 		e.do(&help, "GET", Prefix+"/users/team-a", nil).expectStatus(t, http.StatusOK)
 		e.do(&help, "PATCH", Prefix+"/users/team-a", map[string]any{"description": "managed"}).expectStatus(t, http.StatusOK)

@@ -55,6 +55,7 @@ export const NO_CAPABILITIES: Capabilities = Object.freeze({
   viewStats: false,
   manageConfig: false,
   manageUsers: false,
+  listUsers: false,
   managePolicies: false,
   manageBuckets: false,
   discovery: false,

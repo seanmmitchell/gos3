@@ -89,6 +89,62 @@ test.describe('self-service keys need admin:CreateOwnAccessKey (C3)', () => {
   })
 })
 
+test.describe('a delegated user manager (C4 scoped admin resources)', () => {
+  test.describe.configure({ mode: 'serial' })
+  const base = uniqueName('deleg').replace(/-/g, '_').slice(0, 30)
+  const manager = `${base}_mgr`
+  const member = `${base}_team_a`
+  const outsider = `${base}_other`
+  const policy = uniqueName('e2e-team-managers')
+  let creds: CreatedUser['key']
+
+  test.beforeAll(async ({ api }) => {
+    await api.admin('PUT', `/policies/${policy}`, {
+      document: {
+        Version: '2012-10-17',
+        Statement: [
+          { Effect: 'Allow', Action: ['admin:ListUsers', 'admin:ListPolicies'], Resource: ['arn:gos3:admin:::*'] },
+          {
+            Effect: 'Allow',
+            Action: ['admin:GetUser', 'admin:UpdateUser'],
+            Resource: [`arn:gos3:admin:::user/${base}_team_*`],
+            Condition: { 'ForAllValues:StringEquals': { 'admin:PolicyName': ['readonly'] } }
+          }
+        ]
+      }
+    })
+    creds = (await api.admin<CreatedUser>('POST', '/users', { name: manager, policies: [policy], createKey: true })).key
+    // The member holds a policy the manager may not attach: editing only
+    // its description must not resend (and so re-attach) it.
+    await api.admin('POST', '/users', { name: member, policies: ['readwrite'] })
+    await api.admin('POST', '/users', { name: outsider, policies: ['readonly'] })
+  })
+  test.afterAll(async ({ api }) => {
+    for (const u of [manager, member, outsider]) await api.admin('DELETE', `/users/${u}`).catch(() => undefined)
+    await api.admin('DELETE', `/policies/${policy}`).catch(() => undefined)
+  })
+
+  test('sees the users page and edits a team member within scope', async ({ page, ui, api }) => {
+    await signInAs(page, ui, creds.accessKey, creds.secretKey, `/servers/${THIS_SERVER}/users`)
+    const nav = page.getByRole('navigation', { name: 'Server navigation' })
+    await expect(nav.getByRole('link', { name: 'Users' })).toBeVisible()
+    // The management view (title "Users"), not the self-service-only one.
+    await expect(page.getByRole('heading', { name: 'Users', exact: true })).toBeVisible()
+    await page.getByRole('main').getByRole('link', { name: member, exact: true }).click()
+
+    await page.getByRole('textbox', { name: 'Description' }).fill('edited by the team manager')
+    await page.getByRole('button', { name: 'Save', exact: true }).click()
+    await expect(page.getByText('User updated').first()).toBeVisible()
+    const after = await api.admin<{ description?: string, policies: string[] }>('GET', `/users/${member}`)
+    expect(after).toMatchObject({ description: 'edited by the team manager', policies: ['readwrite'] })
+  })
+
+  test('is refused for users outside the pattern', async ({ page, ui }) => {
+    await signInAs(page, ui, creds.accessKey, creds.secretKey, `/servers/${THIS_SERVER}/users/${outsider}`)
+    await expect(page.getByRole('main').getByText(/not allowed|AccessDenied/i).first()).toBeVisible()
+  })
+})
+
 test.describe('probing needs admin:ProbeNetwork (C3)', () => {
   const user = uniqueName('diag').replace(/-/g, '_').slice(0, 40)
   let creds: CreatedUser['key']

@@ -134,7 +134,7 @@ function isReservedId(id: string): boolean {
 }
 
 /** Fields an import may change on an existing connection (endpoint and kind never). */
-export type ImportField = 'name' | 'region' | 'accessKeyId' | 'secretAccessKey' | 'forcePathStyle' | 'serverId' | 'color'
+export type ImportField = 'name' | 'region' | 'accessKeyId' | 'secretAccessKey' | 'forcePathStyle' | 'serverId' | 'color' | 'remember'
 
 const IMPORT_FIELDS: readonly ImportField[] = ['name', 'region', 'accessKeyId', 'secretAccessKey', 'forcePathStyle', 'serverId', 'color']
 
@@ -174,6 +174,7 @@ export interface ImportPlan {
 
 function displayValue(field: ImportField, v: unknown): string {
   if (field === 'secretAccessKey') return v ? 'set' : 'none'
+  if (field === 'remember') return v ? 'on' : 'off'
   if (v === undefined || v === '') return '—'
   return String(v)
 }
@@ -197,7 +198,9 @@ function displayValue(field: ImportField, v: unknown): string {
  * - when an entry changes the access key ID without giving a secret, the
  *   stored secret (which belongs to the old key) is cleared.
  * - `remember` is ignored: only the user decides whether a secret is written
- *   to localStorage (imported connections start session-only).
+ *   to localStorage (imported connections start session-only). An import
+ *   that replaces the secret of a remembered connection turns "remember"
+ *   off, so the imported secret is kept in sessionStorage too.
  * Region and path style may change: requests still go to the same host
  * (virtual-hosted style only prefixes it with the bucket name) and SigV4
  * signatures are bound to that host.
@@ -248,6 +251,7 @@ export function planConnectionImport(existing: readonly Connection[], items: rea
       if (v !== undefined && v !== target[field]) set(field, v)
     }
     if (patch.accessKeyId !== undefined && clean.secretAccessKey === undefined && target.secretAccessKey) set('secretAccessKey', '')
+    if (patch.secretAccessKey && target.remember) set('remember', false)
     if (!changes.length) {
       steps.push({ action: 'skip', target, reason: 'unchanged' })
       continue

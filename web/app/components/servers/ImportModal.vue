@@ -45,7 +45,8 @@ const FIELD_LABELS: Record<ImportField, string> = {
   secretAccessKey: 'secret key',
   forcePathStyle: 'path-style',
   serverId: 'server ID',
-  color: 'color'
+  color: 'color',
+  remember: 'remember secret'
 }
 
 interface PreviewRow {

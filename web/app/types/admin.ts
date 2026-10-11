@@ -60,6 +60,13 @@ export interface Capabilities {
   manageConfig: boolean
   /** admin:CreateUser */
   manageUsers: boolean
+  /**
+   * admin:ListUsers. True for delegated user managers whose other user
+   * actions are scoped to some users (and so do not show in manageUsers).
+   * Absent from older servers: use canListUsers(), which falls back to
+   * manageUsers.
+   */
+  listUsers?: boolean
   /** admin:PutPolicy */
   managePolicies: boolean
   /** admin:ForceDeleteBucket */

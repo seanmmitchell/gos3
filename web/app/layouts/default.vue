@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import type { BreadcrumbItem, NavigationMenuItem } from '@nuxt/ui'
 import { useConnectionsStore } from '~/stores/connections'
+import { usersPageMode } from '~/components/admin/-capabilities'
 
 const store = useConnectionsStore()
 const route = useRoute()
@@ -20,7 +21,7 @@ const serverItems = computed<NavigationMenuItem[]>(() => {
     { label: 'Buckets', icon: 'i-lucide-database', to: appRoutes.buckets(c.id) }
   ]
   if (c.kind === 'gos3') {
-    if (caps.manageUsers) items.push({ label: 'Users', icon: 'i-lucide-users', to: appRoutes.users(c.id) })
+    if (usersPageMode(c.kind, caps) === 'manage') items.push({ label: 'Users', icon: 'i-lucide-users', to: appRoutes.users(c.id) })
     if (caps.managePolicies) items.push({ label: 'Policies', icon: 'i-lucide-shield-check', to: appRoutes.policies(c.id) })
     if (caps.manageConfig) items.push({ label: 'Settings', icon: 'i-lucide-settings', to: appRoutes.settings(c.id) })
     if (caps.discovery) items.push({ label: 'Discovery', icon: 'i-lucide-radar', to: appRoutes.discovery(c.id) })

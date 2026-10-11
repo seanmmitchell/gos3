@@ -18,6 +18,7 @@ export const NO_CAPS: Readonly<Capabilities> = Object.freeze({
   viewStats: false,
   manageConfig: false,
   manageUsers: false,
+  listUsers: false,
   managePolicies: false,
   manageBuckets: false,
   discovery: false,
@@ -48,8 +49,18 @@ export function overviewMode(kind: ConnectionKind | undefined, caps: Capabilitie
 }
 
 /**
+ * Whether the caller may list IAM users (admin:ListUsers). Servers that
+ * predate the `listUsers` capability only reported manageUsers.
+ */
+export function canListUsers(caps: Capabilities | null | undefined): boolean {
+  return !!(caps?.listUsers ?? caps?.manageUsers)
+}
+
+/**
  * Users page:
- * - manage:      full IAM user management (admin:CreateUser)
+ * - manage:      IAM user management (admin:CreateUser, or admin:ListUsers
+ *                for a delegated manager whose user actions are scoped to
+ *                some users; the server refuses the rest per user)
  * - self:        "My access keys" only (/whoami/keys)
  * - unavailable: generic S3 (no admin API)
  */
@@ -57,7 +68,7 @@ export type UsersPageMode = 'manage' | 'self' | 'unavailable'
 
 export function usersPageMode(kind: ConnectionKind | undefined, caps: Capabilities | null | undefined): UsersPageMode {
   if (kind !== 'gos3') return 'unavailable'
-  return caps?.manageUsers ? 'manage' : 'self'
+  return caps?.manageUsers || canListUsers(caps) ? 'manage' : 'self'
 }
 
 /**
