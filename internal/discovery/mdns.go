@@ -4,43 +4,47 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"log"
 	"log/slog"
 	"net"
 	"net/netip"
 	"os"
 	"slices"
 	"strings"
+	"sync"
 	"time"
 
-	"github.com/hashicorp/mdns"
+	"github.com/miekg/dns"
 )
 
 // mDNS settings (docs/discovery.md §2).
 const (
-	mdnsDomain        = "local."
-	mdnsQueryTimeout  = 3 * time.Second
-	mdnsBrowseEvery   = 30 * time.Second
-	mdnsRefreshEvery  = 30 * time.Second
-	mdnsMaxInstance   = 50
-	mdnsMaxTXTFields  = 32
-	mdnsEntriesBuffer = 64
+	mdnsDomain       = "local."
+	mdnsPort         = 5353
+	mdnsQueryTimeout = 3 * time.Second
+	mdnsBrowseEvery  = 30 * time.Second
+	mdnsRefreshEvery = 30 * time.Second
+	mdnsMaxInstance  = 50
+	mdnsMaxTXTFields = 32
 	// mdnsMaxEntries bounds the distinct services kept from one browse.
 	mdnsMaxEntries = 256
+	// mdnsTTL is the TTL of advertised records (as before: 120 s);
+	// mdnsLegacyTTL caps it in replies to legacy unicast queries (RFC 6762
+	// §6.7).
+	mdnsTTL       = 120
+	mdnsLegacyTTL = 10
+	// mdnsMaxPacket is the largest mDNS datagram read (RFC 6762 §17).
+	mdnsMaxPacket = 9000
+	// mdnsMaxResponse bounds every response so it fits in one unfragmented
+	// packet on any common link.
+	mdnsMaxResponse = 1400
+	// mdnsMaxAddrs bounds the A/AAAA records advertised.
+	mdnsMaxAddrs = 16
 )
 
-// debugWriter adapts the standard logger used by hashicorp/mdns to slog at
-// debug level, so the library's chatter never reaches normal logs.
-type debugWriter struct{ logger *slog.Logger }
-
-func (w debugWriter) Write(p []byte) (int, error) {
-	w.logger.Debug(strings.TrimSpace(clip(string(p), 512)))
-	return len(p), nil
-}
-
-func quietLogger(l *slog.Logger) *log.Logger {
-	return log.New(debugWriter{l}, "", 0)
-}
+var (
+	mdnsGroup4 = netip.AddrPortFrom(netip.MustParseAddr("224.0.0.251"), mdnsPort)
+	mdnsGroup6 = netip.AddrPortFrom(netip.MustParseAddr("ff02::fb"), mdnsPort)
+)
 
 // sanitizeLabel maps s to [A-Za-z0-9-] (other characters become '-'),
 // trims leading/trailing '-' and truncates to n bytes.
@@ -85,9 +89,116 @@ func mdnsHostName(id string) string {
 	return h + "." + mdnsDomain
 }
 
+// mdnsServiceName is the fully qualified service type, "_gos3._tcp.local.".
+const mdnsServiceName = MDNSService + "." + mdnsDomain
+
+// mdnsEnumName is the DNS-SD service type enumeration name (RFC 6763 §9).
+const mdnsEnumName = "_services._dns-sd._udp." + mdnsDomain
+
+// mdnsZone holds the DNS-SD records advertising this server: the only
+// records the responder ever answers with.
+type mdnsZone struct {
+	Instance string       // instance label, "nas-b3f1c2"
+	Service  string       // MDNSService
+	HostName string       // "host.local."
+	Port     int          // listener port
+	IPs      []netip.Addr // advertised addresses
+	TXT      []string
+
+	// Lower-cased owner names, for matching questions.
+	serviceName, instanceName, hostName string
+
+	enum, ptr, srv, txt dns.RR
+	a, aaaa             []dns.RR
+}
+
+func rrHeader(name string, t uint16) dns.RR_Header {
+	return dns.RR_Header{Name: name, Rrtype: t, Class: dns.ClassINET, Ttl: mdnsTTL}
+}
+
+// newMDNSZone builds the records of one service instance.
+func newMDNSZone(instance, host string, port int, ips []netip.Addr, txt []string) (*mdnsZone, error) {
+	if instance == "" || port <= 0 || port > 65535 {
+		return nil, errors.New("mDNS: missing instance name or port")
+	}
+	instanceFQDN := instance + "." + mdnsServiceName
+	if _, ok := dns.IsDomainName(instanceFQDN); !ok {
+		return nil, fmt.Errorf("mDNS: invalid instance name %q", instance)
+	}
+	if _, ok := dns.IsDomainName(host); !ok || !dns.IsFqdn(host) {
+		return nil, fmt.Errorf("mDNS: invalid host name %q", host)
+	}
+	z := &mdnsZone{
+		Instance:     instance,
+		Service:      MDNSService,
+		HostName:     host,
+		Port:         port,
+		TXT:          slices.Clone(txt),
+		serviceName:  strings.ToLower(mdnsServiceName),
+		instanceName: strings.ToLower(instanceFQDN),
+		hostName:     strings.ToLower(host),
+	}
+	z.enum = &dns.PTR{Hdr: rrHeader(mdnsEnumName, dns.TypePTR), Ptr: mdnsServiceName}
+	z.ptr = &dns.PTR{Hdr: rrHeader(mdnsServiceName, dns.TypePTR), Ptr: instanceFQDN}
+	z.srv = &dns.SRV{Hdr: rrHeader(instanceFQDN, dns.TypeSRV), Priority: 10, Weight: 1, Port: uint16(port), Target: host}
+	z.txt = &dns.TXT{Hdr: rrHeader(instanceFQDN, dns.TypeTXT), Txt: z.TXT}
+	for _, ip := range ips {
+		ip = ip.Unmap().WithZone("")
+		if len(z.IPs) >= mdnsMaxAddrs || !ip.IsValid() || slices.Contains(z.IPs, ip) {
+			continue
+		}
+		z.IPs = append(z.IPs, ip)
+		if ip.Is4() {
+			z.a = append(z.a, &dns.A{Hdr: rrHeader(host, dns.TypeA), A: net.IP(ip.AsSlice())})
+		} else {
+			z.aaaa = append(z.aaaa, &dns.AAAA{Hdr: rrHeader(host, dns.TypeAAAA), AAAA: net.IP(ip.AsSlice())})
+		}
+	}
+	return z, nil
+}
+
+// records returns the answer and additional records for question q (RFC
+// 6763 §12: a PTR answer comes with the SRV, TXT and address records, an
+// SRV answer with the address records). Questions for any other name, type
+// or class get nothing.
+func (z *mdnsZone) records(q dns.Question) (answer, extra []dns.RR) {
+	if c := q.Qclass &^ (1 << 15); c != dns.ClassINET && c != dns.ClassANY {
+		return nil, nil
+	}
+	is := func(t uint16) bool { return q.Qtype == t || q.Qtype == dns.TypeANY }
+	addrs := append(slices.Clone(z.a), z.aaaa...)
+	switch strings.ToLower(q.Name) {
+	case strings.ToLower(mdnsEnumName):
+		if is(dns.TypePTR) {
+			answer = append(answer, z.enum)
+		}
+	case z.serviceName:
+		if is(dns.TypePTR) {
+			answer = append(answer, z.ptr)
+			extra = append([]dns.RR{z.srv, z.txt}, addrs...)
+		}
+	case z.instanceName:
+		if is(dns.TypeSRV) {
+			answer = append(answer, z.srv)
+			extra = addrs
+		}
+		if is(dns.TypeTXT) {
+			answer = append(answer, z.txt)
+		}
+	case z.hostName:
+		if is(dns.TypeA) {
+			answer = append(answer, z.a...)
+		}
+		if is(dns.TypeAAAA) {
+			answer = append(answer, z.aaaa...)
+		}
+	}
+	return answer, extra
+}
+
 // buildMDNSZone builds the DNS-SD records advertising info. The returned
 // key changes whenever any advertised value changes.
-func buildMDNSZone(info Info) (*mdns.MDNSService, string, error) {
+func buildMDNSZone(info Info) (*mdnsZone, string, error) {
 	if !validID(info.ID) {
 		return nil, "", errors.New("server ID unknown")
 	}
@@ -98,10 +209,6 @@ func buildMDNSZone(info Info) (*mdns.MDNSService, string, error) {
 	scheme, port, ok := portOf(mdnsBaseURL(info, addrs))
 	if !ok {
 		return nil, "", errors.New("no S3 endpoint URL to advertise")
-	}
-	ips := make([]net.IP, 0, len(addrs))
-	for _, a := range addrs {
-		ips = append(ips, net.IP(a.AsSlice()))
 	}
 	api := cleanField(info.APIVersion, 16)
 	if api == "" {
@@ -118,12 +225,12 @@ func buildMDNSZone(info Info) (*mdns.MDNSService, string, error) {
 	}
 	instance := mdnsInstanceName(info.Name, info.ID)
 	host := mdnsHostName(info.ID)
-	svc, err := mdns.NewMDNSService(instance, MDNSService, mdnsDomain, host, port, ips, txt)
+	z, err := newMDNSZone(instance, host, port, addrs, txt)
 	if err != nil {
 		return nil, "", err
 	}
-	key := fmt.Sprintf("%s|%s|%d|%v|%s", instance, host, port, addrs, strings.Join(txt, "|"))
-	return svc, key, nil
+	key := fmt.Sprintf("%s|%s|%d|%v|%s", instance, host, port, z.IPs, strings.Join(txt, "|"))
+	return z, key, nil
 }
 
 // mdnsBaseURL picks the endpoint whose scheme and port the mDNS records
@@ -148,27 +255,43 @@ func mdnsBaseURL(info Info, addrs []netip.Addr) string {
 	return info.Endpoints.All[0]
 }
 
-// mdnsAdvertiser keeps an mDNS responder in sync with the server's Info.
+// mdnsAdvertiser keeps the mDNS responder's zone in sync with the server's
+// Info. The responder's sockets are opened on the first refresh that has a
+// zone to advertise and stay open until shutdown; later changes only swap
+// the zone.
 type mdnsAdvertiser struct {
-	self    func() Info
-	logger  *slog.Logger
-	server  *mdns.Server
+	self   func() Info
+	logger *slog.Logger
+	// open opens the responder sockets (replaceable in tests).
+	open func(*slog.Logger) ([]*mdnsSocket, error)
+
+	resp    *mdnsResponder
+	socks   []*mdnsSocket
+	serving sync.WaitGroup
 	key     string
 	lastErr string
 }
 
-// refresh (re)starts the responder when the advertised data changed.
+// refresh updates the advertised zone, opening the sockets when needed.
 func (a *mdnsAdvertiser) refresh() {
-	svc, key, err := buildMDNSZone(a.self())
-	if err == nil && key == a.key && a.server != nil {
-		return
+	if a.resp == nil {
+		a.resp = newMDNSResponder(a.logger)
 	}
-	a.shutdown()
-	if err == nil {
-		a.server, err = mdns.NewServer(&mdns.Config{Zone: svc, Logger: quietLogger(a.logger)})
+	z, key, err := buildMDNSZone(a.self())
+	if err == nil && a.socks == nil {
+		open := a.open
+		if open == nil {
+			open = openMDNSResponderSockets
+		}
+		if a.socks, err = open(a.logger); err == nil {
+			for _, s := range a.socks {
+				a.serving.Go(func() { a.resp.serve(s) })
+			}
+		}
 	}
 	if err != nil {
-		a.server = nil
+		a.resp.setZone(nil)
+		a.key = ""
 		if msg := err.Error(); msg != a.lastErr {
 			a.logger.Warn("mDNS advertising unavailable", "err", err)
 			a.lastErr = msg
@@ -177,15 +300,24 @@ func (a *mdnsAdvertiser) refresh() {
 		}
 		return
 	}
-	a.key, a.lastErr = key, ""
-	a.logger.Debug("mDNS advertising", "service", MDNSService)
+	if key != a.key {
+		a.resp.setZone(z)
+		a.key = key
+		a.logger.Debug("mDNS advertising", "service", MDNSService, "instance", z.Instance, "port", z.Port)
+	}
+	a.lastErr = ""
 }
 
+// shutdown closes the responder sockets and waits for its goroutines.
 func (a *mdnsAdvertiser) shutdown() {
-	if a.server != nil {
-		_ = a.server.Shutdown()
-		a.server = nil
-		a.key = ""
+	for _, s := range a.socks {
+		_ = s.Close()
+	}
+	a.serving.Wait()
+	a.socks = nil
+	a.key = ""
+	if a.resp != nil {
+		a.resp.setZone(nil)
 	}
 }
 
@@ -235,119 +367,4 @@ func ipFamilies() (v4, v6 bool) {
 		}
 	}
 	return v4, v6
-}
-
-// mdnsQuery runs one DNS-SD browse for _gos3._tcp lasting timeout and, once
-// it has finished, feeds the results to out as candidates.
-func mdnsQuery(ctx context.Context, timeout time.Duration, logger *slog.Logger, selfID string, out sink) error {
-	v4, v6 := ipFamilies()
-	if !v4 && !v6 {
-		return errors.New("no multicast-capable interface")
-	}
-	entries := make(chan *mdns.ServiceEntry, mdnsEntriesBuffer)
-	// hashicorp/mdns keeps rewriting a ServiceEntry after delivering it (a
-	// later answer for the same service, e.g. the same reply received on a
-	// second interface, updates its fields in the query goroutine), so only
-	// collect the pointers while the query runs and read the entries once
-	// QueryContext has returned and nothing writes to them any more.
-	var got []*mdns.ServiceEntry
-	done := make(chan struct{})
-	go func() {
-		defer close(done)
-		seen := make(map[*mdns.ServiceEntry]bool)
-		for e := range entries {
-			if e != nil && !seen[e] && len(got) < mdnsMaxEntries {
-				seen[e] = true
-				got = append(got, e)
-			}
-		}
-	}()
-	err := mdns.QueryContext(ctx, &mdns.QueryParam{
-		Service:     MDNSService,
-		Domain:      "local",
-		Timeout:     timeout,
-		Entries:     entries,
-		DisableIPv4: !v4,
-		DisableIPv6: !v6,
-		Logger:      quietLogger(logger),
-	})
-	// QueryContext has returned, so nothing sends on or writes to entries
-	// any more.
-	close(entries)
-	<-done
-	for _, e := range got {
-		c, ok := mdnsCandidate(e, selfID)
-		if !ok {
-			continue
-		}
-		// Like beacons, mDNS answers are unauthenticated and link-local:
-		// only probe addresses on this host's links.
-		c.urls = slices.DeleteFunc(c.urls, func(u string) bool {
-			_, host, _, ok := urlHostPort(u)
-			ip, err := netip.ParseAddr(host)
-			return !ok || err != nil || !hostNets.onLink(ip)
-		})
-		if len(c.urls) > 0 {
-			out.candidate(c)
-		}
-	}
-	return err
-}
-
-// mdnsCandidate converts a DNS-SD result into a probe candidate.
-func mdnsCandidate(e *mdns.ServiceEntry, selfID string) (candidate, bool) {
-	if e == nil || e.Port <= 0 || e.Port > 65535 {
-		return candidate{}, false
-	}
-	fields := make(map[string]string)
-	for i, f := range e.InfoFields {
-		if i >= mdnsMaxTXTFields {
-			break
-		}
-		if k, v, ok := strings.Cut(f, "="); ok {
-			fields[strings.ToLower(k)] = v
-		}
-	}
-	id := fields["id"]
-	if id != "" && (!validID(id) || id == selfID) {
-		return candidate{}, false
-	}
-	scheme := "http"
-	if strings.EqualFold(fields["scheme"], "https") {
-		scheme = "https"
-	}
-	c := candidate{
-		id:      id,
-		name:    fields["name"],
-		version: fields["v"],
-		region:  fields["region"],
-		source:  SourceMDNS,
-	}
-	if c.name == "" {
-		inst, _, _ := strings.Cut(e.Name, ".")
-		c.name = inst
-	}
-	add := func(ip net.IP, zone string) {
-		if ip == nil || ip.IsUnspecified() || ip.IsMulticast() {
-			return
-		}
-		host := ip.String()
-		if zone != "" && ip.To4() == nil && ip.IsLinkLocalUnicast() {
-			host += "%" + zone
-		}
-		if u, err := NormalizeBaseURL(baseURL(scheme, host, e.Port)); err == nil {
-			c.urls = append(c.urls, u)
-		}
-	}
-	add(e.AddrV4, "") // IPv4 preferred
-	if e.AddrV6IPAddr != nil {
-		add(e.AddrV6IPAddr.IP, e.AddrV6IPAddr.Zone)
-	}
-	if len(c.urls) == 0 && e.Addr != nil {
-		add(e.Addr, "")
-	}
-	if len(c.urls) == 0 {
-		return candidate{}, false
-	}
-	return c, true
 }

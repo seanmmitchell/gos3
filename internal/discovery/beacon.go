@@ -308,7 +308,7 @@ func openBeacon(group *net.UDPAddr, o beaconOptions, multicastErr func(error)) (
 	if err := b.upc.SetTTL(1); err != nil {
 		b.logger.Debug("beacon: set unicast TTL", "err", err)
 	}
-	b.ifaces = multicastInterfaces()
+	b.ifaces = multicastInterfaces(false)
 	mc, joined, err := listenGroup(group, b.ifaces)
 	if err != nil {
 		if multicastErr != nil {
@@ -348,8 +348,8 @@ func listenGroup(group *net.UDPAddr, ifaces []net.Interface) (net.PacketConn, in
 }
 
 // multicastInterfaces returns the up, multicast-capable interfaces with an
-// IPv4 address.
-func multicastInterfaces() []net.Interface {
+// address of the family (IPv6 when v6, else IPv4).
+func multicastInterfaces(v6 bool) []net.Interface {
 	ifs, err := net.Interfaces()
 	if err != nil {
 		return nil
@@ -364,7 +364,7 @@ func multicastInterfaces() []net.Interface {
 			continue
 		}
 		for _, a := range addrs {
-			if ipn, ok := a.(*net.IPNet); ok && ipn.IP.To4() != nil {
+			if ipn, ok := a.(*net.IPNet); ok && (ipn.IP.To4() == nil) == v6 {
 				out = append(out, ifi)
 				break
 			}

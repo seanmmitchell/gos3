@@ -2,6 +2,7 @@ package discovery
 
 import (
 	"cmp"
+	"fmt"
 	"slices"
 	"strings"
 	"sync"
@@ -106,9 +107,41 @@ type candidate struct {
 // peerEntry is one row of the peer table.
 type peerEntry struct {
 	peer      Peer
+	info      Info      // last verified identity document
 	lastProbe time.Time // last /_gos3/info probe (success or failure)
 	probeURL  string    // last address that answered a probe
+
+	// Claims of this (verified) peer's ID by another address while its
+	// known addresses still answered (see Service.record).
+	conflicts    int
+	conflictAt   time.Time
+	conflictAddr string
 }
+
+// Identity conflicts (docs/discovery.md, "Peer identity").
+const (
+	// conflictHold is how long a recorded conflict stays in Peer.Error.
+	conflictHold = 10 * time.Minute
+	// conflictFresh: a verified peer that answered a probe at a known
+	// address this recently is not re-probed before a claim from another
+	// address is rejected.
+	conflictFresh = 10 * time.Second
+	// maxConflictReprobes bounds the known addresses re-probed per claim.
+	maxConflictReprobes = 4
+)
+
+// observeResult says what observeInfo did with a verified Info document.
+type observeResult int
+
+const (
+	// observeRejected: our own ID, an invalid ID, or the table is full.
+	observeRejected observeResult = iota
+	// observeStored: the peer was added or refreshed.
+	observeStored
+	// observeConflict: a verified peer with this ID is known at other
+	// addresses; nothing was changed.
+	observeConflict
+)
 
 // peerTable is the set of known peers keyed by server ID. It is safe for
 // concurrent use; all methods take the current time explicitly so that tests
@@ -204,25 +237,69 @@ func (t *peerTable) deleteLocked(id string) {
 }
 
 // observeInfo records a successful /_gos3/info probe of addr. src is added to
-// the peer's sources unless empty (re-probes). Returns the updated peer and
-// whether it is in the table.
-func (t *peerTable) observeInfo(info Info, addr string, src Source, now time.Time, selfID string) (Peer, bool) {
+// the peer's sources unless empty (re-probes).
+//
+// Server IDs are not authenticated, so a document for an already verified
+// peer fetched from an address the peer is not known at changes nothing:
+// the result is observeConflict and the caller decides (Service.record
+// re-probes the known addresses, then calls conflict or move). Exceptions,
+// stored as usual: addresses the verified record itself advertises
+// (Endpoints.S3 / Endpoints.All), configured seeds and DNS SRV targets.
+//
+// It returns the updated peer (observeStored), the unchanged verified peer
+// (observeConflict) or nothing (observeRejected).
+func (t *peerTable) observeInfo(info Info, addr string, src Source, now time.Time, selfID string) (Peer, observeResult) {
 	if !validID(info.ID) || info.ID == selfID {
-		return Peer{}, false
+		return Peer{}, observeRejected
 	}
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	e, ok := t.peers[info.ID]
+	if ok && e.peer.Verified && !slices.Contains(e.peer.Addresses, addr) && !t.vouchedLocked(e, addr, src) {
+		return clonePeer(e.peer), observeConflict
+	}
 	if !ok {
 		e = &peerEntry{peer: Peer{ID: info.ID, FirstSeen: now}}
 		if !t.insertLocked(info.ID, e) {
-			return Peer{}, false
+			return Peer{}, observeRejected
 		}
 	}
+	t.storeLocked(e, info, addr, src, now)
+	return clonePeer(e.peer), observeStored
+}
+
+// vouchedLocked reports whether a verified peer may be observed at the new
+// address addr without a conflict check: the peer's own verified document
+// advertises addr, or the operator configured it (a seed or DNS SRV).
+func (t *peerTable) vouchedLocked(e *peerEntry, addr string, src Source) bool {
+	switch src {
+	case SourceDNS:
+		return true
+	case SourceStatic:
+		if _, ok := t.seeds[addr]; ok {
+			return true
+		}
+	}
+	for _, u := range append([]string{e.peer.Endpoints.S3}, e.peer.Endpoints.All...) {
+		if n, err := NormalizeBaseURL(u); err == nil && n == addr {
+			return true
+		}
+	}
+	return false
+}
+
+// storeLocked writes a verified document fetched from addr into e. The
+// addresses of an entry that was not verified yet came from unauthenticated
+// sightings and are replaced by addr.
+func (t *peerTable) storeLocked(e *peerEntry, info Info, addr string, src Source, now time.Time) {
 	p := &e.peer
 	if !p.Verified {
 		t.unverified--
+		p.Addresses = nil
 	}
+	e.info = info
+	e.info.Endpoints = cloneEndpoints(info.Endpoints)
+	e.info.Features = slices.Clone(info.Features)
 	p.Name = info.Name
 	p.Version = info.Version
 	p.Region = info.Region
@@ -236,9 +313,99 @@ func (t *peerTable) observeInfo(info Info, addr string, src Source, now time.Tim
 	p.Healthy = true
 	p.Verified = true
 	p.Error = ""
+	if !e.conflictAt.IsZero() && now.Sub(e.conflictAt) < conflictHold {
+		p.Error = conflictText(e.conflictAddr, e.conflicts)
+	}
 	e.lastProbe = now
 	e.probeURL = addr
-	return clonePeer(*p), true
+}
+
+func conflictText(addr string, n int) string {
+	msg := "ID claimed by another address: " + addr + " served this server ID while the known addresses still answered"
+	if n > 1 {
+		msg += fmt.Sprintf(" (%d claims)", n)
+	}
+	return cleanField(msg, maxErrorLen)
+}
+
+// knownTargets returns the known addresses of verified peer id to re-probe
+// before a claim of its ID from another address is decided (last good
+// address first, at most maxConflictReprobes), or alive=true when the peer
+// answered at a known address within fresh, so no re-probe is needed.
+func (t *peerTable) knownTargets(id string, now time.Time, fresh time.Duration) (urls []string, alive bool) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	e, ok := t.peers[id]
+	if !ok || !e.peer.Verified {
+		return nil, false
+	}
+	if e.peer.Healthy && !e.lastProbe.IsZero() && now.Sub(e.lastProbe) < fresh && !now.Before(e.lastProbe) {
+		return nil, true
+	}
+	if e.probeURL != "" && slices.Contains(e.peer.Addresses, e.probeURL) {
+		urls = append(urls, e.probeURL)
+	}
+	for _, a := range slices.Backward(e.peer.Addresses) {
+		if len(urls) >= maxConflictReprobes {
+			break
+		}
+		if a != e.probeURL {
+			urls = append(urls, a)
+		}
+	}
+	return urls, false
+}
+
+// conflict records that addr served info, claiming verified peer info.ID,
+// while the peer still answered at a known address. The verified record is
+// kept. A document identical to the verified one (the same server reached
+// at another address) is not a conflict. It reports whether this is the
+// first conflict for the peer within conflictHold (worth a warning).
+func (t *peerTable) conflict(info Info, addr string, now time.Time) bool {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	e, ok := t.peers[info.ID]
+	if !ok || !e.peer.Verified || sameInfo(e.info, info) {
+		return false
+	}
+	first := e.conflictAt.IsZero() || now.Sub(e.conflictAt) >= conflictHold
+	e.conflicts++
+	e.conflictAt = now
+	e.conflictAddr = addr
+	e.peer.Error = conflictText(addr, e.conflicts)
+	return first
+}
+
+// move stores info fetched from addr as peer info.ID after its known
+// addresses stopped answering with that ID: the old addresses are dropped
+// and addr becomes the peer's only address.
+func (t *peerTable) move(info Info, addr string, src Source, now time.Time, selfID string) (Peer, bool) {
+	if !validID(info.ID) || info.ID == selfID {
+		return Peer{}, false
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	e, ok := t.peers[info.ID]
+	if !ok {
+		e = &peerEntry{peer: Peer{ID: info.ID, FirstSeen: now}}
+		if !t.insertLocked(info.ID, e) {
+			return Peer{}, false
+		}
+	}
+	e.peer.Addresses = nil
+	e.conflicts, e.conflictAt, e.conflictAddr = 0, time.Time{}, ""
+	t.storeLocked(e, info, addr, src, now)
+	return clonePeer(e.peer), true
+}
+
+// sameInfo reports whether two verified documents describe the server
+// identically.
+func sameInfo(a, b Info) bool {
+	return a.ID == b.ID && a.Name == b.Name && a.Version == b.Version &&
+		a.APIVersion == b.APIVersion && a.Region == b.Region && a.StartedAt.Equal(b.StartedAt) &&
+		a.Endpoints.S3 == b.Endpoints.S3 && a.Endpoints.Admin == b.Endpoints.Admin &&
+		a.Endpoints.UI == b.Endpoints.UI && slices.Equal(a.Endpoints.All, b.Endpoints.All) &&
+		slices.Equal(a.Features, b.Features)
 }
 
 // hint records an unverified sighting (c.id must be set). It creates an unverified entry for

@@ -4,14 +4,13 @@ import (
 	"context"
 	"errors"
 	"net"
+	"net/netip"
 	"slices"
 	"strconv"
 	"strings"
 	"sync"
 	"testing"
 	"time"
-
-	"github.com/hashicorp/mdns"
 )
 
 // mechSnapshot returns the running mechanisms by name.
@@ -481,35 +480,41 @@ func TestBuildMDNSZone(t *testing.T) {
 }
 
 func TestMDNSCandidate(t *testing.T) {
-	e := &mdns.ServiceEntry{
-		Name:         "nas-b3f1c2._gos3._tcp.local.",
-		AddrV4:       net.IPv4(10, 0, 0, 5),
-		AddrV6IPAddr: &net.IPAddr{IP: net.ParseIP("fe80::1"), Zone: "eth0"},
-		Port:         9000,
-		InfoFields:   []string{"id=b3f1c2d4e5f60718", "name=nas", "v=0.1.0", "region=eu", "scheme=http", "junk"},
+	e := &mdnsEntry{
+		name:   "nas-b3f1c2._gos3._tcp.local.",
+		port:   9000,
+		txt:    []string{"id=b3f1c2d4e5f60718", "name=nas", "v=0.1.0", "region=eu", "scheme=http", "junk"},
+		hasSRV: true,
+		hasTXT: true,
+		zone:   "eth0",
 	}
-	c, ok := mdnsCandidate(e, "self")
+	addrs := []netip.Addr{netip.MustParseAddr("fe80::1"), netip.MustParseAddr("10.0.0.5"), netip.MustParseAddr("10.0.0.6")}
+	c, ok := e.candidate(addrs, "self")
 	if !ok || c.id != "b3f1c2d4e5f60718" || c.name != "nas" || c.version != "0.1.0" || c.region != "eu" || c.source != SourceMDNS {
 		t.Fatalf("candidate = %+v %v", c, ok)
 	}
 	if !slices.Equal(c.urls, []string{"http://10.0.0.5:9000", "http://[fe80::1%25eth0]:9000"}) {
 		t.Errorf("urls = %v", c.urls)
 	}
-	e.InfoFields = []string{"scheme=https"}
-	e.AddrV6IPAddr = nil
-	c, ok = mdnsCandidate(e, "self")
+	e.txt = []string{"scheme=https"}
+	c, ok = e.candidate(addrs[1:2], "self")
 	if !ok || c.id != "" || c.name != "nas-b3f1c2" || !slices.Equal(c.urls, []string{"https://10.0.0.5:9000"}) {
 		t.Errorf("no-id candidate = %+v", c)
 	}
-	for _, bad := range []*mdns.ServiceEntry{
-		nil,
-		{AddrV4: net.IPv4(1, 2, 3, 4), Port: 0},
-		{AddrV4: net.IPv4(1, 2, 3, 4), Port: 9000, InfoFields: []string{"id=self"}},
-		{AddrV4: net.IPv4(1, 2, 3, 4), Port: 9000, InfoFields: []string{"id=bad id"}},
-		{Port: 9000},
-		{AddrV4: net.IPv4zero, Port: 9000},
+	ip := []netip.Addr{netip.MustParseAddr("1.2.3.4")}
+	for _, bad := range []struct {
+		e     mdnsEntry
+		addrs []netip.Addr
+	}{
+		{mdnsEntry{port: 0, hasSRV: true, hasTXT: true}, ip},
+		{mdnsEntry{port: 9000, hasSRV: true, hasTXT: true, txt: []string{"id=self"}}, ip},
+		{mdnsEntry{port: 9000, hasSRV: true, hasTXT: true, txt: []string{"id=bad id"}}, ip},
+		{mdnsEntry{port: 9000, hasSRV: true, hasTXT: true}, nil},
+		{mdnsEntry{port: 9000, hasSRV: true, hasTXT: true}, []netip.Addr{netip.IPv4Unspecified()}},
+		{mdnsEntry{port: 9000, hasTXT: true}, ip}, // no SRV
+		{mdnsEntry{port: 9000, hasSRV: true}, ip}, // no TXT
 	} {
-		if c, ok := mdnsCandidate(bad, "self"); ok {
+		if c, ok := bad.e.candidate(bad.addrs, "self"); ok {
 			t.Errorf("accepted %+v → %+v", bad, c)
 		}
 	}
@@ -530,7 +535,7 @@ func TestMDNSAdvertiseAndBrowse(t *testing.T) {
 	info.Endpoints.S3 = baseURL("http", ips[0].String(), 9555)
 	adv := &mdnsAdvertiser{self: func() Info { return info }, logger: testLogger(t)}
 	adv.refresh()
-	if adv.server == nil {
+	if len(adv.socks) == 0 {
 		t.Skip("mDNS responder unavailable")
 	}
 	ctx, cancel := context.WithCancel(context.Background())
