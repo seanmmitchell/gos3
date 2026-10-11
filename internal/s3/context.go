@@ -62,6 +62,9 @@ type reqContext struct {
 
 	// in counts request body bytes read from the wire.
 	in *countingBody
+	// preAuthLimit is set while the absolute pre-authorization deadline
+	// of Server.limitPreAuthBody applies to in.
+	preAuthLimit bool
 
 	// bucketInfo caches the result of Server.bucketInfo.
 	bucketInfo   storage.BucketInfo
@@ -108,6 +111,29 @@ func (rc *reqContext) userName() string {
 
 // addLog adds attributes to the request's access log line.
 func (rc *reqContext) addLog(attrs ...slog.Attr) { rc.logAttrs = append(rc.logAttrs, attrs...) }
+
+// limitPreAuthBody gives the body of a request whose handler reads it
+// before authorizing (AuthzByHandler: the authorization depends on the
+// body) an absolute deadline, preAuthBodyTimeout from now: the idle
+// deadline alone would let a caller that is never authorized hold the
+// request by trickling a byte now and then. The handler lifts it with
+// clearPreAuthLimit once the caller is authorized (authorizeOpWith) or
+// the body has been read. PostObject (NoAuth) sets its own limit.
+func (s *Server) limitPreAuthBody(rc *reqContext) {
+	if rc.in == nil || s.preAuthBodyTimeout <= 0 {
+		return
+	}
+	rc.in.setLimit(time.Now().Add(s.preAuthBodyTimeout))
+	rc.preAuthLimit = true
+}
+
+// clearPreAuthLimit removes the deadline set by limitPreAuthBody.
+func (rc *reqContext) clearPreAuthLimit() {
+	if rc.preAuthLimit {
+		rc.preAuthLimit = false
+		rc.in.setLimit(time.Time{})
+	}
+}
 
 // bucketInfo returns the addressed bucket's info, cached for the request.
 // A missing bucket yields NoSuchBucket (with BucketName).

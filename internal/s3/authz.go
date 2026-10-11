@@ -90,7 +90,13 @@ func (s *Server) authorizeOpWith(ctx context.Context, r *http.Request, rc *reqCo
 	case resObject:
 		t.Bucket, t.Key = rc.bucket, rc.key
 	}
-	return s.authorizeTarget(ctx, r, rc, t)
+	if err := s.authorizeTarget(ctx, r, rc, t); err != nil {
+		return err
+	}
+	// An AuthzByHandler handler has authorized the caller: the rest of its
+	// body (if any) is no longer read before authorization.
+	rc.clearPreAuthLimit()
+	return nil
 }
 
 // authorize is the handler helper for secondary resources: it authorizes

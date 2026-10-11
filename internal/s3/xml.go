@@ -18,8 +18,10 @@ import (
 
 // --- Request bodies ---
 
-// maxXMLBodySize bounds XML request bodies that are buffered in memory
-// (configuration documents, DeleteObjects, CompleteMultipartUpload ...).
+// maxXMLBodySize is the default bound of XML request bodies that are
+// buffered in memory (decodeXMLBody). The documents that list many entries
+// (DeleteObjects, CompleteMultipartUpload) are streamed instead; see
+// xml_stream.go.
 const maxXMLBodySize = 2 << 20
 
 // readBody reads a whole request body of at most max bytes. A larger body

@@ -168,7 +168,25 @@ These limits are fixed (not configurable):
   (S3 API); otherwise, and always for `/_gos3/*` endpoints, the response
   carries `Connection: close` and the connection is closed. A client that
   announces a body and never sends it cannot hold a connection open.
-- PostObject form fields before the file must arrive within 60 s.
+- Bodies read before the caller is authorized must arrive completely within
+  60 s, however steadily they trickle in: PostObject form fields before the
+  file, and the bodies of DeleteObjects (at most about 6.2 MiB; the keys to
+  authorize are in it), PutObjectTagging, PutObjectRetention and
+  PutObjectLegalHold (at most 64 KiB; their condition keys come from the
+  body). Every other S3 request is authorized before its body is read.
+
+### Request size limits
+
+XML request bodies are bounded by the largest valid request: about 6.2 MiB
+for DeleteObjects (1000 keys), about 2.4 MiB for CompleteMultipartUpload
+(10000 parts), at most 2 MiB for bucket configuration documents and 64 KiB
+for object subresources; a larger body is rejected with `MaxMessageLengthExceeded`
+after reading at most one byte more. DeleteObjects and
+CompleteMultipartUpload documents are parsed as they arrive: the 1001st
+`<Object>` or the 10001st `<Part>` ends the request at once, and nesting
+depth, element count and the size of a single tag are bounded, so the work
+and memory a request causes stay proportional to a valid one, also for an
+anonymous DeleteObjects that is rejected per key afterwards.
 - Slow CopyObject, UploadPartCopy and CompleteMultipartUpload calls keep the
   connection alive with whitespace (see
   [s3-compatibility.md](s3-compatibility.md#other-differences-from-aws)).
