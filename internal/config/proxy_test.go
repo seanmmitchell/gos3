@@ -9,7 +9,7 @@ import (
 )
 
 // TestTrustedProxiesLoad checks server.trusted_proxies from the YAML file,
-// the GOS3_SERVER_TRUSTED_PROXIES variable (which wins) and a flag override,
+// the GOS3_TRUSTED_PROXIES variable (which wins) and a flag override,
 // with entries trimmed.
 func TestTrustedProxiesLoad(t *testing.T) {
 	file := writeFile(t, "c.yaml", "server:\n  trust_proxy_headers: true\n  trusted_proxies: [\" 10.0.0.0/8 \", \"192.0.2.10\", \"\"]\n")
@@ -24,7 +24,7 @@ func TestTrustedProxiesLoad(t *testing.T) {
 		t.Fatalf("Validate: %v", err)
 	}
 
-	c, err = load(file, env(map[string]string{"GOS3_SERVER_TRUSTED_PROXIES": " 172.16.0.0/12 , 2001:db8::/32,, "}), nil)
+	c, err = load(file, env(map[string]string{"GOS3_TRUSTED_PROXIES": " 172.16.0.0/12 , 2001:db8::/32,, "}), nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -32,7 +32,7 @@ func TestTrustedProxiesLoad(t *testing.T) {
 		t.Errorf("env: %q, want %q", c.Server.TrustedProxies, want)
 	}
 
-	c, err = load(file, env(map[string]string{"GOS3_SERVER_TRUSTED_PROXIES": ""}), nil)
+	c, err = load(file, env(map[string]string{"GOS3_TRUSTED_PROXIES": ""}), nil)
 	if err != nil || len(c.Server.TrustedProxies) != 0 {
 		t.Errorf("empty env clears the list: %q %v", c.Server.TrustedProxies, err)
 	}
@@ -67,7 +67,7 @@ func TestTrustedProxiesValidate(t *testing.T) {
 	}
 	// Invalid values are rejected at load time too (serve and config print
 	// call Validate after Load).
-	c, err := load("", env(map[string]string{"GOS3_SERVER_TRUSTED_PROXIES": "10.0.0.0/8,nope"}), nil)
+	c, err := load("", env(map[string]string{"GOS3_TRUSTED_PROXIES": "10.0.0.0/8,nope"}), nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -100,7 +100,7 @@ func TestTrustedProxiesPrinted(t *testing.T) {
 	if err := WriteEnvTable(&buf); err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(buf.String(), "GOS3_SERVER_TRUSTED_PROXIES") || !strings.Contains(buf.String(), "server.trusted_proxies") {
+	if !strings.Contains(buf.String(), "GOS3_TRUSTED_PROXIES") || !strings.Contains(buf.String(), "server.trusted_proxies") {
 		t.Errorf("env table lacks the variable:\n%s", buf.String())
 	}
 }
