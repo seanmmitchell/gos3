@@ -1,12 +1,16 @@
 # pnpm settings for the web UI (a single package, not a workspace).
 
 # Supply-chain cooldown: only resolve package versions that were published at
-# least 7 days ago (value in minutes). Malicious or broken releases are
-# usually caught and pulled within days, and dependency scanners (Socket)
-# flag versions younger than a week. Raise a dependency past the cooldown
-# only for a security fix, via minimumReleaseAgeExclude below.
-minimumReleaseAge: 10080
-minimumReleaseAgeExclude: []
+# least 14 days ago (value in minutes). Malicious or broken releases are
+# usually caught and pulled within days, and the dependency scanner on this
+# repository (Socket) flags versions younger than about two weeks. Raise a
+# dependency past the cooldown only for a security fix, via
+# minimumReleaseAgeExclude below.
+minimumReleaseAge: 20160
+minimumReleaseAgeExclude:
+  # Security fixes younger than the cooldown, pinned below in overrides.
+  - shell-quote
+  - source-map-js
 
 # Patched versions of vulnerable transitive dependencies.
 overrides:
@@ -16,6 +20,11 @@ overrides:
   '@simple-git/argv-parser': ^2.0.1
   # esbuild dev-server file read, via @nuxt/fonts.
   fontless>esbuild: ^0.28.1
+  # GHSA-pqg4-j6r4-53mv (critical): quote() command injection, via Nuxt
+  # devtools' launch-editor. Oldest fixed release.
+  shell-quote: 1.11.0
+  # GHSA-68fv-2mgg-jv7q: event-loop DoS, via postcss. Oldest fixed release.
+  source-map-js: 1.2.2
 
 # Only these packages may run install scripts.
 onlyBuiltDependencies:

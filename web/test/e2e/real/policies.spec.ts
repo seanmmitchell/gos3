@@ -5,6 +5,16 @@ import { confirmDialog, expect, test, THIS_SERVER, uniqueName } from './fixtures
 
 test.describe.configure({ mode: 'serial' })
 
+// Picks an option in an open select menu and waits for the menu to close.
+// Re-selecting the current value leaves the menu open in some Nuxt UI
+// releases, and its focus trap would then swallow the next typed input.
+async function pickOption(page: Page, name: string): Promise<void> {
+  await page.getByRole('option', { name, exact: true }).first().click()
+  const listbox = page.getByRole('listbox')
+  if (await listbox.isVisible()) await page.keyboard.press('Escape')
+  await expect(listbox).toBeHidden()
+}
+
 test.describe('policies', () => {
   const policy = uniqueName('e2e-photos-ro')
   const user = uniqueName('simuser').replace(/-/g, '_').slice(0, 40)
@@ -80,10 +90,10 @@ test.describe('policies', () => {
     await page.goto(ui(`servers/${THIS_SERVER}/policies/${policy}`))
     const sim = page.getByRole('main').locator('form').filter({ has: page.getByRole('button', { name: 'Simulate' }) })
     await sim.getByRole('button', { name: 'User' }).click()
-    await page.getByRole('option', { name: user, exact: true }).click()
+    await pickOption(page, user)
     await sim.getByRole('button', { name: 'Action' }).click()
     await page.getByPlaceholder('Search or type an action…').fill('s3:GetObject')
-    await page.getByRole('option', { name: 's3:GetObject', exact: true }).first().click()
+    await pickOption(page, 's3:GetObject')
     await sim.getByRole('textbox', { name: 'Bucket' }).fill(bucket)
     await sim.getByRole('textbox', { name: 'Object key' }).fill('cat.jpg')
     await sim.getByRole('button', { name: 'Simulate' }).click()
@@ -99,7 +109,7 @@ test.describe('policies', () => {
 
     await sim.getByRole('button', { name: 'Action' }).click()
     await page.getByPlaceholder('Search or type an action…').fill('s3:PutObject')
-    await page.getByRole('option', { name: 's3:PutObject', exact: true }).first().click()
+    await pickOption(page, 's3:PutObject')
     await sim.getByRole('button', { name: 'Simulate' }).click()
     await expect(page.getByText('Denied (no matching allow)')).toBeVisible()
   })

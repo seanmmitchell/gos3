@@ -1,7 +1,7 @@
 # Weekly update pull requests for GitHub Actions, container base images, Go
 # modules and the web UI's npm packages.
 #
-# Every ecosystem waits 7 days after a release before proposing it (the same
+# Every ecosystem waits 14 days after a release before proposing it (the same
 # supply-chain cooldown web/pnpm-workspace.yaml enforces with
 # minimumReleaseAge), so freshly published, possibly malicious or broken
 # versions are never picked up automatically. Security updates are not
@@ -13,19 +13,19 @@ updates:
     schedule:
       interval: weekly
     cooldown:
-      default-days: 7
+      default-days: 14
   - package-ecosystem: docker
     directories: ["/", "/deploy/docker"]
     schedule:
       interval: weekly
     cooldown:
-      default-days: 7
+      default-days: 14
   - package-ecosystem: gomod
     directory: /
     schedule:
       interval: weekly
     cooldown:
-      default-days: 7
+      default-days: 14
     groups:
       go-test-clients:
         patterns: ["github.com/aws/*", "github.com/minio/*"]
@@ -39,7 +39,7 @@ updates:
     schedule:
       interval: weekly
     cooldown:
-      default-days: 7
+      default-days: 14
     groups:
       nuxt:
         patterns: ["nuxt", "@nuxt/*", "vue", "vue-router", "vite", "vitest"]

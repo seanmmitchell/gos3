@@ -316,13 +316,15 @@ them). Everything else in `go.mod` is used by tests only.
 Supply-chain rules:
 
 - **Release cooldown.** New versions are adopted only once they are at least
-  7 days old, which gives the ecosystem time to catch malicious or broken
+  14 days old, which gives the ecosystem time to catch malicious or broken
   releases. The web UI enforces this with pnpm's `minimumReleaseAge` in
-  `web/pnpm-workspace.yaml` (an exception needs an entry in
-  `minimumReleaseAgeExclude`, reserved for security fixes), and Dependabot
-  applies the same cooldown to update pull requests for npm, Go modules,
-  GitHub Actions and container images. Go test dependencies are pinned to
-  releases that were at least two weeks old when chosen.
+  `web/pnpm-workspace.yaml`, and Dependabot applies the same cooldown to
+  update pull requests for npm, Go modules, GitHub Actions and container
+  images. Go dependencies are pinned to releases that were at least 14 days
+  old when chosen. The only exceptions are security fixes younger than the
+  cooldown: they are listed in `minimumReleaseAgeExclude` and pinned to the
+  oldest fixed release in `overrides` (currently `shell-quote` 1.11.0 and
+  `source-map-js` 1.2.2).
 - **Small module graph.** `github.com/minio/minio-go/v7` (a test-only client)
   stays on v7.1.x: v7.2 and later declare their linter toolchain as module
   requirements, which would add about 200 modules to gos3's module graph.
