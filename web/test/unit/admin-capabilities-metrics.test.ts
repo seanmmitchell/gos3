@@ -2,8 +2,10 @@ import { describe, expect, it } from 'vitest'
 import type { Capabilities, MinuteBucket, OpStats } from '~/types/admin'
 import {
   BUCKET_TABS,
+  canCreateOwnKeys,
   canForceDeleteBucket,
   canManageOwnKeys,
+  canProbe,
   canShowBucketUsage,
   canSimulate,
   hasCapability,
@@ -78,6 +80,32 @@ describe('capability gating', () => {
     expect(canForceDeleteBucket('gos3', caps({ admin: true }))).toBe(false)
     expect(canShowBucketUsage('gos3', caps({ admin: true }))).toBe(true)
     expect(canShowBucketUsage('gos3', NO_CAPS)).toBe(false)
+  })
+
+  it('gates probing on admin:ProbeNetwork (probe), falling back to discovery for older servers', () => {
+    expect(canProbe('gos3', caps({ discovery: true, probe: true }))).toBe(true)
+    // diagnostics: reads discovery, may not probe
+    expect(canProbe('gos3', caps({ discovery: true, probe: false }))).toBe(false)
+    expect(canProbe('gos3', caps({ probe: true }))).toBe(true)
+    expect(canProbe('s3', caps({ probe: true }))).toBe(false)
+    expect(canProbe('gos3', null)).toBe(false)
+    // server without the field: it still gated probes on admin:GetDiscovery
+    const { probe: _p, ...old } = caps({ discovery: true })
+    expect(canProbe('gos3', old)).toBe(true)
+    const { probe: _q, ...oldNoDiscovery } = caps()
+    expect(canProbe('gos3', oldNoDiscovery)).toBe(false)
+  })
+
+  it('gates self-service key creation on admin:CreateOwnAccessKey (createOwnKeys)', () => {
+    expect(canCreateOwnKeys('gos3', false, caps({ createOwnKeys: true }))).toBe(true)
+    expect(canCreateOwnKeys('gos3', false, caps({ createOwnKeys: false }))).toBe(false)
+    expect(canCreateOwnKeys('gos3', true, caps({ createOwnKeys: true }))).toBe(false) // root has no IAM keys
+    expect(canCreateOwnKeys('s3', false, caps({ createOwnKeys: true }))).toBe(false)
+    expect(canCreateOwnKeys('gos3', false, null)).toBe(false)
+    // server without the field allowed it unless explicitly denied
+    const { createOwnKeys: _c, ...old } = caps()
+    expect(canCreateOwnKeys('gos3', false, old)).toBe(true)
+    expect(NO_CAPS).toMatchObject({ probe: false, createOwnKeys: false })
   })
 
   it('resolves bucket settings tabs from the query', () => {

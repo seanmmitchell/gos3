@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import type { NamedPolicy } from '~/types/admin'
 import { AdminError } from '~/utils/admin/client'
-import { emptyIdentityPolicy, formatPolicy, parsePolicyText, validatePolicyDocument, validatePolicyName } from './-policies'
+import { ADMIN_RESOURCE_FORMS, emptyIdentityPolicy, formatPolicy, parsePolicyText, validatePolicyDocument, validatePolicyName } from './-policies'
 
 /**
  * Create / edit / view an IAM identity policy (PUT /policies/{name}).
@@ -67,6 +67,7 @@ const nameError = computed(() => {
 })
 const descriptionError = computed(() => (description.value.length > 1024 ? 'At most 1024 characters' : undefined))
 const validateDoc = (v: unknown) => validatePolicyDocument(v, 'identity')
+const showAdminHelp = ref(false)
 
 async function applyTemplate(rendered: string) {
   if (text.value.trim() && text.value !== original.value.text && text.value !== emptyIdentityPolicy()) {
@@ -135,6 +136,29 @@ async function reset() {
     <AdminPolicyTemplatePicker v-if="!readonly" @apply="applyTemplate" />
     <div class="space-y-2">
       <CommonJsonEditor v-model="text" label="Policy document" :rows="18" :readonly="readonly" :validate="validateDoc" />
+      <UCollapsible v-model:open="showAdminHelp">
+        <UButton
+          color="neutral"
+          variant="link"
+          size="xs"
+          :icon="showAdminHelp ? 'i-lucide-chevron-down' : 'i-lucide-chevron-right'"
+          label="Admin resources and condition keys"
+          class="px-0"
+        />
+        <template #content>
+          <div class="space-y-2 pt-1 text-xs text-muted" data-testid="admin-resource-help">
+            <p>Admin actions (admin:…) are evaluated against these resources; "*" and arn:gos3:admin:::* match all of them. Wildcards are allowed in names.</p>
+            <ul class="space-y-1">
+              <li v-for="f in ADMIN_RESOURCE_FORMS" :key="f.arn">
+                <code class="font-mono text-highlighted">{{ f.arn }}</code> — {{ f.description }}
+              </li>
+            </ul>
+            <p>
+              Condition key <code class="font-mono text-highlighted">admin:PolicyName</code> (multi-valued) lists the policies a CreateUser / UpdateUser request attaches, e.g. <code class="font-mono">"ForAllValues:StringEquals": {"admin:PolicyName": ["readonly"]}</code>.
+            </p>
+          </div>
+        </template>
+      </UCollapsible>
       <UAlert
         v-if="policyServerError"
         color="error"

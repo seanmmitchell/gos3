@@ -23,7 +23,7 @@ export function useWhoAmI(id?: MaybeRefOrGetter<string | null | undefined>) {
   const isRoot = computed(() => whoami.value?.isRoot ?? false)
 
   function can(cap: CapabilityName): boolean {
-    return capabilities.value[cap]
+    return !!capabilities.value[cap]
   }
 
   async function refresh(force = true) {

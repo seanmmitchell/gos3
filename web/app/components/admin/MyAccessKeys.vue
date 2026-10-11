@@ -1,15 +1,19 @@
 <script setup lang="ts">
 import type { AccessKey } from '~/types/admin'
+import { canCreateOwnKeys } from '~/components/admin/-capabilities'
 import CreateKeyModal from './CreateKeyModal.vue'
 import NewAccessKeyModal from './NewAccessKeyModal.vue'
 
 /**
  * Self-service access keys of the signed-in IAM user (/whoami/keys): list,
  * create (secret shown once) and delete. The key signing this session
- * cannot be deleted.
+ * cannot be deleted. Creating needs an explicit Allow of
+ * admin:CreateOwnAccessKey (whoami capability `createOwnKeys`); listing and
+ * deleting do not.
  */
 const { connection, requireAdmin } = useConnection()
-const { whoami, refresh: refreshWhoAmI } = useWhoAmI()
+const { whoami, capabilities, isRoot, refresh: refreshWhoAmI } = useWhoAmI()
+const canCreate = computed(() => canCreateOwnKeys(connection.value?.kind, isRoot.value, whoami.value ? capabilities.value : null))
 const overlay = useOverlay()
 const confirm = useConfirm()
 
@@ -75,9 +79,13 @@ async function onDelete(key: AccessKey) {
             Keys of <span class="font-medium">{{ whoami?.user || 'this identity' }}</span>. The key signing this session cannot be deleted here.
           </p>
         </div>
-        <UButton icon="i-lucide-plus" label="Create key" :loading="create.loading.value" @click="onCreate" />
+        <UButton v-if="canCreate" icon="i-lucide-plus" label="Create key" :loading="create.loading.value" @click="onCreate" />
       </div>
     </template>
+    <p v-if="whoami && !canCreate" class="mb-4 flex items-start gap-2 text-sm text-muted" data-testid="create-own-key-denied">
+      <UIcon name="i-lucide-lock" class="mt-0.5 size-4 shrink-0" aria-hidden="true" />
+      <span>Creating keys for yourself needs a policy that allows <code class="font-mono text-xs">admin:CreateOwnAccessKey</code>; ask an administrator. You can still list and delete your keys.</span>
+    </p>
     <CommonErrorAlert v-if="error" :error="error" retryable class="mb-4" @retry="refresh" />
     <AdminAccessKeysTable
       v-else
