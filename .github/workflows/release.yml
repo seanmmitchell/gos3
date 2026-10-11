@@ -118,7 +118,7 @@ jobs:
           go build -trimpath \
             -ldflags "-s -w -X $pkg.Version=$TAG -X $pkg.Commit=$commit -X $pkg.Date=$date" \
             -o "build/$name/gos3$ext" ./cmd/gos3
-          cp LICENSE README.md "build/$name/"
+          cp LICENSE THIRD_PARTY_NOTICES README.md "build/$name/"
           if [ "$GOOS" = windows ]; then
             (cd build && zip -qr "../dist/$name.zip" "$name")
           else

@@ -1,5 +1,6 @@
-# Only cmd/, internal/, go.mod/go.sum and web/ (sources) are needed to build
-# the image. Keep the context small and free of local state and secrets.
+# Only cmd/, internal/, go.mod/go.sum, web/ (sources), LICENSE and
+# THIRD_PARTY_NOTICES are needed to build the images. Keep the context small
+# and free of local state and secrets.
 .git
 .github
 .editorconfig
@@ -38,6 +39,7 @@ web/.nuxt/
 web/.output/
 web/.data/
 web/.e2e-cache/
+web/.notices/
 web/dist
 web/test-results/
 web/playwright-report/
