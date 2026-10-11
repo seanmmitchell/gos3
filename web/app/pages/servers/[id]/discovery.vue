@@ -9,6 +9,7 @@ import type { ConnectionInput } from '~/types/connection'
 import type { Peer, ScanRequest, ScanResult } from '~/types/admin'
 import { prefillFromPeer } from '~/components/servers/-form'
 import { suggestCidr } from '~/components/discovery/-scan-form'
+import { canProbe } from '~/components/admin/-capabilities'
 import { AdminError } from '~/utils/admin/client'
 
 useHead({ title: 'Discovery' })
@@ -19,7 +20,7 @@ const route = useRoute()
 const toast = useToast()
 const id = computed(() => routeParam(route.params.id))
 const { connection, isGos3, requireAdmin } = useConnection()
-const { can, whoami } = useWhoAmI()
+const { can, whoami, capabilities } = useWhoAmI()
 
 const discovery = useLoader(() => requireAdmin().discovery(), { immediate: false })
 const state = computed(() => discovery.data.value)
@@ -51,8 +52,19 @@ onBeforeUnmount(stopTimer)
 
 // -- probe & scan ------------------------------------------------------------------
 
+/** POST /discovery/probe needs admin:ProbeNetwork (not admin:GetDiscovery). */
+const probeCapable = computed(() => canProbe(connection.value?.kind, capabilities.value))
+
 async function probe(url: string): Promise<Peer> {
-  const p = await requireAdmin().probe(url)
+  let p: Peer
+  try {
+    p = await requireAdmin().probe(url)
+  } catch (e) {
+    if (e instanceof AdminError && e.isAccessDenied) {
+      throw new AdminError(e.code, `Not allowed: probing a URL needs admin:ProbeNetwork. ${e.message}`.trim(), e.status, e)
+    }
+    throw e
+  }
   void refresh() // the probed peer joins the table
   return p
 }
@@ -208,7 +220,15 @@ function addPeer(p: Peer) {
                   {{ connection?.name }} fetches /_gos3/info from the URL and adds the server to its peer table.
                 </p>
               </template>
-              <DiscoveryProbeForm :probe="probe" id-prefix="server-probe" @add="addPeer" />
+              <UAlert
+                v-if="!probeCapable"
+                color="neutral"
+                variant="subtle"
+                icon="i-lucide-lock"
+                title="Not allowed"
+                description="Your identity lacks admin:ProbeNetwork. Reading the peer table (admin:GetDiscovery) does not include probing URLs; an administrator can grant it with a custom policy or the admin policy."
+              />
+              <DiscoveryProbeForm v-else :probe="probe" id-prefix="server-probe" @add="addPeer" />
             </UCard>
 
             <UCard class="xl:col-span-3" :ui="{ body: 'space-y-4' }">
