@@ -1,6 +1,7 @@
 // HTTP verification of candidates (GET <base>/_gos3/info) and a small
 // bounded-concurrency worker pool, used by local discovery, probe and scan.
 import type { Info } from '~/types/admin'
+import { BLOCKED_ADDRESS_CODE, BlockedAddressError, guardedFetch } from './netguard'
 import { isInfo } from './peers'
 
 export const INFO_PATH = '/_gos3/info'
@@ -9,18 +10,34 @@ const MAX_INFO_BYTES = 64 * 1024
 
 export type FetchFn = (input: string, init?: RequestInit) => Promise<Response>
 
+/**
+ * Coarse failure categories. Probe errors are returned to unauthenticated
+ * clients of the UI server, so they never carry low-level details (socket
+ * error codes, resolver messages, timings): only these categories.
+ */
+export type ProbeErrorKind = 'unreachable' | 'timeout' | 'http' | 'auth' | 'not-gos3' | 'blocked' | 'aborted'
+
+const KIND_MESSAGE: Record<Exclude<ProbeErrorKind, 'http'>, string> = {
+  'unreachable': 'unreachable',
+  'timeout': 'timed out',
+  'auth': 'authentication required',
+  'not-gos3': 'not a gos3 server',
+  'blocked': 'address not allowed',
+  'aborted': 'aborted'
+}
+
 export class ProbeError extends Error {
-  constructor(message: string) {
-    super(message)
+  constructor(readonly kind: ProbeErrorKind, readonly status?: number) {
+    super(kind === 'http' ? `HTTP ${status ?? 0}` : KIND_MESSAGE[kind])
     this.name = 'ProbeError'
   }
 }
 
-function causeMessage(e: unknown): string {
-  const cause = (e as { cause?: { code?: string, message?: string } })?.cause
-  if (cause?.code) return cause.code
-  if (cause?.message) return cause.message
-  return e instanceof Error ? e.message : String(e)
+function isBlocked(e: unknown): boolean {
+  for (let cur: unknown = e, i = 0; cur && i < 4; cur = (cur as { cause?: unknown }).cause, i++) {
+    if (cur instanceof BlockedAddressError || (cur as { code?: unknown }).code === BLOCKED_ADDRESS_CODE) return true
+  }
+  return false
 }
 
 /**
@@ -38,7 +55,7 @@ export async function readLimited(res: Response, limit: number): Promise<string>
     size += value.byteLength
     if (size > limit) {
       await reader.cancel().catch(() => {})
-      throw new ProbeError('identity document too large')
+      throw new ProbeError('not-gos3')
     }
     chunks.push(value)
   }
@@ -53,10 +70,11 @@ export async function readLimited(res: Response, limit: number): Promise<string>
 
 /**
  * Fetches and validates the identity document of baseUrl. Throws ProbeError
- * with a human readable message (timeout, connection error, not gos3 …).
+ * with a coarse category (see ProbeErrorKind). The default fetch refuses
+ * blocked destinations at connect time (./netguard.ts).
  */
 export async function fetchInfo(baseUrl: string, opts: { timeoutMs?: number, signal?: AbortSignal, fetch?: FetchFn } = {}): Promise<Info> {
-  const doFetch: FetchFn = opts.fetch ?? ((u, i) => globalThis.fetch(u, i))
+  const doFetch: FetchFn = opts.fetch ?? guardedFetch
   const timeoutMs = opts.timeoutMs ?? VERIFY_TIMEOUT_MS
   const ctrl = new AbortController()
   let timedOut = false
@@ -72,37 +90,39 @@ export async function fetchInfo(baseUrl: string, opts: { timeoutMs?: number, sig
     try {
       res = await doFetch(baseUrl + INFO_PATH, { headers: { accept: 'application/json' }, signal: ctrl.signal, redirect: 'manual' })
     } catch (e) {
-      if (timedOut) throw new ProbeError(`timed out after ${timeoutMs} ms`)
+      if (e instanceof ProbeError) throw e
+      if (isBlocked(e)) throw new ProbeError('blocked')
+      if (timedOut) throw new ProbeError('timeout')
       if (opts.signal?.aborted) throw new ProbeError('aborted')
-      throw new ProbeError(`connection failed (${causeMessage(e)})`)
+      throw new ProbeError('unreachable')
     }
     if (res.status === 401 || res.status === 403) {
       await res.body?.cancel().catch(() => {})
-      throw new ProbeError(`identity document requires authentication (HTTP ${res.status})`)
+      throw new ProbeError('auth')
     }
     if (!res.ok) {
       await res.body?.cancel().catch(() => {})
-      throw new ProbeError(res.status === 404 ? 'not a gos3 server (no /_gos3/info)' : `HTTP ${res.status}`)
+      throw res.status === 404 ? new ProbeError('not-gos3') : new ProbeError('http', res.status)
     }
     const len = Number(res.headers.get('content-length') ?? '0')
     if (len > MAX_INFO_BYTES) {
       await res.body?.cancel().catch(() => {})
-      throw new ProbeError('identity document too large')
+      throw new ProbeError('not-gos3')
     }
     let body: string
     try {
       body = await readLimited(res, MAX_INFO_BYTES)
     } catch (e) {
       if (e instanceof ProbeError) throw e
-      throw new ProbeError(timedOut ? `timed out after ${timeoutMs} ms` : `read failed (${causeMessage(e)})`)
+      throw new ProbeError(timedOut ? 'timeout' : opts.signal?.aborted ? 'aborted' : 'unreachable')
     }
     let json: unknown
     try {
       json = JSON.parse(body)
     } catch {
-      throw new ProbeError('not a gos3 server (invalid identity document)')
+      throw new ProbeError('not-gos3')
     }
-    if (!isInfo(json)) throw new ProbeError('not a gos3 server')
+    if (!isInfo(json)) throw new ProbeError('not-gos3')
     return json
   } finally {
     clearTimeout(timer)

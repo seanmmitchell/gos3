@@ -17,8 +17,9 @@ the settings to review before you expose a server.
       secrets.
 - [ ] If metrics are public (`metrics.public`), restrict who can reach
       `/_gos3/metrics`.
-- [ ] Do not expose a standalone web UI's Node server to untrusted networks,
-      or set `GOS3_UI_LOCAL_DISCOVERY=false`.
+- [ ] Enable a standalone web UI's local discovery
+      (`GOS3_UI_LOCAL_DISCOVERY=true`) only when its Node server is not
+      reachable from untrusted networks.
 
 ## Authentication
 
@@ -289,18 +290,29 @@ then cannot verify it.
   a limited server-side request vector. The response must be a valid gos3
   `Info` document (at most 64 KiB), and probes never follow redirects or use
   proxies. Grant `diagnostics` only to trusted users.
-- The standalone web UI's Node server performs local discovery (mDNS, beacon,
-  scans, probes) for **anyone who can reach it**, without authentication.
-  Restrict access to it, or set `GOS3_UI_LOCAL_DISCOVERY=false`. Against DNS
+- The standalone web UI's Node server can perform local discovery (mDNS,
+  beacon, scans, probes) from the UI host. It has no authentication, so
+  this is **off unless `GOS3_UI_LOCAL_DISCOVERY=true`** (the container image
+  leaves it off; the compose demo turns it on because it publishes the UI on
+  `127.0.0.1` only). When on, anyone who can reach the server can make it
+  probe and scan, so enable it only on a trusted interface. Against DNS
   rebinding and other websites, its `/api/discovery/*` routes answer 403
   unless the `Host` is an IP address, `localhost`/`*.localhost` or a name in
   `GOS3_UI_ALLOWED_HOSTS`, and refuse a foreign `Origin` (one that matches
   neither the `Host` nor a name listed in `GOS3_UI_ALLOWED_HOSTS`) or
-  `Sec-Fetch-Site: cross-site`/`same-site`. At most 2 scans and 4 local
-  discoveries run at once per UI server (`429 TooManyRequests`). Its probes
-  read at most 64 KiB of `/_gos3/info` (with or without `Content-Length`);
-  local discovery keeps at most 2048 mDNS records and 1024 beacon candidates
-  and verifies at most 256 URLs.
+  `Sec-Fetch-Site: cross-site`/`same-site`. It never connects to cloud
+  metadata addresses (`169.254.169.254`, `169.254.170.2`, `169.254.170.23`,
+  `fd00:ec2::254`, `100.100.100.200`), unspecified, multicast or broadcast
+  addresses: literals are refused up front, and host names are checked
+  against the addresses they resolve to when the connection is made (DNS
+  rebinding cannot bypass it). Probe failures report only a coarse reason
+  (unreachable, timed out, `HTTP <status>`, authentication required, not a
+  gos3 server). At most 2 scans, 4 local discoveries and 8 probes run at
+  once per UI server (`429 TooManyRequests`), each taking its slot before
+  the request body is read; bodies are capped at 8 KiB (probe) and 64 KiB
+  (scan) with `413`. Its probes read at most 64 KiB of `/_gos3/info` (with
+  or without `Content-Length`); local discovery keeps at most 2048 mDNS
+  records and 1024 beacon candidates and verifies at most 256 URLs.
 
 ## Admin API notes
 

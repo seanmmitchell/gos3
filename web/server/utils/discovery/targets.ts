@@ -10,6 +10,7 @@
 // number of hosts is capped (MAX_SCAN_HOSTS). Pure functions: unit-tested in
 // test/unit/discovery-server.test.ts.
 import { isIP } from 'node:net'
+import { blockedUrlHost, isBlockedAddress } from './netguard'
 
 export const DEFAULT_PORT = 9000
 /** Hard cap of hosts a single scan may expand to. */
@@ -127,6 +128,15 @@ export function normalizeBaseUrl(raw: string): string {
   if (u.username || u.password) throw new ScanRequestError(`"${clip(s)}": URLs with credentials are not allowed`)
   const path = u.pathname.replace(/\/+$/, '')
   return `${u.protocol}//${u.host}${path}`
+}
+
+/**
+ * Throws ScanRequestError when url's host is an IP literal that is never
+ * probed (cloud metadata, unspecified, multicast, broadcast; contract C6).
+ */
+export function assertProbeableUrl(url: string, raw: string = url): void {
+  const blocked = blockedUrlHost(url)
+  if (blocked) throw new ScanRequestError(`"${clip(raw.trim())}": ${blocked} is a cloud metadata, unspecified, multicast or broadcast address, which is never probed`)
 }
 
 export type ScanTarget =
@@ -262,16 +272,26 @@ export function planScan(body: unknown, opts: PlanOptions = {}): ScanPlan {
   }
   for (const raw of req.targets as string[]) {
     const t = parseScanTarget(raw)
+    // An explicit target that is a blocked address is an error; blocked
+    // addresses inside a CIDR are skipped. Host names are checked when the
+    // probe connects (./netguard.ts).
+    const explicit = (u: string) => {
+      assertProbeableUrl(u, raw)
+      push(u)
+    }
     if (t.kind === 'url') {
       addHosts(1)
-      push(t.url)
+      explicit(t.url)
     } else if (t.kind === 'host') {
       addHosts(1)
-      for (const port of t.port ? [t.port] : ports) for (const scheme of schemes) push(baseUrl(scheme, t.host, port))
+      for (const port of t.port ? [t.port] : ports) for (const scheme of schemes) explicit(baseUrl(scheme, t.host, port))
     } else {
       const n = cidrHostCount(t.cidr.bits)
       addHosts(n)
-      for (const ip of expandCidr(t.cidr, maxHosts)) for (const port of ports) for (const scheme of schemes) push(baseUrl(scheme, ip, port))
+      for (const ip of expandCidr(t.cidr, maxHosts)) {
+        if (isBlockedAddress(ip)) continue
+        for (const port of ports) for (const scheme of schemes) push(baseUrl(scheme, ip, port))
+      }
     }
   }
   return { urls, hosts, timeoutMs, concurrency }

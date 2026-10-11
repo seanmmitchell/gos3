@@ -9,7 +9,7 @@ It ships in two modes from one codebase:
 | Mode | Build | Served by | Notes |
 |---|---|---|---|
 | **Embedded** | `pnpm generate:embed` → `.output/public/` | the gos3 binary at `/_gos3/ui/` (copied to `internal/webui/dist/` by the integration build) | fully static, offline-safe; auto-detects the hosting server (same origin, no CORS) |
-| **Standalone** | `pnpm build` → `.output/` | `node .output/server/index.mjs` | adds Nitro server routes in `server/` for *local* network discovery (mDNS / beacon / scan) |
+| **Standalone** | `pnpm build` → `.output/` | `node .output/server/index.mjs` | adds Nitro server routes in `server/` for *local* network discovery (mDNS / beacon / scan; off unless `GOS3_UI_LOCAL_DISCOVERY=true`) |
 
 ## Screenshots
 
@@ -80,6 +80,7 @@ expose `ETag`, `x-amz-version-id`, … (`cors.expose_headers`).
 pnpm build
 PORT=3000 HOST=0.0.0.0 node .output/server/index.mjs     # Nitro node-server (also NITRO_PORT / NITRO_HOST)
 NUXT_PUBLIC_SERVERS='[{"name":"NAS","endpoint":"http://10.0.0.5:9000"}]' node .output/server/index.mjs
+GOS3_UI_LOCAL_DISCOVERY=true HOST=127.0.0.1 node .output/server/index.mjs   # + local discovery (trusted clients only)
 ```
 
 The browser talks to every S3 server **directly** (requests are signed in the
@@ -106,16 +107,18 @@ CORS is configured.
 ### Local discovery routes (Nitro, standalone only)
 
 The Node server adds routes that discover gos3 servers **from the UI host**
-(the browser cannot do mDNS, multicast or port scans). The static/embedded
-build has no server routes; the UI detects that (`capabilities` → 404 or HTML)
-and hides the feature.
+(the browser cannot do mDNS, multicast or port scans). They are **off unless
+`GOS3_UI_LOCAL_DISCOVERY=true`** (also `1`, `on`, `yes`, `enabled`): the
+server has no authentication. The static/embedded build has no server
+routes; the UI detects that (`capabilities` → 404 or HTML) and hides the
+feature.
 
 | Route | Body / query | Response |
 |---|---|---|
 | `GET /api/discovery/capabilities` | | `{localDiscovery, mdns, beacon, scan, maxScanHosts}` |
 | `GET /api/discovery/local?wait=<ms>` | `wait` 500–10000 (default 3000) | mDNS browse (`_gos3._tcp`) + beacon query (`239.255.73.83:7373`), then `/_gos3/info` verification: `{peers, errors, candidates, elapsedMs}` |
 | `POST /api/discovery/scan` | admin API `ScanRequest` (`timeout` in ns) | `ScanResult`; ≤ 1024 hosts, ≤ 64 ports, ≤ 4096 probes, concurrency ≤ 64 |
-| `POST /api/discovery/probe` | `{"url": "http://host:9000"}` | the server's `Info`, or 502 `ProbeFailed` |
+| `POST /api/discovery/probe` | `{"url": "http://host:9000"}` | the server's `Info`, or 502 `ProbeFailed` with a coarse reason (`unreachable`, `timed out`, `HTTP <status>`, `authentication required`, `not a gos3 server`, `address not allowed`) |
 
 - Errors use the admin envelope `{"error": {"code", "message"}}`.
 - POSTs require `Content-Type: application/json` (415 otherwise). A
@@ -133,17 +136,28 @@ and hides the feature.
   (`proxy_set_header Host $host;`), otherwise probes and scans get 403.
   Opening the console via another host name without listing it hides local
   discovery.
-- At most 2 scans and 4 local discoveries run at once per UI server; more
-  get 429 `TooManyRequests` (with `Retry-After`).
+- At most 2 scans, 4 local discoveries and 8 probes run at once per UI
+  server; more get 429 `TooManyRequests` (with `Retry-After`). Scans and
+  probes take their slot before reading the request body.
+- Request bodies are capped (probe 8 KiB, scan 64 KiB): 413 by
+  `Content-Length` or as soon as a streamed body passes the cap (the
+  connection is then closed), 408 when the body takes over 10 s, 400 on
+  invalid JSON.
+- Cloud metadata (`169.254.169.254`, `169.254.170.2`, `169.254.170.23`,
+  `fd00:ec2::254`, `100.100.100.200`), unspecified, multicast and broadcast
+  addresses (IPv4-mapped IPv6 forms included) are never probed: literals are
+  refused up front (400; skipped inside CIDRs), and host names are checked
+  against every resolved address at connect time
+  (`server/utils/discovery/netguard.ts`), so DNS rebinding cannot bypass it.
 - Probes read at most 64 KiB of an identity document (with or without
-  `Content-Length`); local discovery keeps at most 2048 mDNS records and
-  1024 beacon candidates, and verifies at most 256 URLs.
-- The Node server has **no authentication**: anyone who can reach it can make
-  it probe and scan (bounded as above). Bind it to a trusted interface, or
-  turn them off with **`GOS3_UI_LOCAL_DISCOVERY=false`** (also `0`, `off`,
-  `no`, `disabled`): `local`, `scan` and `probe` then answer 403,
-  `capabilities` reports `localDiscovery: false` and the UI hides local
-  discovery.
+  `Content-Length`) and never follow redirects; local discovery keeps at
+  most 2048 mDNS records and 1024 beacon candidates, and verifies at most
+  256 URLs.
+- The Node server has **no authentication**: with local discovery on,
+  anyone who can reach it can make it probe and scan (bounded as above).
+  Enable it only on a trusted interface. While it is off (the default),
+  `local`, `scan` and `probe` answer 403, `capabilities` reports
+  `localDiscovery: false` and the UI shows local discovery as turned off.
 - mDNS uses `multicast-dns` when it can be loaded; the beacon needs UDP
   multicast on the host's network (often unavailable in containers — scans
   and probes still work).
@@ -412,14 +426,17 @@ layout derives breadcrumbs from these routes; override with
   - starts gos3 *alpha* and *beta* (memory backend, root keys `saroot` /
     `saroot-secret-key`, discovery with scans but no multicast and no seeds,
     CORS for both UI origins) and two UI servers: the plain one on
-    `http://localhost:3000` (a free port if 3000 is taken) and a preset one
-    (`servers.json` + `NUXT_PUBLIC_SERVERS` at runtime). Processes run under
+    `http://localhost:3000` (a free port if 3000 is taken) with
+    `GOS3_UI_LOCAL_DISCOVERY=true`, and a preset one (`servers.json` +
+    `NUXT_PUBLIC_SERVERS` at runtime) with local discovery off (the
+    default). Processes run under
     `real/watchdog.mjs`, so an aborted run does not leave them behind.
   Specs cover adding a server (type detection, test connection, credentials),
   import/export, presets, browsing/uploads (multipart reads `ETag`) and the
   metadata editor reading `x-amz-meta-*` cross-origin, and the Discover page
   (UI-host scan of `127.0.0.1` with both ports, browser/UI-host probes, peer
-  tables of connected servers). Env: `E2E_SKIP_UI_BUILD=1`, `E2E_KEEP_DATA=1`
+  tables of connected servers, the off-by-default routes, metadata targets
+  and body caps). Env: `E2E_SKIP_UI_BUILD=1`, `E2E_KEEP_DATA=1`
   (keeps `/tmp/gos3-standalone-*` with the logs).
 - E2E: `pnpm test:e2e` (Playwright, `test/e2e/*.spec.ts`) builds the embedded
   bundle and serves it via `test/e2e/serve.mjs`, which mocks `GET /_gos3/info`.

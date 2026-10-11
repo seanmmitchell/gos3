@@ -2,13 +2,13 @@
 // host for `wait` ms (default 3000, 500–10000), then verification of every
 // candidate via GET /_gos3/info. Returns {peers, errors, candidates, elapsedMs}.
 // At most MAX_CONCURRENT_LOCAL run at once (429 TooManyRequests beyond).
-import { clientAbortSignal, errorResponse, localSlots, MAX_CONCURRENT_LOCAL, rejectForeignRequest, tooManyRequests } from '../../utils/discovery/http'
+import { clientAbortSignal, discoveryDisabled, errorResponse, localSlots, MAX_CONCURRENT_LOCAL, rejectForeignRequest, tooManyRequests } from '../../utils/discovery/http'
 import { DEFAULT_WAIT_MS, discoverLocal, loadMdns, localDiscoveryEnabled, MAX_WAIT_MS, MIN_WAIT_MS } from '../../utils/discovery/local'
 
 export default defineEventHandler(async (event) => {
   const foreign = rejectForeignRequest(event)
   if (foreign) return foreign
-  if (!localDiscoveryEnabled()) return errorResponse(event, 403, 'AccessDenied', 'Local discovery is disabled on this UI server.')
+  if (!localDiscoveryEnabled()) return discoveryDisabled(event)
   const q = getQuery(event)
   let wait = DEFAULT_WAIT_MS
   if (q.wait !== undefined) {
@@ -23,8 +23,8 @@ export default defineEventHandler(async (event) => {
   try {
     const mdns = (await loadMdns()) !== null
     return await discoverLocal(wait, { mdns, signal: clientAbortSignal(event) })
-  } catch (e) {
-    return errorResponse(event, 500, 'InternalError', e instanceof Error ? e.message : String(e))
+  } catch {
+    return errorResponse(event, 500, 'InternalError', 'Local discovery failed.')
   } finally {
     release()
   }
