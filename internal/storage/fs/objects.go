@@ -259,11 +259,12 @@ func (b *Backend) OpenObject(ctx context.Context, bucket, key, versionID string)
 		if !validDataID(dataID) {
 			return storage.ObjectInfo{}, nil, fmt.Errorf("%w: invalid data ID for %s/%s", errCorrupt, bucket, key)
 		}
-		f, err := os.Open(b.dataPath(bucketID, dataID))
+		f, err := openShared(b.dataPath(bucketID, dataID))
 		if err != nil {
-			if errors.Is(err, iofs.ErrNotExist) && attempt < openRetries {
-				// Superseded and unlinked after our lookup; the metadata
-				// has changed, so resolve again.
+			if (errors.Is(err, iofs.ErrNotExist) || openRaced(err)) && attempt < openRetries {
+				// Superseded and unlinked after our lookup (or, on Windows,
+				// being unlinked right now); the metadata has changed, so
+				// resolve again.
 				continue
 			}
 			return storage.ObjectInfo{}, nil, fmt.Errorf("fs: open data of %s/%s: %w", bucket, key, err)

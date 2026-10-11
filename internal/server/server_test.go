@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"runtime"
 	"slices"
 	"strings"
 	"testing"
@@ -346,7 +347,8 @@ func TestPersistenceAcrossRestart(t *testing.T) {
 		if err != nil {
 			t.Fatalf("%s: %v", f, err)
 		}
-		if f != "server-id" && st.Mode().Perm() != 0o600 {
+		// Windows has no POSIX permission bits (ACLs apply instead).
+		if f != "server-id" && runtime.GOOS != "windows" && st.Mode().Perm() != 0o600 {
 			t.Errorf("%s mode %v", f, st.Mode().Perm())
 		}
 	}

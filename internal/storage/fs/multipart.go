@@ -548,9 +548,9 @@ func (b *Backend) appendPart(ctx context.Context, t *tmpFile, uploadID, file str
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	f, err := os.Open(b.partPath(uploadID, file))
+	f, err := openShared(b.partPath(uploadID, file))
 	if err != nil {
-		if errors.Is(err, iofs.ErrNotExist) {
+		if errors.Is(err, iofs.ErrNotExist) || openRaced(err) {
 			// Replaced, aborted or completed concurrently.
 			return fmt.Errorf("%w: part %d vanished", errPartsChanged, n)
 		}

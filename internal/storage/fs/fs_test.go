@@ -10,6 +10,7 @@ import (
 	"math/rand/v2"
 	"os"
 	"path/filepath"
+	"runtime"
 	"slices"
 	"strings"
 	"sync"
@@ -36,6 +37,9 @@ func TestOpenErrors(t *testing.T) {
 // are private to the server's user (they hold metadata, and the server
 // keeps root credentials next to them).
 func TestSystemDirPermissions(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("Windows has no POSIX permission bits; the data directory's ACLs apply")
+	}
 	dir := t.TempDir()
 	b := openTest(t, dir)
 	for _, d := range []string{b.sysDir, b.dataDir, b.tmpDir, b.uploadDir} {

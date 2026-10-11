@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"runtime"
 	"strings"
 	"sync"
 	"testing"
@@ -512,11 +513,13 @@ func TestPersistence(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if fi.Mode().Perm() != 0o600 {
+	// Windows has no POSIX permission bits; access is governed by the
+	// directory's ACLs (see docs/security.md).
+	if runtime.GOOS != "windows" && fi.Mode().Perm() != 0o600 {
 		t.Fatalf("iam.json mode = %v", fi.Mode().Perm())
 	}
 	di, _ := os.Stat(dir)
-	if di.Mode().Perm() != 0o700 {
+	if runtime.GOOS != "windows" && di.Mode().Perm() != 0o700 {
 		t.Fatalf("dir mode = %v", di.Mode().Perm())
 	}
 	raw, _ := os.ReadFile(filepath.Join(dir, FileName))
@@ -628,6 +631,9 @@ func TestPersistenceErrors(t *testing.T) {
 func TestPersistFailureLeavesStateUnchanged(t *testing.T) {
 	if os.Geteuid() == 0 {
 		t.Skip("root ignores directory permissions")
+	}
+	if runtime.GOOS == "windows" {
+		t.Skip("a read-only directory mode does not stop writes on Windows; TestPersistFailureRollbackViaFile covers the rollback")
 	}
 	ctx := context.Background()
 	dir := t.TempDir()

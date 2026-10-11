@@ -124,7 +124,10 @@ The data directory (default `./data`, `/data` in the container) holds:
 | `.gos3/server-id` | random server ID | public |
 
 Keep the directory owned by the gos3 user with mode 0700, and treat backups as
-secret too. **gos3 does not encrypt objects.** Bucket default encryption and
+secret too. On Windows the modes above do not apply: files inherit the ACLs of
+the data directory, so put it somewhere only the gos3 account (and
+administrators) can read, not in a shared location such as `C:\ProgramData`
+with default permissions. **gos3 does not encrypt objects.** Bucket default encryption and
 `x-amz-server-side-encryption` headers are accepted and reported for client
 compatibility only. Use full-disk or file system encryption if you need
 encryption at rest. SSE-C is rejected (`NotImplemented`).
@@ -302,6 +305,17 @@ then cannot verify it.
 - Admin requests are recorded in metrics (op `Admin`) and in the access log.
   The log contains paths only, never query strings, so presigned URL signatures
   are not logged.
+
+## Dependencies
+
+Go dependencies are scanned with `govulncheck` in CI. The web UI's npm
+lockfile pins patched versions of transitive dependencies through
+`pnpm.overrides` in `web/package.json` (for example `simple-git`, pulled in
+by Nuxt devtools, which gos3 disables). Two advisories have no upstream fix
+yet and only affect build and development tooling: `node-forge` (Nitro's dev
+server, `listhen`) and `braces` (file globbing during builds). Neither is part
+of the embedded UI, which is static files, nor of the standalone UI server
+bundle (`web/.output/server`).
 
 ## Reporting vulnerabilities
 

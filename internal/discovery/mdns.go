@@ -25,6 +25,8 @@ const (
 	mdnsMaxInstance   = 50
 	mdnsMaxTXTFields  = 32
 	mdnsEntriesBuffer = 64
+	// mdnsMaxEntries bounds the distinct services kept from one browse.
+	mdnsMaxEntries = 256
 )
 
 // debugWriter adapts the standard logger used by hashicorp/mdns to slog at
@@ -235,31 +237,28 @@ func ipFamilies() (v4, v6 bool) {
 	return v4, v6
 }
 
-// mdnsQuery runs one DNS-SD browse for _gos3._tcp lasting timeout and feeds
-// the results to out as candidates.
+// mdnsQuery runs one DNS-SD browse for _gos3._tcp lasting timeout and, once
+// it has finished, feeds the results to out as candidates.
 func mdnsQuery(ctx context.Context, timeout time.Duration, logger *slog.Logger, selfID string, out sink) error {
 	v4, v6 := ipFamilies()
 	if !v4 && !v6 {
 		return errors.New("no multicast-capable interface")
 	}
 	entries := make(chan *mdns.ServiceEntry, mdnsEntriesBuffer)
+	// hashicorp/mdns keeps rewriting a ServiceEntry after delivering it (a
+	// later answer for the same service, e.g. the same reply received on a
+	// second interface, updates its fields in the query goroutine), so only
+	// collect the pointers while the query runs and read the entries once
+	// QueryContext has returned and nothing writes to them any more.
+	var got []*mdns.ServiceEntry
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
+		seen := make(map[*mdns.ServiceEntry]bool)
 		for e := range entries {
-			c, ok := mdnsCandidate(e, selfID)
-			if !ok {
-				continue
-			}
-			// Like beacons, mDNS answers are unauthenticated and
-			// link-local: only probe addresses on this host's links.
-			c.urls = slices.DeleteFunc(c.urls, func(u string) bool {
-				_, host, _, ok := urlHostPort(u)
-				ip, err := netip.ParseAddr(host)
-				return !ok || err != nil || !hostNets.onLink(ip)
-			})
-			if len(c.urls) > 0 {
-				out.candidate(c)
+			if e != nil && !seen[e] && len(got) < mdnsMaxEntries {
+				seen[e] = true
+				got = append(got, e)
 			}
 		}
 	}()
@@ -272,9 +271,26 @@ func mdnsQuery(ctx context.Context, timeout time.Duration, logger *slog.Logger, 
 		DisableIPv6: !v6,
 		Logger:      quietLogger(logger),
 	})
-	// QueryContext has returned, so nothing sends on entries any more.
+	// QueryContext has returned, so nothing sends on or writes to entries
+	// any more.
 	close(entries)
 	<-done
+	for _, e := range got {
+		c, ok := mdnsCandidate(e, selfID)
+		if !ok {
+			continue
+		}
+		// Like beacons, mDNS answers are unauthenticated and link-local:
+		// only probe addresses on this host's links.
+		c.urls = slices.DeleteFunc(c.urls, func(u string) bool {
+			_, host, _, ok := urlHostPort(u)
+			ip, err := netip.ParseAddr(host)
+			return !ok || err != nil || !hostNets.onLink(ip)
+		})
+		if len(c.urls) > 0 {
+			out.candidate(c)
+		}
+	}
 	return err
 }
 
