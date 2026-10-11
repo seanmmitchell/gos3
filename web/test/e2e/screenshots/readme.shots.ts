@@ -33,7 +33,9 @@ class Api {
   constructor(readonly base: string) {}
 
   async req(method: string, path: string, body?: string | Uint8Array<ArrayBuffer>, headers: Record<string, string> = {}): Promise<Response> {
-    const r = await this.aws.fetch(`${this.base}${path}`, { method, body, headers })
+    // Sign the payload hash: the admin API refuses unsigned bodies.
+    const signed = body === undefined ? headers : { 'x-amz-content-sha256': createHash('sha256').update(body).digest('hex'), ...headers }
+    const r = await this.aws.fetch(`${this.base}${path}`, { method, body, headers: signed })
     if (!r.ok) throw new Error(`${method} ${path}: ${r.status} ${await r.text()}`)
     return r
   }
