@@ -363,8 +363,8 @@ deploy/              systemd unit, Kubernetes manifests, standalone UI Dockerfil
 docs/                documentation
 ```
 
-CI (`.github/workflows/ci.yml`) runs gofmt, vet, the Go unit and e2e tests
-with `-race`, the web typecheck, tests and builds, the Playwright suites, the
+CI (`.github/workflows/ci.yml`) runs gofmt, vet, govulncheck, the Go unit and
+e2e tests with `-race`, the web typecheck, tests and builds, the Playwright suites, the
 compatibility suite, and the Docker builds. Pushing a `v*` tag builds release
 archives and a multi-arch image on `ghcr.io` (`release.yml`).
 
