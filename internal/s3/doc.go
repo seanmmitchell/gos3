@@ -19,7 +19,9 @@ package s3
 //     auth.Result over the raw body) and strips "aws-chunked" from
 //     Content-Encoding;
 //  5. authorizes the primary resource with the op's IAM action (authz.go;
-//     not for DeleteObjects/PostObject, which authorize themselves);
+//     not for the AuthzByHandler ops, which authorize themselves after
+//     reading their body: those get an absolute deadline for that read,
+//     see Server.limitPreAuthBody);
 //  6. calls the handler from opTable (ops.go).
 //
 // # Handler signature
@@ -65,6 +67,8 @@ package s3
 //	bucketError(err, bucket)     same, adding BucketName to NoSuchBucket
 //	readBody(r, max), decodeXMLBody(r, max, &v), decodeXML(data, &v)
 //	                             bounded reads; MalformedXML / MissingRequestBodyError
+//	newXMLStream(r, max, elems)  streamed parsing of list documents with
+//	                             bounded work (xml_stream.go)
 //	formatXMLTime(t), formatHTTPTime(t), parseHTTPTime(s), parseISOTime(s)
 //	parseEncodingType(q), s3URLEncode(s), maybeURLEncode(s, enc)
 //	Owner, ownerFor(user)        ID = hex sha256(user), DisplayName = user ("" -> root)
@@ -135,6 +139,10 @@ package s3
 // After changing a policy,
 // CORS, ACL or public access block document (or deleting a bucket) call
 // s.invalidateBucketConfig(bucket).
+//
+// Handlers that read an object whose authorization may have looked at it
+// (object ACL, s3:ExistingObjectTag) open it with s.openAuthorizedObject
+// (objectForRead does), which serves exactly the version evaluated.
 //
 // # Tests (testutil_test.go)
 //

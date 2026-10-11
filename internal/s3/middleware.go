@@ -226,6 +226,9 @@ func (s *Server) serve(w *responseWriter, r *http.Request, rc *reqContext) {
 			s.writeError(w, r, rc, err)
 			return
 		}
+	} else if !op.NoAuth {
+		// The handler reads the body before it authorizes the caller.
+		s.limitPreAuthBody(rc)
 	}
 
 	handler := op.handler

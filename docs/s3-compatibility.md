@@ -76,7 +76,7 @@ gets `400 InvalidArgument`, whether it is signed or not.
 | GetObject | ✅ | `Range` (single range), `partNumber`, conditional headers (`If-Match`, `If-None-Match`, `If-Modified-Since`, `If-Unmodified-Since`, `If-Range` with a strong ETag or the exact `Last-Modified`; a mismatch serves the whole object with 200), `response-*` overrides (signed requests only), `versionId`, `x-amz-checksum-mode: ENABLED`. `partNumber=1` on a single-part object returns 206 with `Content-Range`; an empty part returns an empty 200. Responses carry `X-Content-Type-Options: nosniff` and, except for PDFs, `Content-Security-Policy: sandbox` (see [security.md](security.md#object-responses)). |
 | HeadObject | ✅ | Same as GetObject without a body. |
 | DeleteObject | ✅ | Versioning semantics (delete markers), `x-amz-bypass-governance-retention`, `If-Match`. The `If-Match` and object lock checks are atomic with the delete. |
-| DeleteObjects | ✅ | Up to 1000 keys, `Quiet` mode, per-key `ETag` condition, object lock checks. |
+| DeleteObjects | ✅ | Up to 1000 keys (`MalformedXML` beyond, as AWS), `Quiet` mode, per-key `ETag` condition, object lock checks. The body may be at most about 6.2 MiB and must arrive within 60 s (see [Limits](#limits)). |
 | CopyObject | ✅ | Versioned sources, `x-amz-copy-source-if-*`, `x-amz-metadata-directive` / `x-amz-tagging-directive` (COPY / REPLACE), checksum recomputation. Like UploadPartCopy and CompleteMultipartUpload, a copy that takes longer than about 5 s sends `200` early with whitespace keep-alives and may then report an `<Error>` inside the 200 body, as AWS does; the copy stops when the client disconnects. An ACL or `REPLACE` tags need `s3:PutObjectAcl` / `s3:PutObjectTagging`; copying the tags of a tagged source (`COPY`, the default) needs tagging permissions too (see [Authorization](#authorization)). |
 | GetObjectAttributes | ✅ | ETag, Checksum, ObjectParts (paged), StorageClass, ObjectSize. |
 | Get/Put/DeleteObjectTagging | ✅ | Up to 10 tags; version-aware. PutObjectTagging evaluates `s3:RequestObjectTag/<key>` and `s3:RequestObjectTagKeys` from the XML body. |
@@ -95,7 +95,7 @@ gets `400 InvalidArgument`, whether it is signed or not.
 | CreateMultipartUpload | ✅ | Metadata, tags, ACL, storage class, object lock and SSE headers carry over to the object. `x-amz-checksum-algorithm` and `x-amz-checksum-type` (COMPOSITE / FULL_OBJECT). An ACL or tags need `s3:PutObjectAcl` / `s3:PutObjectTagging`. |
 | UploadPart | ✅ | Part numbers 1–10000, parts up to 5 GiB, checksum validation. |
 | UploadPartCopy | ✅ | `x-amz-copy-source-range`, versioned sources, copy-source conditions. |
-| CompleteMultipartUpload | ✅ | Every part except the last must be at least 5 MiB. Multipart ETag `md5(part md5s)-N`. Composite or full-object checksums. `If-None-Match` / `If-Match`. Total size up to 5 TiB. Slow completions send whitespace keep-alives, as AWS does. |
+| CompleteMultipartUpload | ✅ | Every part except the last must be at least 5 MiB. Multipart ETag `md5(part md5s)-N`. Composite or full-object checksums. `If-None-Match` / `If-Match`. Total size up to 5 TiB. Slow completions send whitespace keep-alives, as AWS does. A list of more than 10000 parts gets the error of its first invalid part number (`InvalidArgument`, or `InvalidPartOrder`) without the rest being read; the body may be at most about 2.4 MiB. |
 | AbortMultipartUpload | ✅ | |
 | ListParts | ✅ | `max-parts`, `part-number-marker`, per-part checksums. |
 
@@ -282,6 +282,9 @@ ListObjectsV2, ListParts and GetObjectAttributes.
 | Single PUT | `server.max_object_size` (default 5 GiB, at most 5 TiB) |
 | Multipart | 10000 parts of 5 MiB – 5 GiB (the last may be smaller), 5 TiB in total |
 | `max-keys`, DeleteObjects keys | 1000 |
+| DeleteObjects request body | 6,454,096 bytes (1000 keys of 1024 bytes that all need escaping, with version IDs and ETags) |
+| CompleteMultipartUpload request body | 2,564,096 bytes (10000 parts with an ETag and a SHA-256 checksum) |
+| Other request bodies | 1 MiB for bucket configuration documents (lifecycle 2 MiB, policy 20 KiB, ACL 64 KiB), 64 KiB for object tagging, ACL, retention and legal hold |
 | Presigned URL lifetime | 7 days |
 | Bucket policy size | 20 KiB |
 
@@ -302,9 +305,21 @@ ListObjectsV2, ListParts and GetObjectAttributes.
   element of errors. Use `encoding-type=url` for such keys (the web UI always
   does for ListObjectsV2, ListObjectVersions and ListMultipartUploads).
 - Request bodies that send no data for 60 s fail with `400 RequestTimeout`.
-  On HTTP/1.1 the unread body of a rejected request is drained for at most
+  The bodies gos3 must read before it can authorize the request
+  (DeleteObjects, PutObjectTagging, PutObjectRetention, PutObjectLegalHold,
+  and PostObject's form fields) must arrive completely within 60 s. On
+  HTTP/1.1 the unread body of a rejected request is drained for at most
   10 s and 256 KiB; otherwise the response carries `Connection: close`. These
   limits are fixed.
+- XML request documents with more than 16 levels of nesting, a single tag
+  (or text between two tags) over 16 KiB, or far more elements than the
+  largest valid request are rejected with `MalformedXML`.
+- A read whose authorization depended on the object itself (its ACL, or an
+  `s3:ExistingObjectTag` condition) serves exactly the version that was
+  evaluated, also as a CopyObject or UploadPartCopy source. When the object
+  is replaced in the meantime, a versioned bucket serves the evaluated (now
+  older) version; for an unversioned object, or when its ACL or tags changed,
+  the request fails with `403 AccessDenied`.
 - An upload aborted by the client is recorded in the access log with status
   `499` and `client_aborted=true`.
 - **Root bypasses bucket policies.** The root credentials are never subject to

@@ -81,6 +81,7 @@ type Server struct {
 	bodyIdleTimeout     time.Duration // a stalled body read fails with RequestTimeout
 	unreadBodyGrace     time.Duration // draining a body the handler did not read
 	postPreambleTimeout time.Duration // PostObject form fields before the policy is verified
+	preAuthBodyTimeout  time.Duration // bodies read before authorization (AuthzByHandler ops)
 }
 
 // Default request body timeouts. AWS answers RequestTimeout after about
@@ -88,10 +89,18 @@ type Server struct {
 // of a rejected request's body and PostObject's form fields (its client is
 // not authenticated until they have been read) must arrive within a fixed
 // time.
+//
+// The same holds for the bodies read before the caller is authorized
+// (DeleteObjects, PutObjectTagging, PutObjectRetention,
+// PutObjectLegalHold): at most maxDeleteObjectsBody (about 6.2 MiB, a
+// request of 1000 maximal keys) or 64 KiB. 60 s allows such a maximal
+// DeleteObjects at about 110 KB/s (under 1 Mbit/s); typical bodies are a
+// few KiB to about 100 KiB.
 const (
 	defaultBodyIdleTimeout     = 60 * time.Second
 	defaultUnreadBodyGrace     = 10 * time.Second
 	defaultPostPreambleTimeout = 60 * time.Second
+	defaultPreAuthBodyTimeout  = 60 * time.Second
 )
 
 var _ http.Handler = (*Server)(nil)
@@ -128,6 +137,7 @@ func New(opts Options) *Server {
 		bodyIdleTimeout:     defaultBodyIdleTimeout,
 		unreadBodyGrace:     defaultUnreadBodyGrace,
 		postPreambleTimeout: defaultPostPreambleTimeout,
+		preAuthBodyTimeout:  defaultPreAuthBodyTimeout,
 	}
 	if s.settings == nil {
 		s.settings = config.NewStore(config.Settings{Region: defaultRegion}, "")
