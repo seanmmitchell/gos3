@@ -375,7 +375,8 @@ then cannot verify it.
   server-side request vector. The response must be a valid gos3 `Info`
   document (at most 64 KiB), probes never follow redirects or use proxies,
   each is bounded by 10 s, and at most 4 run at once per server (`429
-  TooManyRequests`). A failed probe reports only `unreachable`, `timed out`,
+  TooManyRequests`). Targets that are, or resolve to, cloud metadata,
+  unspecified, multicast or broadcast addresses are refused (`400`). A failed probe reports only `unreachable`, `timed out`,
   `HTTP <status>` or `not a gos3 server`, never the underlying error, so
   probes do not reveal banners of other services or why a connection failed
   (refused, reset, TLS or protocol errors all read `unreachable`).

@@ -90,6 +90,11 @@ func (a *api) probe(rc *reqCtx) (int, any, error) {
 	ctx, cancel := context.WithTimeout(rc.ctx, probeTimeout)
 	defer cancel()
 	peer, err := a.d.Discovery.Probe(ctx, req.URL)
+	if errors.Is(err, discovery.ErrBlockedAddress) {
+		// A cloud metadata, unspecified, multicast or broadcast target
+		// (directly or after DNS resolution) is the caller's mistake.
+		return 0, nil, badRequest("url: %s: address not allowed", req.URL)
+	}
 	if err != nil {
 		return 0, nil, errorf(http.StatusBadGateway, codeProbeFailed, "probing %s failed: %s", req.URL, probeFailure(err))
 	}

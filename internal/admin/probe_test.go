@@ -123,6 +123,27 @@ func TestProbeErrorsAreCoarse(t *testing.T) {
 	}
 }
 
+// TestProbeRefusesBlockedAddresses checks that probes of cloud metadata,
+// unspecified and multicast addresses are refused with 400 before any
+// request is sent, and never reported as a reachable or unreachable host.
+func TestProbeRefusesBlockedAddresses(t *testing.T) {
+	e := newEnv(t)
+	for _, u := range []string{
+		"http://169.254.169.254",
+		"http://169.254.169.254:80/latest/meta-data",
+		"http://[fd00:ec2::254]",
+		"http://100.100.100.200",
+		"http://0.0.0.0:9000",
+		"http://[::ffff:169.254.169.254]",
+		"http://224.0.0.251:9000",
+	} {
+		msg := e.root("POST", "/discovery/probe", map[string]any{"url": u}).expectError(t, http.StatusBadRequest, codeInvalidRequest)
+		if !strings.HasSuffix(msg, "address not allowed") {
+			t.Errorf("%s: message %q, want an address-not-allowed refusal", u, msg)
+		}
+	}
+}
+
 // TestProbeFailureCategories checks the error to message mapping,
 // including the timeout cases that are slow to provoke over the network.
 func TestProbeFailureCategories(t *testing.T) {
