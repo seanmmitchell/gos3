@@ -310,7 +310,7 @@ seeds, DNS SRV and active scans; every candidate is verified by fetching
 - Go ≥ 1.25 (toolchain auto). `gofmt`, `go vet` clean. Std `log/slog`.
   Stdlib `net/http` (Go 1.22+ mux patterns OK for the admin API).
 - Allowed third-party Go deps (already in go.mod): `go.etcd.io/bbolt`,
-  `github.com/hashicorp/mdns`, `gopkg.in/yaml.v3`, and for tests only
+  `github.com/miekg/dns`, `gopkg.in/yaml.v3`, and for tests only
   `github.com/aws/aws-sdk-go-v2/...` and `github.com/minio/minio-go/v7`.
 - Tests: `go test ./internal/<pkg>/...` for your package; `-race` must pass.
 - `make build` (UI + binary), `make ui`, `make test`, `make e2e`, `make e2e-web`,

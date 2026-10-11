@@ -264,13 +264,34 @@ then cannot verify it.
   `discovery.advertise: false` to hide them.
 - Beacon datagrams are accepted only from this host or a directly connected
   subnet, are rate-limited per sender, and can only make a server probe the
-  sender's own IP (announced host names are never resolved). mDNS answers are
-  only probed at on-link addresses. See
+  sender's own IP (announced host names are never resolved). See
   [discovery.md](discovery.md#3-udp-multicast-beacon).
+- The mDNS responder (UDP 5353) answers only senders on this host or a
+  directly connected subnet, and only questions about the server's own
+  records. It collapses duplicate questions (at most 8 per query),
+  rate-limits each sender like the beacon (50 responses per second in
+  total), multicasts answers to the group with TTL 255 and keeps every
+  response to one packet of at most 1400 bytes, so it cannot be used to
+  reflect or amplify traffic towards other networks. It runs whatever the
+  listen address and `server.public_info` are: on hosts with a routable
+  address, also firewall UDP 5353 from outside the local network, or set
+  `discovery.mdns: false`. mDNS answers are accepted only from on-link
+  senders, and only the responder's own address is probed (a loopback
+  address only when the responder is this host). See
+  [discovery.md](discovery.md#2-mdns--dns-sd).
 - Announcements are unauthenticated hints. A candidate becomes a peer only after
   its `/_gos3/info` was fetched, and adding a server to the UI still needs
   credentials. A malicious host on the network can still make itself appear in
-  peer lists.
+  peer lists, but it cannot take over a verified peer's entry (name,
+  endpoints, addresses) while that peer still answers at its known
+  addresses; such a claim is shown in the peer's `error` and logged. See
+  [discovery.md](discovery.md#peer-identity).
+- Discovery probes (admin API probe, scans, seeds, DNS SRV, verification of
+  announcements) never connect to cloud metadata endpoints
+  (`169.254.169.254`, `169.254.170.2`, `169.254.170.23`, `fd00:ec2::254`,
+  `100.100.100.200`) or to unspecified, multicast or broadcast addresses,
+  checked after DNS resolution. Peer errors hold a fixed category, never
+  text the probed service sent.
 - **Scans** (`POST /_gos3/admin/v1/discovery/scan`) need `admin:ScanNetwork`
   and `discovery.allow_scan: true` (the default). They are limited to
   `max_scan_hosts` hosts (default 1024) and 5 minutes, and at most 2 scans
@@ -308,10 +329,9 @@ then cannot verify it.
 
 ## Dependencies
 
-The shipped `gos3` binary links six third-party Go modules: `go.etcd.io/bbolt`,
-`github.com/hashicorp/mdns`, `github.com/miekg/dns`, `golang.org/x/net`,
-`golang.org/x/sys` and `gopkg.in/yaml.v3` (`go version -m bin/gos3` lists
-them). Everything else in `go.mod` is used by tests only.
+The shipped `gos3` binary links five third-party Go modules: `go.etcd.io/bbolt`,
+`github.com/miekg/dns`, `golang.org/x/net`, `golang.org/x/sys` and
+`gopkg.in/yaml.v3` (`go version -m bin/gos3` lists them). Everything else in `go.mod` is used by tests only.
 
 Supply-chain rules:
 
