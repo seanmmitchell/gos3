@@ -83,8 +83,9 @@ export class LocalDiscoveryClient {
 
   /**
    * Capabilities, or null when the routes do not exist (static build). When
-   * the UI server turned local discovery off (GOS3_UI_LOCAL_DISCOVERY=false)
-   * the result has `localDiscovery: false`. Never throws.
+   * local discovery is off on the UI server (the default; it is enabled with
+   * GOS3_UI_LOCAL_DISCOVERY=true) the result has `localDiscovery: false`.
+   * Never throws.
    */
   async capabilities(timeoutMs = 3000): Promise<LocalCapabilities | null> {
     try {

@@ -6,6 +6,7 @@ import {
   adminConditionKeys,
   adminRequestResource,
   adminResourceType,
+  buildSimulateRequest,
   IAM_POLICY_TEMPLATES,
   isAdminAction,
   parseConditionLines,
@@ -128,6 +129,20 @@ describe('admin actions, resources and condition keys', () => {
     expect(adminRequestResource('*')).toBeUndefined()
     expect(adminRequestResource('arn:gos3:admin:::*')).toBeUndefined()
     expect(adminRequestResource(' arn:gos3:admin:::user/a ')).toBe('arn:gos3:admin:::user/a')
+  })
+
+  it('builds simulate requests with resource for admin actions and bucket/key for s3 actions', () => {
+    const inputs = { user: 'helper', bucket: 'photos', key: 'cat.jpg', resource: 'arn:gos3:admin:::user/team-a' }
+    // admin action: resource, never bucket/key
+    expect(buildSimulateRequest({ ...inputs, action: ' admin:UpdateUser ', conditions: { 'admin:PolicyName': ['readonly'] } }))
+      .toEqual({ user: 'helper', action: 'admin:UpdateUser', resource: 'arn:gos3:admin:::user/team-a', conditions: { 'admin:PolicyName': ['readonly'] } })
+    // service level: no resource at all
+    for (const resource of ['', ' ', '*', 'arn:gos3:admin:::*']) {
+      expect(buildSimulateRequest({ ...inputs, action: 'admin:ProbeNetwork', resource })).toEqual({ user: 'helper', action: 'admin:ProbeNetwork' })
+    }
+    // s3 action: bucket/key, never resource
+    expect(buildSimulateRequest({ ...inputs, action: 's3:GetObject', conditions: {} })).toEqual({ user: 'helper', action: 's3:GetObject', bucket: 'photos', key: 'cat.jpg' })
+    expect(buildSimulateRequest({ user: '', action: 's3:ListAllMyBuckets', bucket: ' ', key: '', resource: 'arn:gos3:admin:::user/x' })).toEqual({ user: '', action: 's3:ListAllMyBuckets' })
   })
 
   it('suggests admin:PolicyName for CreateUser and UpdateUser only', () => {

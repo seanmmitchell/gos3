@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import type { Decision } from '~/types/admin'
-import { ADMIN_SERVICE_ARN, adminArn, adminConditionKeys, adminRequestResource, adminResourceType, isAdminAction, parseConditionLines, SIMULATOR_ACTIONS, validateAdminResource } from './-policies'
+import { ADMIN_SERVICE_ARN, adminArn, adminConditionKeys, adminResourceType, buildSimulateRequest, isAdminAction, parseConditionLines, SIMULATOR_ACTIONS, validateAdminResource } from './-policies'
 
 /**
  * Authorization simulator (POST /authz/simulate): "may <user> do <action>
@@ -66,17 +66,14 @@ const conditionsHelp = computed(() => {
 
 const sim = useAsyncAction(async () => {
   const u = props.fixedUser ?? (user.value === ANONYMOUS ? '' : user.value)
-  const admin = adminAction.value
-  const req = {
+  const req = buildSimulateRequest({
     user: u,
-    action: action.value.trim(),
-    // Admin actions are evaluated against an admin resource, S3 actions
-    // against bucket/key: only the matching inputs are sent.
-    bucket: admin ? undefined : bucket.value.trim() || undefined,
-    key: admin ? undefined : key.value.trim() || undefined,
-    resource: admin ? adminRequestResource(resource.value) : undefined,
-    conditions: Object.keys(conditions.value.conditions).length ? conditions.value.conditions : undefined
-  }
+    action: action.value,
+    bucket: bucket.value,
+    key: key.value,
+    resource: resource.value,
+    conditions: conditions.value.conditions
+  })
   const decision = await requireAdmin().simulate(req)
   const target = req.resource ?? (req.bucket ? `${req.bucket}${req.key ? `/${req.key}` : ''}` : '*')
   result.value = { decision, request: `${u || 'anonymous'} → ${req.action} on ${target}` }
