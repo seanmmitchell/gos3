@@ -9,22 +9,24 @@
 minimumReleaseAge: 20160
 minimumReleaseAgeExclude:
   # Security fixes younger than the cooldown, pinned below in overrides.
-  - shell-quote
   - source-map-js
 
 # Patched versions of vulnerable transitive dependencies.
 overrides:
-  # Nuxt devtools (disabled in nuxt.config.ts) pulls simple-git:
-  # GHSA-x6jw-m9v5-85vh, GHSA-858h-whjf-mvg5, GHSA-v5rq-49vh-5v5c.
-  simple-git: ^4.0.2
-  '@simple-git/argv-parser': ^2.0.1
   # esbuild dev-server file read, via @nuxt/fonts.
   fontless>esbuild: ^0.28.1
-  # GHSA-pqg4-j6r4-53mv (critical): quote() command injection, via Nuxt
-  # devtools' launch-editor. Oldest fixed release.
-  shell-quote: 1.11.0
   # GHSA-68fv-2mgg-jv7q: event-loop DoS, via postcss. Oldest fixed release.
   source-map-js: 1.2.2
+  # Nuxt devtools, disabled in nuxt.config.ts, so Nuxt never loads it. Removed
+  # with its dependency tree (simple-git, launch-editor and shell-quote, which
+  # needed security overrides of their own).
+  '@nuxt/devtools': '-'
+  # open 10.2 and later moved their WSL and PowerShell handling into two young
+  # helper packages, wsl-utils and powershell-utils (Socket flags the latter).
+  # 10.1.2 is the last release without them and has the same API;
+  # rollup-plugin-visualizer calls it only when asked to open a bundle report
+  # in a browser.
+  open: 10.1.2
   # WebAssembly fallbacks, loaded only when the native binary is missing (a
   # platform without a prebuilt one). Removed to keep unused code out of the
   # dependency tree; every supported platform has the native package.

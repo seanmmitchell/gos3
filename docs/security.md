@@ -454,19 +454,19 @@ Supply-chain rules:
   images. Go dependencies are pinned to releases that were at least 14 days
   old when chosen. The only exceptions are security fixes younger than the
   cooldown: they are listed in `minimumReleaseAgeExclude` and pinned to the
-  oldest fixed release in `overrides` (currently `shell-quote` 1.11.0 and
-  `source-map-js` 1.2.2).
+  oldest fixed release in `overrides` (currently `source-map-js` 1.2.2).
 - **Small module graph.** `github.com/minio/minio-go/v7` (a test-only client)
   stays on v7.1.x: v7.2 and later declare their linter toolchain as module
   requirements, which would add about 200 modules to gos3's module graph.
 - **Patched transitive packages.** `overrides` in `web/pnpm-workspace.yaml`
-  forces patched versions where a dependency lags behind (for example
-  `simple-git`, pulled in by Nuxt devtools, which gos3 disables).
-- **No unused fallbacks.** The same `overrides` remove the WebAssembly
-  fallbacks of Tailwind's and Parcel's native binaries
-  (`@tailwindcss/oxide-wasm32-wasi`, `@parcel/watcher-wasm`). They load only
-  on platforms without a prebuilt native package, which gos3 does not
-  support.
+  forces patched versions where a dependency lags behind.
+- **No unused packages.** The same `overrides` remove packages gos3 never
+  loads: Nuxt devtools, which gos3 disables (with it go `simple-git`,
+  `launch-editor` and `shell-quote`), and the WebAssembly fallbacks of
+  Tailwind's and Parcel's native binaries (`@tailwindcss/oxide-wasm32-wasi`,
+  `@parcel/watcher-wasm`), which load only on platforms without a prebuilt
+  native package. `open` stays on 10.1.2, the last release before it moved
+  its WSL and PowerShell handling into `wsl-utils` and `powershell-utils`.
 - **Install scripts.** Only the packages listed in `onlyBuiltDependencies`
   may run install scripts.
 - **Scanning.** CI runs `govulncheck`; `pnpm audit` covers the web UI.
