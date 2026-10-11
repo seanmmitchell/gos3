@@ -22,7 +22,9 @@ Base path: `/_gos3/admin/v1` on the S3 listener. JSON in/out
   that would survive revoking the current one.
 - `aws:SourceIp` / `aws:SecureTransport` conditions and the remote address
   in the admin access log use `X-Forwarded-For` / `X-Forwarded-Proto` only
-  when `server.trust_proxy_headers` is on, as for the S3 API.
+  when `server.trust_proxy_headers` is on and the peer is in
+  `server.trusted_proxies` (or that list is empty), with the same rules as
+  the S3 API (see [deployment.md](deployment.md#reverse-proxy)).
 - CORS: preflight `OPTIONS` is answered without auth using the global
   `cors` settings; actual responses carry the matching CORS headers.
 - Request bodies are limited to 1 MiB and decoded strictly: unknown fields and

@@ -151,10 +151,17 @@ of discarding them. See [operations.md](operations.md#the-data-directory).
   keys returned by the admin API when keys are created) travel in clear text.
 - With `server.tls_cert` / `tls_key`, gos3 accepts TLS 1.2 or later and serves
   HTTP/2.
-- Behind a proxy, enable `server.trust_proxy_headers` only when the proxy
-  overwrites `X-Forwarded-For` and `X-Forwarded-Proto`. Otherwise clients can
-  fake `aws:SourceIp` and `aws:SecureTransport` conditions. The setting
-  applies to the S3 API and the admin API (conditions and access log alike).
+- Behind a proxy, enable `server.trust_proxy_headers` and list the proxies
+  in `server.trusted_proxies`. gos3 then honours `X-Forwarded-For` /
+  `X-Forwarded-Proto` only from those peers, takes the rightmost
+  `X-Forwarded-For` entry that is not a trusted proxy as the client and the
+  last `X-Forwarded-Proto` value as the transport, so a client cannot choose
+  its `aws:SourceIp` by sending its own header, even through a proxy that
+  appends to it. With an empty `trusted_proxies` every peer is trusted: a
+  client that can reach gos3 without the proxy can then fake
+  `aws:SourceIp` and `aws:SecureTransport`. The setting applies to the S3
+  API, the admin API and the `/_gos3/*` endpoints (conditions and access
+  logs alike).
 
 ### Timeouts
 
