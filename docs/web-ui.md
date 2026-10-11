@@ -40,6 +40,33 @@ now" option, on by default) also `admin:CreateAccessKey`. A role with only
 `admin:CreateUser` gets a 403 from the create form unless it selects no
 policies and clears that option.
 
+- **Self-service keys.** A user without `admin:CreateUser` sees "My access
+  keys" on the Users page: it lists the user's own keys and deletes them
+  (except the key signing the session). Creating a key there needs a policy
+  that explicitly allows `admin:CreateOwnAccessKey` (whoami capability
+  `createOwnKeys`; no built-in policy except `admin` grants it, and it is
+  always false for root, which has no IAM keys). Without it the "Create key"
+  button is hidden and the card names the missing action. The "Own access
+  keys" policy template grants it. With a server that does not report
+  `createOwnKeys` yet, the UI assumes creation is allowed, as such servers
+  allowed it unless explicitly denied.
+- **Discovery probe.** "Probe a URL" on a server's Discovery page
+  (`POST /discovery/probe`) needs `admin:ProbeNetwork` (whoami capability
+  `probe`). Reading the peer table needs only `admin:GetDiscovery`, so the
+  built-in `diagnostics` policy shows the peers but not the probe form; the
+  card says that `admin:ProbeNetwork` is missing instead. With a server that
+  does not report `probe` yet, the UI falls back to `discovery`
+  (`admin:GetDiscovery`), the permission such servers checked.
+- **Policy editor and simulator.** Admin actions are evaluated against
+  `arn:gos3:admin:::user/<name>`, `arn:gos3:admin:::policy/<name>` and
+  `arn:gos3:admin:::bucket/<name>` (see [admin-api.md](admin-api.md));
+  `*` and `arn:gos3:admin:::*` match all of them. The policy editor lists
+  these forms and the `admin:PolicyName` condition key (the policies a
+  CreateUser / UpdateUser request attaches), and the "Manage some users"
+  template scopes user management to a name pattern and to a list of
+  attachable policies. For an admin action the simulator asks for an admin
+  resource instead of a bucket and key (empty = service level).
+
 ### Object browser notes
 
 - Listings use `encoding-type=url` (ListObjectsV2, ListObjectVersions and
@@ -78,7 +105,11 @@ policies and clears that option.
 ## Signing in and credentials
 
 Every request is signed in the browser with AWS SigV4, both for the S3 API and
-the admin API. There are no sessions or cookies. A connection is
+the admin API. There are no sessions or cookies. Admin API requests also sign
+their payload: `X-Amz-Content-Sha256` is the hex SHA-256 of the exact body
+sent (of the empty string when there is none), so a captured request cannot
+be replayed with another body; gos3 rejects admin requests with a body whose
+payload is not signed. (S3 requests keep `UNSIGNED-PAYLOAD`.) A connection is
 `{name, endpoint, region, accessKeyId, secretAccessKey, kind, forcePathStyle}`,
 where `kind` is `gos3` or `s3`.
 
@@ -86,6 +117,18 @@ where `kind` is `gos3` or `s3`.
   Otherwise it is kept in `sessionStorage` and is gone when the tab closes.
   Use "remember" only on a trusted device.
 - Connections can be exported and imported as JSON, with or without secrets.
+  Before importing, the dialog lists what each entry will do: add a server,
+  update fields of an existing one (secret values are never shown), or skip
+  it. An entry matches an existing connection by ID, or by endpoint and
+  access key. An import never points an existing connection, and the secret
+  stored with it, at another server: an entry that would change a
+  connection's endpoint or kind is added as a separate server instead, with
+  only the credentials the file itself holds. The embedded "this server"
+  connection and presets are never changed by an import (matching entries
+  for the same server are skipped), and imported entries cannot take their
+  IDs. Changing the access key without a new secret clears the stored
+  secret, and `remember` in a file is ignored: imported secrets stay in
+  `sessionStorage` until you turn "remember" on.
 - Several open tabs share connection changes (added, edited and removed
   connections and remembered secrets). The active server and secrets kept
   only for the session stay per tab.
