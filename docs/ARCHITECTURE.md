@@ -263,7 +263,11 @@ so no clash.
 - Bucket policies (`?policy`) are evaluated together with identity policies;
   explicit Deny wins; anonymous requests are allowed only by bucket policy
   (`Principal: "*"`) or public canned ACLs.
-- Admin API actions are `admin:<Action>` (see `docs/admin-api.md`).
+- Admin API actions are `admin:<Action>`, evaluated against
+  `arn:gos3:admin:::user/<name>`, `…:policy/<name>`, `…:bucket/<name>` or
+  service level (see `docs/admin-api.md`); s3 and admin ARNs never
+  cross-match. Admin request bodies must be signed (hex SHA-256 or signed
+  streaming).
 
 ## Admin API
 

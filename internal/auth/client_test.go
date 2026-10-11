@@ -6,6 +6,7 @@ import (
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/hex"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -180,10 +181,21 @@ func TestClientHelperErrors(t *testing.T) {
 		t.Error("empty credentials accepted")
 	}
 	// Payload defaults.
+	// A re-readable body is hashed (and left unread) ...
 	req, _ = http.NewRequest("PUT", "http://h/b/k", strings.NewReader("x"))
 	_ = SignRequest(req, c, "", "", "", now)
+	if got, want := req.Header.Get("X-Amz-Content-Sha256"), "2d711642b726b04401627ca9fbac32f5c8530fb1903cc4db02258717921a4881"; got != want {
+		t.Errorf("re-readable body default: %s, want %s", got, want)
+	}
+	if b, _ := io.ReadAll(req.Body); string(b) != "x" {
+		t.Errorf("body consumed: %q", b)
+	}
+	// ... any other body is sent as UNSIGNED-PAYLOAD.
+	req, _ = http.NewRequest("PUT", "http://h/b/k", io.NopCloser(strings.NewReader("x")))
+	req.ContentLength = 1
+	_ = SignRequest(req, c, "", "", "", now)
 	if req.Header.Get("X-Amz-Content-Sha256") != PayloadUnsigned {
-		t.Errorf("body default: %s", req.Header.Get("X-Amz-Content-Sha256"))
+		t.Errorf("stream body default: %s", req.Header.Get("X-Amz-Content-Sha256"))
 	}
 	// Re-signing replaces the previous Authorization.
 	_ = SignRequest(req, c, "", "", "", now)

@@ -61,25 +61,82 @@ stored in `<data>/.gos3/iam.json` (mode 0600). A user can have up to 10 keys,
 and keys can be deactivated. Users can list, create and delete their own keys
 through `/_gos3/admin/v1/whoami/keys`.
 
-Users may create and delete their own keys without any grant, unless a
-policy explicitly denies `admin:CreateOwnAccessKey` /
-`admin:DeleteOwnAccessKey` (a Deny of `admin:*` also matches). Deny them to
-stop a user, or a stolen key, from minting keys that would survive revoking
-the current one.
+Creating a key for oneself needs an explicit Allow of
+`admin:CreateOwnAccessKey`, which only the built-in `admin` policy grants;
+give it in a custom policy to users who should manage their own keys. Without
+it, a stolen key cannot mint fresh keys that would survive revoking the
+stolen one. An explicit Deny still wins over the Allow. Every self-service
+key creation is logged at Info with the user, the new access key ID and the
+access key that signed the request. Listing and deleting one's own keys
+needs no grant (deleting is refused only by an explicit Deny of
+`admin:DeleteOwnAccessKey` or `admin:*`). When a key leaks, check the log
+for keys it created; disabling the user (`PATCH /users/{name}` with
+`"disabled": true`) revokes all of the user's keys at once.
 
 Creating a user through the admin API needs `admin:CreateUser`; creating it
 with policies attached also needs `admin:UpdateUser`, and with an initial
 access key (`"createKey": true`) also `admin:CreateAccessKey`, the same
 actions that gate those steps on their own routes. A role with only
 `admin:CreateUser` can therefore create users without policies or keys, but
-cannot create a user with the `admin` policy and take its key, so it is not
-equivalent to `admin:*`.
+cannot create a user with the `admin` policy and take its key.
 
 Built-in policies: `admin` (everything, including the admin API), `readwrite`
 (all S3 actions), `readonly`, `writeonly`, and `diagnostics` (server info,
-stats and discovery in the admin API only). Custom policies use the IAM policy
-language; the admin API's `/authz/simulate` endpoint and the UI's policy
-simulator show which statement decides a request.
+stats and discovery state in the admin API only; no probes or scans). Custom
+policies use the IAM policy language; the admin API's `/authz/simulate`
+endpoint and the UI's policy simulator show which statement decides a
+request.
+
+### Scoping admin permissions
+
+Several admin actions are each **equivalent to full admin** when granted on
+every resource (`"Resource": "*"` or `arn:gos3:admin:::*`), because they let
+the holder give itself any permission:
+
+- `admin:UpdateUser`: attach the `admin` policy to yourself.
+- `admin:CreateUser` together with `admin:UpdateUser` (or with
+  `admin:CreateAccessKey`): create a user with the `admin` policy and use it.
+- `admin:PutPolicy`: rewrite a policy attached to yourself to allow `*`.
+- `admin:CreateAccessKey`: create a key (with a secret you choose) for an
+  administrator and sign as them.
+- `admin:UpdateAccessKey`: reactivate an administrator key that was
+  deactivated, for example after it leaked.
+- `admin:UpdateConfig`: change CORS, discovery and the public URL; treat it
+  like root access.
+
+To delegate part of user or policy management, scope these actions with the
+per-target resources (see
+[admin-api.md](admin-api.md#resources-and-condition-keys)):
+`arn:gos3:admin:::user/<name>` for user and key actions (a key is evaluated
+as its owner), `arn:gos3:admin:::policy/<name>` for policy actions and
+`arn:gos3:admin:::bucket/<name>` for `admin:GetBucket` and
+`admin:ForceDeleteBucket`, with wildcards, and limit which policies may be
+attached with the multi-valued condition key `admin:PolicyName`. For
+example, this help-desk policy manages only `team-*` users, which cannot
+include the help-desk user itself, and may attach only `readonly`:
+
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    { "Effect": "Allow", "Action": "admin:ListUsers", "Resource": "arn:gos3:admin:::*" },
+    { "Effect": "Allow",
+      "Action": ["admin:GetUser", "admin:UpdateUser", "admin:CreateUser",
+                 "admin:CreateAccessKey", "admin:UpdateAccessKey", "admin:DeleteAccessKey"],
+      "Resource": "arn:gos3:admin:::user/team-*",
+      "Condition": { "ForAllValues:StringEquals": { "admin:PolicyName": ["readonly"] } } }
+  ]
+}
+```
+
+Name the scoped users and policies so that the delegated user and the
+policies attached to it fall outside the pattern, and do not let it attach
+policies that grant admin actions. A Deny with
+`"ForAnyValue:StringEquals": {"admin:PolicyName": "admin"}` on
+`admin:UpdateUser` and `admin:CreateUser` blocks attaching `admin` whatever
+else is allowed. `*` and `arn:gos3:admin:::*` keep matching every admin
+resource, and s3 ARNs such as `arn:aws:s3:::*` never grant admin actions. The
+UI's capability flags (`GET /whoami`) reflect only unscoped grants.
 
 Setting an ACL or tags while writing an object needs more than
 `s3:PutObject`, as on AWS: PutObject, CopyObject (with the `REPLACE` tagging
@@ -147,9 +204,15 @@ of discarding them. See [operations.md](operations.md#the-data-directory).
 
 ## Transport
 
-- gos3 serves plain HTTP unless TLS is configured. Signatures protect requests
-  from tampering, but without TLS the data and the responses (including secret
-  keys returned by the admin API when keys are created) travel in clear text.
+- gos3 serves plain HTTP unless TLS is configured. A signature covers the
+  method, path, query and signed headers, and the body only when the client
+  signs its SHA-256: S3 requests sent with `UNSIGNED-PAYLOAD` or a presigned
+  URL can have their body replaced by anyone on the path, and a captured
+  request can be replayed within the 15-minute clock skew (there is no
+  replay cache). The admin API therefore refuses unsigned bodies (see
+  [admin-api.md](admin-api.md#authentication--authorization)). Without TLS the
+  data and the responses (including secret keys returned by the admin API
+  when keys are created) also travel in clear text.
 - With `server.tls_cert` / `tls_key`, gos3 accepts TLS 1.2 or later and serves
   HTTP/2.
 - Behind a proxy, enable `server.trust_proxy_headers` and list the proxies
@@ -284,12 +347,17 @@ then cannot verify it.
   `max_scan_hosts` hosts (default 1024) and 5 minutes, and at most 2 scans
   run at once per server (`429 TooManyRequests`). Set `allow_scan: false`
   where port scanning is unwelcome.
-- **Probes** (`POST /_gos3/admin/v1/discovery/probe`) need only
-  `admin:GetDiscovery`, which the `diagnostics` policy grants. They make the
-  server fetch `<url>/_gos3/info` from any HTTP(S) host it can reach, which is
-  a limited server-side request vector. The response must be a valid gos3
-  `Info` document (at most 64 KiB), and probes never follow redirects or use
-  proxies. Grant `diagnostics` only to trusted users.
+- **Probes** (`POST /_gos3/admin/v1/discovery/probe`) need
+  `admin:ProbeNetwork`, which the `diagnostics` policy does not grant (only
+  `admin`, or a custom policy). They make the server fetch
+  `<url>/_gos3/info` from any HTTP(S) host it can reach, which is a limited
+  server-side request vector. The response must be a valid gos3 `Info`
+  document (at most 64 KiB), probes never follow redirects or use proxies,
+  each is bounded by 10 s, and at most 4 run at once per server (`429
+  TooManyRequests`). A failed probe reports only `unreachable`, `timed out`,
+  `HTTP <status>` or `not a gos3 server`, never the underlying error, so
+  probes do not reveal banners of other services or why a connection failed
+  (refused, reset, TLS or protocol errors all read `unreachable`).
 - The standalone web UI's Node server can perform local discovery (mDNS,
   beacon, scans, probes) from the UI host. It has no authentication, so
   this is **off unless `GOS3_UI_LOCAL_DISCOVERY=true`** (the container image
@@ -320,7 +388,9 @@ then cannot verify it.
   including versions under object lock retention or legal hold. It needs
   `admin:ForceDeleteBucket`, which only `admin` grants by default.
 - `PUT /_gos3/admin/v1/config` (`admin:UpdateConfig`) can change CORS,
-  discovery and the public URL. Treat it like root access.
+  discovery and the public URL. Treat it like root access (see
+  [Scoping admin permissions](#scoping-admin-permissions) for the other
+  admin-equivalent actions).
 - Admin requests are recorded in metrics (op `Admin`) and in the access log.
   The log contains paths only, never query strings, so presigned URL signatures
   are not logged.

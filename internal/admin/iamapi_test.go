@@ -111,7 +111,10 @@ func TestUsers(t *testing.T) {
 
 func TestOwnKeys(t *testing.T) {
 	e := newEnv(t)
-	alice := e.addUser("alice") // no policies at all: self-service needs none
+	// Listing and deleting own keys needs no grant; creating them needs an
+	// explicit Allow (TestCreateOwnKeyNeedsExplicitAllow).
+	e.putPolicy("own-keys", map[string]any{"Effect": "Allow", "Action": "admin:CreateOwnAccessKey", "Resource": "*"})
+	alice := e.addUser("alice", "own-keys")
 	other := e.addUser("other")
 
 	r := e.do(&alice, "GET", Prefix+"/whoami/keys", nil)

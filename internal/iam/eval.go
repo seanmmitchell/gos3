@@ -8,9 +8,59 @@ import (
 	"github.com/seanmmitchell/gos3/internal/auth"
 )
 
-// AdminResourceARN is the resource that admin:* actions are evaluated
-// against (besides "*").
-const AdminResourceARN = "arn:gos3:admin:::*"
+// AdminResourceARN is the resource that service-level admin:* actions are
+// evaluated against (besides "*"). As a policy resource it matches every
+// admin resource.
+const AdminResourceARN = adminARNPrefix + "*"
+
+// adminARNPrefix starts every admin resource ARN.
+const adminARNPrefix = "arn:gos3:admin:::"
+
+// Types of per-target admin resources (arn:gos3:admin:::<type>/<name>).
+const (
+	adminTypeUser   = "user"
+	adminTypePolicy = "policy"
+	adminTypeBucket = "bucket"
+)
+
+// CondAdminPolicyName is the multi-valued condition key holding the policy
+// names an admin:CreateUser or admin:UpdateUser request attaches (absent
+// when the request attaches none).
+const CondAdminPolicyName = "admin:PolicyName"
+
+// AdminUserARN returns the admin resource of an IAM user
+// (arn:gos3:admin:::user/<name>).
+func AdminUserARN(name string) string { return adminARNPrefix + adminTypeUser + "/" + name }
+
+// AdminPolicyARN returns the admin resource of an IAM policy
+// (arn:gos3:admin:::policy/<name>).
+func AdminPolicyARN(name string) string { return adminARNPrefix + adminTypePolicy + "/" + name }
+
+// AdminBucketARN returns the admin resource of a bucket
+// (arn:gos3:admin:::bucket/<name>).
+func AdminBucketARN(name string) string { return adminARNPrefix + adminTypeBucket + "/" + name }
+
+// ValidAdminRequestResource reports whether r is a resource an admin
+// request can be evaluated against: "" (service level) or
+// arn:gos3:admin:::{user,policy,bucket}/<name> with a non-empty name.
+func ValidAdminRequestResource(r string) bool {
+	if r == "" {
+		return true
+	}
+	rest, ok := strings.CutPrefix(r, adminARNPrefix)
+	if !ok || len(r) > 2048 {
+		return false
+	}
+	typ, name, ok := strings.Cut(rest, "/")
+	if !ok || name == "" {
+		return false
+	}
+	switch typ {
+	case adminTypeUser, adminTypePolicy, adminTypeBucket:
+		return true
+	}
+	return false
+}
 
 // s3ServiceARN is the resource that service-level s3 actions (Bucket == "",
 // e.g. s3:ListAllMyBuckets) are evaluated against besides "*".
@@ -44,6 +94,9 @@ func newEvalCtx(req *AuthzRequest, now time.Time) *evalCtx {
 		now:     now,
 	}
 	switch {
+	case c.isAdmin:
+		// Admin actions never take an s3 resource from Bucket/Key.
+		c.resource = req.Resource
 	case req.Bucket == "":
 	case req.Key == "":
 		c.resource = BucketARN(req.Bucket)
@@ -124,13 +177,24 @@ func (c *evalCtx) actionMatches(patterns []string) bool {
 }
 
 // resourceMatches reports whether the request resource matches any pattern.
-// Service-level requests (Bucket == "") only match "*", plus
-// "arn:aws:s3:::*" for s3 actions and "arn:gos3:admin:::*" for admin
-// actions.
+// "*" matches everything. Otherwise admin actions only match patterns that
+// start with "arn:gos3:admin:::" and s3 actions only patterns that do not,
+// so no s3 ARN (not even "arn:aws:s3:::*" or "arn:*") grants an admin
+// action and no admin ARN grants an s3 action. Service-level requests (no
+// resource) only match "arn:aws:s3:::*" for s3 actions and
+// "arn:gos3:admin:::*" for admin actions; per-target admin resources
+// (arn:gos3:admin:::user/<name>, ...) are glob-matched like s3 ARNs, policy
+// variables included.
 func (c *evalCtx) resourceMatches(patterns []string) bool {
 	for _, p := range patterns {
+		if p == "*" {
+			return true
+		}
+		if strings.HasPrefix(p, adminARNPrefix) != c.isAdmin {
+			continue
+		}
 		if c.resource == "" {
-			if p == "*" || (c.isAdmin && p == AdminResourceARN) || (!c.isAdmin && p == s3ServiceARN) {
+			if (c.isAdmin && p == AdminResourceARN) || (!c.isAdmin && p == s3ServiceARN) {
 				return true
 			}
 			continue
