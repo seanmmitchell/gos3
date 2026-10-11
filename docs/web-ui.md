@@ -11,7 +11,7 @@ bucket and object features. It runs in two modes built from the same code in
 | Build | `make build` (or `cd web && pnpm generate:embed`, then `make build-go`) | `cd web && pnpm build`, or `docker build -f deploy/docker/web.Dockerfile .` |
 | Default connection | The hosting gos3 server, detected automatically | None; add servers or ship presets |
 | CORS needed | No for the hosting server (same origin); yes for other servers it manages | Yes, for every server |
-| Local discovery (mDNS, beacon, scan from the UI host) | No (needs the Node server) | Yes |
+| Local discovery (mDNS, beacon, scan from the UI host) | No (needs the Node server) | Optional, off by default (`GOS3_UI_LOCAL_DISCOVERY=true`) |
 | Presets | `servers.json` baked in at build time | `NUXT_PUBLIC_SERVERS` at runtime, or `servers.json` at build time |
 
 The UI works offline: fonts and icons are bundled, and it loads nothing from
@@ -39,6 +39,35 @@ and with an initial access key (the create form's "Create an access key
 now" option, on by default) also `admin:CreateAccessKey`. A role with only
 `admin:CreateUser` gets a 403 from the create form unless it selects no
 policies and clears that option.
+
+- **Self-service keys.** A user without `admin:CreateUser` sees "My access
+  keys" on the Users page: it lists the user's own keys and deletes them
+  (except the key signing the session). Creating a key there needs a policy
+  that explicitly allows `admin:CreateOwnAccessKey` (whoami capability
+  `createOwnKeys`; no built-in policy except `admin` grants it, and it is
+  always false for root, which has no IAM keys). Without it the "Create key"
+  button is hidden and the card names the missing action. The "Own access
+  keys" policy template grants it. With a server that does not report
+  `createOwnKeys` yet, the UI assumes creation is allowed, as such servers
+  allowed it unless explicitly denied.
+- **Discovery probe.** "Probe a URL" on a server's Discovery page
+  (`POST /discovery/probe`) needs `admin:ProbeNetwork` (whoami capability
+  `probe`). Reading the peer table needs only `admin:GetDiscovery`, so the
+  built-in `diagnostics` policy shows the peers but not the probe form; the
+  card says that `admin:ProbeNetwork` is missing instead. With a server that
+  does not report `probe` yet, the UI falls back to `discovery`
+  (`admin:GetDiscovery`), the permission such servers checked.
+- **Policy editor and simulator.** Admin actions are evaluated against
+  `arn:gos3:admin:::user/<name>`, `arn:gos3:admin:::policy/<name>` and
+  `arn:gos3:admin:::bucket/<name>` (see [admin-api.md](admin-api.md));
+  `*` and `arn:gos3:admin:::*` match all of them. The policy editor lists
+  these forms and the `admin:PolicyName` condition key (the policies a
+  CreateUser / UpdateUser request attaches), and the "Manage some users"
+  template scopes user management to a name pattern and to a list of
+  attachable policies. Such a delegated manager still gets the Users page
+  (it lists all users; actions on users outside the pattern are refused by
+  the server and shown as errors). For an admin action the simulator asks for an admin
+  resource instead of a bucket and key (empty = service level).
 
 ### Object browser notes
 
@@ -78,7 +107,11 @@ policies and clears that option.
 ## Signing in and credentials
 
 Every request is signed in the browser with AWS SigV4, both for the S3 API and
-the admin API. There are no sessions or cookies. A connection is
+the admin API. There are no sessions or cookies. Admin API requests also sign
+their payload: `X-Amz-Content-Sha256` is the hex SHA-256 of the exact body
+sent (of the empty string when there is none), so a captured request cannot
+be replayed with another body; gos3 rejects admin requests with a body whose
+payload is not signed. (S3 requests keep `UNSIGNED-PAYLOAD`.) A connection is
 `{name, endpoint, region, accessKeyId, secretAccessKey, kind, forcePathStyle}`,
 where `kind` is `gos3` or `s3`.
 
@@ -86,6 +119,19 @@ where `kind` is `gos3` or `s3`.
   Otherwise it is kept in `sessionStorage` and is gone when the tab closes.
   Use "remember" only on a trusted device.
 - Connections can be exported and imported as JSON, with or without secrets.
+  Before importing, the dialog lists what each entry will do: add a server,
+  update fields of an existing one (secret values are never shown), or skip
+  it. An entry matches an existing connection by ID, or by endpoint and
+  access key. An import never points an existing connection, and the secret
+  stored with it, at another server: an entry that would change a
+  connection's endpoint or kind is added as a separate server instead, with
+  only the credentials the file itself holds. The embedded "this server"
+  connection and presets are never changed by an import (matching entries
+  for the same server are skipped), and imported entries cannot take their
+  IDs. Changing the access key without a new secret clears the stored
+  secret, and `remember` in a file is ignored: imported secrets stay in
+  `sessionStorage` until you turn "remember" on (an import that replaces
+  the secret of a remembered connection turns "remember" off).
 - Several open tabs share connection changes (added, edited and removed
   connections and remembered secrets). The active server and secrets kept
   only for the session stay per tab.
@@ -158,28 +204,49 @@ Other runtime variables of the Node server:
 | `HOST`, `PORT` (or `NITRO_HOST`, `NITRO_PORT`) | Listen address (default port 3000). |
 | `NUXT_PUBLIC_SERVERS` | Preset connections (JSON array). |
 | `NUXT_PUBLIC_APP_NAME` | Display name (default `gos3`). |
-| `GOS3_UI_LOCAL_DISCOVERY` | `false` (also `0`, `off`, `no`, `disabled`) turns off the local discovery routes below. |
+| `GOS3_UI_LOCAL_DISCOVERY` | `true` (also `1`, `on`, `yes`, `enabled`) turns on the local discovery routes below. They are off when it is unset or has any other value. |
 | `GOS3_UI_ALLOWED_HOSTS` | Extra host names (comma separated) under which the discovery routes below answer, for example `console.example.com`. IP addresses, `localhost` and `*.localhost` are always accepted as `Host`. A listed name is also accepted as the host name of the browser's `Origin` (any port), which matters behind a reverse proxy that rewrites `Host`. `*` only turns the `Host` check off; it does not accept any `Origin`. Set it whenever the UI is reached through a DNS name. |
 
 ### Local discovery routes
 
 Browsers cannot send mDNS or multicast packets or scan networks, so the
-standalone Node server does this from the UI host:
+standalone Node server can do this from the UI host. **These routes are off
+unless `GOS3_UI_LOCAL_DISCOVERY=true`.** While they are off, `capabilities`
+reports `localDiscovery: false` (the Discover page says local discovery is
+turned off and still probes from the browser), and `local`, `scan` and
+`probe` answer `403 AccessDenied`.
 
 | Route | Purpose |
 |---|---|
 | `GET /api/discovery/capabilities` | `{localDiscovery, mdns, beacon, scan, maxScanHosts}`. The UI hides local discovery when this route is missing (embedded mode). |
 | `GET /api/discovery/local?wait=<ms>` | mDNS browse (`_gos3._tcp`) plus a beacon query (`239.255.73.83:7373`), then verification through `/_gos3/info`. `wait` is 500–10000 ms (default 3000). |
 | `POST /api/discovery/scan` | Scans CIDRs, hosts or URLs (an admin API `ScanRequest`): at most 1024 hosts, 64 ports, 4096 probes and concurrency 64. |
-| `POST /api/discovery/probe` | `{"url": "http://host:9000"}` → that server's `Info`, or 502 `ProbeFailed`. |
+| `POST /api/discovery/probe` | `{"url": "http://host:9000"}` → that server's `Info`, or 502 `ProbeFailed` with a coarse reason: `unreachable`, `timed out`, `HTTP <status>`, `authentication required`, `not a gos3 server` or `address not allowed`. |
 
-**The Node server has no authentication.** Anyone who can reach it can make it
-probe and scan, within the limits above. Bind it to a trusted interface, put it
-behind an authenticating proxy, or set `GOS3_UI_LOCAL_DISCOVERY=false`.
+**The Node server has no authentication.** With local discovery on, anyone
+who can reach it can make it probe and scan, within the limits below. Turn it
+on only where every client is trusted: bind the server to a trusted interface
+(the compose demo publishes it on `127.0.0.1`) or put it behind an
+authenticating proxy.
 
-Each UI server runs at most 2 `POST /api/discovery/scan` and 4
-`GET /api/discovery/local` requests at once; further requests get
-`429 TooManyRequests` (the admin API error envelope) with `Retry-After: 5`.
+Each UI server runs at most 2 `POST /api/discovery/scan`, 4
+`GET /api/discovery/local` and 8 `POST /api/discovery/probe` requests at once;
+further requests get `429 TooManyRequests` (the admin API error envelope) with
+`Retry-After: 5`. Scans and probes take their slot before the request body is
+read. Request bodies are capped at 8 KiB for probes and 64 KiB for scans:
+a larger `Content-Length`, or a streamed body that grows past the cap, gets
+`413` and the connection is closed; a body that does not arrive within 10
+seconds gets `408`, invalid JSON `400`.
+
+Probes, scans and the verification of discovered candidates never connect to
+cloud metadata addresses (`169.254.169.254`, `169.254.170.2`,
+`169.254.170.23`, `fd00:ec2::254`, `100.100.100.200`), unspecified
+(`0.0.0.0/8`, `::`), multicast or broadcast addresses, including their
+IPv4-mapped IPv6 forms. IP literals are refused up front (a probe or an
+explicit scan target answers `400`; such addresses inside a CIDR are
+skipped), and host names are checked against every address they resolve to
+when the connection is made, so DNS rebinding cannot bypass the check.
+Loopback, private ranges and other link-local addresses stay allowed.
 
 Protection against other websites:
 
@@ -201,7 +268,7 @@ Protection against other websites:
   page cannot send without a CORS preflight that the server never approves.
 
 Probes read at most 64 KiB of an identity document (with or without
-`Content-Length`). Local discovery keeps at most 2048 mDNS records and 1024
+`Content-Length`), and never follow redirects or use proxies. Local discovery keeps at most 2048 mDNS records and 1024
 beacon candidates, and verifies at most 256 URLs.
 
 Multicast is often unavailable in containers (Kubernetes, Docker Desktop).

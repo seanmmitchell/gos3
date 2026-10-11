@@ -1,5 +1,6 @@
 // Admin pages + bucket settings E2E against a gos3 server mocked with
 // Playwright request interception (admin JSON API + the S3 calls they use).
+import { createHash } from 'node:crypto'
 import { expect, test } from '@playwright/test'
 import type { Page, Route } from '@playwright/test'
 
@@ -31,11 +32,14 @@ const INFO = {
   startedAt: new Date(now - 3600_000).toISOString()
 }
 
-const ALL_CAPS = { admin: true, viewInfo: true, viewStats: true, manageConfig: true, manageUsers: true, managePolicies: true, manageBuckets: true, discovery: true, scan: true }
+// Root: createOwnKeys is always false (root has no IAM keys).
+const ALL_CAPS = { admin: true, viewInfo: true, viewStats: true, manageConfig: true, manageUsers: true, managePolicies: true, manageBuckets: true, discovery: true, scan: true, probe: true, createOwnKeys: false }
 
 interface MockState {
   log: string[]
   bodies: Record<string, string>
+  /** Admin requests: payload hash header and the headers covered by the signature. */
+  signing: Record<string, { payloadHash: string, signedHeaders: string }>
   users: { name: string, description?: string, disabled: boolean, policies: string[], keys: { accessKey: string, status: string, createdAt: string, description?: string }[], createdAt: string, updatedAt: string }[]
   policies: { name: string, description?: string, builtin: boolean, document: unknown, createdAt: string, updatedAt: string }[]
   settings: Record<string, unknown>
@@ -47,6 +51,7 @@ function initialState(): MockState {
   return {
     log: [],
     bodies: {},
+    signing: {},
     users: [{
       name: 'alice',
       description: 'Backup job',
@@ -118,6 +123,11 @@ async function mockGos3(page: Page): Promise<MockState> {
 
     if (path === '/_gos3/info') return json(200, INFO)
     if (path.startsWith(ADMIN)) {
+      const h = req.headers()
+      st.signing[`${method} ${path}${url.search}`] = {
+        payloadHash: h['x-amz-content-sha256'] ?? '',
+        signedHeaders: /SignedHeaders=([^,]+)/.exec(h.authorization ?? '')?.[1] ?? ''
+      }
       const p = path.slice(ADMIN.length)
       if (p === '/whoami') return json(200, { user: '', accessKey: 'ROOTKEY', isRoot: true, policies: [], capabilities: ALL_CAPS, server: INFO })
       if (p === '/info') return json(200, { ...INFO, backend: 'fs', dataPath: '/data', goVersion: 'go1.25.0', os: 'linux', arch: 'amd64', numCPU: 8, uptimeSeconds: 3600 })
@@ -316,6 +326,11 @@ test.describe('admin pages', () => {
     await expect(secret).toBeHidden()
     await expect(page.getByRole('link', { name: 'bob' })).toBeVisible()
     expect(JSON.parse(st.bodies['POST /_gos3/admin/v1/users']!)).toMatchObject({ name: 'bob', createKey: true, disabled: false })
+    // Admin payloads are signed (C1): the hash of the exact body, covered by the signature.
+    const sha256 = (s: string) => createHash('sha256').update(s).digest('hex')
+    expect(st.signing['POST /_gos3/admin/v1/users']).toEqual({ payloadHash: sha256(st.bodies['POST /_gos3/admin/v1/users']!), signedHeaders: expect.stringContaining('x-amz-content-sha256') })
+    expect(st.signing['GET /_gos3/admin/v1/whoami']?.payloadHash).toBe(sha256(''))
+    for (const s of Object.values(st.signing)) expect(s.payloadHash).not.toBe('UNSIGNED-PAYLOAD')
   })
 
   test('user detail: keys, deactivate with confirmation and permission check', async ({ page }) => {

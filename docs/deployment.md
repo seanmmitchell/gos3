@@ -91,7 +91,10 @@ Notes:
   version, edit the tag and the digest of the `FROM` line together.
 
 The standalone web UI has its own image, `deploy/docker/web.Dockerfile`
-(`make docker-ui`); see [web-ui.md](web-ui.md#standalone-mode).
+(`make docker-ui`); see [web-ui.md](web-ui.md#standalone-mode). Its local
+discovery routes are off unless you set `GOS3_UI_LOCAL_DISCOVERY=true`; do
+that only where every client that can reach the container is trusted (for
+example `-p 127.0.0.1:3000:3000`).
 
 ## Docker Compose
 
@@ -119,9 +122,12 @@ docker compose down -v                        # stop and delete the data volumes
   Desktop). Add the second node through its published port,
   `http://localhost:9002`.
 - The standalone UI is preset with both nodes (`NUXT_PUBLIC_SERVERS`), and its
-  local discovery finds them through the beacon inside the network. Local
-  discovery answers only when the UI is opened via an IP address or
-  `localhost`; if you open it through a DNS name, set
+  local discovery finds them through the beacon inside the network. The
+  compose file turns local discovery on (`GOS3_UI_LOCAL_DISCOVERY`, default
+  `true` there, off in the image) because the UI is published on
+  `127.0.0.1`; set `GOS3_UI_LOCAL_DISCOVERY=false` if you change
+  `GOS3_DEMO_BIND`. Local discovery answers only when the UI is opened via an
+  IP address or `localhost`; if you open it through a DNS name, set
   `GOS3_UI_ALLOWED_HOSTS=<name>` (passed through by the compose file).
 
 ## systemd
@@ -212,10 +218,19 @@ How it fits together:
   proxy that adds authentication.
 - An Ingress in front of the Service must allow large bodies and must not
   buffer them (see the nginx settings below). The host it serves must be the
-  host clients sign; set `trust_proxy_headers: true` in the ConfigMap.
-- A standalone web UI deployed next to gos3 and reached through an Ingress
-  host name needs `GOS3_UI_ALLOWED_HOSTS=<that host>` for its local discovery
-  routes (see [web-ui.md](web-ui.md#local-discovery-routes)).
+  host clients sign; set `trust_proxy_headers: true` in the ConfigMap, and
+  `trusted_proxies` to the Ingress controller pods' addresses so requests
+  that bypass the Ingress cannot forge their address. Listing the whole pod
+  CIDR is simpler but lets every pod in it choose its own `aws:SourceIp`;
+  do that only when a NetworkPolicy allows nothing but the Ingress
+  controller to reach gos3, or when no policy relies on in-cluster source
+  addresses.
+- A standalone web UI deployed next to gos3 keeps its local discovery
+  routes off unless `GOS3_UI_LOCAL_DISCOVERY=true`; leave them off when the
+  UI is reachable through an Ingress, since they have no authentication.
+  If you do enable them, a UI reached through an Ingress host name also
+  needs `GOS3_UI_ALLOWED_HOSTS=<that host>` (see
+  [web-ui.md](web-ui.md#local-discovery-routes)).
 
 ## Reverse proxy
 
@@ -229,12 +244,29 @@ gos3 can sit behind nginx, Caddy, Traefik or a cloud load balancer. The rules:
    parts (up to 5 GiB) and large downloads. Slow CopyObject, UploadPartCopy and
    CompleteMultipartUpload calls are kept alive by gos3 with whitespace every
    5 s. gos3 itself fails a request body that sends no data for 60 s
-   (`RequestTimeout`); this limit is fixed.
-3. Set `server.trust_proxy_headers: true` only when the proxy **overwrites**
-   `X-Forwarded-For` and `X-Forwarded-Proto`. Then `aws:SourceIp`,
-   `aws:SecureTransport` and the access log see the real client. gos3 uses the
-   *first* `X-Forwarded-For` entry, so a proxy that appends to a header sent by
-   the client would let the client choose its address.
+   (`RequestTimeout`); this limit is fixed. Bodies read before the caller is
+   authorized (DeleteObjects, up to about 6.2 MiB, and the small
+   PutObjectTagging / PutObjectRetention / PutObjectLegalHold bodies) must
+   arrive completely within 60 s, so a maximal DeleteObjects needs at least
+   about 110 KB/s end to end (see [security.md](security.md#timeouts)).
+3. Set `server.trust_proxy_headers: true` and list the proxies in
+   `server.trusted_proxies`. Then `aws:SourceIp`, `aws:SecureTransport` and
+   the access logs see the real client:
+   - Forwarding headers are honoured only from a peer in `trusted_proxies`
+     (every peer when the list is empty). Requests that reach gos3 directly
+     are taken at face value.
+   - The client is the **rightmost** `X-Forwarded-For` entry that is not in
+     `trusted_proxies`. Each proxy appends the address it received the
+     request from, so the entries to the right of that one were written by
+     your proxies and anything further left may have been forged by the
+     client. With a chain (CDN, load balancer, Ingress) list every hop.
+     List only proxies: a client whose own address is in the list is
+     skipped like a proxy, so it could choose its `aws:SourceIp`.
+   - With an empty `trusted_proxies` the rightmost entry is the client. That
+     is right for a single proxy that appends to or overwrites the header,
+     as long as clients cannot reach gos3 without going through it.
+   - `aws:SecureTransport` follows the **last** `X-Forwarded-Proto` value, so
+     the proxy must set (overwrite) or append it.
 4. Set `server.public_url` to the public URL (for example
    `https://s3.example.com`), so `/_gos3/info`, discovery and the UI advertise
    it instead of the internal address.
@@ -259,7 +291,7 @@ server {
         proxy_pass http://127.0.0.1:9000;           # no URI part: the request URI is passed unchanged
         proxy_http_version 1.1;
         proxy_set_header Host $http_host;            # exactly what the client signed (incl. a non-default port)
-        proxy_set_header X-Forwarded-For $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;   # appending is fine: gos3 reads it from the right
         proxy_set_header X-Forwarded-Proto $scheme;
         proxy_set_header Connection "";
     }
@@ -279,6 +311,17 @@ s3.example.com, *.s3.example.com {
 Caddy passes `Host` through unchanged. Unless you configure trusted proxies,
 it replaces any `X-Forwarded-For` / `X-Forwarded-Proto` sent by the client.
 A wildcard certificate needs the DNS challenge.
+
+With either proxy on the same host as gos3, the gos3 side is:
+
+```yaml
+server:
+  trust_proxy_headers: true
+  trusted_proxies: ["127.0.0.1", "::1"]
+```
+
+Requests from any other address (clients that reach gos3's port without the
+proxy) then keep their own address whatever headers they send.
 
 ## Virtual-hosted-style domains
 

@@ -37,6 +37,7 @@ var envVars = []EnvVar{
 	{"GOS3_PUBLIC_INFO", "server.public_info", "serve /_gos3/info without auth (bool)", boolean(func(c *Config) *bool { return &c.Server.PublicInfo })},
 	{"GOS3_SHUTDOWN_TIMEOUT", "server.shutdown_timeout", "graceful shutdown timeout (duration)", duration(func(c *Config) *time.Duration { return &c.Server.ShutdownTimeout })},
 	{"GOS3_TRUST_PROXY_HEADERS", "server.trust_proxy_headers", "honour X-Forwarded-For/-Proto (bool)", boolean(func(c *Config) *bool { return &c.Server.TrustProxyHeaders })},
+	{"GOS3_TRUSTED_PROXIES", "server.trusted_proxies", "proxies whose X-Forwarded-* are honoured, CIDRs or IPs, comma-separated", list(func(c *Config) *[]string { return &c.Server.TrustedProxies })},
 	{"GOS3_DATA", "storage.path", "data directory", str(func(c *Config) *string { return &c.Storage.Path })},
 	{"GOS3_STORAGE_BACKEND", "storage.backend", "fs or memory", str(func(c *Config) *string { return &c.Storage.Backend })},
 	{"GOS3_FSYNC", "storage.fsync_data", "fsync object data on commit (bool)", boolean(func(c *Config) *bool { return &c.Storage.FsyncData })},

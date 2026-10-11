@@ -39,17 +39,24 @@ func (a *api) createUser(rc *reqCtx) (int, any, error) {
 	if err := rc.decodeBody(&req, false); err != nil {
 		return 0, nil, err
 	}
+	// The route's own action is evaluated here: its target (the new
+	// user) and admin:PolicyName come from the body.
+	target := iam.AdminUserARN(req.Name)
+	conds := policyNameConditions(req.Policies)
+	if err := a.requireAction(rc, rc.action, target, conds); err != nil {
+		return 0, nil, err
+	}
 	// The body can also attach policies and mint a key; those are gated by
 	// their own actions on the other routes, so check them here as well,
 	// before anything is created. Otherwise admin:CreateUser alone would be
 	// equivalent to admin:* (create a user with "admin" and take its key).
 	if len(req.Policies) > 0 {
-		if err := a.requireAction(rc, "admin:UpdateUser"); err != nil {
+		if err := a.requireAction(rc, "admin:UpdateUser", target, conds); err != nil {
 			return 0, nil, err
 		}
 	}
 	if req.CreateKey {
-		if err := a.requireAction(rc, "admin:CreateAccessKey"); err != nil {
+		if err := a.requireAction(rc, "admin:CreateAccessKey", target, nil); err != nil {
 			return 0, nil, err
 		}
 	}
@@ -84,12 +91,29 @@ func (a *api) getUser(rc *reqCtx) (int, any, error) {
 	return http.StatusOK, u, nil
 }
 
+// policyNameConditions returns the admin:PolicyName condition key of a
+// request attaching policies (nil when it attaches none).
+func policyNameConditions(policies []string) map[string][]string {
+	if len(policies) == 0 {
+		return nil
+	}
+	return map[string][]string{iam.CondAdminPolicyName: policies}
+}
+
 func (a *api) updateUser(rc *reqCtx) (int, any, error) {
 	var upd iam.UserUpdate
 	if err := rc.decodeBody(&upd, false); err != nil {
 		return 0, nil, err
 	}
-	u, err := a.d.IAM.UpdateUser(rc.ctx, rc.r.PathValue("name"), upd)
+	name := rc.r.PathValue("name")
+	var conds map[string][]string
+	if upd.Policies != nil {
+		conds = policyNameConditions(*upd.Policies)
+	}
+	if err := a.requireAction(rc, rc.action, iam.AdminUserARN(name), conds); err != nil {
+		return 0, nil, err
+	}
+	u, err := a.d.IAM.UpdateUser(rc.ctx, name, upd)
 	if err != nil {
 		return 0, nil, err
 	}
@@ -203,10 +227,14 @@ func (a *api) deletePolicy(rc *reqCtx) (int, any, error) {
 
 // simulateRequest is the POST /authz/simulate body.
 type simulateRequest struct {
-	User       string                       `json:"user"`
-	Action     string                       `json:"action"`
+	User   string `json:"user"`
+	Action string `json:"action"`
+	// Bucket and Key name the resource of s3 actions, Resource that of
+	// admin actions (arn:gos3:admin:::user/<name>, ...; empty = service
+	// level).
 	Bucket     string                       `json:"bucket"`
 	Key        string                       `json:"key"`
+	Resource   string                       `json:"resource"`
 	Conditions map[string]iam.StringOrSlice `json:"conditions"`
 }
 
@@ -232,6 +260,18 @@ func (a *api) simulate(rc *reqCtx) (int, any, error) {
 	if req.Key != "" && req.Bucket == "" {
 		return 0, nil, badRequest("key requires bucket")
 	}
+	if len(req.Action) >= len("admin:") && strings.EqualFold(req.Action[:len("admin:")], "admin:") {
+		if req.Bucket != "" {
+			return 0, nil, badRequest("bucket and key apply to s3 actions; admin actions take resource " +
+				"(e.g. \"arn:gos3:admin:::bucket/<name>\", or empty for service level)")
+		}
+		if !iam.ValidAdminRequestResource(req.Resource) {
+			return 0, nil, badRequest("resource must be empty (service level) or arn:gos3:admin:::user/<name>, " +
+				"arn:gos3:admin:::policy/<name> or arn:gos3:admin:::bucket/<name>")
+		}
+	} else if req.Resource != "" {
+		return 0, nil, badRequest("resource applies to admin actions; s3 actions take bucket and key")
+	}
 	if len(req.Conditions) > maxSimulateConditions {
 		return 0, nil, badRequest("at most %d condition keys allowed", maxSimulateConditions)
 	}
@@ -256,7 +296,7 @@ func (a *api) simulate(rc *reqCtx) (int, any, error) {
 		}
 	}
 
-	areq := iam.AuthzRequest{Identity: id, Action: req.Action, Bucket: req.Bucket, Key: req.Key}
+	areq := iam.AuthzRequest{Identity: id, Action: req.Action, Bucket: req.Bucket, Key: req.Key, Resource: req.Resource}
 	if len(req.Conditions) > 0 {
 		areq.Conditions = make(map[string][]string, len(req.Conditions))
 		for k, v := range req.Conditions {

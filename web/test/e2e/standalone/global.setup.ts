@@ -7,10 +7,12 @@
 //                allowed, but no mDNS/beacon multicast and no seeds, so the
 //                UI host's scan is what finds them
 //   ui           the standalone Node server on http://localhost:3000 (or a
-//                free port when 3000 is taken), no presets
+//                free port when 3000 is taken), no presets, with local
+//                discovery turned on (GOS3_UI_LOCAL_DISCOVERY=true)
 //   presetUi     a second Node server with presets from public/servers.json
-//                and from NUXT_PUBLIC_SERVERS (set at runtime), and with
-//                GOS3_UI_LOCAL_DISCOVERY=false. Nitro serves
+//                and from NUXT_PUBLIC_SERVERS (set at runtime), and without
+//                GOS3_UI_LOCAL_DISCOVERY (local discovery off, the
+//                default). Nitro serves
 //                public/ from a manifest made at build time, so servers.json
 //                must exist before `nuxt build`: the setup builds a temp copy
 //                of the sources (outside web/) with that file added — presets
@@ -263,13 +265,14 @@ setup('build and start the standalone UI and two gos3 instances', async () => {
   write(state)
   state.beta = startGos3(binary, 'beta', bPort, origins, tmp)
   write(state)
-  state.ui = startUi(OUTPUT_DIR, uiPort, join(tmp, 'ui.log'))
+  // Local discovery is off unless enabled explicitly.
+  state.ui = startUi(OUTPUT_DIR, uiPort, join(tmp, 'ui.log'), { GOS3_UI_LOCAL_DISCOVERY: 'true' })
   write(state)
 
   // Presets: servers.json baked into the preset build + NUXT_PUBLIC_SERVERS (beta).
-  // It also runs with local discovery turned off.
+  // GOS3_UI_LOCAL_DISCOVERY is unset (startUi drops it), so local discovery
+  // is off: the default.
   state.presetUi = startUi(PRESET_OUTPUT_DIR, presetPort, join(tmp, 'preset-ui.log'), {
-    GOS3_UI_LOCAL_DISCOVERY: 'false',
     NUXT_PUBLIC_SERVERS: JSON.stringify([{ id: PRESET_ENV_ID, name: 'Preset from env', endpoint: state.beta.url, kind: 'gos3', accessKeyId: ROOT_ACCESS_KEY }])
   })
   write(state)

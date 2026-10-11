@@ -2,7 +2,7 @@
 import type { DropdownMenuItem, TableColumn } from '@nuxt/ui'
 import type { NamedPolicy } from '~/types/admin'
 import { AdminError } from '~/utils/admin/client'
-import { canSimulate, identityPending, policiesPageMode } from '~/components/admin/-capabilities'
+import { canListUsers, canSimulate, identityPending, policiesPageMode } from '~/components/admin/-capabilities'
 import CreatePolicyModal from '~/components/admin/CreatePolicyModal.vue'
 
 /**
@@ -27,7 +27,7 @@ const simulate = computed(() => canSimulate(connection.value?.kind, capabilities
 
 const policies = useLoader(() => requireAdmin().listPolicies(), { immediate: false, initial: [] })
 // Users (to show where policies are attached); optional.
-const users = useLoader(() => (capabilities.value.manageUsers ? requireAdmin().listUsers() : Promise.resolve([])).catch(() => []), { immediate: false, initial: [] })
+const users = useLoader(() => (canListUsers(capabilities.value) ? requireAdmin().listUsers() : Promise.resolve([])).catch(() => []), { immediate: false, initial: [] })
 
 watch([mode, id], ([m]) => {
   if (m !== 'unavailable') {
@@ -185,7 +185,7 @@ function rowActions(p: NamedPolicy): DropdownMenuItem[][] {
             <span class="tabular-nums">{{ statementCount(row.original) }}</span>
           </template>
           <template #attached-cell="{ row }">
-            <span v-if="!capabilities.manageUsers" class="text-xs text-dimmed">—</span>
+            <span v-if="!canListUsers(capabilities)" class="text-xs text-dimmed">—</span>
             <span v-else-if="!(attachedTo.get(row.original.name)?.length)" class="text-xs text-dimmed">No users</span>
             <span v-else class="text-sm" :title="attachedTo.get(row.original.name)?.join(', ')">
               {{ attachedTo.get(row.original.name)?.length }} user{{ attachedTo.get(row.original.name)?.length === 1 ? '' : 's' }}

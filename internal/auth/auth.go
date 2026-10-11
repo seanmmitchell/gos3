@@ -195,7 +195,8 @@ type Credentials struct {
 // SignRequest signs r in place with SigV4 (Authorization header) — a client
 // helper for tests, discovery probes and peer calls. payloadHash is the hex
 // SHA-256 of the body or PayloadUnsigned ("" picks the empty-body hash for
-// bodiless requests, else PayloadUnsigned). It sets X-Amz-Date,
+// bodiless requests, the body's hash when r.GetBody can re-read it, else
+// PayloadUnsigned; the admin API refuses unsigned bodies). It sets X-Amz-Date,
 // X-Amz-Content-Sha256 and Authorization, signs host, every x-amz-* header,
 // content-type and content-md5, and pins r.URL.RawPath to the AWS-encoded
 // path so the path on the wire is exactly the signed one. Empty region and

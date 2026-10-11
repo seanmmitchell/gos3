@@ -8,7 +8,6 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
-	"net"
 	"net/http"
 	"path"
 	"strconv"
@@ -16,6 +15,7 @@ import (
 	"time"
 
 	"github.com/seanmmitchell/gos3/internal/auth"
+	"github.com/seanmmitchell/gos3/internal/clientip"
 	"github.com/seanmmitchell/gos3/internal/discovery"
 	"github.com/seanmmitchell/gos3/internal/iam"
 	"github.com/seanmmitchell/gos3/internal/s3err"
@@ -84,7 +84,31 @@ type route struct {
 	method string
 	path   string // relative to Prefix, Go ServeMux pattern syntax
 	action string // IAM action without the "admin:" prefix; "" = any identity
+	res    target // what action is evaluated against
 	h      handlerFunc
+}
+
+// target says which resource a route's action is evaluated against
+// (docs/security.md "Scoping admin permissions").
+type target struct {
+	// resource returns the admin resource ARN of the request (nil: service
+	// level, i.e. matched by "*" and arn:gos3:admin:::* only).
+	resource func(rc *reqCtx) string
+	// inHandler: the target or condition keys come from the request body,
+	// so the handler authorizes rc.action itself (requireAction) after
+	// decoding it and before acting on it.
+	inHandler bool
+}
+
+var (
+	service   = target{}
+	inHandler = target{inHandler: true}
+)
+
+// pathTarget evaluates against the admin ARN that arn builds from the
+// path value param (e.g. iam.AdminUserARN of {name}).
+func pathTarget(arn func(string) string, param string) target {
+	return target{resource: func(rc *reqCtx) string { return arn(rc.r.PathValue(param)) }}
 }
 
 // api is the admin API handler.
@@ -98,6 +122,7 @@ type api struct {
 	usage  *ttlCache[storage.BucketUsage] // per bucket
 	totals *ttlCache[storageTotals]       // key ""
 	scans  chan struct{}                  // running network scans (semaphore)
+	probes chan struct{}                  // running probes (semaphore)
 }
 
 // usageTTL is how long computed storage usage is cached.
@@ -110,7 +135,10 @@ func newAPI(d Deps) *api {
 	if d.Backend == nil || d.Verifier == nil || d.IAM == nil || d.Settings == nil {
 		panic("admin: Deps.Backend, Verifier, IAM and Settings are required")
 	}
-	a := &api{d: d, log: d.Logger, now: time.Now, scans: make(chan struct{}, maxConcurrentScans)}
+	a := &api{d: d, log: d.Logger, now: time.Now,
+		scans:  make(chan struct{}, maxConcurrentScans),
+		probes: make(chan struct{}, maxConcurrentProbes),
+	}
 	if a.log == nil {
 		a.log = slog.Default()
 	}
@@ -125,41 +153,56 @@ func newAPI(d Deps) *api {
 
 // routes lists every endpoint (docs/admin-api.md).
 func (a *api) routes() []route {
+	user := pathTarget(iam.AdminUserARN, "name")
+	policy := pathTarget(iam.AdminPolicyARN, "name")
+	bucket := pathTarget(iam.AdminBucketARN, "name")
+	keyOwner := target{resource: a.keyOwnerARN}
 	return []route{
 		// Identity
-		{"GET", "/whoami", "", a.whoami},
-		{"GET", "/whoami/keys", "", a.listOwnKeys},
-		{"POST", "/whoami/keys", "", a.createOwnKey},               // unless admin:CreateOwnAccessKey is denied
-		{"DELETE", "/whoami/keys/{accessKey}", "", a.deleteOwnKey}, // unless admin:DeleteOwnAccessKey is denied
+		{"GET", "/whoami", "", service, a.whoami},
+		{"GET", "/whoami/keys", "", service, a.listOwnKeys},
+		{"POST", "/whoami/keys", "CreateOwnAccessKey", service, a.createOwnKey},
+		{"DELETE", "/whoami/keys/{accessKey}", "", service, a.deleteOwnKey}, // unless admin:DeleteOwnAccessKey is denied
 		// Server
-		{"GET", "/info", "ServerInfo", a.serverInfo},
-		{"GET", "/stats", "GetStats", a.stats},
-		{"GET", "/config", "GetConfig", a.getConfig},
-		{"PUT", "/config", "UpdateConfig", a.putConfig},
+		{"GET", "/info", "ServerInfo", service, a.serverInfo},
+		{"GET", "/stats", "GetStats", service, a.stats},
+		{"GET", "/config", "GetConfig", service, a.getConfig},
+		{"PUT", "/config", "UpdateConfig", service, a.putConfig},
 		// Users & access keys
-		{"GET", "/users", "ListUsers", a.listUsers},
-		{"POST", "/users", "CreateUser", a.createUser},
-		{"GET", "/users/{name}", "GetUser", a.getUser},
-		{"PATCH", "/users/{name}", "UpdateUser", a.updateUser},
-		{"DELETE", "/users/{name}", "DeleteUser", a.deleteUser},
-		{"POST", "/users/{name}/keys", "CreateAccessKey", a.createAccessKey},
-		{"PATCH", "/keys/{accessKey}", "UpdateAccessKey", a.updateAccessKey},
-		{"DELETE", "/keys/{accessKey}", "DeleteAccessKey", a.deleteAccessKey},
+		{"GET", "/users", "ListUsers", service, a.listUsers},
+		{"POST", "/users", "CreateUser", inHandler, a.createUser}, // user/<body name>, admin:PolicyName
+		{"GET", "/users/{name}", "GetUser", user, a.getUser},
+		{"PATCH", "/users/{name}", "UpdateUser", inHandler, a.updateUser}, // user/{name}, admin:PolicyName
+		{"DELETE", "/users/{name}", "DeleteUser", user, a.deleteUser},
+		{"POST", "/users/{name}/keys", "CreateAccessKey", user, a.createAccessKey},
+		{"PATCH", "/keys/{accessKey}", "UpdateAccessKey", keyOwner, a.updateAccessKey},
+		{"DELETE", "/keys/{accessKey}", "DeleteAccessKey", keyOwner, a.deleteAccessKey},
 		// Policies
-		{"GET", "/policies", "ListPolicies", a.listPolicies},
-		{"GET", "/policies/{name}", "GetPolicy", a.getPolicy},
-		{"PUT", "/policies/{name}", "PutPolicy", a.putPolicy},
-		{"DELETE", "/policies/{name}", "DeletePolicy", a.deletePolicy},
-		{"POST", "/authz/simulate", "SimulatePolicy", a.simulate},
+		{"GET", "/policies", "ListPolicies", service, a.listPolicies},
+		{"GET", "/policies/{name}", "GetPolicy", policy, a.getPolicy},
+		{"PUT", "/policies/{name}", "PutPolicy", policy, a.putPolicy},
+		{"DELETE", "/policies/{name}", "DeletePolicy", policy, a.deletePolicy},
+		{"POST", "/authz/simulate", "SimulatePolicy", service, a.simulate},
 		// Buckets
-		{"GET", "/buckets", "ListBuckets", a.listBuckets},
-		{"GET", "/buckets/{name}", "GetBucket", a.getBucket},
-		{"DELETE", "/buckets/{name}", "ForceDeleteBucket", a.deleteBucket},
+		{"GET", "/buckets", "ListBuckets", service, a.listBuckets},
+		{"GET", "/buckets/{name}", "GetBucket", bucket, a.getBucket},
+		{"DELETE", "/buckets/{name}", "ForceDeleteBucket", bucket, a.deleteBucket},
 		// Discovery
-		{"GET", "/discovery", "GetDiscovery", a.getDiscovery},
-		{"POST", "/discovery/probe", "GetDiscovery", a.probe},
-		{"POST", "/discovery/scan", "ScanNetwork", a.scan},
+		{"GET", "/discovery", "GetDiscovery", service, a.getDiscovery},
+		{"POST", "/discovery/probe", "ProbeNetwork", service, a.probe},
+		{"POST", "/discovery/scan", "ScanNetwork", service, a.scan},
 	}
+}
+
+// keyOwnerARN is the target of the {accessKey} routes: the user owning the
+// key, or service level for unknown keys (so a delegated administrator
+// cannot tell unknown keys from other users' keys).
+func (a *api) keyOwnerARN(rc *reqCtx) string {
+	owner, err := a.d.IAM.AccessKeyOwner(rc.ctx, rc.r.PathValue("accessKey"))
+	if err != nil {
+		return ""
+	}
+	return iam.AdminUserARN(owner)
 }
 
 // register installs the routes on the mux. Every path additionally gets a
@@ -252,12 +295,18 @@ func (a *api) endpoint(rt route) http.Handler {
 				"AccessDenied: anonymous requests are not allowed; sign the request with AWS Signature Version 4"))
 			return
 		}
+		if e := checkSignedPayload(r, res); e != nil {
+			writeError(w, e)
+			return
+		}
 		rc := &reqCtx{r: r, ctx: r.Context(), auth: res, id: res.Identity, action: action}
-		if action != "" {
-			dec := a.authorize(rc, action)
-			if !dec.Allowed {
-				writeError(w, errorf(http.StatusForbidden, codeAccessDenied,
-					"%s is not allowed to perform %s", describeIdentity(rc.id), action))
+		if action != "" && !rt.res.inHandler {
+			resource := ""
+			if rt.res.resource != nil {
+				resource = rt.res.resource(rc)
+			}
+			if err := a.requireAction(rc, action, resource, nil); err != nil {
+				writeError(w, a.toAPIError(err))
 				return
 			}
 		}
@@ -282,31 +331,88 @@ func (a *api) endpoint(rt route) http.Handler {
 	})
 }
 
-// authorize evaluates an admin action for the request's identity.
-func (a *api) authorize(rc *reqCtx, action string) iam.Decision {
+// signedPayloadMessage explains why checkSignedPayload refused a request.
+const signedPayloadMessage = "admin API requests with a body must sign the payload: " +
+	"set X-Amz-Content-Sha256 to the hex SHA-256 of the body"
+
+// checkSignedPayload refuses admin requests whose body the signature does
+// not cover. With UNSIGNED-PAYLOAD (or a presigned URL, or unsigned
+// streaming) SigV4 signs only the method, path, query and headers, so a
+// captured request could be replayed within the clock-skew window with a
+// different body: a policy document, a user's policies, the settings.
+// Every POST, PUT and PATCH, and any other request carrying a body, must
+// therefore use header authentication with the body's hex SHA-256 (which
+// auth verifies while the handler reads the body) or signed aws-chunked
+// streaming.
+func checkSignedPayload(r *http.Request, res *auth.Result) *apiError {
+	switch r.Method {
+	case http.MethodPost, http.MethodPut, http.MethodPatch:
+	default:
+		if r.ContentLength == 0 && len(r.TransferEncoding) == 0 {
+			return nil
+		}
+	}
+	if res.Method == auth.MethodHeaderV4 {
+		switch m := res.PayloadMode; {
+		case m == auth.PayloadStreamingSigned, m == auth.PayloadStreamingSignedTrailer, isHexSHA256(m):
+			return nil
+		}
+	}
+	return errorf(http.StatusBadRequest, codeInvalidRequest, "%s", signedPayloadMessage)
+}
+
+// isHexSHA256 reports whether s is a hex-encoded SHA-256 digest.
+func isHexSHA256(s string) bool {
+	if len(s) != 64 {
+		return false
+	}
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if (c < '0' || c > '9') && (c < 'a' || c > 'f') && (c < 'A' || c > 'F') {
+			return false
+		}
+	}
+	return true
+}
+
+// authorize evaluates an admin action for the request's identity against
+// resource (an iam.Admin*ARN; "" = service level) with the request's
+// condition keys plus extra.
+func (a *api) authorize(rc *reqCtx, action, resource string, extra map[string][]string) iam.Decision {
+	conds := requestConditions(rc.r, a.d.TrustProxyHeaders)
+	for k, v := range extra {
+		conds[k] = v
+	}
 	return a.d.IAM.Authorize(rc.ctx, iam.AuthzRequest{
 		Identity:   rc.id,
 		Action:     action,
-		Conditions: requestConditions(rc.r, a.d.TrustProxyHeaders),
+		Resource:   resource,
+		Conditions: conds,
 	})
 }
 
 // requireAction returns a 403 AccessDenied error unless the caller is
-// allowed action. Handlers use it for actions beyond the route's own, e.g.
-// when one request body also does what another route gates separately.
-func (a *api) requireAction(rc *reqCtx, action string) error {
-	if !a.authorize(rc, action).Allowed {
+// allowed action on resource (see authorize). Handlers of inHandler routes
+// use it for the route's own action once the body names the target, and
+// any handler for actions beyond the route's own, e.g. when one request
+// body also does what another route gates separately.
+func (a *api) requireAction(rc *reqCtx, action, resource string, extra map[string][]string) error {
+	if !a.authorize(rc, action, resource, extra).Allowed {
+		on := ""
+		if resource != "" {
+			on = " on " + resource
+		}
 		return errorf(http.StatusForbidden, codeAccessDenied,
-			"%s is not allowed to perform %s", describeIdentity(rc.id), action)
+			"%s is not allowed to perform %s%s", describeIdentity(rc.id), action, on)
 	}
 	return nil
 }
 
 // requestConditions builds the IAM condition context of a request.
-// aws:SourceIp and aws:SecureTransport come from the connection or, with
-// trustProxy, from X-Forwarded-For / X-Forwarded-Proto (see ClientInfo).
-func requestConditions(r *http.Request, trustProxy bool) map[string][]string {
-	ip, secure := ClientInfo(r, trustProxy)
+// aws:SourceIp and aws:SecureTransport come from the connection or, behind a
+// trusted proxy, from X-Forwarded-For / X-Forwarded-Proto (see ClientInfo).
+func requestConditions(r *http.Request, proxy clientip.Resolver) map[string][]string {
+	ip, secure := ClientInfo(r, proxy)
 	c := map[string][]string{
 		"aws:SecureTransport": {strconv.FormatBool(secure)},
 	}
@@ -323,27 +429,11 @@ func requestConditions(r *http.Request, trustProxy bool) map[string][]string {
 }
 
 // ClientInfo returns the client IP address of r and whether it reached the
-// server over TLS. With trustProxy (server.trust_proxy_headers) the first
-// valid X-Forwarded-For entry and X-Forwarded-Proto win over the connection,
-// the same rule the S3 API applies.
-func ClientInfo(r *http.Request, trustProxy bool) (ip string, secure bool) {
-	ip = r.RemoteAddr
-	if host, _, err := net.SplitHostPort(ip); err == nil {
-		ip = host
-	}
-	secure = r.TLS != nil
-	if trustProxy {
-		if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
-			first, _, _ := strings.Cut(xff, ",")
-			if a := net.ParseIP(strings.TrimSpace(first)); a != nil {
-				ip = a.String()
-			}
-		}
-		if p := r.Header.Get("X-Forwarded-Proto"); p != "" {
-			secure = strings.EqualFold(strings.TrimSpace(p), "https")
-		}
-	}
-	return ip, secure
+// server over TLS, honouring X-Forwarded-For / X-Forwarded-Proto from the
+// trusted proxies of proxy: the same rule the S3 API applies (see package
+// clientip).
+func ClientInfo(r *http.Request, proxy clientip.Resolver) (ip string, secure bool) {
+	return proxy.ClientInfo(r)
 }
 
 func describeIdentity(id auth.Identity) string {

@@ -133,7 +133,7 @@ type NamedPolicy struct {
 func ParsePolicy(data []byte) (*PolicyDocument, error) {
 	doc, reason := decodePolicy(data)
 	if reason == "" {
-		reason = validateIdentityPolicy(doc)
+		reason = validateNewIdentityPolicy(doc)
 	}
 	if reason != "" {
 		return nil, wrapf(ErrInvalidPolicy, reason)
@@ -162,12 +162,18 @@ type AuthzRequest struct {
 	// Action is an IAM action such as "s3:GetObject", "s3:ListBucket" or
 	// "admin:ListUsers".
 	Action string
-	// Bucket/Key identify the resource. Resource ARNs are
+	// Bucket/Key identify the resource of s3 actions. Resource ARNs are
 	// arn:aws:s3:::<bucket> (Key == "") and arn:aws:s3:::<bucket>/<key>.
-	// Bucket == "" means a service-level action (resource "*"); admin actions
-	// use Bucket == "" and match Resource "*" or "arn:gos3:admin:::*".
+	// Bucket == "" means a service-level action (resource "*"). Admin
+	// actions ignore Bucket and Key (see Resource).
 	Bucket string
 	Key    string
+	// Resource is the resource of admin actions: AdminUserARN,
+	// AdminPolicyARN or AdminBucketARN of the target, or "" for
+	// service-level admin actions, which match only the policy resources
+	// "*" and "arn:gos3:admin:::*". s3 actions ignore it. s3 ARNs never
+	// match admin resources and admin ARNs never match s3 resources.
+	Resource string
 	// BucketPolicy is the parsed bucket policy (nil if none).
 	BucketPolicy *PolicyDocument
 	// ACL is the effective canned ACL ("public-read", "public-read-write",
@@ -276,6 +282,12 @@ func (m *Manager) CreateAccessKey(ctx context.Context, user, description, access
 // UpdateAccessKey sets the status (KeyActive or KeyInactive) of a key.
 func (m *Manager) UpdateAccessKey(ctx context.Context, accessKey, status string) error {
 	return m.updateAccessKey(ctx, accessKey, status)
+}
+
+// AccessKeyOwner returns the name of the user owning an IAM access key,
+// whatever its status (ErrKeyNotFound for unknown keys and the root key).
+func (m *Manager) AccessKeyOwner(ctx context.Context, accessKey string) (string, error) {
+	return m.accessKeyOwner(ctx, accessKey)
 }
 
 // DeleteAccessKey deletes an access key.

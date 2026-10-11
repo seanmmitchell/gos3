@@ -5,7 +5,11 @@
 //   const { users } = await admin.listUsers()
 //
 // Requests are SigV4-signed with aws4fetch (service "s3", the connection's
-// region, UNSIGNED-PAYLOAD). Errors are thrown as AdminError.
+// region). The payload is always signed: X-Amz-Content-Sha256 carries the hex
+// SHA-256 of the exact body bytes that are sent (of the empty string when
+// there is no body), never UNSIGNED-PAYLOAD, so a captured request cannot be
+// replayed with another body. gos3 rejects admin requests with a body whose
+// payload is unsigned. Errors are thrown as AdminError.
 import { AwsClient } from 'aws4fetch'
 import type {
   AccessKey,
@@ -32,6 +36,7 @@ import type {
   UserUpdate,
   WhoAmI
 } from '~/types/admin'
+import { sha256Hex } from '../s3/hash'
 import { child, text, tryParseXml } from '../s3/xml'
 import { normalizeEndpoint } from '../s3/url'
 
@@ -293,11 +298,15 @@ export class AdminClient {
   async request<T>(method: string, path: string, opts: RequestOptions = {}): Promise<T> {
     const url = this.url(path, opts.query, opts.raw)
     const headers: Record<string, string> = { Accept: opts.expect === 'text' ? 'text/plain' : 'application/json' }
-    let body: string | undefined
+    let body: Uint8Array<ArrayBuffer> | undefined
     if (opts.body !== undefined) {
-      body = JSON.stringify(opts.body)
+      body = new TextEncoder().encode(JSON.stringify(opts.body))
       headers['Content-Type'] = 'application/json'
     }
+    // Sign the payload (C1): aws4fetch puts this value into the canonical
+    // request (and SignedHeaders) instead of UNSIGNED-PAYLOAD. The hashed
+    // bytes are the bytes sent.
+    headers['X-Amz-Content-Sha256'] = await sha256Hex(body ?? '')
     return withTimeout(opts.timeoutMs ?? this.timeoutMs, opts.signal, async (signal, timedOut) => {
       let res: Response
       let text: string

@@ -1,6 +1,7 @@
 // Fixtures and helpers for the real-server specs: the running gos3
 // instances (see global.setup.ts), sign-in through the embedded UI, and a
 // signed Node-side client to arrange/verify state behind the UI's back.
+import { createHash } from 'node:crypto'
 import { expect, test as base, type Page } from '@playwright/test'
 import { AwsClient } from 'aws4fetch'
 import { readState, ROOT_ACCESS_KEY, ROOT_SECRET_KEY, type RealServer } from './env'
@@ -23,12 +24,16 @@ export class ServerApi {
     return this.aws.fetch(`${this.server.url}${path}`, init)
   }
 
+  /**
+   * Signed admin API request. The payload is signed (X-Amz-Content-Sha256 =
+   * hex SHA-256 of the body, of '' without one): gos3 rejects admin
+   * requests with a body whose payload is UNSIGNED-PAYLOAD.
+   */
   async admin<T = unknown>(method: string, path: string, body?: unknown): Promise<T> {
-    const r = await this.fetch(`/_gos3/admin/v1${path}`, {
-      method,
-      headers: body === undefined ? {} : { 'content-type': 'application/json' },
-      body: body === undefined ? undefined : JSON.stringify(body)
-    })
+    const payload = body === undefined ? undefined : JSON.stringify(body)
+    const headers: Record<string, string> = { 'x-amz-content-sha256': createHash('sha256').update(payload ?? '').digest('hex') }
+    if (payload !== undefined) headers['content-type'] = 'application/json'
+    const r = await this.fetch(`/_gos3/admin/v1${path}`, { method, headers, body: payload })
     const text = await r.text()
     if (!r.ok) throw new Error(`admin ${method} ${path}: ${r.status} ${text}`)
     return (text ? JSON.parse(text) : undefined) as T

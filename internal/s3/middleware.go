@@ -6,7 +6,6 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
-	"net"
 	"net/http"
 	"net/url"
 	"runtime/debug"
@@ -227,6 +226,9 @@ func (s *Server) serve(w *responseWriter, r *http.Request, rc *reqContext) {
 			s.writeError(w, r, rc, err)
 			return
 		}
+	} else if !op.NoAuth {
+		// The handler reads the body before it authorizes the caller.
+		s.limitPreAuthBody(rc)
 	}
 
 	handler := op.handler
@@ -375,25 +377,10 @@ func stripAWSChunked(h http.Header) {
 }
 
 // clientInfo returns the client IP and whether the connection is secure,
-// honoring X-Forwarded-For / X-Forwarded-Proto when TrustProxyHeaders is set.
+// honoring X-Forwarded-For / X-Forwarded-Proto from trusted proxies (see
+// package clientip).
 func (s *Server) clientInfo(r *http.Request) (ip string, secure bool) {
-	ip = r.RemoteAddr
-	if host, _, err := net.SplitHostPort(ip); err == nil {
-		ip = host
-	}
-	secure = r.TLS != nil
-	if s.trustProxy {
-		if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
-			first, _, _ := strings.Cut(xff, ",")
-			if a := net.ParseIP(strings.TrimSpace(first)); a != nil {
-				ip = a.String()
-			}
-		}
-		if p := r.Header.Get("X-Forwarded-Proto"); p != "" {
-			secure = strings.EqualFold(strings.TrimSpace(p), "https")
-		}
-	}
-	return ip, secure
+	return s.clientIP.ClientInfo(r)
 }
 
 // accessLog writes the structured access log line for a finished request.

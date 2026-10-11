@@ -292,10 +292,9 @@ func (s *Service) scan(ctx context.Context, req ScanRequest) (ScanResult, error)
 				if err != nil || info.ID == selfID {
 					continue
 				}
-				now := s.now()
-				p, ok := s.table.observeInfo(info, u, SourceScan, now, selfID)
+				p, ok := s.record(ctx, info, u, SourceScan)
 				if !ok {
-					p = peerFromInfo(info, u, SourceScan, now)
+					p = peerFromInfo(info, u, SourceScan, s.now())
 				}
 				mu.Lock()
 				if prev, dup := found[p.ID]; dup {
@@ -318,8 +317,10 @@ func (s *Service) scan(ctx context.Context, req ScanRequest) (ScanResult, error)
 		Elapsed: time.Since(start).Round(time.Millisecond).String(),
 	}
 	for id, p := range found {
-		// Prefer the merged table view (sources from all mechanisms).
-		if tp, ok := s.table.get(id); ok {
+		// Prefer the merged table view (sources from all mechanisms) when
+		// the table's peer is the one found at these addresses (not a
+		// verified peer whose ID the found server merely claims).
+		if tp, ok := s.table.get(id); ok && slices.ContainsFunc(p.Addresses, func(a string) bool { return slices.Contains(tp.Addresses, a) }) {
 			for _, a := range p.Addresses {
 				addAddress(&tp, a)
 			}

@@ -274,8 +274,12 @@ func (s *Service) Peers() []Peer {
 // adding it to the peer table with SourceProbe. baseURL is normalised with
 // NormalizeBaseURL ("nas:9000" → "http://nas:9000"). Without a deadline on
 // ctx the probe times out after 5 s. Probing this server itself returns its
-// peer view without adding it to the table. Errors wrap ErrInvalidURL,
-// ErrNotGos3 or the transport error.
+// peer view without adding it to the table, and so does probing a URL that
+// claims the ID of a verified peer still answering at its known addresses
+// (the claim is recorded as a conflict). Errors wrap ErrInvalidURL,
+// ErrNotGos3, ErrBlockedAddress (a cloud metadata, unspecified, multicast or
+// broadcast address, checked after DNS resolution) or the transport error;
+// ProbeErrorText turns them into a fixed category.
 func (s *Service) Probe(ctx context.Context, baseURL string) (Peer, error) {
 	if ctx == nil {
 		ctx = context.Background()
@@ -287,20 +291,22 @@ func (s *Service) Probe(ctx context.Context, baseURL string) (Peer, error) {
 	pctx, cancel := withDefaultTimeout(ctx, defaultProbeTimeout)
 	defer cancel()
 	info, err := s.prober.fetch(pctx, u)
-	now := s.now()
 	if err != nil {
+		now := s.now()
 		for _, id := range s.table.findByAddr(u) {
-			s.table.probeFailed(id, err.Error(), now)
+			s.table.probeFailed(id, ProbeErrorText(err), now)
 		}
 		return Peer{}, err
 	}
-	selfID := s.selfID()
-	if info.ID != selfID {
-		if p, ok := s.table.observeInfo(info, u, SourceProbe, now, selfID); ok {
+	if info.ID != s.selfID() {
+		// A claim of a verified peer's ID from a new address does not
+		// change the table while the peer still answers (see record); the
+		// caller then gets what this URL serves.
+		if p, ok := s.record(pctx, info, u, SourceProbe); ok {
 			return p, nil
 		}
 	}
-	return peerFromInfo(info, u, SourceProbe, now), nil
+	return peerFromInfo(info, u, SourceProbe, s.now()), nil
 }
 
 // Scan actively probes targets and adds found servers with SourceScan.

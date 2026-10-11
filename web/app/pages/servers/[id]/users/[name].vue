@@ -2,6 +2,7 @@
 import type { AccessKey, User } from '~/types/admin'
 import { AdminError } from '~/utils/admin/client'
 import { canSimulate, identityPending, usersPageMode } from '~/components/admin/-capabilities'
+import { userDetailsUpdate } from '~/components/admin/-users'
 import CreateKeyModal from '~/components/admin/CreateKeyModal.vue'
 import NewAccessKeyModal from '~/components/admin/NewAccessKeyModal.vue'
 
@@ -62,7 +63,7 @@ const detailsDirty = computed(() => {
 const descriptionError = computed(() => (description.value.length > 1024 ? 'At most 1024 characters' : undefined))
 
 const saveDetails = useAsyncAction(async () => {
-  const updated = await requireAdmin().updateUser(name.value, { description: description.value.trim(), policies: selectedPolicies.value })
+  const updated = await requireAdmin().updateUser(name.value, userDetailsUpdate(user.data.value, description.value, selectedPolicies.value))
   user.data.value = updated
   return updated
 }, { successMessage: 'User updated', errorTitle: 'Could not update user' })

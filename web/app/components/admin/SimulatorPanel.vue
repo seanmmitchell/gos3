@@ -1,11 +1,13 @@
 <script setup lang="ts">
 import type { Decision } from '~/types/admin'
-import { parseConditionLines, SIMULATOR_ACTIONS } from './-policies'
+import { ADMIN_SERVICE_ARN, adminArn, adminConditionKeys, adminResourceType, buildSimulateRequest, isAdminAction, parseConditionLines, SIMULATOR_ACTIONS, validateAdminResource } from './-policies'
 
 /**
  * Authorization simulator (POST /authz/simulate): "may <user> do <action>
  * on <bucket>/<key>?" — evaluates identity policies, the bucket policy and
- * canned ACLs exactly like a real request.
+ * canned ACLs exactly like a real request. Admin actions take an admin
+ * resource instead of a bucket/key (arn:gos3:admin:::user/<name>,
+ * …:::policy/<name>, …:::bucket/<name>; empty = service level).
  *
  *   <AdminSimulatorPanel :users="['alice', 'bob']" />
  *   <AdminSimulatorPanel fixed-user="alice" />
@@ -31,6 +33,7 @@ const user = ref(props.fixedUser ?? props.users[0] ?? ANONYMOUS)
 const action = ref('s3:GetObject')
 const bucket = ref('')
 const key = ref('')
+const resource = ref('')
 const conditionsText = ref('')
 const showConditions = ref(false)
 const result = ref<{ decision: Decision, request: string } | null>(null)
@@ -48,18 +51,31 @@ watch(() => props.users, (list) => {
 const userItems = computed(() => [ANONYMOUS, ...props.users.filter(u => u !== ANONYMOUS)])
 const actionItems = computed(() => [...SIMULATOR_ACTIONS])
 const conditions = computed(() => parseConditionLines(conditionsText.value))
+const adminAction = computed(() => isAdminAction(action.value))
+const resourceType = computed(() => adminResourceType(action.value))
+const resourcePlaceholder = computed(() => (resourceType.value ? adminArn(resourceType.value, resourceType.value === 'user' ? 'alice' : resourceType.value === 'policy' ? 'readonly' : 'photos') : ADMIN_SERVICE_ARN))
+const resourceHelp = computed(() => resourceType.value
+  ? `Empty = service level. ${action.value.trim()} is evaluated against ${adminArn(resourceType.value, '<name>')}.`
+  : 'Empty = service level (this action has no per-target resource).')
+const resourceError = computed(() => (adminAction.value ? validateAdminResource(resource.value) : undefined))
+const conditionsHelp = computed(() => {
+  const extra = adminAction.value ? adminConditionKeys(action.value) : []
+  const base = 'One key=value per line, multiple values comma separated, e.g. aws:SourceIp=10.0.0.7'
+  return extra.length ? `${base}. ${action.value.trim()} also sets ${extra.join(', ')}, e.g. ${extra[0]}=readonly,readwrite` : base
+})
 
 const sim = useAsyncAction(async () => {
   const u = props.fixedUser ?? (user.value === ANONYMOUS ? '' : user.value)
-  const req = {
+  const req = buildSimulateRequest({
     user: u,
-    action: action.value.trim(),
-    bucket: bucket.value.trim() || undefined,
-    key: key.value.trim() || undefined,
-    conditions: Object.keys(conditions.value.conditions).length ? conditions.value.conditions : undefined
-  }
+    action: action.value,
+    bucket: bucket.value,
+    key: key.value,
+    resource: resource.value,
+    conditions: conditions.value.conditions
+  })
   const decision = await requireAdmin().simulate(req)
-  const target = req.bucket ? `${req.bucket}${req.key ? `/${req.key}` : ''}` : '*'
+  const target = req.resource ?? (req.bucket ? `${req.bucket}${req.key ? `/${req.key}` : ''}` : '*')
   result.value = { decision, request: `${u || 'anonymous'} → ${req.action} on ${target}` }
   return decision
   // Errors are shown inline (next to the inputs that caused them) rather than
@@ -78,6 +94,7 @@ async function run() {
     errorMsg.value = conditions.value.error
     return
   }
+  if (resourceError.value) return
   await sim.run()
 }
 
@@ -116,12 +133,17 @@ function onCreateAction(item: string) {
             @create="onCreateAction"
           />
         </UFormField>
-        <UFormField label="Bucket" name="bucket" help="Empty = no specific bucket.">
-          <UInput v-model="bucket" class="w-full" placeholder="photos" autocomplete="off" />
+        <UFormField v-if="adminAction" label="Admin resource" name="resource" :help="resourceHelp" :error="resourceError" class="sm:col-span-2">
+          <UInput v-model="resource" class="w-full font-mono" :placeholder="resourcePlaceholder" autocomplete="off" spellcheck="false" />
         </UFormField>
-        <UFormField label="Object key" name="key">
-          <UInput v-model="key" class="w-full" placeholder="2024/cat.jpg" autocomplete="off" />
-        </UFormField>
+        <template v-else>
+          <UFormField label="Bucket" name="bucket" help="Empty = no specific bucket.">
+            <UInput v-model="bucket" class="w-full" placeholder="photos" autocomplete="off" />
+          </UFormField>
+          <UFormField label="Object key" name="key">
+            <UInput v-model="key" class="w-full" placeholder="2024/cat.jpg" autocomplete="off" />
+          </UFormField>
+        </template>
       </div>
       <UCollapsible v-model:open="showConditions">
         <UButton
@@ -137,7 +159,7 @@ function onCreateAction(item: string) {
             class="pt-2"
             label="Conditions"
             name="conditions"
-            help="One key=value per line, multiple values comma separated, e.g. aws:SourceIp=10.0.0.7"
+            :help="conditionsHelp"
             :error="conditions.error"
           >
             <UTextarea v-model="conditionsText" :rows="3" class="w-full font-mono" placeholder="aws:SecureTransport=true" />

@@ -75,6 +75,54 @@ func (l *localNets) onLink(ip netip.Addr) bool {
 	return false
 }
 
+// isBroadcast reports whether ip is the IPv4 limited broadcast address or
+// the directed broadcast address of a directly connected subnet (prefixes
+// up to /30). Such a source address is spoofed: replying to it would reach
+// every host of the link.
+func (l *localNets) isBroadcast(ip netip.Addr) bool {
+	ip = ip.WithZone("").Unmap()
+	if !ip.Is4() {
+		return false
+	}
+	if ip == netip.AddrFrom4([4]byte{255, 255, 255, 255}) {
+		return true
+	}
+	for _, p := range l.get() {
+		if !p.Addr().Is4() || p.Bits() > 30 || !p.Contains(ip) {
+			continue
+		}
+		a := p.Masked().Addr().As4()
+		host := uint32(1)<<(32-p.Bits()) - 1
+		n := (uint32(a[0])<<24 | uint32(a[1])<<16 | uint32(a[2])<<8 | uint32(a[3])) | host
+		if ip == netip.AddrFrom4([4]byte{byte(n >> 24), byte(n >> 16), byte(n >> 8), byte(n)}) {
+			return true
+		}
+	}
+	return false
+}
+
+// routed reports whether a datagram from src that arrived with IP TTL /
+// IPv6 hop limit ttl (0: unknown) was forwarded by a router. mDNS senders
+// use 255 (RFC 6762 §11) and every router decrements it, so a lower value
+// from another host means the datagram came from off the link and its
+// on-link source address is spoofed. Datagrams from this host itself are
+// never routed.
+func (l *localNets) routed(src netip.Addr, ttl int) bool {
+	return ttl > 0 && ttl < 255 && !l.isLocal(src.WithZone("").Unmap())
+}
+
+// advertisedBy reports whether a host at src may advertise ip as its own
+// address: ip is src itself or, when src is this host (isLocal), a
+// loopback or local address. Unauthenticated announcements (beacons, mDNS)
+// therefore only ever make a server probe the sender.
+func advertisedBy(ip, src netip.Addr, isLocal func(netip.Addr) bool) bool {
+	ip, src = ip.Unmap().WithZone(""), src.Unmap().WithZone("")
+	if !ip.IsValid() || ip.IsUnspecified() || ip.IsMulticast() || !src.IsValid() {
+		return false
+	}
+	return ip == src || (isLocal != nil && isLocal(src) && (ip.IsLoopback() || isLocal(ip)))
+}
+
 // interfacePrefixes returns the addresses (with their subnet) of every up
 // interface.
 func interfacePrefixes() []netip.Prefix {

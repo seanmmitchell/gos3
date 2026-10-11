@@ -60,6 +60,13 @@ export interface Capabilities {
   manageConfig: boolean
   /** admin:CreateUser */
   manageUsers: boolean
+  /**
+   * admin:ListUsers. True for delegated user managers whose other user
+   * actions are scoped to some users (and so do not show in manageUsers).
+   * Absent from older servers: use canListUsers(), which falls back to
+   * manageUsers.
+   */
+  listUsers?: boolean
   /** admin:PutPolicy */
   managePolicies: boolean
   /** admin:ForceDeleteBucket */
@@ -68,6 +75,18 @@ export interface Capabilities {
   discovery: boolean
   /** admin:ScanNetwork */
   scan: boolean
+  /**
+   * admin:ProbeNetwork (POST /discovery/probe). Absent from older servers,
+   * which gated probes on admin:GetDiscovery: use canProbe()
+   * (~/components/admin/-capabilities), which falls back to `discovery`.
+   */
+  probe?: boolean
+  /**
+   * admin:CreateOwnAccessKey explicitly allowed (POST /whoami/keys); always
+   * false for root. Absent from older servers, which allowed it unless
+   * explicitly denied: use canCreateOwnKeys(), which then assumes allowed.
+   */
+  createOwnKeys?: boolean
 }
 
 export type CapabilityName = keyof Capabilities
@@ -337,6 +356,12 @@ export interface SimulateRequest {
   action: string
   bucket?: string
   key?: string
+  /**
+   * Admin resource for admin:* actions (arn:gos3:admin:::user/<name>,
+   * …:::policy/<name>, …:::bucket/<name>); omitted = service level. Not
+   * combined with bucket/key.
+   */
+  resource?: string
   conditions?: Record<string, string[]>
 }
 

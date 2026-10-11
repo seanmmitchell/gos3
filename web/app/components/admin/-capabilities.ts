@@ -18,10 +18,13 @@ export const NO_CAPS: Readonly<Capabilities> = Object.freeze({
   viewStats: false,
   manageConfig: false,
   manageUsers: false,
+  listUsers: false,
   managePolicies: false,
   manageBuckets: false,
   discovery: false,
-  scan: false
+  scan: false,
+  probe: false,
+  createOwnKeys: false
 })
 
 /** True when the connection is gos3 and the identity has `cap`. */
@@ -46,8 +49,18 @@ export function overviewMode(kind: ConnectionKind | undefined, caps: Capabilitie
 }
 
 /**
+ * Whether the caller may list IAM users (admin:ListUsers). Servers that
+ * predate the `listUsers` capability only reported manageUsers.
+ */
+export function canListUsers(caps: Capabilities | null | undefined): boolean {
+  return !!(caps?.listUsers ?? caps?.manageUsers)
+}
+
+/**
  * Users page:
- * - manage:      full IAM user management (admin:CreateUser)
+ * - manage:      IAM user management (admin:CreateUser, or admin:ListUsers
+ *                for a delegated manager whose user actions are scoped to
+ *                some users; the server refuses the rest per user)
  * - self:        "My access keys" only (/whoami/keys)
  * - unavailable: generic S3 (no admin API)
  */
@@ -55,7 +68,7 @@ export type UsersPageMode = 'manage' | 'self' | 'unavailable'
 
 export function usersPageMode(kind: ConnectionKind | undefined, caps: Capabilities | null | undefined): UsersPageMode {
   if (kind !== 'gos3') return 'unavailable'
-  return caps?.manageUsers ? 'manage' : 'self'
+  return caps?.manageUsers || canListUsers(caps) ? 'manage' : 'self'
 }
 
 /**
@@ -64,6 +77,30 @@ export function usersPageMode(kind: ConnectionKind | undefined, caps: Capabiliti
  */
 export function canManageOwnKeys(kind: ConnectionKind | undefined, isRoot: boolean, hasIdentity: boolean): boolean {
   return kind === 'gos3' && hasIdentity && !isRoot
+}
+
+/**
+ * Creating a key for oneself (POST /whoami/keys) needs an explicit Allow of
+ * admin:CreateOwnAccessKey; listing and deleting one's own keys do not.
+ *
+ * Servers that predate the `createOwnKeys` capability allowed self-service
+ * creation unless it was explicitly denied, so a missing field counts as
+ * allowed: the button then matches what that server enforces (and a 403
+ * from it is shown as an error). Root never has IAM keys.
+ */
+export function canCreateOwnKeys(kind: ConnectionKind | undefined, isRoot: boolean, caps: Capabilities | null | undefined): boolean {
+  if (kind !== 'gos3' || isRoot || !caps) return false
+  return caps.createOwnKeys ?? true
+}
+
+/**
+ * Probing a URL from the server (POST /discovery/probe) needs
+ * admin:ProbeNetwork. Servers that predate the `probe` capability gated it
+ * on admin:GetDiscovery, so a missing field falls back to `discovery`.
+ */
+export function canProbe(kind: ConnectionKind | undefined, caps: Capabilities | null | undefined): boolean {
+  if (kind !== 'gos3' || !caps) return false
+  return caps.probe ?? caps.discovery
 }
 
 /**

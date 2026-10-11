@@ -260,7 +260,8 @@ func (s *Server) openCopySource(r *http.Request, rc *reqContext, src copySource)
 	if err != nil {
 		return storage.BucketInfo{}, storage.ObjectInfo{}, nil, err
 	}
-	info, rd, err := s.backend.OpenObject(ctx, src.Bucket, src.Key, src.VersionID)
+	// The version authorization evaluated (see openAuthorizedObject).
+	info, rd, err := s.openAuthorizedObject(ctx, rc, src.Bucket, src.Key, src.VersionID, true)
 	if err != nil {
 		return bi, info, nil, objectLookupError(err, src.Bucket, src.Key, src.VersionID)
 	}
@@ -324,24 +325,113 @@ type deleteError struct {
 	Message   string `xml:"Message"`
 }
 
-// maxDeleteObjectsBody bounds the DeleteObjects request body (1000 keys of
-// up to 1024 bytes, XML-escaped, plus version IDs and markup).
-const maxDeleteObjectsBody = 8 << 20
+// maxDeleteObjectsBody bounds the DeleteObjects request body. It is the
+// largest request a client can legitimately send, 1000 entries of:
+//
+//	<Object></Object>                          17
+//	<Key></Key>                                11
+//	key: 1024 bytes, each escaped as at most
+//	  6 bytes ("&quot;", "&apos;", "&#x0D;")  6144
+//	<VersionId></VersionId>                    23
+//	version ID (gos3: < 32, AWS: 32)          128
+//	<ETag></ETag>                              13
+//	&quot; + 32 hex + "-10000" + &quot;        50
+//	white space (pretty-printed documents)     64
+//	                                         ----
+//	                                         6450
+//
+// 1000 * 6450 = 6,450,000 bytes, plus 4 KiB for the XML declaration, the
+// <Delete xmlns="..."> root and <Quiet>: 6,454,096 bytes (about 6.2 MiB).
+// The body is parsed as it arrives (see parseDeleteRequest), so its size
+// bounds the bytes read and parsed, not the memory kept.
+const maxDeleteObjectsBody = maxDeleteObjects*6450 + 4096
+
+// maxDeleteObjectsElements bounds the XML elements of a DeleteObjects
+// body: an <Object> and its three fields are four elements; six per entry
+// (the 1001st included, which is rejected) leave room for others.
+const maxDeleteObjectsElements = (maxDeleteObjects+1)*6 + 64
+
+// parseDeleteRequest reads a DeleteObjects document from x. It stops with
+// MalformedXML at the 1001st <Object>, before reading the rest of the
+// body, and otherwise accepts what encoding/xml accepted for deleteRequest
+// (unknown elements ignored, the last of repeated fields wins). The body
+// is read to its end, so its Content-MD5 / checksum is verified, before it
+// returns successfully.
+func parseDeleteRequest(x *xmlStream) (deleteRequest, error) {
+	var req deleteRequest
+	if err := x.root("Delete"); err != nil {
+		return req, err
+	}
+	for {
+		el, ok, err := x.next()
+		if err != nil {
+			return req, err
+		}
+		if !ok {
+			break
+		}
+		switch el.Name.Local {
+		case "Quiet":
+			v, err := x.text()
+			if err != nil {
+				return req, err
+			}
+			if req.Quiet, err = parseXMLBool(v); err != nil {
+				return req, x.fail(err)
+			}
+		case "Object":
+			if len(req.Objects) == maxDeleteObjects {
+				return req, s3err.ErrMalformedXML
+			}
+			var o deleteIdentifier
+			if err := x.fields(func(name, v string) {
+				switch name {
+				case "Key":
+					o.Key = v
+				case "VersionId":
+					o.VersionID = v
+				case "ETag":
+					o.ETag = v
+				}
+			}); err != nil {
+				return req, err
+			}
+			req.Objects = append(req.Objects, o)
+		default:
+			if err := x.skip(); err != nil {
+				return req, err
+			}
+		}
+	}
+	return req, x.finish()
+}
 
 // handleDeleteObjects implements DeleteObjects: up to 1000 keys, each
 // authorized (s3:DeleteObject / s3:DeleteObjectVersion) and deleted on its
 // own; failures are reported per key in the DeleteResult. Quiet mode
 // omits successful deletions.
+//
+// The body is read before anything is authorized (the keys to authorize
+// are in it), possibly from an anonymous caller: it is streamed with
+// bounded size and work (parseDeleteRequest) and within the absolute
+// pre-authorization deadline the core set (see Server.limitPreAuthBody).
 func (s *Server) handleDeleteObjects(w http.ResponseWriter, r *http.Request, rc *reqContext) error {
 	ctx := r.Context()
 	bi, err := s.bucketInfo(ctx, rc)
 	if err != nil {
 		return err
 	}
-	var req deleteRequest
-	if err := s.decodeValidatedXML(r, rc, maxDeleteObjectsBody, &req); err != nil {
+	x, err := s.validatedXMLStream(r, rc, maxDeleteObjectsBody, maxDeleteObjectsElements)
+	if err != nil {
 		return err
 	}
+	req, err := parseDeleteRequest(x)
+	if err != nil {
+		return err
+	}
+	// The whole body has been read: the per-key authorizations below
+	// decide what happens, the pre-authorization deadline is done.
+	rc.clearPreAuthLimit()
 	if len(req.Objects) == 0 || len(req.Objects) > maxDeleteObjects {
 		return s3err.ErrMalformedXML
 	}

@@ -38,12 +38,105 @@ export function clientAbortSignal(event: H3Event): AbortSignal {
   return ctrl.signal
 }
 
-/** Reads a JSON body without throwing (undefined on invalid JSON). */
-export async function readJsonBody(event: H3Event): Promise<{ ok: true, body: unknown } | { ok: false }> {
+/** 403 answer of the probe, scan and local routes while local discovery is off. */
+export function discoveryDisabled(event: H3Event): ErrorEnvelope {
+  return errorResponse(event, 403, 'AccessDenied', 'Local discovery is disabled on this UI server (enable it with GOS3_UI_LOCAL_DISCOVERY=true).')
+}
+
+/** Body caps of the POST routes. */
+export const PROBE_BODY_LIMIT = 8 * 1024
+export const SCAN_BODY_LIMIT = 64 * 1024
+/** Time a client has to send the whole (small) request body. */
+export const BODY_TIMEOUT_MS = 10_000
+
+/** A request body that cannot be accepted, with its HTTP status. */
+export class BodyError extends Error {
+  constructor(readonly status: 400 | 408 | 413, message: string) {
+    super(message)
+    this.name = 'BodyError'
+  }
+}
+
+/** The request stream readCappedBody needs (an IncomingMessage). */
+export type BodyStream = NodeJS.ReadableStream & { readableEnded?: boolean, destroy?: (err?: Error) => unknown }
+
+/**
+ * Reads a request body of at most `limit` bytes. Rejects with BodyError 413
+ * when Content-Length announces more (without reading anything) or as soon
+ * as the streamed size passes the limit, 408 when the body does not arrive
+ * within timeoutMs, and 400 when the client aborts. On rejection the stream
+ * is paused and detached, and what was buffered is dropped; the caller
+ * disposes of the connection (see readJsonBody).
+ */
+export function readCappedBody(req: BodyStream, limit: number, opts: { contentLength?: string, timeoutMs?: number } = {}): Promise<Buffer> {
+  return new Promise((resolve, reject) => {
+    const declared = opts.contentLength?.trim()
+    if (declared && /^\d+$/.test(declared) && Number(declared) > limit) {
+      return reject(new BodyError(413, `The request body exceeds ${limit} bytes.`))
+    }
+    if (req.readableEnded) return resolve(Buffer.alloc(0))
+    let chunks: Buffer[] = []
+    let size = 0
+    let done = false
+    const finish = (err?: BodyError) => {
+      if (done) return
+      done = true
+      clearTimeout(timer)
+      req.removeListener('data', onData)
+      req.removeListener('end', onEnd)
+      req.removeListener('error', onError)
+      req.removeListener('close', onClose)
+      if (err) {
+        chunks = []
+        req.pause()
+        req.on('error', () => {}) // late errors of a discarded stream
+        reject(err)
+      } else {
+        resolve(Buffer.concat(chunks, size))
+      }
+    }
+    const onData = (c: Buffer | string) => {
+      const b = typeof c === 'string' ? Buffer.from(c) : c
+      size += b.length
+      if (size > limit) return finish(new BodyError(413, `The request body exceeds ${limit} bytes.`))
+      chunks.push(b)
+    }
+    const onEnd = () => finish()
+    const onError = () => finish(new BodyError(400, 'The request body could not be read.'))
+    const onClose = () => finish(new BodyError(400, 'The request body was not received completely.'))
+    const timer = setTimeout(() => finish(new BodyError(408, 'The request body was not received in time.')), opts.timeoutMs ?? BODY_TIMEOUT_MS)
+    req.on('data', onData)
+    req.on('end', onEnd)
+    req.on('error', onError)
+    req.on('close', onClose)
+  })
+}
+
+/**
+ * Reads a JSON request body of at most `limit` bytes (see readCappedBody).
+ * Never throws: on failure the error envelope (status set) is returned.
+ * When the body was not consumed completely, the response asks the client
+ * to close the connection and the request is destroyed once the response
+ * is sent, so the rest of an oversized upload is never read.
+ */
+export async function readJsonBody(event: H3Event, limit: number, opts: { timeoutMs?: number } = {}): Promise<{ ok: true, body: unknown } | { ok: false, error: ErrorEnvelope }> {
+  const req = event.node.req as unknown as BodyStream
+  let raw: Buffer
   try {
-    return { ok: true, body: await readBody<unknown>(event) }
+    raw = await readCappedBody(req, limit, { contentLength: getRequestHeader(event, 'content-length'), timeoutMs: opts.timeoutMs })
+  } catch (e) {
+    const err = e instanceof BodyError ? e : new BodyError(400, 'The request body could not be read.')
+    setResponseHeader(event, 'connection', 'close')
+    const res = event.node.res
+    const dispose = () => req.destroy?.()
+    res.once('finish', dispose)
+    res.once('close', dispose)
+    return { ok: false, error: errorResponse(event, err.status, 'InvalidRequest', err.message) }
+  }
+  try {
+    return { ok: true, body: JSON.parse(raw.toString('utf8')) as unknown }
   } catch {
-    return { ok: false }
+    return { ok: false, error: errorResponse(event, 400, 'InvalidRequest', 'The request body is not valid JSON.') }
   }
 }
 
@@ -157,11 +250,18 @@ export class Slots {
 export const MAX_CONCURRENT_SCANS = 2
 /** At most this many GET /api/discovery/local run at once. */
 export const MAX_CONCURRENT_LOCAL = 4
+/**
+ * At most this many POST /api/discovery/probe run at once (the Discover
+ * page probes a list of URLs with 6 requests in flight).
+ */
+export const MAX_CONCURRENT_PROBES = 8
 
 /** Process-wide slots for /api/discovery/scan. */
 export const scanSlots = new Slots(MAX_CONCURRENT_SCANS)
 /** Process-wide slots for /api/discovery/local. */
 export const localSlots = new Slots(MAX_CONCURRENT_LOCAL)
+/** Process-wide slots for /api/discovery/probe. */
+export const probeSlots = new Slots(MAX_CONCURRENT_PROBES)
 
 /** The 429 TooManyRequests envelope sent when slots are full. */
 export function tooManyRequests(event: H3Event, what: string, max: number): ErrorEnvelope {

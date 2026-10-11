@@ -44,10 +44,71 @@ The server ID is random (16 hex chars), persisted in `<data>/.gos3/server-id`
   may point at another host and port.
 - TXT records: `id=<id>`, `name=<name>`, `v=<version>`, `api=v1`,
   `region=<region>`, `scheme=http|https`, `info=/_gos3/info`.
-- Browsing: query every 30 s (3 s listen window). Candidate URL =
-  `<scheme>://<ip>:<port>` for each address (IPv4 preferred). Only addresses
-  on a directly connected subnet (or on this host) are probed; answers that
-  point elsewhere are ignored.
+- Records have a TTL of 120 s; at most 16 addresses are advertised.
+
+### Responder
+
+gos3 answers mDNS queries itself (no third-party mDNS library). It listens
+on UDP 5353, joined to `224.0.0.251` and `ff02::fb` on every multicast
+interface (either family may be unavailable; advertising stops only when
+neither is). Every query is checked before it is answered:
+
+- Datagrams from senders that are neither on this host nor on a directly
+  connected subnet are dropped, as are datagrams from a broadcast or
+  unspecified source address. mDNS is link-local; the port also receives
+  unicast datagrams from anywhere that can reach it.
+- Only standard queries are read. Duplicate questions are collapsed and at
+  most 8 distinct questions per query are considered.
+- Only questions about this server's own records are answered: PTR for
+  `_gos3._tcp.local.` (with the SRV, TXT, A and AAAA records as additional
+  records) and for the DNS-SD type enumeration
+  `_services._dns-sd._udp.local.`, SRV/TXT for the instance name, and A/AAAA
+  for the host name. A query without such a question costs the sender
+  nothing.
+- Datagrams from other hosts must arrive with IP TTL / hop limit 255, as
+  mDNS senders set it (RFC 6762 §11): a router decrements it, so a lower
+  value means the datagram came from off the link with a spoofed on-link
+  source, and it is dropped. Legacy tools that query with a lower TTL (for
+  example `dig -p 5353`) therefore get answers only when run on this host.
+- Each sender is rate-limited with the beacon's token bucket (a burst of 32
+  answered queries, then 4 per second), and all responses together are
+  limited to 50 per second. A query whose answer is not sent (the same
+  multicast answer went out less than a second ago) counts against
+  neither.
+- Answers are multicast to the group with IP TTL / hop limit 255, out of the
+  interface the query arrived on, and the same answers at most once per
+  second per interface (RFC 6762 §6). Questions with the unicast-response
+  bit (§5.4) and legacy queries sent from a port other than 5353 (§6.7) are
+  answered by unicast to the sender, which the checks above restrict to
+  this host and its directly connected subnets. Legacy replies repeat the
+  query ID and question and carry TTLs of at most 10 s.
+- Every response is one packet of at most 1400 bytes (additional records
+  are dropped first if it would be larger).
+
+Advertising runs whatever the S3 listen address is and is independent of
+`server.public_info`. On hosts with a routable address, firewall UDP 5353
+from outside the local network anyway, or set `discovery.mdns: false` (or
+`discovery.advertise: false`).
+
+### Browsing
+
+- A PTR query for `_gos3._tcp.local.` is sent every 30 s from an ephemeral
+  socket per IP family (a legacy query, so responders answer by unicast);
+  answers are collected for 3 s on that socket and on the group port.
+  Incomplete answers trigger follow-up SRV/TXT and A/AAAA questions (at most
+  32 per browse).
+- Responses from senders that are not on this host or a directly connected
+  subnet are dropped, and so are responses from other hosts that arrived
+  with a TTL / hop limit below 255 (forwarded by a router, so the source is
+  spoofed). Records from different senders are never combined,
+  and an advertised address is accepted only when it is the responding
+  packet's source address, or, when the sender is this host, a loopback or
+  local address. So an mDNS answer can only make the server probe the
+  responder itself (like a beacon), never another host or a loopback port.
+- At most 256 instances per browse, 16 per sender. Candidate URL =
+  `<scheme>://<ip>:<port>` (IPv4 preferred, then IPv6 with the interface
+  zone for link-local addresses); an instance needs SRV, TXT and an
+  accepted address.
 - Peer names have control characters (C0, DEL, C1), bidi controls and line
   or paragraph separators stripped.
 
@@ -149,11 +210,49 @@ scan. The server's own address is probed but left out of `found`.
   `bye` beacon from one of the peer's addresses or a failed probe marks the
   peer unhealthy; an address that now answers with a different ID marks it
   unhealthy too. A failed probe of an unverified sighting never marks a
-  verified peer unhealthy.
+  verified peer unhealthy. `error` holds a fixed category (`connection
+  refused`, `timed out`, `not a gos3 server`, `TLS certificate not trusted`,
+  ...), never text the probed service sent.
 - Probes use `GET <base>/_gos3/info` with a 5 s timeout and a 64 KiB limit;
   they never use HTTP proxies or follow redirects, and HTTPS certificates are
   verified (a peer with a self-signed certificate stays unverified with a TLS
   error).
+- Probes never connect to cloud metadata addresses (`169.254.169.254`,
+  `169.254.170.2`, `169.254.170.23`, `fd00:ec2::254`, `100.100.100.200`),
+  unspecified addresses (`0.0.0.0/8`, `::`), multicast addresses or
+  `255.255.255.255`, also in IPv4-mapped or NAT64 (`64:ff9b::/96`) form. The
+  check runs on the resolved address of every connection attempt, so a host
+  name that resolves there is refused too (`address not allowed`). This
+  applies to the admin API probe, scans, seeds, DNS SRV targets, candidate
+  verification and re-probes. Other link-local addresses stay allowed:
+  zeroconf networks use them.
+
+### Peer identity
+
+Server IDs are not authenticated: any server can serve any ID. The first
+verified record of an ID is kept while the peer still answers:
+
+- A verified peer's *known addresses* are the addresses where its
+  `/_gos3/info` was fetched. Unverified sightings never add to them, and
+  when an unverified entry is verified its sighting addresses are replaced
+  by the verified one.
+- When a server at a new address answers with the ID of a verified peer
+  (from the admin probe, a scan, a beacon or an mDNS sighting), nothing
+  changes yet: the peer's known addresses are re-probed first (at most 4;
+  not at all if one answered within the last 10 s). If one still answers
+  with the ID, the verified record (name, version, region, endpoints,
+  features, addresses, re-probe address) is kept and the claim is recorded:
+  `error` reads `ID claimed by another address: <url> ...` for 10 minutes
+  and a warning is logged. A claim whose document is identical to the
+  verified one (the same server reached at another address) is ignored.
+  The admin API probe and scans still report what the new address serves.
+- Only when no known address answers with the ID any more does the peer
+  move: the new document replaces the record and the new address becomes
+  its only address.
+- Without a re-probe, a new address is accepted when the verified record
+  itself advertises it (`endpoints.s3` or `endpoints.all`, e.g. the other
+  interfaces of a multi-homed server), when it is a configured seed, or
+  when it comes from a DNS SRV lookup of a configured domain.
 - The table holds at most 4096 peers (unverified sightings are evicted first),
   of which at most 256 unverified ones (a new sighting replaces the stalest),
   and at most 32 addresses per peer.
@@ -167,7 +266,11 @@ scan. The server's own address is probed but left out of `found`.
 
 - Beacons and mDNS are unauthenticated hints; only `/_gos3/info` (HTTP/HTTPS)
   verification promotes a candidate, and adding a discovered server to the UI
-  still requires credentials.
+  still requires credentials. Both accept datagrams only from this host and
+  directly connected subnets, rate-limit each sender, and only make the
+  server probe the sender itself.
+- A verified peer cannot be taken over by another server claiming its ID
+  while it still answers (see [Peer identity](#peer-identity)).
 - Scans are opt-in (`allowScan`) and require `admin:ScanNetwork`.
 - Disable all advertising with `discovery.advertise: false` or the whole
   subsystem with `discovery.enabled: false`. `publicInfo: false` only

@@ -1,10 +1,20 @@
 import { describe, expect, it } from 'vitest'
 import {
+  ADMIN_ACTIONS,
+  ADMIN_RESOURCE_FORMS,
+  adminArn,
+  adminConditionKeys,
+  adminRequestResource,
+  adminResourceType,
+  buildSimulateRequest,
   IAM_POLICY_TEMPLATES,
+  isAdminAction,
   parseConditionLines,
   parsePolicyText,
   renderIamTemplate,
+  SIMULATOR_ACTIONS,
   templateParamErrors,
+  validateAdminResource,
   validateCidrList,
   validatePolicyDocument,
   validatePolicyName,
@@ -75,6 +85,92 @@ describe('IAM policy templates', () => {
     expect(validateCidrList('192.168.1.10, fd00::/8')).toBeUndefined()
     expect(validateCidrList('300.1.1.1/8')).toBeDefined()
     expect(validateCidrList('')).toBeDefined()
+  })
+})
+
+describe('admin actions, resources and condition keys', () => {
+  it('lists every admin action, including the new self-service and probe actions', () => {
+    for (const a of ['admin:ProbeNetwork', 'admin:CreateOwnAccessKey', 'admin:DeleteOwnAccessKey', 'admin:GetDiscovery', 'admin:ScanNetwork', 'admin:UpdateUser', 'admin:GetPolicy', 'admin:GetBucket']) {
+      expect(ADMIN_ACTIONS).toContain(a)
+      expect(SIMULATOR_ACTIONS).toContain(a)
+    }
+    expect(new Set(SIMULATOR_ACTIONS).size).toBe(SIMULATOR_ACTIONS.length)
+    for (const a of ADMIN_ACTIONS) expect(validatePolicyDocument({ Statement: [{ Effect: 'Allow', Action: a, Resource: '*' }] }, 'identity')).toBeUndefined()
+  })
+
+  it('maps admin actions to their per-target resource type', () => {
+    for (const a of ['admin:CreateUser', 'admin:GetUser', 'admin:UpdateUser', 'admin:DeleteUser', 'admin:CreateAccessKey', 'admin:UpdateAccessKey', 'admin:DeleteAccessKey']) expect(adminResourceType(a)).toBe('user')
+    for (const a of ['admin:GetPolicy', 'admin:PutPolicy', 'admin:DeletePolicy']) expect(adminResourceType(a)).toBe('policy')
+    for (const a of ['admin:GetBucket', 'admin:ForceDeleteBucket']) expect(adminResourceType(a)).toBe('bucket')
+    for (const a of ['admin:ListUsers', 'admin:ProbeNetwork', 'admin:CreateOwnAccessKey', 'admin:UpdateConfig', 's3:GetObject']) expect(adminResourceType(a)).toBeUndefined()
+    expect(adminResourceType(' Admin:updateuser ')).toBe('user')
+    expect(isAdminAction('admin:GetStats')).toBe(true)
+    expect(isAdminAction('s3:GetObject')).toBe(false)
+  })
+
+  it('offers the three admin ARN forms, which are valid identity policy resources', () => {
+    const arns = ADMIN_RESOURCE_FORMS.map(f => f.arn)
+    expect(arns).toEqual(['arn:gos3:admin:::*', 'arn:gos3:admin:::user/<name>', 'arn:gos3:admin:::policy/<name>', 'arn:gos3:admin:::bucket/<name>'])
+    for (const t of ['user', 'policy', 'bucket'] as const) {
+      expect(validatePolicyDocument({ Statement: [{ Effect: 'Allow', Action: 'admin:*', Resource: adminArn(t, 'team-*') }] }, 'identity')).toBeUndefined()
+    }
+  })
+
+  it('validates and normalises simulator admin resources', () => {
+    expect(validateAdminResource('')).toBeUndefined()
+    expect(validateAdminResource('arn:gos3:admin:::*')).toBeUndefined()
+    expect(validateAdminResource('arn:gos3:admin:::user/alice')).toBeUndefined()
+    expect(validateAdminResource('arn:gos3:admin:::policy/readonly')).toBeUndefined()
+    expect(validateAdminResource('arn:gos3:admin:::bucket/photos')).toBeUndefined()
+    expect(validateAdminResource('arn:gos3:admin:::user/')).toBeDefined()
+    expect(validateAdminResource('arn:gos3:admin:::thing/x')).toBeDefined()
+    expect(validateAdminResource('arn:aws:s3:::b')).toBeDefined()
+    expect(adminRequestResource('  ')).toBeUndefined()
+    expect(adminRequestResource('*')).toBeUndefined()
+    expect(adminRequestResource('arn:gos3:admin:::*')).toBeUndefined()
+    expect(adminRequestResource(' arn:gos3:admin:::user/a ')).toBe('arn:gos3:admin:::user/a')
+  })
+
+  it('builds simulate requests with resource for admin actions and bucket/key for s3 actions', () => {
+    const inputs = { user: 'helper', bucket: 'photos', key: 'cat.jpg', resource: 'arn:gos3:admin:::user/team-a' }
+    // admin action: resource, never bucket/key
+    expect(buildSimulateRequest({ ...inputs, action: ' admin:UpdateUser ', conditions: { 'admin:PolicyName': ['readonly'] } }))
+      .toEqual({ user: 'helper', action: 'admin:UpdateUser', resource: 'arn:gos3:admin:::user/team-a', conditions: { 'admin:PolicyName': ['readonly'] } })
+    // service level: no resource at all
+    for (const resource of ['', ' ', '*', 'arn:gos3:admin:::*']) {
+      expect(buildSimulateRequest({ ...inputs, action: 'admin:ProbeNetwork', resource })).toEqual({ user: 'helper', action: 'admin:ProbeNetwork' })
+    }
+    // s3 action: bucket/key, never resource
+    expect(buildSimulateRequest({ ...inputs, action: 's3:GetObject', conditions: {} })).toEqual({ user: 'helper', action: 's3:GetObject', bucket: 'photos', key: 'cat.jpg' })
+    expect(buildSimulateRequest({ user: '', action: 's3:ListAllMyBuckets', bucket: ' ', key: '', resource: 'arn:gos3:admin:::user/x' })).toEqual({ user: '', action: 's3:ListAllMyBuckets' })
+  })
+
+  it('suggests admin:PolicyName for CreateUser and UpdateUser only', () => {
+    expect(adminConditionKeys('admin:CreateUser')).toEqual(['admin:PolicyName'])
+    expect(adminConditionKeys('admin:UpdateUser')).toEqual(['admin:PolicyName'])
+    expect(adminConditionKeys('admin:DeleteUser')).toEqual([])
+    expect(adminConditionKeys('s3:GetObject')).toEqual([])
+  })
+
+  it('own-access-keys allows creating and deleting own keys at service level', () => {
+    const d = JSON.parse(renderIamTemplate('own-access-keys', {})) as { Statement: { Effect: string, Action: string[], Resource: string[] }[] }
+    expect(d.Statement).toEqual([{ Sid: 'OwnAccessKeys', Effect: 'Allow', Action: ['admin:CreateOwnAccessKey', 'admin:DeleteOwnAccessKey'], Resource: ['arn:gos3:admin:::*'] }])
+  })
+
+  it('user-manager scopes user actions to a pattern and limits attachable policies', () => {
+    type Doc = { Statement: { Sid: string, Action: string[], Resource: string[], Condition?: Record<string, Record<string, unknown>> }[] }
+    const d = JSON.parse(renderIamTemplate('user-manager', { users: 'team-*', policies: 'readonly, readwrite' })) as Doc
+    const manage = d.Statement.find(s => s.Sid === 'ManageUsers')!
+    expect(manage.Resource).toEqual(['arn:gos3:admin:::user/team-*'])
+    expect(manage.Action).toContain('admin:UpdateUser')
+    expect(manage.Condition).toEqual({ 'ForAllValues:StringEquals': { 'admin:PolicyName': ['readonly', 'readwrite'] } })
+    const none = JSON.parse(renderIamTemplate('user-manager', { users: 'team-*' })) as Doc
+    expect(none.Statement.find(s => s.Sid === 'ManageUsers')!.Condition).toEqual({ Null: { 'admin:PolicyName': 'true' } })
+    const t = IAM_POLICY_TEMPLATES.find(x => x.id === 'user-manager')!
+    expect(templateParamErrors(t, {})).toEqual({ users: 'Required' })
+    expect(templateParamErrors(t, { users: 'bad name' }).users).toBeDefined()
+    expect(templateParamErrors(t, { users: 'team-*', policies: 'ok, a/b' }).policies).toBeDefined()
+    expect(templateParamErrors(t, { users: 'team-*', policies: 'readonly' })).toEqual({})
   })
 })
 

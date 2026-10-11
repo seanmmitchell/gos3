@@ -303,6 +303,17 @@ func (m *Manager) updateAccessKey(ctx context.Context, accessKey, status string)
 	})
 }
 
+func (m *Manager) accessKeyOwner(ctx context.Context, accessKey string) (string, error) {
+	if err := ctxErr(ctx); err != nil {
+		return "", err
+	}
+	k := m.snapshot().keys[accessKey]
+	if k == nil {
+		return "", ErrKeyNotFound
+	}
+	return k.User, nil
+}
+
 func (m *Manager) deleteAccessKey(ctx context.Context, accessKey string) error {
 	if err := ctxErr(ctx); err != nil {
 		return err
@@ -369,7 +380,7 @@ func (m *Manager) putPolicy(ctx context.Context, name, description string, doc P
 		return NamedPolicy{}, err
 	}
 	d := cloneDocument(doc)
-	if reason := validateIdentityPolicy(&d); reason != "" {
+	if reason := validateNewIdentityPolicy(&d); reason != "" {
 		return NamedPolicy{}, wrapf(ErrInvalidPolicy, reason)
 	}
 	if b, err := json.Marshal(d); err != nil || len(b) > MaxPolicySize {

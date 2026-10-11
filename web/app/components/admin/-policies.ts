@@ -3,7 +3,7 @@
 // so obvious mistakes are flagged before saving) and name validation.
 //
 // File name starts with "-" so Nuxt does not register it as a component.
-import type { PolicyDocument, PolicyStatement } from '~/types/admin'
+import type { PolicyDocument, PolicyStatement, SimulateRequest } from '~/types/admin'
 
 export const POLICY_VERSION = '2012-10-17'
 
@@ -115,15 +115,19 @@ export function formatPolicy(doc: PolicyDocument | unknown): string {
 // Identity policy templates
 // ---------------------------------------------------------------------------
 
-export type TemplateParam = 'bucket' | 'cidr'
+export type TemplateParam = 'bucket' | 'cidr' | 'users' | 'policies'
 
 export interface PolicyTemplateParams {
   bucket?: string
   cidr?: string
+  /** User name or pattern (wildcards allowed), e.g. team-*. */
+  users?: string
+  /** Comma separated policy names a user manager may attach. */
+  policies?: string
 }
 
 export interface IamPolicyTemplate {
-  id: 'readonly-bucket' | 'readwrite-bucket' | 'prefix-per-user' | 'deny-delete' | 'ip-restricted'
+  id: 'readonly-bucket' | 'readwrite-bucket' | 'prefix-per-user' | 'deny-delete' | 'ip-restricted' | 'own-access-keys' | 'user-manager'
   label: string
   description: string
   /** Parameters the template needs (shown as inputs). */
@@ -134,6 +138,119 @@ export interface IamPolicyTemplate {
 }
 
 const s3Arn = (bucket: string, path?: string) => `arn:aws:s3:::${bucket}${path !== undefined ? `/${path}` : ''}`
+
+// ---------------------------------------------------------------------------
+// Admin actions and resources
+// ---------------------------------------------------------------------------
+
+/** Resource of service-level admin actions (and of every admin action). */
+export const ADMIN_SERVICE_ARN = 'arn:gos3:admin:::*'
+
+/** Per-target admin resource types: arn:gos3:admin:::<type>/<name>. */
+export type AdminResourceType = 'user' | 'policy' | 'bucket'
+
+/** ARN of one admin target (wildcards allowed in policies). */
+export function adminArn(type: AdminResourceType, name: string): string {
+  return `arn:gos3:admin:::${type}/${name}`
+}
+
+/**
+ * Resource forms admin actions are evaluated against (suggestions for the
+ * policy editor and the simulator). "*" and arn:gos3:admin:::* match all.
+ */
+export const ADMIN_RESOURCE_FORMS: readonly { type: AdminResourceType | 'service', arn: string, description: string }[] = [
+  { type: 'service', arn: ADMIN_SERVICE_ARN, description: 'Every admin action and target' },
+  { type: 'user', arn: adminArn('user', '<name>'), description: 'CreateUser, GetUser, UpdateUser, DeleteUser; CreateAccessKey (target user); UpdateAccessKey / DeleteAccessKey (the key\'s owner)' },
+  { type: 'policy', arn: adminArn('policy', '<name>'), description: 'GetPolicy, PutPolicy, DeletePolicy' },
+  { type: 'bucket', arn: adminArn('bucket', '<name>'), description: 'GetBucket, ForceDeleteBucket' }
+]
+
+/** Every admin action (IAM action "admin:<Action>"), see docs/admin-api.md. */
+export const ADMIN_ACTIONS: readonly string[] = [
+  'admin:ServerInfo',
+  'admin:GetStats',
+  'admin:GetConfig',
+  'admin:UpdateConfig',
+  'admin:ListUsers',
+  'admin:CreateUser',
+  'admin:GetUser',
+  'admin:UpdateUser',
+  'admin:DeleteUser',
+  'admin:CreateAccessKey',
+  'admin:UpdateAccessKey',
+  'admin:DeleteAccessKey',
+  'admin:CreateOwnAccessKey',
+  'admin:DeleteOwnAccessKey',
+  'admin:ListPolicies',
+  'admin:GetPolicy',
+  'admin:PutPolicy',
+  'admin:DeletePolicy',
+  'admin:SimulatePolicy',
+  'admin:ListBuckets',
+  'admin:GetBucket',
+  'admin:ForceDeleteBucket',
+  'admin:GetDiscovery',
+  'admin:ProbeNetwork',
+  'admin:ScanNetwork'
+]
+
+const ADMIN_RESOURCE_TYPES: Readonly<Record<string, AdminResourceType>> = {
+  'admin:createuser': 'user',
+  'admin:getuser': 'user',
+  'admin:updateuser': 'user',
+  'admin:deleteuser': 'user',
+  'admin:createaccesskey': 'user',
+  'admin:updateaccesskey': 'user',
+  'admin:deleteaccesskey': 'user',
+  'admin:getpolicy': 'policy',
+  'admin:putpolicy': 'policy',
+  'admin:deletepolicy': 'policy',
+  'admin:getbucket': 'bucket',
+  'admin:forcedeletebucket': 'bucket'
+}
+
+/** True for admin:* actions (case-insensitive prefix). */
+export function isAdminAction(action: string): boolean {
+  return /^admin:/i.test(action.trim())
+}
+
+/** Target type an admin action is evaluated against (undefined = service level). */
+export function adminResourceType(action: string): AdminResourceType | undefined {
+  return ADMIN_RESOURCE_TYPES[action.trim().toLowerCase()]
+}
+
+/** Condition keys only some admin actions set, by action (lower-cased). */
+const ADMIN_CONDITION_KEYS: Readonly<Record<string, readonly string[]>> = {
+  // the policy names a CreateUser / UpdateUser body attaches (multi-valued;
+  // absent when the body attaches none)
+  'admin:createuser': ['admin:PolicyName'],
+  'admin:updateuser': ['admin:PolicyName']
+}
+
+/** Action-specific condition keys of an admin action (suggested by the simulator). */
+export function adminConditionKeys(action: string): readonly string[] {
+  return ADMIN_CONDITION_KEYS[action.trim().toLowerCase()] ?? []
+}
+
+/**
+ * The `resource` of a simulate request for an admin action: undefined for
+ * the service level (empty, "*" or arn:gos3:admin:::*), else the trimmed ARN.
+ */
+export function adminRequestResource(resource: string): string | undefined {
+  const r = resource.trim()
+  return !r || r === '*' || r === ADMIN_SERVICE_ARN ? undefined : r
+}
+
+/**
+ * Checks a simulator resource for an admin action: empty (service level) or
+ * arn:gos3:admin:::{user,policy,bucket}/<name>. Returns an error message.
+ */
+export function validateAdminResource(resource: string): string | undefined {
+  if (adminRequestResource(resource) === undefined) return undefined
+  const r = resource.trim()
+  if (!/^arn:gos3:admin:::(user|policy|bucket)\/.+$/.test(r)) return 'Use arn:gos3:admin:::user/<name>, …:::policy/<name> or …:::bucket/<name> (empty = service level)'
+  return undefined
+}
 
 /** Default when a template is applied without a bucket: all buckets. */
 const bucketOrAll = (b?: string) => (b?.trim() ? b.trim() : '*')
@@ -237,6 +354,44 @@ export const IAM_POLICY_TEMPLATES: readonly IamPolicyTemplate[] = [
         Resource: '*',
         Condition: { NotIpAddress: { 'aws:SourceIp': (cidr ?? '').split(/[\s,]+/).filter(Boolean) } }
       })
+  },
+  {
+    id: 'own-access-keys',
+    label: 'Own access keys',
+    description: 'Let users create and delete access keys for themselves (My access keys). Creating needs an explicit allow of admin:CreateOwnAccessKey.',
+    params: [],
+    required: [],
+    build: () =>
+      doc({
+        Sid: 'OwnAccessKeys',
+        Effect: 'Allow',
+        Action: ['admin:CreateOwnAccessKey', 'admin:DeleteOwnAccessKey'],
+        Resource: [ADMIN_SERVICE_ARN]
+      })
+  },
+  {
+    id: 'user-manager',
+    label: 'Manage some users',
+    description: 'Create, edit and delete the users matching a name pattern and manage their keys, attaching only the listed policies (empty = none). Keep the pattern from matching the manager itself or administrators.',
+    params: ['users', 'policies'],
+    required: ['users'],
+    build: ({ users, policies }) => {
+      const names = (policies ?? '').split(/[\s,]+/).filter(Boolean)
+      return doc(
+        { Sid: 'ListUsersAndPolicies', Effect: 'Allow', Action: ['admin:ListUsers', 'admin:ListPolicies'], Resource: [ADMIN_SERVICE_ARN] },
+        {
+          Sid: 'ManageUsers',
+          Effect: 'Allow',
+          Action: ['admin:CreateUser', 'admin:GetUser', 'admin:UpdateUser', 'admin:DeleteUser', 'admin:CreateAccessKey', 'admin:UpdateAccessKey', 'admin:DeleteAccessKey'],
+          Resource: [adminArn('user', users?.trim() || '*')],
+          // admin:PolicyName lists the policies a CreateUser/UpdateUser body
+          // attaches (absent when it attaches none).
+          Condition: names.length
+            ? { 'ForAllValues:StringEquals': { 'admin:PolicyName': names } }
+            : { Null: { 'admin:PolicyName': 'true' } }
+        }
+      )
+    }
   }
 ]
 
@@ -269,6 +424,12 @@ export function templateParamErrors(t: IamPolicyTemplate, p: PolicyTemplateParam
   }
   if (t.params.includes('bucket') && p.bucket?.trim() && !/^[a-z0-9.*?-]+$/.test(p.bucket.trim())) {
     out.bucket = 'Invalid bucket name or pattern'
+  }
+  if (t.params.includes('users') && p.users?.trim() && !/^[\w+=,.@*?-]+$/.test(p.users.trim())) {
+    out.users = 'Invalid user name or pattern'
+  }
+  if (t.params.includes('policies') && p.policies?.trim() && p.policies.split(/[\s,]+/).filter(Boolean).some(n => !IAM_NAME_RE.test(n))) {
+    out.policies = 'Invalid policy name'
   }
   return out
 }
@@ -328,18 +489,39 @@ export const SIMULATOR_ACTIONS: readonly string[] = [
   's3:PutBucketObjectLockConfiguration',
   's3:GetBucketAcl',
   's3:PutBucketAcl',
-  'admin:ServerInfo',
-  'admin:GetStats',
-  'admin:GetConfig',
-  'admin:UpdateConfig',
-  'admin:ListUsers',
-  'admin:CreateUser',
-  'admin:ListPolicies',
-  'admin:PutPolicy',
-  'admin:ForceDeleteBucket',
-  'admin:GetDiscovery',
-  'admin:ScanNetwork'
+  ...ADMIN_ACTIONS
 ]
+
+/**
+ * Builds the POST /authz/simulate body from the simulator inputs. Admin
+ * actions are evaluated against an admin resource and S3 actions against
+ * bucket/key, and the server rejects the other combination (400), so only
+ * the inputs matching the action are sent: admin actions get `resource`
+ * (omitted for the service level) and never bucket/key; S3 actions get
+ * bucket/key and never `resource`.
+ */
+export function buildSimulateRequest(input: {
+  user: string
+  action: string
+  bucket?: string
+  key?: string
+  resource?: string
+  conditions?: Record<string, string[]>
+}): SimulateRequest {
+  const action = input.action.trim()
+  const req: SimulateRequest = { user: input.user, action }
+  if (isAdminAction(action)) {
+    const resource = adminRequestResource(input.resource ?? '')
+    if (resource) req.resource = resource
+  } else {
+    const bucket = input.bucket?.trim()
+    const key = input.key?.trim()
+    if (bucket) req.bucket = bucket
+    if (key) req.key = key
+  }
+  if (input.conditions && Object.keys(input.conditions).length) req.conditions = input.conditions
+  return req
+}
 
 /**
  * Parses simulator conditions from "key=value[,value]" lines into the

@@ -17,8 +17,9 @@ the settings to review before you expose a server.
       secrets.
 - [ ] If metrics are public (`metrics.public`), restrict who can reach
       `/_gos3/metrics`.
-- [ ] Do not expose a standalone web UI's Node server to untrusted networks,
-      or set `GOS3_UI_LOCAL_DISCOVERY=false`.
+- [ ] Enable a standalone web UI's local discovery
+      (`GOS3_UI_LOCAL_DISCOVERY=true`) only when its Node server is not
+      reachable from untrusted networks.
 
 ## Authentication
 
@@ -60,25 +61,82 @@ stored in `<data>/.gos3/iam.json` (mode 0600). A user can have up to 10 keys,
 and keys can be deactivated. Users can list, create and delete their own keys
 through `/_gos3/admin/v1/whoami/keys`.
 
-Users may create and delete their own keys without any grant, unless a
-policy explicitly denies `admin:CreateOwnAccessKey` /
-`admin:DeleteOwnAccessKey` (a Deny of `admin:*` also matches). Deny them to
-stop a user, or a stolen key, from minting keys that would survive revoking
-the current one.
+Creating a key for oneself needs an explicit Allow of
+`admin:CreateOwnAccessKey`, which only the built-in `admin` policy grants;
+give it in a custom policy to users who should manage their own keys. Without
+it, a stolen key cannot mint fresh keys that would survive revoking the
+stolen one. An explicit Deny still wins over the Allow. Every self-service
+key creation is logged at Info with the user, the new access key ID and the
+access key that signed the request. Listing and deleting one's own keys
+needs no grant (deleting is refused only by an explicit Deny of
+`admin:DeleteOwnAccessKey` or `admin:*`). When a key leaks, check the log
+for keys it created; disabling the user (`PATCH /users/{name}` with
+`"disabled": true`) revokes all of the user's keys at once.
 
 Creating a user through the admin API needs `admin:CreateUser`; creating it
 with policies attached also needs `admin:UpdateUser`, and with an initial
 access key (`"createKey": true`) also `admin:CreateAccessKey`, the same
 actions that gate those steps on their own routes. A role with only
 `admin:CreateUser` can therefore create users without policies or keys, but
-cannot create a user with the `admin` policy and take its key, so it is not
-equivalent to `admin:*`.
+cannot create a user with the `admin` policy and take its key.
 
 Built-in policies: `admin` (everything, including the admin API), `readwrite`
 (all S3 actions), `readonly`, `writeonly`, and `diagnostics` (server info,
-stats and discovery in the admin API only). Custom policies use the IAM policy
-language; the admin API's `/authz/simulate` endpoint and the UI's policy
-simulator show which statement decides a request.
+stats and discovery state in the admin API only; no probes or scans). Custom
+policies use the IAM policy language; the admin API's `/authz/simulate`
+endpoint and the UI's policy simulator show which statement decides a
+request.
+
+### Scoping admin permissions
+
+Several admin actions are each **equivalent to full admin** when granted on
+every resource (`"Resource": "*"` or `arn:gos3:admin:::*`), because they let
+the holder give itself any permission:
+
+- `admin:UpdateUser`: attach the `admin` policy to yourself.
+- `admin:CreateUser` together with `admin:UpdateUser` (or with
+  `admin:CreateAccessKey`): create a user with the `admin` policy and use it.
+- `admin:PutPolicy`: rewrite a policy attached to yourself to allow `*`.
+- `admin:CreateAccessKey`: create a key (with a secret you choose) for an
+  administrator and sign as them.
+- `admin:UpdateAccessKey`: reactivate an administrator key that was
+  deactivated, for example after it leaked.
+- `admin:UpdateConfig`: change CORS, discovery and the public URL; treat it
+  like root access.
+
+To delegate part of user or policy management, scope these actions with the
+per-target resources (see
+[admin-api.md](admin-api.md#resources-and-condition-keys)):
+`arn:gos3:admin:::user/<name>` for user and key actions (a key is evaluated
+as its owner), `arn:gos3:admin:::policy/<name>` for policy actions and
+`arn:gos3:admin:::bucket/<name>` for `admin:GetBucket` and
+`admin:ForceDeleteBucket`, with wildcards, and limit which policies may be
+attached with the multi-valued condition key `admin:PolicyName`. For
+example, this help-desk policy manages only `team-*` users, which cannot
+include the help-desk user itself, and may attach only `readonly`:
+
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    { "Effect": "Allow", "Action": "admin:ListUsers", "Resource": "arn:gos3:admin:::*" },
+    { "Effect": "Allow",
+      "Action": ["admin:GetUser", "admin:UpdateUser", "admin:CreateUser",
+                 "admin:CreateAccessKey", "admin:UpdateAccessKey", "admin:DeleteAccessKey"],
+      "Resource": "arn:gos3:admin:::user/team-*",
+      "Condition": { "ForAllValues:StringEquals": { "admin:PolicyName": ["readonly"] } } }
+  ]
+}
+```
+
+Name the scoped users and policies so that the delegated user and the
+policies attached to it fall outside the pattern, and do not let it attach
+policies that grant admin actions. A Deny with
+`"ForAnyValue:StringEquals": {"admin:PolicyName": "admin"}` on
+`admin:UpdateUser` and `admin:CreateUser` blocks attaching `admin` whatever
+else is allowed. `*` and `arn:gos3:admin:::*` keep matching every admin
+resource, and s3 ARNs such as `arn:aws:s3:::*` never grant admin actions. The
+UI's capability flags (`GET /whoami`) reflect only unscoped grants.
 
 Setting an ACL or tags while writing an object needs more than
 `s3:PutObject`, as on AWS: PutObject, CopyObject (with the `REPLACE` tagging
@@ -146,15 +204,31 @@ of discarding them. See [operations.md](operations.md#the-data-directory).
 
 ## Transport
 
-- gos3 serves plain HTTP unless TLS is configured. Signatures protect requests
-  from tampering, but without TLS the data and the responses (including secret
-  keys returned by the admin API when keys are created) travel in clear text.
+- gos3 serves plain HTTP unless TLS is configured. A signature covers the
+  method, path, query and signed headers, and the body only when the client
+  signs its SHA-256: S3 requests sent with `UNSIGNED-PAYLOAD` or a presigned
+  URL can have their body replaced by anyone on the path, and a captured
+  request can be replayed within the 15-minute clock skew (there is no
+  replay cache). The admin API therefore refuses unsigned bodies (see
+  [admin-api.md](admin-api.md#authentication--authorization)). Without TLS the
+  data and the responses (including secret keys returned by the admin API
+  when keys are created) also travel in clear text.
 - With `server.tls_cert` / `tls_key`, gos3 accepts TLS 1.2 or later and serves
   HTTP/2.
-- Behind a proxy, enable `server.trust_proxy_headers` only when the proxy
-  overwrites `X-Forwarded-For` and `X-Forwarded-Proto`. Otherwise clients can
-  fake `aws:SourceIp` and `aws:SecureTransport` conditions. The setting
-  applies to the S3 API and the admin API (conditions and access log alike).
+- Behind a proxy, enable `server.trust_proxy_headers` and list the proxies
+  in `server.trusted_proxies`. gos3 then honours `X-Forwarded-For` /
+  `X-Forwarded-Proto` only from those peers, takes the rightmost
+  `X-Forwarded-For` entry that is not a trusted proxy as the client and the
+  last `X-Forwarded-Proto` value as the transport, so a client cannot choose
+  its `aws:SourceIp` by sending its own header, even through a proxy that
+  appends to it. List only the proxies themselves, never a subnet that also
+  holds clients: a client whose own address is in `trusted_proxies` is
+  skipped like a proxy hop, so it can choose its `aws:SourceIp` again.
+  With an empty `trusted_proxies` every peer is trusted: a
+  client that can reach gos3 without the proxy can then fake
+  `aws:SourceIp` and `aws:SecureTransport`. The setting applies to the S3
+  API, the admin API and the `/_gos3/*` endpoints (conditions and access
+  logs alike).
 
 ### Timeouts
 
@@ -168,10 +242,28 @@ These limits are fixed (not configurable):
   (S3 API); otherwise, and always for `/_gos3/*` endpoints, the response
   carries `Connection: close` and the connection is closed. A client that
   announces a body and never sends it cannot hold a connection open.
-- PostObject form fields before the file must arrive within 60 s.
+- Bodies read before the caller is authorized must arrive completely within
+  60 s, however steadily they trickle in: PostObject form fields before the
+  file, and the bodies of DeleteObjects (at most about 6.2 MiB; the keys to
+  authorize are in it), PutObjectTagging, PutObjectRetention and
+  PutObjectLegalHold (at most 64 KiB; their condition keys come from the
+  body). Every other S3 request is authorized before its body is read.
 - Slow CopyObject, UploadPartCopy and CompleteMultipartUpload calls keep the
   connection alive with whitespace (see
   [s3-compatibility.md](s3-compatibility.md#other-differences-from-aws)).
+
+### Request size limits
+
+XML request bodies are bounded by the largest valid request: about 6.2 MiB
+for DeleteObjects (1000 keys), about 2.4 MiB for CompleteMultipartUpload
+(10000 parts), at most 2 MiB for bucket configuration documents and 64 KiB
+for object subresources; a larger body is rejected with `MaxMessageLengthExceeded`
+after reading at most one byte more. DeleteObjects and
+CompleteMultipartUpload documents are parsed as they arrive: the 1001st
+`<Object>` or the 10001st `<Part>` ends the request at once, and nesting
+depth, element count and the size of a single tag are bounded, so the work
+and memory a request causes stay proportional to a valid one, also for an
+anonymous DeleteObjects that is rejected per key afterwards.
 
 ## Object responses
 
@@ -264,36 +356,74 @@ then cannot verify it.
   `discovery.advertise: false` to hide them.
 - Beacon datagrams are accepted only from this host or a directly connected
   subnet, are rate-limited per sender, and can only make a server probe the
-  sender's own IP (announced host names are never resolved). mDNS answers are
-  only probed at on-link addresses. See
+  sender's own IP (announced host names are never resolved). See
   [discovery.md](discovery.md#3-udp-multicast-beacon).
+- The mDNS responder (UDP 5353) answers only senders on this host or a
+  directly connected subnet, and only questions about the server's own
+  records. It collapses duplicate questions (at most 8 per query),
+  rate-limits each sender like the beacon (50 responses per second in
+  total), multicasts answers to the group with TTL 255 and keeps every
+  response to one packet of at most 1400 bytes, so it cannot be used to
+  reflect or amplify traffic towards other networks. It runs whatever the
+  listen address and `server.public_info` are: on hosts with a routable
+  address, also firewall UDP 5353 from outside the local network, or set
+  `discovery.mdns: false`. mDNS answers are accepted only from on-link
+  senders, and only the responder's own address is probed (a loopback
+  address only when the responder is this host). See
+  [discovery.md](discovery.md#2-mdns--dns-sd).
 - Announcements are unauthenticated hints. A candidate becomes a peer only after
   its `/_gos3/info` was fetched, and adding a server to the UI still needs
   credentials. A malicious host on the network can still make itself appear in
-  peer lists.
+  peer lists, but it cannot take over a verified peer's entry (name,
+  endpoints, addresses) while that peer still answers at its known
+  addresses; such a claim is shown in the peer's `error` and logged. See
+  [discovery.md](discovery.md#peer-identity).
+- Discovery probes (admin API probe, scans, seeds, DNS SRV, verification of
+  announcements) never connect to cloud metadata endpoints
+  (`169.254.169.254`, `169.254.170.2`, `169.254.170.23`, `fd00:ec2::254`,
+  `100.100.100.200`) or to unspecified, multicast or broadcast addresses,
+  checked after DNS resolution. Peer errors hold a fixed category, never
+  text the probed service sent.
 - **Scans** (`POST /_gos3/admin/v1/discovery/scan`) need `admin:ScanNetwork`
   and `discovery.allow_scan: true` (the default). They are limited to
   `max_scan_hosts` hosts (default 1024) and 5 minutes, and at most 2 scans
   run at once per server (`429 TooManyRequests`). Set `allow_scan: false`
   where port scanning is unwelcome.
-- **Probes** (`POST /_gos3/admin/v1/discovery/probe`) need only
-  `admin:GetDiscovery`, which the `diagnostics` policy grants. They make the
-  server fetch `<url>/_gos3/info` from any HTTP(S) host it can reach, which is
-  a limited server-side request vector. The response must be a valid gos3
-  `Info` document (at most 64 KiB), and probes never follow redirects or use
-  proxies. Grant `diagnostics` only to trusted users.
-- The standalone web UI's Node server performs local discovery (mDNS, beacon,
-  scans, probes) for **anyone who can reach it**, without authentication.
-  Restrict access to it, or set `GOS3_UI_LOCAL_DISCOVERY=false`. Against DNS
+- **Probes** (`POST /_gos3/admin/v1/discovery/probe`) need
+  `admin:ProbeNetwork`, which the `diagnostics` policy does not grant (only
+  `admin`, or a custom policy). They make the server fetch
+  `<url>/_gos3/info` from any HTTP(S) host it can reach, which is a limited
+  server-side request vector. The response must be a valid gos3 `Info`
+  document (at most 64 KiB), probes never follow redirects or use proxies,
+  each is bounded by 10 s, and at most 4 run at once per server (`429
+  TooManyRequests`). Targets that are, or resolve to, cloud metadata,
+  unspecified, multicast or broadcast addresses are refused (`400`). A failed probe reports only `unreachable`, `timed out`,
+  `HTTP <status>` or `not a gos3 server`, never the underlying error, so
+  probes do not reveal banners of other services or why a connection failed
+  (refused, reset, TLS or protocol errors all read `unreachable`).
+- The standalone web UI's Node server can perform local discovery (mDNS,
+  beacon, scans, probes) from the UI host. It has no authentication, so
+  this is **off unless `GOS3_UI_LOCAL_DISCOVERY=true`** (the container image
+  leaves it off; the compose demo turns it on because it publishes the UI on
+  `127.0.0.1` only). When on, anyone who can reach the server can make it
+  probe and scan, so enable it only on a trusted interface. Against DNS
   rebinding and other websites, its `/api/discovery/*` routes answer 403
   unless the `Host` is an IP address, `localhost`/`*.localhost` or a name in
   `GOS3_UI_ALLOWED_HOSTS`, and refuse a foreign `Origin` (one that matches
   neither the `Host` nor a name listed in `GOS3_UI_ALLOWED_HOSTS`) or
-  `Sec-Fetch-Site: cross-site`/`same-site`. At most 2 scans and 4 local
-  discoveries run at once per UI server (`429 TooManyRequests`). Its probes
-  read at most 64 KiB of `/_gos3/info` (with or without `Content-Length`);
-  local discovery keeps at most 2048 mDNS records and 1024 beacon candidates
-  and verifies at most 256 URLs.
+  `Sec-Fetch-Site: cross-site`/`same-site`. It never connects to cloud
+  metadata addresses (`169.254.169.254`, `169.254.170.2`, `169.254.170.23`,
+  `fd00:ec2::254`, `100.100.100.200`), unspecified, multicast or broadcast
+  addresses: literals are refused up front, and host names are checked
+  against the addresses they resolve to when the connection is made (DNS
+  rebinding cannot bypass it). Probe failures report only a coarse reason
+  (unreachable, timed out, `HTTP <status>`, authentication required, not a
+  gos3 server). At most 2 scans, 4 local discoveries and 8 probes run at
+  once per UI server (`429 TooManyRequests`), each taking its slot before
+  the request body is read; bodies are capped at 8 KiB (probe) and 64 KiB
+  (scan) with `413`. Its probes read at most 64 KiB of `/_gos3/info` (with
+  or without `Content-Length`); local discovery keeps at most 2048 mDNS
+  records and 1024 beacon candidates and verifies at most 256 URLs.
 
 ## Admin API notes
 
@@ -301,17 +431,18 @@ then cannot verify it.
   including versions under object lock retention or legal hold. It needs
   `admin:ForceDeleteBucket`, which only `admin` grants by default.
 - `PUT /_gos3/admin/v1/config` (`admin:UpdateConfig`) can change CORS,
-  discovery and the public URL. Treat it like root access.
+  discovery and the public URL. Treat it like root access (see
+  [Scoping admin permissions](#scoping-admin-permissions) for the other
+  admin-equivalent actions).
 - Admin requests are recorded in metrics (op `Admin`) and in the access log.
   The log contains paths only, never query strings, so presigned URL signatures
   are not logged.
 
 ## Dependencies
 
-The shipped `gos3` binary links six third-party Go modules: `go.etcd.io/bbolt`,
-`github.com/hashicorp/mdns`, `github.com/miekg/dns`, `golang.org/x/net`,
-`golang.org/x/sys` and `gopkg.in/yaml.v3` (`go version -m bin/gos3` lists
-them). Everything else in `go.mod` is used by tests only.
+The shipped `gos3` binary links five third-party Go modules: `go.etcd.io/bbolt`,
+`github.com/miekg/dns`, `golang.org/x/net`, `golang.org/x/sys` and
+`gopkg.in/yaml.v3` (`go version -m bin/gos3` lists them). Everything else in `go.mod` is used by tests only.
 
 Supply-chain rules:
 

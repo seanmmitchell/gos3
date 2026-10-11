@@ -18,17 +18,22 @@ type whoAmI struct {
 	Server       discovery.Info `json:"server"`
 }
 
-// capabilities are derived by evaluating admin actions for the caller.
+// capabilities are derived by evaluating admin actions for the caller at
+// service level: a grant scoped to some users, policies or buckets
+// (arn:gos3:admin:::user/team-*) does not show up here.
 type capabilities struct {
 	Admin          bool `json:"admin"`          // any admin:* allowed
 	ViewInfo       bool `json:"viewInfo"`       // admin:ServerInfo
 	ViewStats      bool `json:"viewStats"`      // admin:GetStats
 	ManageConfig   bool `json:"manageConfig"`   // admin:UpdateConfig
 	ManageUsers    bool `json:"manageUsers"`    // admin:CreateUser
+	ListUsers      bool `json:"listUsers"`      // admin:ListUsers (also granted to delegated user managers)
 	ManagePolicies bool `json:"managePolicies"` // admin:PutPolicy
 	ManageBuckets  bool `json:"manageBuckets"`  // admin:ForceDeleteBucket
 	Discovery      bool `json:"discovery"`      // admin:GetDiscovery
 	Scan           bool `json:"scan"`           // admin:ScanNetwork
+	Probe          bool `json:"probe"`          // admin:ProbeNetwork
+	CreateOwnKeys  bool `json:"createOwnKeys"`  // admin:CreateOwnAccessKey (never root)
 }
 
 // adminActions are every admin:* action used by the API; "admin" in
@@ -39,14 +44,14 @@ var adminActions = []string{
 	"CreateAccessKey", "UpdateAccessKey", "DeleteAccessKey",
 	"ListPolicies", "GetPolicy", "PutPolicy", "DeletePolicy", "SimulatePolicy",
 	"ListBuckets", "GetBucket", "ForceDeleteBucket",
-	"GetDiscovery", "ScanNetwork",
+	"GetDiscovery", "ScanNetwork", "ProbeNetwork",
 }
 
 func (a *api) whoami(rc *reqCtx) (int, any, error) {
 	allowed := make(map[string]bool, len(adminActions))
 	anyAllowed := false
 	for _, act := range adminActions {
-		ok := a.authorize(rc, "admin:"+act).Allowed
+		ok := a.authorize(rc, "admin:"+act, "", nil).Allowed
 		allowed[act] = ok
 		anyAllowed = anyAllowed || ok
 	}
@@ -73,20 +78,28 @@ func (a *api) whoami(rc *reqCtx) (int, any, error) {
 			ViewStats:      allowed["GetStats"],
 			ManageConfig:   allowed["UpdateConfig"],
 			ManageUsers:    allowed["CreateUser"],
+			ListUsers:      allowed["ListUsers"],
 			ManagePolicies: allowed["PutPolicy"],
 			ManageBuckets:  allowed["ForceDeleteBucket"],
 			Discovery:      allowed["GetDiscovery"],
 			Scan:           allowed["ScanNetwork"],
+			Probe:          allowed["ProbeNetwork"],
+			// Root has no IAM keys to manage (POST /whoami/keys answers 400).
+			CreateOwnKeys: !rc.id.IsRoot && a.authorize(rc, actionCreateOwnKey, "", nil).Allowed,
 		},
 		Server: a.info(),
 	}, nil
 }
 
-// Self-service access key actions. Unlike the other admin actions they are
-// allowed to every authenticated user by default (managing one's own keys
-// needs no grant) and refused only by an explicit Deny, e.g. of "admin:*"
-// or of the action itself: that lets operators lock a user (or a stolen key)
-// out of minting fresh keys that would survive revoking the current one.
+// Self-service access key actions (not in adminActions: they do not make
+// the caller an administrator).
+//
+// Creating a key for oneself needs an explicit Allow of
+// admin:CreateOwnAccessKey (the route's action; only the built-in "admin"
+// policy grants it): a stolen key must not be able to mint fresh keys that
+// survive revoking it. Deleting one's own keys only reduces access, so it
+// is allowed to every authenticated user unless admin:DeleteOwnAccessKey
+// is explicitly denied (e.g. by a Deny of "admin:*").
 const (
 	actionCreateOwnKey = "admin:CreateOwnAccessKey"
 	actionDeleteOwnKey = "admin:DeleteOwnAccessKey"
@@ -98,7 +111,7 @@ func (a *api) authorizeSelfService(rc *reqCtx, action string) error {
 	if rc.id.IsRoot {
 		return nil
 	}
-	if d := a.authorize(rc, action); !d.Allowed && d.ExplicitDeny {
+	if d := a.authorize(rc, action, "", nil); !d.Allowed && d.ExplicitDeny {
 		return errorf(http.StatusForbidden, codeAccessDenied,
 			"%s is explicitly denied %s", describeIdentity(rc.id), action)
 	}
@@ -135,16 +148,17 @@ func (a *api) createOwnKey(rc *reqCtx) (int, any, error) {
 	if err := rc.decodeBody(&body, true); err != nil {
 		return 0, nil, err
 	}
+	// The route already required an explicit Allow of actionCreateOwnKey
+	// (root passes that and is refused here).
 	if _, err := a.selfUser(rc); err != nil {
-		return 0, nil, err
-	}
-	if err := a.authorizeSelfService(rc, actionCreateOwnKey); err != nil {
 		return 0, nil, err
 	}
 	k, err := a.d.IAM.CreateAccessKey(rc.ctx, rc.id.User, body.Description, "", "")
 	if err != nil {
 		return 0, nil, err
 	}
+	a.log.Info("admin: access key created (self-service)", "user", rc.id.User,
+		"accessKey", k.AccessKey, "signedBy", rc.id.AccessKey)
 	return http.StatusCreated, k, nil
 }
 

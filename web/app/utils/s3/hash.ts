@@ -116,6 +116,16 @@ export function md5Base64(input: BytesInput): string {
 }
 
 // ---------------------------------------------------------------------------
+// SHA-256 (WebCrypto)
+// ---------------------------------------------------------------------------
+
+/** Lower-case hex SHA-256 of input (strings are UTF-8 encoded). */
+export async function sha256Hex(input: BytesInput): Promise<string> {
+  const bytes = toBytes(input)
+  return bytesToHex(new Uint8Array(await globalThis.crypto.subtle.digest('SHA-256', bytes as Uint8Array<ArrayBuffer>)))
+}
+
+// ---------------------------------------------------------------------------
 // CRC32 (IEEE 802.3, as used by x-amz-checksum-crc32)
 // ---------------------------------------------------------------------------
 

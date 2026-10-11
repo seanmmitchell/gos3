@@ -1,9 +1,11 @@
 package auth
 
 import (
+	"crypto/sha256"
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"net/url"
 	"sort"
@@ -41,9 +43,18 @@ func signRequest(r *http.Request, c Credentials, region, service, payloadHash st
 		service = serviceS3
 	}
 	if payloadHash == "" {
-		if r.Body == nil || r.Body == http.NoBody || r.ContentLength == 0 {
+		switch {
+		case r.Body == nil || r.Body == http.NoBody || r.ContentLength == 0:
 			payloadHash = PayloadEmptySHA256
-		} else {
+		case r.GetBody != nil:
+			// A re-readable body (bytes/strings readers): sign its hash, so
+			// the signature covers the body (the admin API requires that).
+			h, err := hashBody(r)
+			if err != nil {
+				return err
+			}
+			payloadHash = h
+		default:
 			payloadHash = PayloadUnsigned
 		}
 	}
@@ -91,6 +102,21 @@ func signRequest(r *http.Request, c Credentials, region, service, payloadHash st
 	r.Header.Set("Authorization", signV4Algorithm+" Credential="+c.AccessKey+"/"+scope+
 		", SignedHeaders="+signedHeaders+", Signature="+sig)
 	return nil
+}
+
+// hashBody returns the hex SHA-256 of a copy of r's body from r.GetBody,
+// leaving r.Body unread.
+func hashBody(r *http.Request) (string, error) {
+	body, err := r.GetBody()
+	if err != nil {
+		return "", fmt.Errorf("auth: SignRequest: reading body: %w", err)
+	}
+	defer body.Close()
+	h := sha256.New()
+	if _, err := io.Copy(h, body); err != nil {
+		return "", fmt.Errorf("auth: SignRequest: reading body: %w", err)
+	}
+	return hex.EncodeToString(h.Sum(nil)), nil
 }
 
 func dedupSorted(s []string) []string {

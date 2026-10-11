@@ -33,6 +33,22 @@ func (s *Server) readValidatedBody(r *http.Request, rc *reqContext, max int64) (
 	return readBody(p, max)
 }
 
+// validatedXMLStream is readValidatedBody for a document parsed as it
+// arrives (see xmlStream): a declared length over maxBytes fails at once
+// with MaxMessageLengthExceeded, a longer body after maxBytes+1 bytes, and
+// Content-MD5 / checksum mismatches surface when the stream reaches the
+// end of the body.
+func (s *Server) validatedXMLStream(r *http.Request, rc *reqContext, maxBytes int64, maxElements int) (*xmlStream, error) {
+	if n := rc.contentLength(); n > maxBytes {
+		return nil, s3err.ErrMaxMessageLengthExceeded
+	}
+	p, err := s.newPayloadReader(r, rc, payloadOptions{MaxSize: maxBytes + 1})
+	if err != nil {
+		return nil, err
+	}
+	return newXMLStream(p, maxBytes, maxElements), nil
+}
+
 // decodeValidatedXML reads a validated body (see readValidatedBody) and
 // unmarshals it into v (MissingRequestBodyError / MalformedXML).
 func (s *Server) decodeValidatedXML(r *http.Request, rc *reqContext, max int64, v any) error {

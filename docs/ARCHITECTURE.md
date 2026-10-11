@@ -148,8 +148,10 @@ Unknown subresources → `NotImplemented`. Unsupported method for a resource →
    Handlers that touch a second resource (CopyObject/UploadPartCopy source,
    DeleteObjects per key) call the core's authorize helper themselves.
    `aws:SourceIp` / `aws:SecureTransport` come from `RemoteAddr` / TLS, or
-   from the first `X-Forwarded-For` entry and `X-Forwarded-Proto` when
-   `server.trust_proxy_headers` is set. PublicAccessBlock and
+   from `X-Forwarded-For` (rightmost entry that is not a trusted proxy) and
+   the last `X-Forwarded-Proto` value when `server.trust_proxy_headers` is
+   set and the peer is in `server.trusted_proxies` (package `clientip`,
+   shared with the admin API). PublicAccessBlock and
    ObjectOwnership (BucketOwnerEnforced disables ACLs) are applied here too.
 6. Dispatch to the handler with a per-request context struct (bucket, key, op,
    auth result, identity, request id, versioning status cache, …).
@@ -261,7 +263,11 @@ so no clash.
 - Bucket policies (`?policy`) are evaluated together with identity policies;
   explicit Deny wins; anonymous requests are allowed only by bucket policy
   (`Principal: "*"`) or public canned ACLs.
-- Admin API actions are `admin:<Action>` (see `docs/admin-api.md`).
+- Admin API actions are `admin:<Action>`, evaluated against
+  `arn:gos3:admin:::user/<name>`, `…:policy/<name>`, `…:bucket/<name>` or
+  service level (see `docs/admin-api.md`); s3 and admin ARNs never
+  cross-match. Admin request bodies must be signed (hex SHA-256 or signed
+  streaming).
 
 ## Admin API
 
@@ -310,7 +316,7 @@ seeds, DNS SRV and active scans; every candidate is verified by fetching
 - Go ≥ 1.25 (toolchain auto). `gofmt`, `go vet` clean. Std `log/slog`.
   Stdlib `net/http` (Go 1.22+ mux patterns OK for the admin API).
 - Allowed third-party Go deps (already in go.mod): `go.etcd.io/bbolt`,
-  `github.com/hashicorp/mdns`, `gopkg.in/yaml.v3`, and for tests only
+  `github.com/miekg/dns`, `gopkg.in/yaml.v3`, and for tests only
   `github.com/aws/aws-sdk-go-v2/...` and `github.com/minio/minio-go/v7`.
 - Tests: `go test ./internal/<pkg>/...` for your package; `-race` must pass.
 - `make build` (UI + binary), `make ui`, `make test`, `make e2e`, `make e2e-web`,

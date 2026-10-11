@@ -48,14 +48,16 @@ func TestPeerTableMergeAndTTL(t *testing.T) {
 	// Verified via probe from mDNS at another address.
 	clk.Advance(10 * time.Second)
 	t1 := clk.Now()
-	p, ok = tb.observeInfo(testInfo("p1", "real-name"), "http://10.0.0.2:9000", SourceMDNS, t1, "self")
-	if !ok || !p.Verified || !p.Healthy || p.Name != "real-name" {
+	p, res := tb.observeInfo(testInfo("p1", "real-name"), "http://10.0.0.2:9000", SourceMDNS, t1, "self")
+	if res != observeStored || !p.Verified || !p.Healthy || p.Name != "real-name" {
 		t.Fatalf("after observe: %+v", p)
 	}
 	if !slices.Equal(p.Sources, []Source{SourceBeacon, SourceMDNS}) {
 		t.Errorf("sources = %v", p.Sources)
 	}
-	if !slices.Equal(p.Addresses, []string{"http://10.0.0.1:9000", "http://10.0.0.2:9000"}) {
+	// The unauthenticated sighting's address is not kept: only verified
+	// addresses count as the peer's known addresses.
+	if !slices.Equal(p.Addresses, []string{"http://10.0.0.2:9000"}) {
 		t.Errorf("addresses = %v", p.Addresses)
 	}
 	if !p.FirstSeen.Equal(t0) || !p.LastSeen.Equal(t1) {
@@ -116,7 +118,7 @@ func TestPeerTableIgnoresSelfAndInvalid(t *testing.T) {
 	if tb.hint(candidate{id: "self", source: SourceBeacon}, now, "self") {
 		t.Error("self hint accepted")
 	}
-	if _, ok := tb.observeInfo(testInfo("self", "me"), "http://x:1", SourceScan, now, "self"); ok {
+	if _, res := tb.observeInfo(testInfo("self", "me"), "http://x:1", SourceScan, now, "self"); res != observeRejected {
 		t.Error("self info accepted")
 	}
 	if tb.hint(candidate{id: "bad id", source: SourceBeacon}, now, "self") {
@@ -192,9 +194,16 @@ func TestPeerTableSortAndCopies(t *testing.T) {
 func TestPeerTableBounds(t *testing.T) {
 	tb := newPeerTable(time.Hour)
 	now := time.Now()
-	// Address list is bounded.
+	// Address list is bounded (addresses the peer advertises itself are
+	// added without a conflict check).
+	multi := testInfo("p", "p")
 	for i := range maxAddressesPerPeer + 10 {
-		tb.observeInfo(testInfo("p", "p"), fmt.Sprintf("http://h%d:1", i), SourceScan, now, "")
+		multi.Endpoints.All = append(multi.Endpoints.All, fmt.Sprintf("http://h%d:1", i))
+	}
+	for i := range maxAddressesPerPeer + 10 {
+		if _, res := tb.observeInfo(multi, fmt.Sprintf("http://h%d:1", i), SourceScan, now, ""); res != observeStored {
+			t.Fatalf("advertised address %d: %v", i, res)
+		}
 	}
 	p, _ := tb.get("p")
 	if len(p.Addresses) != maxAddressesPerPeer || p.Addresses[len(p.Addresses)-1] != fmt.Sprintf("http://h%d:1", maxAddressesPerPeer+9) {
@@ -217,7 +226,7 @@ func TestPeerTableBounds(t *testing.T) {
 	// Verified peers fill the table ("p" is one), evicting unverified
 	// entries first.
 	for i := range maxPeers - 1 {
-		if _, ok := tb.observeInfo(testInfo(fmt.Sprintf("v%d", i), "v"), "http://v:1", SourceScan, now, ""); !ok {
+		if _, res := tb.observeInfo(testInfo(fmt.Sprintf("v%d", i), "v"), "http://v:1", SourceScan, now, ""); res != observeStored {
 			t.Fatalf("verified peer %d rejected", i)
 		}
 	}
@@ -251,8 +260,10 @@ func TestPeerTableBounds(t *testing.T) {
 func TestPeerTableDue(t *testing.T) {
 	clk := newFakeClock()
 	tb := newPeerTable(time.Hour)
-	tb.observeInfo(testInfo("v", "v"), "http://v1:1", SourceScan, clk.Now(), "")
-	tb.observeInfo(testInfo("v", "v"), "http://v2:1", SourceScan, clk.Now(), "")
+	v := testInfo("v", "v")
+	v.Endpoints.All = []string{"http://v1:1", "http://v2:1"}
+	tb.observeInfo(v, "http://v1:1", SourceScan, clk.Now(), "")
+	tb.observeInfo(v, "http://v2:1", SourceScan, clk.Now(), "")
 	tb.hint(candidate{id: "u", source: SourceBeacon, urls: []string{"http://u:1"}}, clk.Now(), "")
 	if d := tb.due(clk.Now(), reprobeEvery); len(d) != 0 {
 		t.Fatalf("due too early: %v", d)

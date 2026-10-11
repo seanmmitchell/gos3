@@ -3,6 +3,7 @@ package admin
 import (
 	"context"
 	"errors"
+	"net"
 	"net/http"
 	"net/netip"
 	"net/url"
@@ -24,6 +25,9 @@ const (
 	// maxConcurrentScans bounds the network scans running at once on this
 	// server: each one may run hundreds of probe workers for minutes.
 	maxConcurrentScans = 2
+	// maxConcurrentProbes bounds the single-URL probes running at once, so
+	// one key cannot make the server hold open many outbound connections.
+	maxConcurrentProbes = 4
 )
 
 type discoveryState struct {
@@ -76,13 +80,58 @@ func (a *api) probe(rc *reqCtx) (int, any, error) {
 	if err := a.requireDiscovery(); err != nil {
 		return 0, nil, err
 	}
+	select {
+	case a.probes <- struct{}{}:
+		defer func() { <-a.probes }()
+	default:
+		return 0, nil, errorf(http.StatusTooManyRequests, codeTooManyRequests,
+			"%d probes are already running on this server; retry when one has finished", maxConcurrentProbes)
+	}
 	ctx, cancel := context.WithTimeout(rc.ctx, probeTimeout)
 	defer cancel()
 	peer, err := a.d.Discovery.Probe(ctx, req.URL)
+	if errors.Is(err, discovery.ErrBlockedAddress) {
+		// A cloud metadata, unspecified, multicast or broadcast target
+		// (directly or after DNS resolution) is the caller's mistake.
+		return 0, nil, badRequest("url: %s: address not allowed", req.URL)
+	}
 	if err != nil {
-		return 0, nil, errorf(http.StatusBadGateway, codeProbeFailed, "probing %s failed: %v", req.URL, err)
+		return 0, nil, errorf(http.StatusBadGateway, codeProbeFailed, "probing %s failed: %s", req.URL, probeFailure(err))
 	}
 	return http.StatusOK, peer, nil
+}
+
+// probeFailure maps a probe error to a coarse category: "timed out",
+// "HTTP <status>", "not a gos3 server" or "unreachable". The raw error is
+// never returned: it would tell refused, filtered and TLS ports apart and
+// echo the first line a non-HTTP service sends (an SSH banner, say), which
+// made probes a port scanner and banner grabber for internal hosts.
+func probeFailure(err error) string {
+	var ne net.Error
+	switch {
+	case errors.Is(err, context.DeadlineExceeded), errors.As(err, &ne) && ne.Timeout():
+		return "timed out"
+	case errors.Is(err, discovery.ErrNotGos3):
+		// discovery reports a non-200 answer as
+		// "<ErrNotGos3>: GET /_gos3/info returned <code> <reason>"; only the
+		// three-digit code is passed on (the reason phrase is the target's).
+		prefix := discovery.ErrNotGos3.Error() + ": GET " + discovery.InfoPath + " returned "
+		if rest, ok := strings.CutPrefix(err.Error(), prefix); ok && len(rest) >= 3 &&
+			isDigits(rest[:3]) && (len(rest) == 3 || rest[3] == ' ') {
+			return "HTTP " + rest[:3]
+		}
+		return "not a gos3 server"
+	}
+	return "unreachable"
+}
+
+func isDigits(s string) bool {
+	for i := 0; i < len(s); i++ {
+		if s[i] < '0' || s[i] > '9' {
+			return false
+		}
+	}
+	return s != ""
 }
 
 func (a *api) scan(rc *reqCtx) (int, any, error) {

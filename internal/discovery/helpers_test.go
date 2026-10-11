@@ -134,7 +134,7 @@ func eventually(t testing.TB, timeout time.Duration, msg string, cond func() boo
 var leakMarkers = []string{
 	"gos3/internal/discovery.(",
 	"gos3/internal/discovery.mdns",
-	"hashicorp/mdns",
+	"gos3/internal/discovery.runMDNSBrowse",
 	"net/http.(*persistConn)",
 }
 

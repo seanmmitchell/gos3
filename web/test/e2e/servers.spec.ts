@@ -49,7 +49,7 @@ test.describe('servers & discovery (embedded build)', () => {
           accessKey: 'AK',
           isRoot: true,
           policies: [],
-          capabilities: { admin: true, viewInfo: true, viewStats: true, manageConfig: true, manageUsers: true, managePolicies: true, manageBuckets: true, discovery: true, scan: true },
+          capabilities: { admin: true, viewInfo: true, viewStats: true, manageConfig: true, manageUsers: true, managePolicies: true, manageBuckets: true, discovery: true, scan: true, probe: true, createOwnKeys: false },
           server: info('e2e0000000000001', 'e2e-gos3', origin)
         }
       })

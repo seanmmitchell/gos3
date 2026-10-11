@@ -15,6 +15,7 @@ import (
 
 	"github.com/seanmmitchell/gos3/internal/admin"
 	"github.com/seanmmitchell/gos3/internal/auth"
+	"github.com/seanmmitchell/gos3/internal/clientip"
 	"github.com/seanmmitchell/gos3/internal/config"
 	"github.com/seanmmitchell/gos3/internal/iam"
 	"github.com/seanmmitchell/gos3/internal/s3err"
@@ -159,7 +160,7 @@ func (s *Server) serveMetrics(w http.ResponseWriter, r *http.Request, st *config
 		d := s.iam.Authorize(r.Context(), iam.AuthzRequest{
 			Identity:   id,
 			Action:     "admin:GetStats",
-			Conditions: requestConditions(r, s.cfg.Server.TrustProxyHeaders),
+			Conditions: requestConditions(r, s.clientIP),
 		})
 		if !d.Allowed {
 			s.logSystem(r, http.StatusForbidden)
@@ -217,8 +218,8 @@ func (s *Server) authenticate(w http.ResponseWriter, r *http.Request) (auth.Iden
 
 // requestConditions is the IAM condition context of a system endpoint
 // request (the same client address rules as the S3 and admin APIs).
-func requestConditions(r *http.Request, trustProxy bool) map[string][]string {
-	ip, secure := admin.ClientInfo(r, trustProxy)
+func requestConditions(r *http.Request, proxy clientip.Resolver) map[string][]string {
+	ip, secure := proxy.ClientInfo(r)
 	return map[string][]string{"aws:SourceIp": {ip}, "aws:SecureTransport": {strconv.FormatBool(secure)}}
 }
 
@@ -261,7 +262,7 @@ func (s *Server) instrumentAdmin(h http.Handler) http.Handler {
 					slog.Int64("bytes_in", n),
 					slog.Int64("bytes_out", rec.bytes),
 					slog.Float64("duration_ms", float64(time.Since(start).Microseconds())/1000),
-					slog.String("remote", s.clientIP(r)))
+					slog.String("remote", s.remoteIP(r)))
 			}
 		}()
 		h.ServeHTTP(rec, r)
@@ -270,13 +271,13 @@ func (s *Server) instrumentAdmin(h http.Handler) http.Handler {
 
 // logSystem logs a rejected system endpoint request at debug level.
 func (s *Server) logSystem(r *http.Request, status int) {
-	s.log.Debug("gos3 endpoint request", "method", r.Method, "path", r.URL.Path, "status", status, "remote", s.clientIP(r))
+	s.log.Debug("gos3 endpoint request", "method", r.Method, "path", r.URL.Path, "status", status, "remote", s.remoteIP(r))
 }
 
-// clientIP is the client address logged for a system endpoint request
-// (X-Forwarded-For with server.trust_proxy_headers).
-func (s *Server) clientIP(r *http.Request) string {
-	ip, _ := admin.ClientInfo(r, s.cfg.Server.TrustProxyHeaders)
+// remoteIP is the client address logged for a system endpoint request
+// (X-Forwarded-For from trusted proxies, see package clientip).
+func (s *Server) remoteIP(r *http.Request) string {
+	ip, _ := s.clientIP.ClientInfo(r)
 	return ip
 }
 

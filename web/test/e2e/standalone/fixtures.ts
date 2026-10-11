@@ -2,6 +2,7 @@
 // instances (see global.setup.ts), a root-signed Node-side client per gos3 to
 // arrange and verify state, and helpers to add a server through the UI.
 import { expect, test as base, type Page } from '@playwright/test'
+import { createHash } from 'node:crypto'
 import { AwsClient } from 'aws4fetch'
 import { readState, ROOT_ACCESS_KEY, ROOT_SECRET_KEY, type Gos3Instance, type StandaloneState, type UiInstance } from './env'
 
@@ -15,8 +16,17 @@ export class Gos3Api {
     this.aws = new AwsClient({ accessKeyId: ROOT_ACCESS_KEY, secretAccessKey: ROOT_SECRET_KEY, service: 's3', region: 'us-east-1' })
   }
 
+  /**
+   * Signed request. String and byte bodies are signed by their SHA-256 (the
+   * admin API refuses unsigned bodies); other requests use UNSIGNED-PAYLOAD.
+   */
   fetch(path: string, init: RequestInit = {}): Promise<Response> {
-    return this.aws.fetch(`${this.server.url}${path}`, init)
+    const headers = new Headers(init.headers)
+    const body = init.body
+    if ((typeof body === 'string' || body instanceof Uint8Array) && !headers.has('x-amz-content-sha256')) {
+      headers.set('x-amz-content-sha256', createHash('sha256').update(body).digest('hex'))
+    }
+    return this.aws.fetch(`${this.server.url}${path}`, { ...init, headers })
   }
 
   async createBucket(bucket: string): Promise<void> {

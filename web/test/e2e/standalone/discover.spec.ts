@@ -30,6 +30,18 @@ test('the UI host offers local discovery', async ({ page, ui }) => {
   // POSTs require JSON (CSRF protection for the scan/probe routes).
   const form = await page.request.post(ui('api/discovery/probe'), { form: { url: 'http://127.0.0.1:9' } })
   expect(form.status()).toBe(415)
+  // Failures carry a coarse reason only, never socket error codes.
+  const down = await page.request.post(ui('api/discovery/probe'), { data: { url: 'http://127.0.0.1:9' } })
+  expect(down.status()).toBe(502)
+  expect((await down.json()).error.message).toBe('http://127.0.0.1:9: unreachable')
+  // Cloud metadata addresses are never probed (also in IPv4-mapped form).
+  for (const url of ['http://169.254.169.254/latest/meta-data', 'http://[::ffff:a9fe:a9fe]']) {
+    const meta = await page.request.post(ui('api/discovery/probe'), { data: { url } })
+    expect(meta.status(), url).toBe(400)
+  }
+  // Request bodies are capped (8 KiB for probes).
+  const big = await page.request.post(ui('api/discovery/probe'), { data: { url: `http://127.0.0.1:9/${'a'.repeat(16 * 1024)}` } })
+  expect(big.status()).toBe(413)
 
   await page.goto(ui('discover'))
   await expect(page.getByRole('heading', { name: 'Discover servers', level: 1 })).toBeVisible()
@@ -117,12 +129,20 @@ test('merges the peer tables of connected gos3 servers', async ({ page, ui, alph
   await expect(row.getByText('Alpha', { exact: true })).toBeVisible()
 })
 
-test('GOS3_UI_LOCAL_DISCOVERY=false turns the UI host routes off', async ({ page, env, alpha }) => {
+test('the UI host routes are off unless GOS3_UI_LOCAL_DISCOVERY=true', async ({ page, env, alpha }) => {
+  // presetUi runs without GOS3_UI_LOCAL_DISCOVERY.
   const presetUi = (path: string) => `${env.presetUi.url}/${path}`
   const caps = await page.request.get(presetUi('api/discovery/capabilities'))
-  expect(await caps.json()).toMatchObject({ localDiscovery: false })
+  expect(caps.ok()).toBe(true)
+  expect(await caps.json()).toMatchObject({ localDiscovery: false, scan: false })
   const scan = await page.request.post(presetUi('api/discovery/scan'), { data: { targets: ['127.0.0.1'], ports: [alpha.port] } })
   expect(scan.status()).toBe(403)
+  expect((await scan.json()).error.message).toMatch(/disabled/)
+  const probe = await page.request.post(presetUi('api/discovery/probe'), { data: { url: alpha.url } })
+  expect(probe.status()).toBe(403)
+  expect(await probe.text()).not.toContain(alpha.id)
+  const local = await page.request.get(presetUi('api/discovery/local?wait=500'))
+  expect(local.status()).toBe(403)
 
   await page.goto(presetUi('discover'))
   await expect(page.getByText(/Turned off on the UI server/)).toBeVisible()

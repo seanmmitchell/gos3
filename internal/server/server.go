@@ -36,6 +36,7 @@ import (
 
 	"github.com/seanmmitchell/gos3/internal/admin"
 	"github.com/seanmmitchell/gos3/internal/auth"
+	"github.com/seanmmitchell/gos3/internal/clientip"
 	"github.com/seanmmitchell/gos3/internal/config"
 	"github.com/seanmmitchell/gos3/internal/discovery"
 	"github.com/seanmmitchell/gos3/internal/iam"
@@ -103,6 +104,7 @@ type Server struct {
 	verifier    *auth.Verifier
 	metrics     *metrics.Registry
 	settings    *config.Store
+	clientIP    clientip.Resolver // client address rules (server.trust_proxy_headers, server.trusted_proxies)
 	s3          http.Handler
 	admin       http.Handler
 	ui          http.Handler // nil when the UI is disabled
@@ -164,6 +166,12 @@ func New(cfg config.Config, logger *slog.Logger, opts ...Option) (_ *Server, err
 		startedAt:  time.Now().UTC().Truncate(time.Second),
 		ready:      make(chan struct{}),
 		bodyIdle:   systemBodyIdleTimeout,
+	}
+	if s.clientIP, err = cfg.ClientIP(); err != nil {
+		return nil, fmt.Errorf("invalid configuration: %w", err)
+	}
+	if len(cfg.Server.TrustedProxies) > 0 && !cfg.Server.TrustProxyHeaders {
+		logger.Warn("server.trusted_proxies has no effect: X-Forwarded-For / X-Forwarded-Proto are ignored unless server.trust_proxy_headers is true")
 	}
 	s.lifeCtx, s.lifeCancel = context.WithCancel(context.Background())
 	defer func() {
@@ -230,15 +238,15 @@ func New(cfg config.Config, logger *slog.Logger, opts ...Option) (_ *Server, err
 	s.verifier = auth.NewVerifier(s.iam, auth.Options{Region: st.Region, StrictRegion: cfg.Auth.StrictRegion})
 	s.metrics = metrics.NewRegistry()
 	s.s3 = s3.NewHandler(s3.Options{
-		Backend:           s.backend,
-		Verifier:          s.verifier,
-		IAM:               s.iam,
-		Metrics:           s.metrics,
-		Settings:          s.settings,
-		Logger:            logger,
-		MaxObjectSize:     cfg.Server.MaxObjectSize,
-		Version:           s.version,
-		TrustProxyHeaders: cfg.Server.TrustProxyHeaders,
+		Backend:       s.backend,
+		Verifier:      s.verifier,
+		IAM:           s.iam,
+		Metrics:       s.metrics,
+		Settings:      s.settings,
+		Logger:        logger,
+		MaxObjectSize: cfg.Server.MaxObjectSize,
+		Version:       s.version,
+		ClientIP:      s.clientIP,
 	})
 	s.disc = discovery.New(st.Discovery, s.Info, logger)
 	s.admin = s.instrumentAdmin(admin.NewHandler(admin.Deps{
@@ -253,7 +261,7 @@ func New(cfg config.Config, logger *slog.Logger, opts ...Option) (_ *Server, err
 		DataPath:    s.dataPath,
 		Logger:      logger,
 
-		TrustProxyHeaders: cfg.Server.TrustProxyHeaders,
+		TrustProxyHeaders: s.clientIP,
 	}))
 	s.lifecycle = lifecycle.NewWorker(s.backend, lifecycle.Options{
 		Interval: time.Duration(st.Lifecycle.IntervalSeconds) * time.Second,

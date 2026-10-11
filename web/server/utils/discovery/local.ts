@@ -10,7 +10,7 @@ import type { DiscoverySource, Peer } from '~/types/admin'
 import { BEACON_GROUP, BEACON_PORT, beaconCandidateUrls, decodeBeacon, encodeQuery, newNonce } from './beacon'
 import { MDNS_SERVICE, missingMdnsNames, parseMdnsRecords, type MdnsRecord } from './mdns'
 import { mergePeers, peerFromInfo, peerFromSighting, type Sighting } from './peers'
-import { fetchInfo, runPool, VERIFY_TIMEOUT_MS } from './probe'
+import { fetchInfo, runPool, VERIFY_TIMEOUT_MS, type FetchFn } from './probe'
 
 export const DEFAULT_WAIT_MS = 3000
 export const MIN_WAIT_MS = 500
@@ -39,10 +39,16 @@ export interface MechanismResult {
   errors: string[]
 }
 
-/** Local discovery can be turned off with GOS3_UI_LOCAL_DISCOVERY=false. */
+/**
+ * Local discovery (the /api/discovery/* probe, scan and local routes) is
+ * off unless GOS3_UI_LOCAL_DISCOVERY is explicitly true (`true`, `1`, `on`,
+ * `yes` or `enabled`, case-insensitive). The Node server has no
+ * authentication, so anyone who can reach it could otherwise make the UI
+ * host probe and scan its networks.
+ */
 export function localDiscoveryEnabled(env: Record<string, string | undefined> = process.env): boolean {
   const v = (env.GOS3_UI_LOCAL_DISCOVERY ?? '').trim().toLowerCase()
-  return !['0', 'false', 'off', 'no', 'disabled'].includes(v)
+  return ['1', 'true', 'on', 'yes', 'enabled'].includes(v)
 }
 
 type MdnsFactory = typeof import('multicast-dns')
@@ -280,7 +286,7 @@ export async function queryBeacon(waitMs: number, signal?: AbortSignal, group = 
  * concurrency). Verified identities become peers; candidates that announced
  * an ID but could not be verified are reported as unverified peers.
  */
-export async function verifyCandidates(candidates: readonly Candidate[], opts: { timeoutMs?: number, signal?: AbortSignal, concurrency?: number, maxUrls?: number } = {}): Promise<Peer[]> {
+export async function verifyCandidates(candidates: readonly Candidate[], opts: { timeoutMs?: number, signal?: AbortSignal, concurrency?: number, maxUrls?: number, fetch?: FetchFn } = {}): Promise<Peer[]> {
   const byUrl = new Map<string, Candidate[]>()
   for (const c of candidates) {
     const list = byUrl.get(c.url)
@@ -291,7 +297,7 @@ export async function verifyCandidates(candidates: readonly Candidate[], opts: {
   const now = new Date()
   const results = await runPool(urls, opts.concurrency ?? 16, async (url) => {
     try {
-      const info = await fetchInfo(url, { timeoutMs: opts.timeoutMs ?? VERIFY_TIMEOUT_MS, signal: opts.signal })
+      const info = await fetchInfo(url, { timeoutMs: opts.timeoutMs ?? VERIFY_TIMEOUT_MS, signal: opts.signal, fetch: opts.fetch })
       return { url, info }
     } catch (e) {
       return { url, error: errText(e) }

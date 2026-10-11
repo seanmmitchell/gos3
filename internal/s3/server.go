@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/seanmmitchell/gos3/internal/auth"
+	"github.com/seanmmitchell/gos3/internal/clientip"
 	"github.com/seanmmitchell/gos3/internal/config"
 	"github.com/seanmmitchell/gos3/internal/iam"
 	"github.com/seanmmitchell/gos3/internal/metrics"
@@ -36,11 +37,11 @@ type Options struct {
 	// Version is the gos3 version reported in the Server header.
 	Version string
 
-	// TrustProxyHeaders makes the handler derive the client address
-	// (aws:SourceIp, access log) from the first X-Forwarded-For entry and
-	// aws:SecureTransport from X-Forwarded-Proto. Enable it only behind a
-	// trusted reverse proxy that overwrites these headers.
-	TrustProxyHeaders bool
+	// ClientIP derives the client address (aws:SourceIp, access log) and
+	// aws:SecureTransport, honouring X-Forwarded-For / X-Forwarded-Proto
+	// from trusted reverse proxies (server.trust_proxy_headers and
+	// server.trusted_proxies). The zero value ignores those headers.
+	ClientIP clientip.Resolver
 	// Now overrides the clock (tests). Defaults to time.Now.
 	Now func() time.Time
 }
@@ -62,7 +63,7 @@ type Server struct {
 	log           *slog.Logger
 	maxObjectSize int64
 	serverHeader  string
-	trustProxy    bool
+	clientIP      clientip.Resolver
 	now           func() time.Time
 	// hostSeed makes x-amz-id-2 values unique per server instance.
 	hostSeed [16]byte
@@ -80,6 +81,7 @@ type Server struct {
 	bodyIdleTimeout     time.Duration // a stalled body read fails with RequestTimeout
 	unreadBodyGrace     time.Duration // draining a body the handler did not read
 	postPreambleTimeout time.Duration // PostObject form fields before the policy is verified
+	preAuthBodyTimeout  time.Duration // bodies read before authorization (AuthzByHandler ops)
 }
 
 // Default request body timeouts. AWS answers RequestTimeout after about
@@ -87,10 +89,18 @@ type Server struct {
 // of a rejected request's body and PostObject's form fields (its client is
 // not authenticated until they have been read) must arrive within a fixed
 // time.
+//
+// The same holds for the bodies read before the caller is authorized
+// (DeleteObjects, PutObjectTagging, PutObjectRetention,
+// PutObjectLegalHold): at most maxDeleteObjectsBody (about 6.2 MiB, a
+// request of 1000 maximal keys) or 64 KiB. 60 s allows such a maximal
+// DeleteObjects at about 110 KB/s (under 1 Mbit/s); typical bodies are a
+// few KiB to about 100 KiB.
 const (
 	defaultBodyIdleTimeout     = 60 * time.Second
 	defaultUnreadBodyGrace     = 10 * time.Second
 	defaultPostPreambleTimeout = 60 * time.Second
+	defaultPreAuthBodyTimeout  = 60 * time.Second
 )
 
 var _ http.Handler = (*Server)(nil)
@@ -120,13 +130,14 @@ func New(opts Options) *Server {
 		log:           opts.Logger,
 		maxObjectSize: opts.MaxObjectSize,
 		serverHeader:  "gos3",
-		trustProxy:    opts.TrustProxyHeaders,
+		clientIP:      opts.ClientIP,
 		now:           opts.Now,
 		configs:       newConfigCache(defaultConfigCacheSize),
 
 		bodyIdleTimeout:     defaultBodyIdleTimeout,
 		unreadBodyGrace:     defaultUnreadBodyGrace,
 		postPreambleTimeout: defaultPostPreambleTimeout,
+		preAuthBodyTimeout:  defaultPreAuthBodyTimeout,
 	}
 	if s.settings == nil {
 		s.settings = config.NewStore(config.Settings{Region: defaultRegion}, "")

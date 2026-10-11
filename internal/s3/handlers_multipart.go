@@ -38,9 +38,28 @@ const (
 	maxPartSize int64 = 5 << 30
 	// maxMultipartObjectSize bounds a completed multipart object: 5 TiB.
 	maxMultipartObjectSize int64 = 5 << 40
-	// maxCompleteBodySize bounds the CompleteMultipartUpload XML body
-	// (10000 parts with ETags and checksums fit comfortably).
-	maxCompleteBodySize = 8 << 20
+	// maxCompleteBodySize bounds the CompleteMultipartUpload XML body. It
+	// is the largest request a client can legitimately send, 10000 parts
+	// of:
+	//
+	//	<Part></Part>                                 13
+	//	<PartNumber>10000</PartNumber>                30
+	//	<ETag>&quot; + 32 hex + &quot;</ETag>        57
+	//	<ChecksumSHA256> + 44 base64 + </...>         77  (the longest checksum)
+	//	                                             ---
+	//	                                             177
+	//
+	// rounded up to 256 bytes for white space (pretty-printed documents):
+	// 10000 * 256 = 2,560,000 bytes, plus 4 KiB for the XML declaration and
+	// the <CompleteMultipartUpload xmlns="..."> root: 2,564,096 bytes
+	// (about 2.4 MiB). The body is parsed as it arrives
+	// (parseCompleteRequest), so this bounds the bytes read and parsed.
+	maxCompleteBodySize = maxPartNumber*256 + 4096
+	// maxCompleteElements bounds the XML elements of a
+	// CompleteMultipartUpload body: a <Part> with all seven fields is eight
+	// elements; ten per entry (the 10001st included, see
+	// parseCompleteRequest) leave room for others.
+	maxCompleteElements = (maxPartNumber+1)*10 + 64
 	// anonymousInitiator is the initiator recorded for uploads started by
 	// anonymous callers (allowed by a bucket policy).
 	anonymousInitiator = "anonymous"
@@ -338,7 +357,8 @@ func (s *Server) handleUploadPartCopy(w http.ResponseWriter, r *http.Request, rc
 	if err != nil {
 		return err
 	}
-	info, rd, err := s.backend.OpenObject(ctx, src.Bucket, src.Key, src.VersionID)
+	// The version authorization evaluated (see openAuthorizedObject).
+	info, rd, err := s.openAuthorizedObject(ctx, rc, src.Bucket, src.Key, src.VersionID, true)
 	if err != nil {
 		return objectLookupError(err, src.Bucket, src.Key, src.VersionID)
 	}
@@ -469,6 +489,65 @@ func objectLocation(r *http.Request, rc *reqContext) string {
 		p = "/" + rc.key
 	}
 	return (&url.URL{Scheme: scheme, Host: r.Host, Path: p}).String()
+}
+
+// parseCompleteRequest reads a CompleteMultipartUpload document from x,
+// accepting what encoding/xml accepted for completeMultipartUpload
+// (unknown elements ignored, the last of repeated fields wins). No valid
+// list has more than 10000 parts (part numbers 1-10000, strictly
+// ascending), so it stops at the 10001st <Part>, before reading the rest
+// of the body, with the error parseCompleteParts reports for the parts
+// read so far (InvalidArgument, InvalidPartOrder or MalformedXML), which
+// is what the whole list would get.
+func parseCompleteRequest(x *xmlStream, uploadID string) (completeMultipartUpload, error) {
+	var req completeMultipartUpload
+	if err := x.root("CompleteMultipartUpload"); err != nil {
+		return req, err
+	}
+	for {
+		el, ok, err := x.next()
+		if err != nil {
+			return req, err
+		}
+		if !ok {
+			break
+		}
+		if el.Name.Local != "Part" {
+			if err := x.skip(); err != nil {
+				return req, err
+			}
+			continue
+		}
+		var p completePart
+		if err := x.fields(func(name, v string) {
+			switch name {
+			case "PartNumber":
+				p.PartNumber = v
+			case "ETag":
+				p.ETag = v
+			case "ChecksumCRC32":
+				p.ChecksumCRC32 = v
+			case "ChecksumCRC32C":
+				p.ChecksumCRC32C = v
+			case "ChecksumCRC64NVME":
+				p.ChecksumCRC64NVME = v
+			case "ChecksumSHA1":
+				p.ChecksumSHA1 = v
+			case "ChecksumSHA256":
+				p.ChecksumSHA256 = v
+			}
+		}); err != nil {
+			return req, err
+		}
+		req.Parts = append(req.Parts, p)
+		if len(req.Parts) > maxPartNumber {
+			if _, err := parseCompleteParts(&req, uploadID); err != nil {
+				return req, err
+			}
+			return req, s3err.ErrMalformedXML // unreachable: see above
+		}
+	}
+	return req, x.finish()
 }
 
 // completionPlan is the validated result of a CompleteMultipartUpload
@@ -705,8 +784,11 @@ func (s *Server) handleCompleteMultipartUpload(w http.ResponseWriter, r *http.Re
 	if err != nil {
 		return err
 	}
-	var req completeMultipartUpload
-	if err := decodeXMLBody(r.Body, maxCompleteBodySize, &req); err != nil {
+	if n := rc.contentLength(); n > maxCompleteBodySize {
+		return s3err.ErrMaxMessageLengthExceeded
+	}
+	req, err := parseCompleteRequest(newXMLStream(r.Body, maxCompleteBodySize, maxCompleteElements), up.UploadID)
+	if err != nil {
 		if errors.Is(err, s3err.ErrMissingRequestBody) {
 			return s3err.ErrMalformedXML
 		}

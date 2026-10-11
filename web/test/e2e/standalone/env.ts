@@ -66,9 +66,9 @@ export interface StandaloneState {
   tmpDir: string
   alpha: Gos3Instance
   beta: Gos3Instance
-  /** Plain standalone UI (no presets) — the one most specs use. */
+  /** Plain standalone UI (no presets, GOS3_UI_LOCAL_DISCOVERY=true) — the one most specs use. */
   ui: UiInstance
-  /** Second UI: a build with public/servers.json, started with NUXT_PUBLIC_SERVERS and GOS3_UI_LOCAL_DISCOVERY=false. */
+  /** Second UI: a build with public/servers.json, started with NUXT_PUBLIC_SERVERS and without GOS3_UI_LOCAL_DISCOVERY (local discovery off). */
   presetUi: UiInstance
 }
 
