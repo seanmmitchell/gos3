@@ -65,11 +65,13 @@ func TestAuthentication(t *testing.T) {
 		}
 	})
 	t.Run("unsigned payload", func(t *testing.T) {
+		// The body would not be covered by the signature (see
+		// TestUnsignedBodyReplayRefused).
 		req, _ := http.NewRequest("POST", e.srv.URL+Prefix+"/users", strings.NewReader(`{"name":"unsigned-payload"}`))
 		if err := auth.SignRequest(req, rootCreds, "us-east-1", "s3", auth.PayloadUnsigned, time.Now()); err != nil {
 			t.Fatal(err)
 		}
-		e.send(req).expectStatus(t, 201)
+		e.send(req).expectError(t, 400, codeInvalidRequest)
 	})
 }
 
@@ -121,12 +123,14 @@ func TestAuthorization(t *testing.T) {
 		}
 	})
 	t.Run("admin policy and root", func(t *testing.T) {
-		all := capabilities{true, true, true, true, true, true, true, true, true}
+		all := capabilities{true, true, true, true, true, true, true, true, true, true, true}
 		for _, c := range []auth.Credentials{adm, rootCreds} {
 			r := e.do(&c, "GET", Prefix+"/whoami", nil)
 			var w whoAmI
 			r.json(t, &w)
-			if w.Capabilities != all {
+			want := all
+			want.CreateOwnKeys = c != rootCreds // root has no IAM keys
+			if w.Capabilities != want {
 				t.Errorf("%s capabilities = %+v", c.AccessKey, w.Capabilities)
 			}
 			e.do(&c, "GET", Prefix+"/users", nil).expectStatus(t, 200)

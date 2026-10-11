@@ -9,17 +9,32 @@ Base path: `/_gos3/admin/v1` on the S3 listener. JSON in/out
 
 - Requests are signed with AWS SigV4 (Authorization header **or** presigned
   query) using the same access keys as the S3 API. Service name `s3`, any
-  region. Body hash: hex SHA-256 or `UNSIGNED-PAYLOAD`.
+  region.
+- **The body must be signed.** Every `POST`, `PUT` and `PATCH`, and any other
+  request that carries a body, must use the Authorization header with
+  `X-Amz-Content-Sha256` set to the hex SHA-256 of the exact body bytes (of
+  the empty string when there is none), or signed aws-chunked streaming
+  (`STREAMING-AWS4-HMAC-SHA256-PAYLOAD[-TRAILER]`). `UNSIGNED-PAYLOAD`,
+  `STREAMING-UNSIGNED-PAYLOAD-TRAILER` and presigned URLs are refused for
+  them with 400 `InvalidRequest` ("admin API requests with a body must sign
+  the payload: …"): their signature does not cover the body, so a captured
+  request could be replayed with another body. A body that does not match
+  its signed hash is 400 `InvalidRequest` (`XAmzContentSHA256Mismatch: …`).
+  Bodiless `GET` and `DELETE` requests may use `UNSIGNED-PAYLOAD` or a
+  presigned URL.
 - Each endpoint requires an IAM action `admin:<Action>` (listed below),
-  checked with `iam.Manager.Authorize` (resource `*`). Root is always allowed;
-  the built-in `admin` policy allows all; `diagnostics` allows `ServerInfo`,
-  `GetStats`, `GetDiscovery`.
+  checked with `iam.Manager.Authorize` against the endpoint's resource (see
+  [Resources and condition keys](#resources-and-condition-keys)). Root is
+  always allowed; the built-in `admin` policy allows all; `diagnostics`
+  allows `ServerInfo`, `GetStats`, `GetDiscovery` (not `ProbeNetwork` or
+  `ScanNetwork`).
 - Endpoints marked *any* only require a valid (non-anonymous) identity.
-  `POST` and `DELETE /whoami/keys` are refused with 403 `AccessDenied` only
-  when an explicit Deny matches `admin:CreateOwnAccessKey` /
-  `admin:DeleteOwnAccessKey` (a Deny of `admin:*` matches too); no Allow is
-  needed. Use such a Deny to stop a user, or a stolen key, from minting keys
-  that would survive revoking the current one.
+  `DELETE /whoami/keys/{accessKey}` is refused with 403 `AccessDenied` only
+  when an explicit Deny matches `admin:DeleteOwnAccessKey` (a Deny of
+  `admin:*` matches too). `POST /whoami/keys` needs an explicit Allow of
+  `admin:CreateOwnAccessKey` (only the built-in `admin` policy grants it), so
+  a stolen key cannot mint keys that would survive revoking it; a Deny still
+  wins over the Allow.
 - `aws:SourceIp` / `aws:SecureTransport` conditions and the remote address
   in the admin access log use `X-Forwarded-For` / `X-Forwarded-Proto` only
   when `server.trust_proxy_headers` is on, as for the S3 API.
@@ -31,6 +46,35 @@ Base path: `/_gos3/admin/v1` on the S3 listener. JSON in/out
   was read closes the connection.
 - Responses carry `Cache-Control: no-store`. Admin requests are counted in
   the metrics as op `Admin` and appear in the access log.
+
+### Resources and condition keys
+
+Admin actions are evaluated against these resources (glob-matched like s3
+ARNs, policy variables such as `${aws:username}` included):
+
+| Resource | Actions |
+|---|---|
+| `arn:gos3:admin:::user/<name>` | CreateUser (the new user's name), GetUser, UpdateUser, DeleteUser, CreateAccessKey (the target user), UpdateAccessKey / DeleteAccessKey (the key's owner; an unknown key is evaluated at service level) |
+| `arn:gos3:admin:::policy/<name>` | GetPolicy, PutPolicy, DeletePolicy |
+| `arn:gos3:admin:::bucket/<name>` | GetBucket, ForceDeleteBucket |
+| service level | every other action (list actions, config, stats, discovery, simulate, self-service) |
+
+The policy resources `*` and `arn:gos3:admin:::*` match every admin
+resource, service level included, so policies written before per-target
+resources existed keep their meaning. A service-level request matches only
+those two. s3 ARNs (`arn:aws:s3:::*`, `arn:*:*:::*`, …) never match admin
+resources and `arn:gos3:admin:::…` never matches s3 resources. New policy
+documents may only use `arn:gos3:admin:::*` and
+`arn:gos3:admin:::<type>/<name>` with type `user`, `policy` or `bucket` (or
+a wildcard pattern of them); other `arn:gos3:` resources are 400
+`InvalidPolicy`.
+
+Condition key `admin:PolicyName` (multi-valued) holds the policy names a
+`POST /users` or `PATCH /users/{name}` body attaches; it is absent when the
+body attaches none (no `policies`, or an empty list). Use it with
+`ForAllValues:StringEquals` to limit which policies a delegated administrator
+may attach, or with `ForAnyValue:StringEquals` in a Deny. See
+[security.md](security.md#scoping-admin-permissions).
 
 ## Errors
 
@@ -44,9 +88,9 @@ Non-2xx responses: `{"error": {"code": "<Code>", "message": "<text>"}}`.
 | 404 | `NotFound` |
 | 405 | `MethodNotAllowed` |
 | 409 | `Conflict` (exists / in use / bucket not empty) |
-| 429 | `TooManyRequests` (`POST /discovery/scan`: 2 scans are already running on this server) |
+| 429 | `TooManyRequests` (`POST /discovery/scan`: 2 scans, or `POST /discovery/probe`: 4 probes, are already running on this server) |
 | 500 | `InternalError` |
-| 502 | `ProbeFailed` (`POST /discovery/probe`: the target did not answer as a gos3 server) |
+| 502 | `ProbeFailed` (`POST /discovery/probe`: the target did not answer as a gos3 server; the message ends in `unreachable`, `timed out`, `HTTP <status>` or `not a gos3 server`) |
 | 503 | `InternalError` (request canceled or timed out) |
 
 ## Endpoints
@@ -56,7 +100,7 @@ Non-2xx responses: `{"error": {"code": "<Code>", "message": "<text>"}}`.
 |---|---|---|---|
 | GET | `/whoami` | *any* | `WhoAmI` |
 | GET | `/whoami/keys` | *any* | `{"keys": AccessKey[]}` (own keys, no secrets) |
-| POST | `/whoami/keys` | *any* unless `admin:CreateOwnAccessKey` is denied | body `{"description"?}` → 201 `AccessKey` (with `secretKey`). Not for root. |
+| POST | `/whoami/keys` | CreateOwnAccessKey (explicit Allow needed) | body `{"description"?}` → 201 `AccessKey` (with `secretKey`). Not for root (400). Logged at Info with the user, the new access key ID and the key that signed the request. |
 | DELETE | `/whoami/keys/{accessKey}` | *any* unless `admin:DeleteOwnAccessKey` is denied | 204 (own keys only; cannot delete the key used to sign this request) |
 
 ```jsonc
@@ -64,8 +108,10 @@ Non-2xx responses: `{"error": {"code": "<Code>", "message": "<text>"}}`.
 {
   "user": "alice", "accessKey": "AKIA…", "isRoot": false,
   "policies": ["readwrite"],
-  "capabilities": {           // derived by evaluating the actions below
-    "admin": false,           // any admin:* allowed
+  "capabilities": {           // derived by evaluating the actions below at
+                              // service level (grants scoped to some users,
+                              // policies or buckets do not show here)
+    "admin": false,           // any admin:* allowed (self-service excluded)
     "viewInfo": true,         // admin:ServerInfo
     "viewStats": false,       // admin:GetStats
     "manageConfig": false,    // admin:UpdateConfig
@@ -73,7 +119,9 @@ Non-2xx responses: `{"error": {"code": "<Code>", "message": "<text>"}}`.
     "managePolicies": false,  // admin:PutPolicy
     "manageBuckets": false,   // admin:ForceDeleteBucket
     "discovery": false,       // admin:GetDiscovery
-    "scan": false             // admin:ScanNetwork
+    "scan": false,            // admin:ScanNetwork
+    "probe": false,           // admin:ProbeNetwork
+    "createOwnKeys": false    // admin:CreateOwnAccessKey explicitly allowed (always false for root)
   },
   "server": Info              // same as GET /_gos3/info
 }
@@ -167,7 +215,7 @@ environment and flags for these fields.
 | Method | Path | Action | Response |
 |---|---|---|---|
 | GET | `/users` | ListUsers | `{"users": iam.User[]}` |
-| POST | `/users` | CreateUser | body `iam.UserSpec` (+ optional `"createKey": true`) → 201 `{"user": User, "key"?: AccessKey}`; the names `.` and `..` are 400 `InvalidName`. A non-empty `"policies"` also requires `admin:UpdateUser`, and `"createKey": true` also requires `admin:CreateAccessKey`; both are checked before anything is created (otherwise 403 `AccessDenied`) |
+| POST | `/users` | CreateUser | body `iam.UserSpec` (+ optional `"createKey": true`) → 201 `{"user": User, "key"?: AccessKey}`; the names `.` and `..` are 400 `InvalidName`. A non-empty `"policies"` also requires `admin:UpdateUser`, and `"createKey": true` also requires `admin:CreateAccessKey`; all three are evaluated on `user/<new name>` (with `admin:PolicyName`) before anything is created (otherwise 403 `AccessDenied`) |
 | GET | `/users/{name}` | GetUser | `iam.User` |
 | PATCH | `/users/{name}` | UpdateUser | body `iam.UserUpdate` → `iam.User` |
 | DELETE | `/users/{name}` | DeleteUser | 204 |
@@ -182,7 +230,7 @@ environment and flags for these fields.
 | GET | `/policies/{name}` | GetPolicy | `iam.NamedPolicy` |
 | PUT | `/policies/{name}` | PutPolicy | body `{"description"?, "document": PolicyDocument}` → `iam.NamedPolicy` (creating a policy named `.` or `..` is 400 `InvalidName`) |
 | DELETE | `/policies/{name}` | DeletePolicy | 204 (409 if attached, 400 if builtin) |
-| POST | `/authz/simulate` | SimulatePolicy | body `{"user": "alice" \| "root" \| "" (anonymous), "action": "s3:GetObject", "bucket": "b", "key": "k", "conditions"?: {"aws:SourceIp": "10.0.0.1" \| ["…"]}}` → `{"allowed": bool, "explicitDeny": bool, "reason": "…"}` (bucket policy and bucket ACL of `bucket` are included; 404 for an unknown user or bucket) |
+| POST | `/authz/simulate` | SimulatePolicy | body `{"user": "alice" \| "root" \| "" (anonymous), "action": "s3:GetObject", "bucket": "b", "key": "k", "resource"?: "arn:gos3:admin:::user/bob", "conditions"?: {"aws:SourceIp": "10.0.0.1" \| ["…"]}}` → `{"allowed": bool, "explicitDeny": bool, "reason": "…"}` (bucket policy and bucket ACL of `bucket` are included; 404 for an unknown user or bucket). `bucket`/`key` are for s3 actions, `resource` (empty = service level, or `arn:gos3:admin:::{user,policy,bucket}/<name>`) for admin actions; mixing them is 400 |
 
 ### Buckets (management helpers; regular bucket ops use the S3 API)
 | Method | Path | Action | Response |
@@ -205,7 +253,7 @@ environment and flags for these fields.
 | Method | Path | Action | Response |
 |---|---|---|---|
 | GET | `/discovery` | GetDiscovery | `{"enabled": bool, "config": discovery.Config, "self": Info, "peers": discovery.Peer[]}` |
-| POST | `/discovery/probe` | GetDiscovery | body `{"url": "http://host:9000"}` → `discovery.Peer` (502 `ProbeFailed` with message on failure) |
+| POST | `/discovery/probe` | ProbeNetwork | body `{"url": "http://host:9000"}` → `discovery.Peer` (502 `ProbeFailed` on failure, with only a coarse reason: `unreachable`, `timed out`, `HTTP <status>` or `not a gos3 server`; 429 `TooManyRequests` while 4 probes are already running on the server; each probe is bounded by 10 s) |
 | POST | `/discovery/scan` | ScanNetwork | body `discovery.ScanRequest` → `discovery.ScanResult` (403 when `allowScan` is false; 400 when the targets expand to more than `maxScanHosts` hosts, or for more than 256 targets, more than 64 ports, a port outside 1–65535, a scheme other than http/https, a `timeout` outside 0–60 s or `concurrency` outside 0–1024; 429 `TooManyRequests` while 2 scans are already running on the server; the whole scan is bounded by 5 minutes) |
 
 ## Public endpoints (no `/admin/v1` prefix; served by `internal/server`)

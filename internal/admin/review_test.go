@@ -53,16 +53,17 @@ func TestTrustProxyHeadersConditions(t *testing.T) {
 	})
 }
 
-// TestOwnKeysExplicitDeny checks that the self-service key endpoints, open
-// to every user by default, honour an explicit Deny: previously a user (or
-// a stolen key) under "Deny admin:*" could still mint fresh access keys
-// that survived deactivating the original one.
+// TestOwnKeysExplicitDeny checks that the self-service key endpoints honour
+// an explicit Deny: previously a user (or a stolen key) under "Deny
+// admin:*" could still mint fresh access keys that survived deactivating
+// the original one.
 func TestOwnKeysExplicitDeny(t *testing.T) {
 	e := newEnv(t)
 	e.putPolicy("deny-admin", map[string]any{"Effect": "Deny", "Action": "admin:*", "Resource": "*"})
 	e.putPolicy("deny-own-keys", map[string]any{"Effect": "Deny", "Action": "admin:CreateOwnAccessKey", "Resource": "*"})
+	e.putPolicy("own-keys", map[string]any{"Effect": "Allow", "Action": "admin:CreateOwnAccessKey", "Resource": "*"})
 
-	plain := e.addUser("plain")
+	plain := e.addUser("plain", "own-keys")
 	r := e.do(&plain, "POST", Prefix+"/whoami/keys", map[string]any{"description": "second"})
 	r.expectStatus(t, http.StatusCreated)
 	var k struct {
@@ -71,7 +72,7 @@ func TestOwnKeysExplicitDeny(t *testing.T) {
 	r.json(t, &k)
 	e.do(&plain, "DELETE", Prefix+"/whoami/keys/"+k.AccessKey, nil).expectStatus(t, http.StatusNoContent)
 
-	locked := e.addUser("locked", "deny-admin")
+	locked := e.addUser("locked", "own-keys", "deny-admin")
 	e.do(&locked, "GET", Prefix+"/whoami/keys", nil).expectStatus(t, 200)
 	e.do(&locked, "POST", Prefix+"/whoami/keys", map[string]any{}).expectError(t, 403, codeAccessDenied)
 	// A second key added by an administrator cannot be deleted either.
@@ -81,7 +82,7 @@ func TestOwnKeysExplicitDeny(t *testing.T) {
 	}
 	e.do(&locked, "DELETE", Prefix+"/whoami/keys/"+k2.AccessKey, nil).expectError(t, 403, codeAccessDenied)
 
-	nokeys := e.addUser("nokeys", "deny-own-keys")
+	nokeys := e.addUser("nokeys", "own-keys", "deny-own-keys")
 	e.do(&nokeys, "POST", Prefix+"/whoami/keys", map[string]any{}).expectError(t, 403, codeAccessDenied)
 }
 
