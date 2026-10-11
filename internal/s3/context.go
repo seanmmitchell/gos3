@@ -66,6 +66,10 @@ type reqContext struct {
 	// of Server.limitPreAuthBody applies to in.
 	preAuthLimit bool
 
+	// authzObjects are the object versions authorization evaluated (see
+	// Server.authzObject), by bucket, key and requested version ID.
+	authzObjects map[objectRef]authzObject
+
 	// bucketInfo caches the result of Server.bucketInfo.
 	bucketInfo   storage.BucketInfo
 	bucketErr    error

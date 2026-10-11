@@ -114,18 +114,10 @@ func deleteMarkerError(w http.ResponseWriter, method string, info storage.Object
 // objectForRead returns the addressed object version (vid "" = latest) of
 // the request's bucket/key, applying the delete marker rules of
 // deleteMarkerError. With open the content reader is returned too (the
-// caller closes it).
+// caller closes it). When authorization looked at the object, the version
+// it evaluated is returned (see openAuthorizedObject).
 func (s *Server) objectForRead(ctx context.Context, w http.ResponseWriter, r *http.Request, rc *reqContext, vid string, open bool) (storage.ObjectInfo, io.ReadSeekCloser, error) {
-	var (
-		info storage.ObjectInfo
-		rd   io.ReadSeekCloser
-		err  error
-	)
-	if open {
-		info, rd, err = s.backend.OpenObject(ctx, rc.bucket, rc.key, vid)
-	} else {
-		info, err = s.backend.GetObjectInfo(ctx, rc.bucket, rc.key, vid)
-	}
+	info, rd, err := s.openAuthorizedObject(ctx, rc, rc.bucket, rc.key, vid, open)
 	if err != nil {
 		return info, nil, objectLookupError(err, rc.bucket, rc.key, vid)
 	}

@@ -260,7 +260,8 @@ func (s *Server) openCopySource(r *http.Request, rc *reqContext, src copySource)
 	if err != nil {
 		return storage.BucketInfo{}, storage.ObjectInfo{}, nil, err
 	}
-	info, rd, err := s.backend.OpenObject(ctx, src.Bucket, src.Key, src.VersionID)
+	// The version authorization evaluated (see openAuthorizedObject).
+	info, rd, err := s.openAuthorizedObject(ctx, rc, src.Bucket, src.Key, src.VersionID, true)
 	if err != nil {
 		return bi, info, nil, objectLookupError(err, src.Bucket, src.Key, src.VersionID)
 	}

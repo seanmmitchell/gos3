@@ -357,7 +357,8 @@ func (s *Server) handleUploadPartCopy(w http.ResponseWriter, r *http.Request, rc
 	if err != nil {
 		return err
 	}
-	info, rd, err := s.backend.OpenObject(ctx, src.Bucket, src.Key, src.VersionID)
+	// The version authorization evaluated (see openAuthorizedObject).
+	info, rd, err := s.openAuthorizedObject(ctx, rc, src.Bucket, src.Key, src.VersionID, true)
 	if err != nil {
 		return objectLookupError(err, src.Bucket, src.Key, src.VersionID)
 	}

@@ -314,6 +314,12 @@ ListObjectsV2, ListParts and GetObjectAttributes.
 - XML request documents with more than 16 levels of nesting, a single tag
   (or text between two tags) over 16 KiB, or far more elements than the
   largest valid request are rejected with `MalformedXML`.
+- A read whose authorization depended on the object itself (its ACL, or an
+  `s3:ExistingObjectTag` condition) serves exactly the version that was
+  evaluated, also as a CopyObject or UploadPartCopy source. When the object
+  is replaced in the meantime, a versioned bucket serves the evaluated (now
+  older) version; for an unversioned object, or when its ACL or tags changed,
+  the request fails with `403 AccessDenied`.
 - An upload aborted by the client is recorded in the access log with status
   `499` and `client_aborted=true`.
 - **Root bypasses bucket policies.** The root credentials are never subject to

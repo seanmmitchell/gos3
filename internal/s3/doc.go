@@ -140,6 +140,10 @@ package s3
 // CORS, ACL or public access block document (or deleting a bucket) call
 // s.invalidateBucketConfig(bucket).
 //
+// Handlers that read an object whose authorization may have looked at it
+// (object ACL, s3:ExistingObjectTag) open it with s.openAuthorizedObject
+// (objectForRead does), which serves exactly the version evaluated.
+//
 // # Tests (testutil_test.go)
 //
 //	e := newTestEnv(t, opts...)             httptest server running New() over memory.New(),

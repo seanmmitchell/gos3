@@ -6,6 +6,7 @@ import (
 	"context"
 	"crypto/tls"
 	"errors"
+	"io"
 	"log/slog"
 	"maps"
 	"net/http"
@@ -163,8 +164,8 @@ func (s *Server) authorizeTarget(ctx context.Context, r *http.Request, rc *reqCo
 	}
 	req.Conditions = s.conditionContext(r, rc, t)
 	if t.Key != "" && s.needsExistingTags(ctx, id, bz) {
-		if info, err := s.backend.GetObjectInfo(ctx, t.Bucket, t.Key, t.VersionID); err == nil && !info.DeleteMarker {
-			for k, v := range info.Tags {
+		if o := s.authzObject(ctx, rc, t.Bucket, t.Key, t.VersionID); o.found && !o.info.DeleteMarker {
+			for k, v := range o.info.Tags {
 				req.Conditions["s3:ExistingObjectTag/"+k] = []string{v}
 			}
 		}
@@ -172,8 +173,8 @@ func (s *Server) authorizeTarget(ctx context.Context, r *http.Request, rc *reqCo
 
 	dec := s.iam.Authorize(ctx, req)
 	if !dec.Allowed && !dec.ExplicitDeny && t.ObjectRead && t.Key != "" && !bz.aclsDisabled {
-		info, err := s.backend.GetObjectInfo(ctx, t.Bucket, t.Key, t.VersionID)
-		if err == nil && !info.DeleteMarker {
+		o := s.authzObject(ctx, rc, t.Bucket, t.Key, t.VersionID)
+		if info := o.info; o.found && !info.DeleteMarker {
 			if acl := effectiveACL(info.ACL, bz.pab); acl != "" {
 				req.ACL = acl
 				dec = s.iam.Authorize(ctx, req)
@@ -191,6 +192,94 @@ func (s *Server) authorizeTarget(ctx context.Context, r *http.Request, rc *reqCo
 		return s3err.ErrAccessDenied
 	}
 	return nil
+}
+
+// objectRef names an object version as a request addresses it (VersionID
+// "" = the latest).
+type objectRef struct{ Bucket, Key, VersionID string }
+
+// authzObject is the result of an object lookup made for an authorization
+// decision.
+type authzObject struct {
+	info  storage.ObjectInfo
+	found bool // false: the lookup failed (no such object or version, or an error)
+}
+
+// authzObject returns the version of bucket/key (vid "" = latest) that
+// authorization evaluates (its tags for s3:ExistingObjectTag conditions,
+// its ACL for object reads). The first lookup in a request is remembered:
+// later decisions in the request see the same version, and the handlers
+// that read the object open exactly that version (openAuthorizedObject),
+// so a concurrent overwrite cannot get a version served that was never
+// authorized.
+func (s *Server) authzObject(ctx context.Context, rc *reqContext, bucket, key, vid string) authzObject {
+	ref := objectRef{bucket, key, vid}
+	if o, ok := rc.authzObjects[ref]; ok {
+		return o
+	}
+	info, err := s.backend.GetObjectInfo(ctx, bucket, key, vid)
+	o := authzObject{info: info, found: err == nil}
+	if rc.authzObjects == nil {
+		rc.authzObjects = map[objectRef]authzObject{}
+	}
+	rc.authzObjects[ref] = o
+	return o
+}
+
+// openAuthorizedObject looks up (open: and opens) bucket/key at version vid
+// ("" = latest) for a read that authorization may have decided from the
+// object itself (authzObject). When it did, the version it evaluated is
+// the one returned: it is opened by its version ID, and if it no longer
+// matches what was evaluated (an unversioned object overwritten in place,
+// its ACL or tags changed, or an object created where none was found)
+// the read fails closed with AccessDenied. Storage errors are returned
+// unconverted (see objectLookupError); the caller closes the reader.
+func (s *Server) openAuthorizedObject(ctx context.Context, rc *reqContext, bucket, key, vid string, open bool) (storage.ObjectInfo, io.ReadSeekCloser, error) {
+	get := func(v string) (storage.ObjectInfo, io.ReadSeekCloser, error) {
+		if open {
+			return s.backend.OpenObject(ctx, bucket, key, v)
+		}
+		info, err := s.backend.GetObjectInfo(ctx, bucket, key, v)
+		return info, nil, err
+	}
+	o, ok := rc.authzObjects[objectRef{bucket, key, vid}]
+	if !ok {
+		return get(vid)
+	}
+	changed := func(info storage.ObjectInfo, rd io.ReadSeekCloser) (storage.ObjectInfo, io.ReadSeekCloser, error) {
+		if rd != nil {
+			_ = rd.Close()
+		}
+		rc.authzReason = "object changed after authorization"
+		return info, nil, s3err.ErrAccessDenied
+	}
+	if !o.found {
+		info, rd, err := get(vid)
+		if err == nil && !info.DeleteMarker {
+			return changed(info, rd)
+		}
+		return info, rd, err
+	}
+	info, rd, err := get(o.info.VersionID)
+	if err != nil {
+		if vid == "" && errors.Is(err, storage.ErrVersionNotFound) {
+			// The version evaluated was the latest; it is gone now.
+			err = storage.ErrObjectNotFound
+		}
+		return info, nil, err
+	}
+	if !sameObjectVersion(o.info, info) {
+		return changed(info, rd)
+	}
+	return info, rd, nil
+}
+
+// sameObjectVersion reports whether b is the object version a describes,
+// with the same content and authorization-relevant metadata.
+func sameObjectVersion(a, b storage.ObjectInfo) bool {
+	return a.VersionID == b.VersionID && a.DeleteMarker == b.DeleteMarker &&
+		a.ETag == b.ETag && a.Size == b.Size && a.LastModified.Equal(b.LastModified) &&
+		a.ACL == b.ACL && maps.Equal(a.Tags, b.Tags)
 }
 
 // effectiveACL applies IgnorePublicAcls to a canned ACL.
