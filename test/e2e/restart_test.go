@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -59,7 +60,7 @@ func TestRestartPersistence(t *testing.T) {
 	if root.AccessKey == "" || root.SecretKey == "" || e1.srv.CredentialsSource() == "" {
 		t.Fatalf("no generated credentials (%q)", e1.srv.CredentialsSource())
 	}
-	if fi, err := os.Stat(filepath.Join(dir, ".gos3", config.RootCredentialsFileName)); err != nil || fi.Mode().Perm() != 0o600 {
+	if fi, err := os.Stat(filepath.Join(dir, ".gos3", config.RootCredentialsFileName)); err != nil || (runtime.GOOS != "windows" && fi.Mode().Perm() != 0o600) { // Windows: ACLs, no POSIX modes
 		t.Fatalf("root credentials file: %v %v", fi, err)
 	}
 	serverID := e1.srv.ServerID()
@@ -127,7 +128,7 @@ func TestRestartPersistence(t *testing.T) {
 	if r := e1.admin(t, root, http.MethodPut, "/config", st, &updated); r.status != 200 || updated.Name != "renamed-e2e" {
 		t.Fatalf("PUT /config: %d %s", r.status, r.body)
 	}
-	if fi, err := os.Stat(filepath.Join(dir, ".gos3", config.SettingsFileName)); err != nil || fi.Mode().Perm() != 0o600 {
+	if fi, err := os.Stat(filepath.Join(dir, ".gos3", config.SettingsFileName)); err != nil || (runtime.GOOS != "windows" && fi.Mode().Perm() != 0o600) { // Windows: ACLs, no POSIX modes
 		t.Fatalf("settings file: %v %v", fi, err)
 	}
 

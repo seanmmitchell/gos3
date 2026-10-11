@@ -73,8 +73,9 @@ async function applyTemplate(rendered: string) {
     const ok = await confirm({ title: 'Replace the current document?', description: 'Your unsaved changes to the policy document will be lost.', confirmLabel: 'Replace', color: 'warning' })
     if (!ok) return
   }
+  // No toast: the editor shows the new document, and in the create dialog a
+  // toast would cover the dialog's footer buttons.
   text.value = rendered
-  toast.add({ title: 'Template applied', description: 'Review the document, then save.', color: 'success', icon: 'i-lucide-circle-check' })
 }
 
 async function save() {
