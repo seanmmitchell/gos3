@@ -263,10 +263,9 @@ func (s *Service) verify(ctx context.Context, c candidate, timeout time.Duration
 		if info.ID == selfID {
 			return
 		}
-		now := s.now()
-		s.table.observeInfo(info, u, c.source, now, selfID)
+		s.record(ctx, info, u, c.source)
 		if c.id != "" && c.id != info.ID {
-			s.table.sightingFailed(c.id, fmt.Sprintf("%s is served by server %s", u, info.ID), now)
+			s.table.sightingFailed(c.id, fmt.Sprintf("%s is served by server %s", u, info.ID), s.now())
 		}
 		return
 	}
@@ -274,17 +273,75 @@ func (s *Service) verify(ctx context.Context, c candidate, timeout time.Duration
 		return
 	}
 	now := s.now()
+	msg := ProbeErrorText(lastErr)
 	if c.id != "" {
 		// An unauthenticated sighting (anyone can announce any ID) never
 		// marks a verified peer unhealthy: its own addresses are re-probed.
-		s.table.sightingFailed(c.id, lastErr.Error(), now)
+		s.table.sightingFailed(c.id, msg, now)
 		return
 	}
 	for _, u := range c.urls {
 		for _, id := range s.table.findByAddr(u) {
-			s.table.probeFailed(id, lastErr.Error(), now)
+			s.table.probeFailed(id, msg, now)
 		}
 	}
+}
+
+// record stores info, fetched from addr, in the peer table and returns the
+// stored peer. Server IDs are not authenticated: when a verified peer with
+// the same ID is known at other addresses, those are re-probed first. If
+// one still answers with the ID, the verified record is kept and the claim
+// is recorded as a conflict (ok=false); only when none does is the peer
+// moved to addr.
+func (s *Service) record(ctx context.Context, info Info, addr string, src Source) (Peer, bool) {
+	selfID := s.selfID()
+	p, res := s.table.observeInfo(info, addr, src, s.now(), selfID)
+	switch res {
+	case observeStored:
+		return p, true
+	case observeRejected:
+		return Peer{}, false
+	}
+	if s.knownStillAnswer(ctx, info.ID) {
+		if s.table.conflict(info, addr, s.now()) {
+			s.logger.Warn("server ID claimed by another address; keeping the verified peer",
+				"id", info.ID, "name", p.Name, "known", p.Addresses, "claimedBy", addr)
+		} else {
+			s.logger.Debug("server ID seen at another address; keeping the verified peer",
+				"id", info.ID, "known", p.Addresses, "address", addr)
+		}
+		return Peer{}, false
+	}
+	moved, ok := s.table.move(info, addr, src, s.now(), selfID)
+	if ok {
+		s.logger.Info("peer moved to a new address", "id", info.ID, "name", moved.Name, "from", p.Addresses, "to", addr)
+	}
+	return moved, ok
+}
+
+// knownStillAnswer reports whether verified peer id answers with its ID at
+// one of its known addresses (re-probing them unless it answered very
+// recently). A cancelled ctx counts as "still answers": nothing moves on
+// an undecided check.
+func (s *Service) knownStillAnswer(ctx context.Context, id string) bool {
+	urls, alive := s.table.knownTargets(id, s.now(), conflictFresh)
+	if alive {
+		return true
+	}
+	selfID := s.selfID()
+	for _, u := range urls {
+		pctx, cancel := context.WithTimeout(ctx, candidateProbeTimeout)
+		info, err := s.prober.fetch(pctx, u)
+		cancel()
+		if ctx.Err() != nil {
+			return true
+		}
+		if err == nil && info.ID == id {
+			s.table.observeInfo(info, u, "", s.now(), selfID)
+			return true
+		}
+	}
+	return false
 }
 
 // verifyAll verifies candidates with bounded concurrency and waits.
@@ -359,7 +416,7 @@ func (s *Service) maintain(ctx context.Context) {
 // reprobe re-verifies a known peer at its addresses (last good one first).
 func (s *Service) reprobe(ctx context.Context, d probeTarget) {
 	selfID := s.selfID()
-	var lastErr error
+	lastErr := "no known address"
 	for _, u := range d.urls {
 		pctx, cancel := context.WithTimeout(ctx, defaultProbeTimeout)
 		info, err := s.prober.fetch(pctx, u)
@@ -368,20 +425,19 @@ func (s *Service) reprobe(ctx context.Context, d probeTarget) {
 			return
 		}
 		if err != nil {
-			lastErr = err
+			lastErr = ProbeErrorText(err)
 			continue
 		}
 		if info.ID != d.id {
-			lastErr = fmt.Errorf("%s is now served by server %s", u, info.ID)
+			lastErr = fmt.Sprintf("%s is now served by server %s", u, info.ID)
 			continue
 		}
+		// d.urls are known addresses: this refreshes the record (a
+		// conflict result only means the peer moved meanwhile).
 		s.table.observeInfo(info, u, "", s.now(), selfID)
 		return
 	}
-	if lastErr == nil {
-		lastErr = fmt.Errorf("no known address")
-	}
-	s.table.probeFailed(d.id, lastErr.Error(), s.now())
+	s.table.probeFailed(d.id, lastErr, s.now())
 }
 
 // runSeeds probes the static seeds on start and every 30 s.
