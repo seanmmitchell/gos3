@@ -310,6 +310,17 @@ func mdnsQuery(ctx context.Context, timeout time.Duration, logger *slog.Logger, 
 type mdnsReceived struct {
 	data []byte
 	src  netip.AddrPort
+	ttl  int // IP TTL / IPv6 hop limit, 0 when unknown
+}
+
+// receive handles one datagram read by a browse socket. A datagram from
+// another host that a router forwarded (TTL / hop limit below 255) is
+// dropped: its on-link source address is spoofed.
+func (b *mdnsBrowser) receive(p mdnsReceived) []dns.Question {
+	if b.local.routed(p.src.Addr(), p.ttl) {
+		return nil
+	}
+	return b.handle(p.data, p.src)
 }
 
 // runMDNSBrowse sends the browse query, feeds every datagram received on
@@ -323,7 +334,7 @@ func runMDNSBrowse(ctx context.Context, timeout time.Duration, queriers, socks [
 		readers.Go(func() {
 			buf := make([]byte, mdnsMaxPacket+1)
 			for {
-				n, src, _, err := s.readFrom(buf)
+				n, src, meta, err := s.readFrom(buf)
 				if err != nil {
 					if errors.Is(err, net.ErrClosed) {
 						return
@@ -339,7 +350,7 @@ func runMDNSBrowse(ctx context.Context, timeout time.Duration, queriers, socks [
 					continue
 				}
 				select {
-				case ch <- mdnsReceived{data: append([]byte(nil), buf[:n]...), src: src}:
+				case ch <- mdnsReceived{data: append([]byte(nil), buf[:n]...), src: src, ttl: meta.ttl}:
 				case <-done:
 					return
 				}
@@ -383,7 +394,7 @@ func runMDNSBrowse(ctx context.Context, timeout time.Duration, queriers, socks [
 		case <-timer.C:
 			return nil
 		case p := <-ch:
-			if qs := b.handle(p.data, p.src); len(qs) > 0 {
+			if qs := b.receive(p); len(qs) > 0 {
 				_ = send(qs)
 			}
 		}

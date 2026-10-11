@@ -40,8 +40,10 @@ server:
   # Addresses (CIDRs or IPs) of the reverse proxies in front of gos3. With
   # trust_proxy_headers, requests from other addresses are taken at face
   # value. Empty: any peer is trusted and the rightmost entry is the client
-  # (fine for a single proxy that gos3 alone can be reached through).
-  # trusted_proxies: ["10.0.0.0/8", "192.0.2.10"]
+  # (fine for a single proxy that gos3 alone can be reached through). List
+  # only the proxies, never subnets that also hold clients: a listed client
+  # could choose its own aws:SourceIp.
+  # trusted_proxies: ["10.0.0.5", "192.0.2.10"]
   trusted_proxies: []
 
 storage:

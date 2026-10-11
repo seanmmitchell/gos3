@@ -34,6 +34,7 @@ type mdnsPacket struct {
 	data    []byte
 	src     netip.AddrPort // source; IPv6 link-local addresses keep their zone
 	ifIndex int            // arrival interface, 0 when unknown
+	ttl     int            // IP TTL / IPv6 hop limit, 0 when unknown
 }
 
 // mdnsWriter sends the responder's answers on the socket the query arrived
@@ -82,7 +83,7 @@ func (r *mdnsResponder) serve(s *mdnsSocket) {
 	buf := make([]byte, mdnsMaxPacket+1)
 	failures := 0
 	for {
-		n, src, ifIndex, err := s.readFrom(buf)
+		n, src, meta, err := s.readFrom(buf)
 		if err != nil {
 			if errors.Is(err, net.ErrClosed) {
 				return
@@ -97,14 +98,16 @@ func (r *mdnsResponder) serve(s *mdnsSocket) {
 		if n > mdnsMaxPacket {
 			continue
 		}
-		r.handle(mdnsPacket{data: buf[:n], src: src, ifIndex: ifIndex}, s)
+		r.handle(mdnsPacket{data: buf[:n], src: src, ifIndex: meta.ifIndex, ttl: meta.ttl}, s)
 	}
 }
 
 // handle processes one datagram:
 //
 //   - senders that are not on this host or a directly connected subnet,
-//     and broadcast or unspecified source addresses, are ignored;
+//     broadcast or unspecified source addresses, and datagrams from other
+//     hosts that arrived with a TTL / hop limit below 255 (forwarded by a
+//     router, so the on-link source is spoofed) are ignored;
 //   - only standard queries are looked at; duplicate questions are
 //     collapsed and at most mdnsMaxQuestions distinct ones are considered;
 //   - questions about anything but this server's own service, instance and
@@ -119,7 +122,7 @@ func (r *mdnsResponder) serve(s *mdnsSocket) {
 //   - every response is a single packet of at most mdnsMaxResponse bytes.
 func (r *mdnsResponder) handle(p mdnsPacket, w mdnsWriter) {
 	src := p.src.Addr()
-	if len(p.data) > mdnsMaxPacket || p.src.Port() == 0 || !r.local.onLink(src) || r.local.isBroadcast(src) {
+	if len(p.data) > mdnsMaxPacket || p.src.Port() == 0 || !r.local.onLink(src) || r.local.isBroadcast(src) || r.local.routed(src, p.ttl) {
 		r.logger.Debug("mDNS: dropping datagram from a sender that is not on the local link", "from", p.src.String())
 		return
 	}
@@ -165,16 +168,28 @@ func (r *mdnsResponder) handle(p mdnsPacket, w mdnsWriter) {
 		return
 	}
 	now := r.now()
+	mkey := ""
+	sendMulticast := false
+	if len(mq) > 0 {
+		mkey = multicastKey(mq, p.ifIndex)
+		sendMulticast = r.multicastDue(mkey, now)
+	}
+	// A query whose multicast answer is suppressed (just sent) and that
+	// needs no unicast reply sends nothing, so it must not use up the
+	// sender's or the global budget: otherwise a flood of such queries
+	// would starve the queries that do get answers.
+	if !sendMulticast && len(uq) == 0 {
+		return
+	}
 	if !r.limit.allow(src.WithZone(""), now) || !r.globalAllow(now) {
 		r.logger.Debug("mDNS: too many queries, dropping", "from", p.src.String())
 		return
 	}
-	if len(mq) > 0 {
-		if r.multicastDue(mq, p.ifIndex, now) {
-			if b, ok := packResponse(0, nil, mAns, mExt, false); ok {
-				if err := w.multicast(b, p.ifIndex); err != nil {
-					r.logger.Debug("mDNS: multicast response", "err", err)
-				}
+	if sendMulticast {
+		r.markMulticast(mkey, now)
+		if b, ok := packResponse(0, nil, mAns, mExt, false); ok {
+			if err := w.multicast(b, p.ifIndex); err != nil {
+				r.logger.Debug("mDNS: multicast response", "err", err)
 			}
 		}
 	}
@@ -211,20 +226,31 @@ func (r *mdnsResponder) globalAllow(now time.Time) bool {
 	return true
 }
 
-// multicastDue reports whether the answers to questions qs may be
-// multicast on interface ifIndex now, and records it.
-func (r *mdnsResponder) multicastDue(qs []dns.Question, ifIndex int, now time.Time) bool {
+// multicastKey identifies the answer set to questions qs on interface
+// ifIndex for multicast suppression.
+func multicastKey(qs []dns.Question, ifIndex int) string {
 	keys := make([]string, len(qs))
 	for i, q := range qs {
 		keys[i] = strings.ToLower(q.Name) + "/" + strconv.Itoa(int(q.Qtype))
 	}
 	slices.Sort(keys)
-	key := strconv.Itoa(ifIndex) + "|" + strings.Join(keys, ",")
+	return strconv.Itoa(ifIndex) + "|" + strings.Join(keys, ",")
+}
+
+// multicastDue reports whether the answer set key may be multicast now
+// (it was not multicast in the last mdnsMulticastGap). It records nothing:
+// markMulticast does once the response is actually sent.
+func (r *mdnsResponder) multicastDue(key string, now time.Time) bool {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	if t, ok := r.lastMulticast[key]; ok && now.Sub(t) < mdnsMulticastGap && !now.Before(t) {
-		return false
-	}
+	t, ok := r.lastMulticast[key]
+	return !ok || now.Sub(t) >= mdnsMulticastGap || now.Before(t)
+}
+
+// markMulticast records that the answer set key was multicast at now.
+func (r *mdnsResponder) markMulticast(key string, now time.Time) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
 	if len(r.lastMulticast) >= maxMulticastEntries {
 		for k, t := range r.lastMulticast {
 			if now.Sub(t) >= mdnsMulticastGap {
@@ -236,7 +262,6 @@ func (r *mdnsResponder) multicastDue(qs []dns.Question, ifIndex int, now time.Ti
 		}
 	}
 	r.lastMulticast[key] = now
-	return true
 }
 
 // packResponse builds an authoritative mDNS response from the answer and

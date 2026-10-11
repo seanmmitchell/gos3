@@ -19,9 +19,11 @@ data:
       # Ingress with a wildcard host:
       # domains: ["s3.example.com"]
       # Behind an Ingress / reverse proxy: honour X-Forwarded-For /
-      # X-Forwarded-Proto, but only from the Ingress controller (its pod
-      # network). The client is the rightmost X-Forwarded-For entry that is
-      # not one of these addresses.
+      # X-Forwarded-Proto, but only from the Ingress controller. The client is
+      # the rightmost X-Forwarded-For entry that is not one of these
+      # addresses. A whole pod network lets every pod in it choose its own
+      # aws:SourceIp: use it only when a NetworkPolicy lets nothing but the
+      # Ingress controller reach gos3 (see docs/deployment.md).
       trust_proxy_headers: false
       # trusted_proxies: ["10.244.0.0/16"]
     storage:

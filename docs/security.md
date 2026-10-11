@@ -221,7 +221,10 @@ of discarding them. See [operations.md](operations.md#the-data-directory).
   `X-Forwarded-For` entry that is not a trusted proxy as the client and the
   last `X-Forwarded-Proto` value as the transport, so a client cannot choose
   its `aws:SourceIp` by sending its own header, even through a proxy that
-  appends to it. With an empty `trusted_proxies` every peer is trusted: a
+  appends to it. List only the proxies themselves, never a subnet that also
+  holds clients: a client whose own address is in `trusted_proxies` is
+  skipped like a proxy hop, so it can choose its `aws:SourceIp` again.
+  With an empty `trusted_proxies` every peer is trusted: a
   client that can reach gos3 without the proxy can then fake
   `aws:SourceIp` and `aws:SecureTransport`. The setting applies to the S3
   API, the admin API and the `/_gos3/*` endpoints (conditions and access
@@ -245,6 +248,9 @@ These limits are fixed (not configurable):
   authorize are in it), PutObjectTagging, PutObjectRetention and
   PutObjectLegalHold (at most 64 KiB; their condition keys come from the
   body). Every other S3 request is authorized before its body is read.
+- Slow CopyObject, UploadPartCopy and CompleteMultipartUpload calls keep the
+  connection alive with whitespace (see
+  [s3-compatibility.md](s3-compatibility.md#other-differences-from-aws)).
 
 ### Request size limits
 
@@ -258,9 +264,6 @@ CompleteMultipartUpload documents are parsed as they arrive: the 1001st
 depth, element count and the size of a single tag are bounded, so the work
 and memory a request causes stay proportional to a valid one, also for an
 anonymous DeleteObjects that is rejected per key afterwards.
-- Slow CopyObject, UploadPartCopy and CompleteMultipartUpload calls keep the
-  connection alive with whitespace (see
-  [s3-compatibility.md](s3-compatibility.md#other-differences-from-aws)).
 
 ## Object responses
 

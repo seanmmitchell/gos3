@@ -101,6 +101,16 @@ func (l *localNets) isBroadcast(ip netip.Addr) bool {
 	return false
 }
 
+// routed reports whether a datagram from src that arrived with IP TTL /
+// IPv6 hop limit ttl (0: unknown) was forwarded by a router. mDNS senders
+// use 255 (RFC 6762 §11) and every router decrements it, so a lower value
+// from another host means the datagram came from off the link and its
+// on-link source address is spoofed. Datagrams from this host itself are
+// never routed.
+func (l *localNets) routed(src netip.Addr, ttl int) bool {
+	return ttl > 0 && ttl < 255 && !l.isLocal(src.WithZone("").Unmap())
+}
+
 // advertisedBy reports whether a host at src may advertise ip as its own
 // address: ip is src itself or, when src is this host (isLocal), a
 // loopback or local address. Unauthenticated announcements (beacons, mDNS)

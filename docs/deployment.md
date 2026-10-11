@@ -219,8 +219,12 @@ How it fits together:
 - An Ingress in front of the Service must allow large bodies and must not
   buffer them (see the nginx settings below). The host it serves must be the
   host clients sign; set `trust_proxy_headers: true` in the ConfigMap, and
-  `trusted_proxies` to the Ingress controller pods' network (for example the
-  pod CIDR) so requests that bypass the Ingress cannot forge their address.
+  `trusted_proxies` to the Ingress controller pods' addresses so requests
+  that bypass the Ingress cannot forge their address. Listing the whole pod
+  CIDR is simpler but lets every pod in it choose its own `aws:SourceIp`;
+  do that only when a NetworkPolicy allows nothing but the Ingress
+  controller to reach gos3, or when no policy relies on in-cluster source
+  addresses.
 - A standalone web UI deployed next to gos3 keeps its local discovery
   routes off unless `GOS3_UI_LOCAL_DISCOVERY=true`; leave them off when the
   UI is reachable through an Ingress, since they have no authentication.
@@ -240,7 +244,11 @@ gos3 can sit behind nginx, Caddy, Traefik or a cloud load balancer. The rules:
    parts (up to 5 GiB) and large downloads. Slow CopyObject, UploadPartCopy and
    CompleteMultipartUpload calls are kept alive by gos3 with whitespace every
    5 s. gos3 itself fails a request body that sends no data for 60 s
-   (`RequestTimeout`); this limit is fixed.
+   (`RequestTimeout`); this limit is fixed. Bodies read before the caller is
+   authorized (DeleteObjects, up to about 6.2 MiB, and the small
+   PutObjectTagging / PutObjectRetention / PutObjectLegalHold bodies) must
+   arrive completely within 60 s, so a maximal DeleteObjects needs at least
+   about 110 KB/s end to end (see [security.md](security.md#timeouts)).
 3. Set `server.trust_proxy_headers: true` and list the proxies in
    `server.trusted_proxies`. Then `aws:SourceIp`, `aws:SecureTransport` and
    the access logs see the real client:
@@ -252,6 +260,8 @@ gos3 can sit behind nginx, Caddy, Traefik or a cloud load balancer. The rules:
      request from, so the entries to the right of that one were written by
      your proxies and anything further left may have been forged by the
      client. With a chain (CDN, load balancer, Ingress) list every hop.
+     List only proxies: a client whose own address is in the list is
+     skipped like a proxy, so it could choose its `aws:SourceIp`.
    - With an empty `trusted_proxies` the rightmost entry is the client. That
      is right for a single proxy that appends to or overwrites the header,
      as long as clients cannot reach gos3 without going through it.

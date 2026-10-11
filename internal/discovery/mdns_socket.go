@@ -15,8 +15,8 @@ import (
 // and joined to the mDNS group of its family on every multicast interface
 // (responder, browser), or an ephemeral socket sending queries (browser).
 // Every datagram is sent with IP TTL / hop limit 255 (RFC 6762 §11), and
-// the arrival interface of received datagrams is reported when the
-// platform supports it.
+// the arrival interface and TTL / hop limit of received datagrams are
+// reported when the platform supports it.
 type mdnsSocket struct {
 	v6     bool
 	conn   net.PacketConn
@@ -31,14 +31,14 @@ func newMDNSSocket(conn net.PacketConn, v6 bool, ifaces []net.Interface, logger 
 	if v6 {
 		s.p6 = ipv6.NewPacketConn(conn)
 		errs = append(errs,
-			s.p6.SetControlMessage(ipv6.FlagInterface, true),
+			s.p6.SetControlMessage(ipv6.FlagInterface|ipv6.FlagHopLimit, true),
 			s.p6.SetMulticastHopLimit(255),
 			s.p6.SetHopLimit(255),
 			s.p6.SetMulticastLoopback(true))
 	} else {
 		s.p4 = ipv4.NewPacketConn(conn)
 		errs = append(errs,
-			s.p4.SetControlMessage(ipv4.FlagInterface, true),
+			s.p4.SetControlMessage(ipv4.FlagInterface|ipv4.FlagTTL, true),
 			s.p4.SetMulticastTTL(255),
 			s.p4.SetTTL(255),
 			s.p4.SetMulticastLoopback(true))
@@ -52,37 +52,43 @@ func newMDNSSocket(conn net.PacketConn, v6 bool, ifaces []net.Interface, logger 
 // Close closes the socket.
 func (s *mdnsSocket) Close() error { return s.conn.Close() }
 
-// readFrom reads one datagram: its length, source (with the IPv6 zone) and
-// arrival interface index (0 when unknown).
-func (s *mdnsSocket) readFrom(buf []byte) (int, netip.AddrPort, int, error) {
+// mdnsMeta is what the IP layer reports about a received datagram.
+type mdnsMeta struct {
+	ifIndex int // arrival interface, 0 when unknown
+	ttl     int // IP TTL / IPv6 hop limit, 0 when unknown
+}
+
+// readFrom reads one datagram: its length, source (with the IPv6 zone),
+// arrival interface and TTL / hop limit.
+func (s *mdnsSocket) readFrom(buf []byte) (int, netip.AddrPort, mdnsMeta, error) {
 	var (
-		n       int
-		src     net.Addr
-		ifIndex int
-		err     error
+		n    int
+		src  net.Addr
+		meta mdnsMeta
+		err  error
 	)
 	if s.v6 {
 		var cm *ipv6.ControlMessage
 		n, cm, src, err = s.p6.ReadFrom(buf)
 		if cm != nil {
-			ifIndex = cm.IfIndex
+			meta = mdnsMeta{ifIndex: cm.IfIndex, ttl: cm.HopLimit}
 		}
 	} else {
 		var cm *ipv4.ControlMessage
 		n, cm, src, err = s.p4.ReadFrom(buf)
 		if cm != nil {
-			ifIndex = cm.IfIndex
+			meta = mdnsMeta{ifIndex: cm.IfIndex, ttl: cm.TTL}
 		}
 	}
 	if err != nil {
-		return n, netip.AddrPort{}, 0, err
+		return n, netip.AddrPort{}, mdnsMeta{}, err
 	}
 	ua, ok := src.(*net.UDPAddr)
 	if !ok {
-		return n, netip.AddrPort{}, ifIndex, nil
+		return n, netip.AddrPort{}, meta, nil
 	}
 	ap := ua.AddrPort()
-	return n, netip.AddrPortFrom(ap.Addr().Unmap(), ap.Port()), ifIndex, nil
+	return n, netip.AddrPortFrom(ap.Addr().Unmap(), ap.Port()), meta, nil
 }
 
 // writeTo sends b to dst out of interface ifIndex (0: the system's choice).

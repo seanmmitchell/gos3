@@ -65,9 +65,16 @@ neither is). Every query is checked before it is answered:
   `_services._dns-sd._udp.local.`, SRV/TXT for the instance name, and A/AAAA
   for the host name. A query without such a question costs the sender
   nothing.
+- Datagrams from other hosts must arrive with IP TTL / hop limit 255, as
+  mDNS senders set it (RFC 6762 §11): a router decrements it, so a lower
+  value means the datagram came from off the link with a spoofed on-link
+  source, and it is dropped. Legacy tools that query with a lower TTL (for
+  example `dig -p 5353`) therefore get answers only when run on this host.
 - Each sender is rate-limited with the beacon's token bucket (a burst of 32
   answered queries, then 4 per second), and all responses together are
-  limited to 50 per second.
+  limited to 50 per second. A query whose answer is not sent (the same
+  multicast answer went out less than a second ago) counts against
+  neither.
 - Answers are multicast to the group with IP TTL / hop limit 255, out of the
   interface the query arrived on, and the same answers at most once per
   second per interface (RFC 6762 §6). Questions with the unicast-response
@@ -91,7 +98,9 @@ from outside the local network anyway, or set `discovery.mdns: false` (or
   Incomplete answers trigger follow-up SRV/TXT and A/AAAA questions (at most
   32 per browse).
 - Responses from senders that are not on this host or a directly connected
-  subnet are dropped. Records from different senders are never combined,
+  subnet are dropped, and so are responses from other hosts that arrived
+  with a TTL / hop limit below 255 (forwarded by a router, so the source is
+  spoofed). Records from different senders are never combined,
   and an advertised address is accepted only when it is the responding
   packet's source address, or, when the sender is this host, a loopback or
   local address. So an mDNS answer can only make the server probe the

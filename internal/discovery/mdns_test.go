@@ -149,6 +149,66 @@ func TestMDNSResponderSourceFilter(t *testing.T) {
 	}
 }
 
+// TestMDNSResponderDropsRoutedDatagrams: queries from other hosts that
+// arrived with a TTL / hop limit below 255 were forwarded by a router, so
+// their on-link source is spoofed and they get no answer (no reflection
+// towards a neighbour). Queries from this host and datagrams whose TTL the
+// platform does not report are unaffected.
+func TestMDNSResponderDropsRoutedDatagrams(t *testing.T) {
+	r, _ := testResponder(t)
+	w := &fakeWriter{}
+	b := query(t, 1, q(mdnsServiceName, dns.TypePTR))
+	for _, tc := range []struct {
+		from    string
+		ttl     int
+		answers bool
+	}{
+		{"10.0.0.7:5353", 254, false},
+		{"10.0.0.7:40000", 64, false}, // legacy port: a unicast reply would reach the spoofed neighbour
+		{"[fe80::7%eth0]:5353", 1, false},
+		{"10.0.0.7:5353", 255, true},
+		{"10.0.0.7:5353", 0, true},
+		{"127.0.0.1:40000", 64, true}, // a local tool such as dig
+		{"10.0.0.1:40000", 64, true},  // this host's own address
+	} {
+		r.handle(mdnsPacket{data: b, src: src(tc.from), ttl: tc.ttl}, w)
+		m, u := w.counts()
+		if got := m+u > 0; got != tc.answers {
+			t.Errorf("%s ttl %d: answered = %v, want %v", tc.from, tc.ttl, got, tc.answers)
+		}
+		w.reset()
+		r.lastMulticast = map[string]time.Time{}
+	}
+}
+
+// TestMDNSResponderSuppressedQueriesCostNothing: queries whose multicast
+// answer is suppressed (sent less than a second ago) send nothing, so they
+// use neither the sender's nor the global budget; a flood of them must not
+// starve queries that do get answers.
+func TestMDNSResponderSuppressedQueriesCostNothing(t *testing.T) {
+	r, _ := testResponder(t)
+	w := &fakeWriter{}
+	qm := query(t, 1, q(mdnsServiceName, dns.TypePTR))
+	r.handle(mdnsPacket{data: qm, src: src("10.0.0.7:5353"), ifIndex: 2}, w)
+	if m, _ := w.counts(); m != 1 {
+		t.Fatalf("first query: %d multicast answers, want 1", m)
+	}
+	for i := range 5 * mdnsMaxResponsesPerSecond {
+		r.handle(mdnsPacket{data: qm, src: src(fmt.Sprintf("10.0.0.%d:5353", 10+i%200)), ifIndex: 2}, w)
+		r.handle(mdnsPacket{data: qm, src: src("10.0.0.7:5353"), ifIndex: 2}, w)
+	}
+	if m, _ := w.counts(); m != 1 {
+		t.Errorf("suppressed queries were answered: %d multicast answers", m)
+	}
+	// The global budget and 10.0.0.7's bucket are untouched: QU queries
+	// (answered by unicast) still get answers.
+	r.handle(mdnsPacket{data: query(t, 2, qu(mdnsServiceName, dns.TypePTR)), src: src("10.0.0.8:5353"), ifIndex: 2}, w)
+	r.handle(mdnsPacket{data: query(t, 3, qu(mdnsServiceName, dns.TypePTR)), src: src("10.0.0.7:5353"), ifIndex: 2}, w)
+	if _, u := w.counts(); u != 2 {
+		t.Errorf("unicast answers after the flood: %d, want 2", u)
+	}
+}
+
 // TestMDNSResponderDuplicatesAndCap: 200 copies of a question get one
 // answer of normal size; only the first mdnsMaxQuestions distinct
 // questions are considered.
@@ -450,6 +510,30 @@ func TestMDNSBrowserSourceFilter(t *testing.T) {
 		if !slices.Equal(got[id], urls) {
 			t.Errorf("%s: urls = %v, want %v", id, got[id], urls)
 		}
+	}
+}
+
+// TestMDNSBrowserDropsRoutedDatagrams: an answer from another host that
+// arrived with a TTL / hop limit below 255 was forwarded by a router, so
+// its on-link source address is spoofed (RFC 6762 §11) and it is dropped.
+func TestMDNSBrowserDropsRoutedDatagrams(t *testing.T) {
+	b := newMDNSBrowser("self", testNets())
+	feed := func(from string, ttl int, rrs ...string) {
+		b.receive(mdnsReceived{data: response(t, rrs...), src: src(from), ttl: ttl})
+	}
+	feed("10.0.0.7:5353", 254, serviceRRs("routed", "r.local.", 9000, "10.0.0.7", "id0000000000000a")...)
+	feed("10.0.0.8:5353", 64, serviceRRs("routed2", "r2.local.", 9000, "10.0.0.8", "id0000000000000b")...)
+	feed("10.0.0.9:5353", 255, serviceRRs("onlink", "o.local.", 9000, "10.0.0.9", "id0000000000000c")...)
+	feed("10.0.0.10:5353", 0, serviceRRs("unknown", "u.local.", 9000, "10.0.0.10", "id0000000000000d")...) // TTL not reported
+	feed("10.0.0.1:5353", 64, serviceRRs("local", "l.local.", 9001, "127.0.0.1", "id0000000000000e")...)   // this host
+
+	var got []string
+	for _, c := range b.candidates() {
+		got = append(got, c.id)
+	}
+	slices.Sort(got)
+	if want := []string{"id0000000000000c", "id0000000000000d", "id0000000000000e"}; !slices.Equal(got, want) {
+		t.Errorf("candidates = %v, want %v", got, want)
 	}
 }
 
