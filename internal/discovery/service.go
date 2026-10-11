@@ -240,8 +240,7 @@ func addrMatchesSource(addr string, src netip.Addr, isLocal func(netip.Addr) boo
 	if err != nil {
 		return false
 	}
-	ip, src = ip.Unmap().WithZone(""), src.Unmap().WithZone("")
-	return ip == src || (isLocal(src) && (ip.IsLoopback() || isLocal(ip)))
+	return advertisedBy(ip, src, isLocal)
 }
 
 // verify probes the candidate's URLs in order; the first valid answer adds
