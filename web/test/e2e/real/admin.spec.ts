@@ -126,15 +126,16 @@ test.describe('discovery', () => {
     const modal = page.getByRole('dialog').filter({ has: page.getByRole('button', { name: 'Add server' }) })
     await expect(modal.getByRole('textbox', { name: /Endpoint URL/ })).toHaveValue(peer.url)
     const same = modal.getByRole('checkbox', { name: /Use the same credentials as/ })
-    if (await same.count()) {
-      await same.check()
-      // The peer listens on another port, so reusing the keys there needs an
-      // explicit trust confirmation.
-      await modal.getByRole('checkbox', { name: /^I trust .+ keys$/ }).check()
-    } else {
+    if (await same.count()) await same.check()
+    else {
       await modal.getByRole('textbox', { name: 'Access key ID' }).fill('e2eroot')
       await modal.getByRole('textbox', { name: 'Secret access key' }).fill('e2eroot-secret-key')
     }
+    // Either way the form holds the primary's keys for a peer on another port,
+    // so saving needs the explicit trust confirmation.
+    const trust = modal.getByRole('checkbox', { name: /^I trust .+ keys$/ })
+    await expect(trust).toBeVisible()
+    await trust.check()
     await modal.getByRole('button', { name: 'Add server' }).click()
     await expect(modal).toBeHidden()
     await expect(peerRow.getByRole('link', { name: new RegExp(`Open ${peer.name}`) }).or(peerRow.getByRole('button', { name: new RegExp(`Open ${peer.name}`) }))).toBeVisible()
