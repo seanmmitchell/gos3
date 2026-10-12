@@ -1,6 +1,6 @@
 # Weekly update pull requests for GitHub Actions, container base images, Go
 # modules, the web UI's npm packages and the compatibility suite's Python
-# packages.
+# packages. Like every change, they target dev (docs/releasing.md).
 #
 # Every ecosystem waits 14 days after a release before proposing it (the same
 # supply-chain cooldown web/pnpm-workspace.yaml enforces with
@@ -12,18 +12,21 @@ version: 2
 updates:
   - package-ecosystem: github-actions
     directory: /
+    target-branch: dev
     schedule:
       interval: weekly
     cooldown:
       default-days: 14
   - package-ecosystem: docker
     directories: ["/", "/deploy/docker"]
+    target-branch: dev
     schedule:
       interval: weekly
     cooldown:
       default-days: 14
   - package-ecosystem: gomod
     directory: /
+    target-branch: dev
     schedule:
       interval: weekly
     cooldown:
@@ -38,6 +41,7 @@ updates:
         versions: [">= 7.2.0"]
   - package-ecosystem: npm
     directory: /web
+    target-branch: dev
     schedule:
       interval: weekly
     cooldown:
@@ -47,6 +51,7 @@ updates:
         patterns: ["nuxt", "@nuxt/*", "vue", "vue-router", "vite", "vitest"]
   - package-ecosystem: pip
     directory: /test/compat
+    target-branch: dev
     schedule:
       interval: weekly
     cooldown:

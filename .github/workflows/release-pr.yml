@@ -1,0 +1,30 @@
+name: Release PR
+
+# main only receives release merges from dev (docs/releasing.md). The main
+# ruleset requires this check, so a pull request into main from any other
+# branch, or from a fork, cannot be merged. It re-runs when a pull request is
+# edited, which covers changing its base branch to main.
+
+on:
+  pull_request:
+    branches: [main]
+    types: [opened, edited, synchronize, reopened]
+
+permissions: {}
+
+jobs:
+  source:
+    name: Release PR source
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    steps:
+      - name: The head branch is dev of this repository
+        env:
+          HEAD_REF: ${{ github.head_ref }}
+          HEAD_REPO: ${{ github.event.pull_request.head.repo.full_name }}
+        run: |
+          if [ "$HEAD_REPO" != "$GITHUB_REPOSITORY" ] || [ "$HEAD_REF" != dev ]; then
+            echo "::error::Pull requests into main must come from dev of $GITHUB_REPOSITORY, not $HEAD_REPO:$HEAD_REF. Target dev instead."
+            exit 1
+          fi
+          echo "Release pull request from dev."
