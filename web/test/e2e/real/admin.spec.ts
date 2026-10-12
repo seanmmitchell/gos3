@@ -126,8 +126,12 @@ test.describe('discovery', () => {
     const modal = page.getByRole('dialog').filter({ has: page.getByRole('button', { name: 'Add server' }) })
     await expect(modal.getByRole('textbox', { name: /Endpoint URL/ })).toHaveValue(peer.url)
     const same = modal.getByRole('checkbox', { name: /Use the same credentials as/ })
-    if (await same.count()) await same.check()
-    else {
+    if (await same.count()) {
+      await same.check()
+      // The peer listens on another port, so reusing the keys there needs an
+      // explicit trust confirmation.
+      await modal.getByRole('checkbox', { name: /^I trust .+ keys$/ }).check()
+    } else {
       await modal.getByRole('textbox', { name: 'Access key ID' }).fill('e2eroot')
       await modal.getByRole('textbox', { name: 'Secret access key' }).fill('e2eroot-secret-key')
     }
