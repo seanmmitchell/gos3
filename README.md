@@ -68,6 +68,9 @@ docker run -d --name gos3 -p 9000:9000 -v gos3-data:/data \
   ghcr.io/seanmmitchell/gos3:latest
 ```
 
+`latest` is the newest release; `X.Y.Z` and `X.Y` pin a release, and `dev`
+follows the development branch.
+
 To build the image yourself, run `docker build -t gos3 .` or `make docker`.
 The image runs as a non-root user (uid 65532), keeps its data in `/data`, and
 has a health check.
@@ -323,6 +326,7 @@ More in [docs/security.md](docs/security.md).
 | [docs/admin-api.md](docs/admin-api.md) | admin JSON API |
 | [docs/discovery.md](docs/discovery.md) | discovery protocol |
 | [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | internals |
+| [docs/releasing.md](docs/releasing.md) | branches, branch rules, versioning, releases and dev builds |
 
 ## Development
 
@@ -368,8 +372,13 @@ docs/                documentation
 
 CI (`.github/workflows/ci.yml`) runs gofmt, vet, govulncheck, the Go unit and
 e2e tests with `-race`, the web typecheck, tests and builds, the Playwright suites, the
-compatibility suite, and the Docker builds. Pushing a `v*` tag builds release
-archives and a multi-arch image on `ghcr.io` (`release.yml`).
+compatibility suite, and the Docker builds.
+
+Pull requests target `dev`, the default branch; `main` only receives release
+merges from `dev`. Every push to `dev` publishes `ghcr.io/seanmmitchell/gos3:dev`,
+and the Release workflow tags `main` with the next version and publishes the
+archives and image. Branch rules, versioning and the release steps are in
+[docs/releasing.md](docs/releasing.md).
 
 ## Limitations
 

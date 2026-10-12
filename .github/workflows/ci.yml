@@ -2,7 +2,7 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    branches: [main, dev]
   pull_request:
   workflow_dispatch:
 
@@ -48,14 +48,12 @@ jobs:
         run: go test -race -count=1 ./test/e2e/...
 
   go-platforms:
-    # Release archives are published for macOS and Windows too. The code
-    # cross-compiles and vets for both, but the suites have not run on these
-    # runners yet (file locking, renaming open files and multicast differ):
-    # make the job blocking once it has passed there.
+    # Release archives are published for macOS and Windows too, so the suites
+    # run there as well (file locking, renaming open files and multicast
+    # differ). Both jobs are required checks in .github/rulesets.
     name: Go tests (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
     timeout-minutes: 30
-    continue-on-error: true
     strategy:
       fail-fast: false
       matrix:

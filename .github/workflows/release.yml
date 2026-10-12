@@ -1,143 +1,91 @@
 name: Release
 
-# Push a tag like v1.2.3 to build the binaries (with the web UI embedded),
-# publish a GitHub release with checksums, and push a multi-arch image to
-# ghcr.io/<owner>/<repo>.
+# Cut a release from main: Actions → Release → Run workflow, branch main, pick
+# the SemVer bump. The workflow tags main's head as the next version (the
+# newest vMAJOR.MINOR.PATCH tag, bumped), tests and builds it with build.yml,
+# pushes the multi-arch image to ghcr.io/<owner>/<repo> and publishes a GitHub
+# release with the archives, checksums and generated notes. Started again on a
+# commit that already carries a release tag, it rebuilds that release instead
+# of bumping, so a failed run can simply be repeated. See docs/releasing.md.
 
 on:
-  push:
-    tags: ["v*"]
   workflow_dispatch:
     inputs:
-      tag:
-        description: Existing tag to (re)release, e.g. v1.2.3
-        required: true
+      bump:
+        description: Part of the newest release version to increment
+        type: choice
+        options: [patch, minor, major]
+        default: patch
 
 permissions:
   contents: read
 
 concurrency:
-  group: release-${{ github.ref }}
+  group: release
   cancel-in-progress: false
 
-env:
-  NODE_VERSION: "22"
-  CI: "true"
-  NUXT_TELEMETRY_DISABLED: "1"
-  COREPACK_ENABLE_DOWNLOAD_PROMPT: "0"
-  TAG: ${{ inputs.tag || github.ref_name }}
-
 jobs:
-  # Nothing is built or published unless the tagged commit passes the Go
-  # checks (the full matrix, including the web and Playwright suites, runs
-  # in ci.yml on every push and pull request).
-  test:
-    name: Go (vet, test, e2e)
+  version:
+    name: Tag the release
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 5
+    permissions:
+      contents: write
+    outputs:
+      tag: ${{ steps.tag.outputs.tag }}
     steps:
-      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
-        with:
-          ref: ${{ env.TAG }}
-      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
-        with:
-          go-version-file: go.mod
-          cache: true
-      - run: go vet ./...
-      - run: go test -race -count=1 ./cmd/... ./internal/...
-      - run: go test -race -count=1 ./test/e2e/...
-
-  ui:
-    name: Build embedded UI
-    runs-on: ubuntu-latest
-    timeout-minutes: 20
-    needs: test
-    steps:
-      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
-        with:
-          ref: ${{ env.TAG }}
-      - uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5.0.0
-        with:
-          node-version: ${{ env.NODE_VERSION }}
-      - name: Test and build (pnpm generate:embed)
-        working-directory: web
+      - name: Releases are cut from main
+        if: github.ref != 'refs/heads/main'
         run: |
-          corepack enable
-          pnpm install --frozen-lockfile
-          pnpm typecheck
-          pnpm test
-          pnpm generate:embed
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
-        with:
-          name: ui-embed
-          path: web/.output/public/
-          retention-days: 3
-
-  binaries:
-    name: gos3 ${{ matrix.goos }}/${{ matrix.goarch }}
-    runs-on: ubuntu-latest
-    timeout-minutes: 20
-    needs: ui
-    strategy:
-      fail-fast: true
-      matrix:
-        goos: [linux, darwin, windows]
-        goarch: [amd64, arm64]
-    steps:
+          echo "::error::Run the Release workflow on main, not $GITHUB_REF."
+          exit 1
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
         with:
-          ref: ${{ env.TAG }}
           fetch-depth: 0
-      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
-        with:
-          go-version-file: go.mod
-          cache: true
-      - uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5.0.0
-        with:
-          name: ui-embed
-          path: ui-embed
-      - name: Embed the UI
-        # Same steps as `make ui`: replace the placeholder with the build.
-        run: |
-          dist=internal/webui/dist
-          find "$dist" -mindepth 1 -maxdepth 1 ! -name .keep -exec rm -rf {} +
-          cp -R ui-embed/. "$dist/"
-          test -f "$dist/index.html" || cp "$dist/200.html" "$dist/index.html"
-      - name: Build
+      - name: Create the tag
+        id: tag
         env:
-          GOOS: ${{ matrix.goos }}
-          GOARCH: ${{ matrix.goarch }}
-          CGO_ENABLED: "0"
+          BUMP: ${{ inputs.bump }}
         run: |
-          pkg=github.com/seanmmitchell/gos3/internal/version
-          commit="$(git rev-parse --short=12 HEAD)"
-          date="$(git log -1 --format=%cI HEAD)"
-          ext=""; [ "$GOOS" = windows ] && ext=".exe"
-          name="gos3_${TAG#v}_${GOOS}_${GOARCH}"
-          mkdir -p "build/$name" dist
-          go build -trimpath \
-            -ldflags "-s -w -X $pkg.Version=$TAG -X $pkg.Commit=$commit -X $pkg.Date=$date" \
-            -o "build/$name/gos3$ext" ./cmd/gos3
-          cp LICENSE THIRD_PARTY_NOTICES README.md "build/$name/"
-          if [ "$GOOS" = windows ]; then
-            (cd build && zip -qr "../dist/$name.zip" "$name")
+          tag="$(.github/scripts/release-version.sh next "$BUMP")"
+          if git rev-parse -q --verify "refs/tags/$tag" >/dev/null; then
+            echo "$tag already tags $(git rev-parse --short=12 HEAD); rebuilding it."
           else
-            tar -C build -czf "dist/$name.tar.gz" "$name"
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git tag -a "$tag" -m "gos3 $tag"
+            git push origin "refs/tags/$tag"
+            echo "Tagged $(git rev-parse --short=12 HEAD) as $tag."
           fi
-          ls -l dist
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
-        with:
-          name: bin-${{ matrix.goos }}-${{ matrix.goarch }}
-          path: dist/*
-          retention-days: 3
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+
+  build:
+    name: Build
+    needs: version
+    permissions:
+      contents: read
+      packages: write
+    uses: ./.github/workflows/build.yml
+    with:
+      ref: ${{ needs.version.outputs.tag }}
+      version: ${{ needs.version.outputs.tag }}
+      # No floating major tag before 1.0.0: 0.x minor releases may break.
+      image-tags: |
+        type=semver,pattern={{version}},value=${{ needs.version.outputs.tag }}
+        type=semver,pattern={{major}}.{{minor}},value=${{ needs.version.outputs.tag }}
+        type=semver,pattern={{major}},value=${{ needs.version.outputs.tag }},enable=${{ !startsWith(needs.version.outputs.tag, 'v0.') }}
+      image-latest: auto
+      cache-scope: release
 
   release:
     name: GitHub release
     runs-on: ubuntu-latest
     timeout-minutes: 10
-    needs: binaries
+    needs: [version, build]
     permissions:
       contents: write
+    env:
+      TAG: ${{ needs.version.outputs.tag }}
     steps:
       - uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5.0.0
         with:
@@ -154,61 +102,8 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
         run: |
-          prerelease=""
-          case "$TAG" in *-*) prerelease="--prerelease" ;; esac
           if gh release view "$TAG" >/dev/null 2>&1; then
             gh release upload "$TAG" dist/* --clobber
           else
-            gh release create "$TAG" dist/* --verify-tag --title "gos3 $TAG" --generate-notes $prerelease
+            gh release create "$TAG" dist/* --verify-tag --title "gos3 $TAG" --generate-notes
           fi
-
-  image:
-    name: Container image (ghcr.io)
-    runs-on: ubuntu-latest
-    timeout-minutes: 45
-    # Only publish an image for a tag whose binaries built.
-    needs: binaries
-    permissions:
-      contents: read
-      packages: write
-    steps:
-      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
-        with:
-          ref: ${{ env.TAG }}
-      - name: Build metadata
-        id: vars
-        run: |
-          echo "commit=$(git rev-parse --short=12 HEAD)" >> "$GITHUB_OUTPUT"
-          echo "date=$(git log -1 --format=%cI HEAD)" >> "$GITHUB_OUTPUT"
-      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3.12.0
-      - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3.7.0
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-      - id: meta
-        uses: docker/metadata-action@c299e40c65443455700f0fdfc63efafe5b349051 # v5.10.0
-        with:
-          images: ghcr.io/${{ github.repository }}
-          tags: |
-            type=semver,pattern={{version}},value=${{ env.TAG }}
-            type=semver,pattern={{major}}.{{minor}},value=${{ env.TAG }}
-            type=semver,pattern={{major}},value=${{ env.TAG }}
-          # A manual re-release of an older tag must not move "latest" back.
-          flavor: |
-            latest=${{ github.event_name == 'push' && 'auto' || 'false' }}
-      - uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6.19.2
-        with:
-          context: .
-          platforms: linux/amd64,linux/arm64
-          push: true
-          tags: ${{ steps.meta.outputs.tags }}
-          labels: ${{ steps.meta.outputs.labels }}
-          build-args: |
-            VERSION=${{ env.TAG }}
-            COMMIT=${{ steps.vars.outputs.commit }}
-            DATE=${{ steps.vars.outputs.date }}
-          cache-from: type=gha,scope=gos3-release
-          cache-to: type=gha,mode=max,scope=gos3-release
-          provenance: true
-          sbom: true

@@ -1,0 +1,47 @@
+{
+  "name": "dev",
+  "target": "branch",
+  "enforcement": "active",
+  "conditions": {
+    "ref_name": {
+      "include": ["refs/heads/dev"],
+      "exclude": []
+    }
+  },
+  "bypass_actors": [],
+  "rules": [
+    { "type": "deletion" },
+    { "type": "non_fast_forward" },
+    { "type": "required_linear_history" },
+    { "type": "required_signatures" },
+    {
+      "type": "pull_request",
+      "parameters": {
+        "required_approving_review_count": 0,
+        "dismiss_stale_reviews_on_push": true,
+        "require_code_owner_review": false,
+        "require_last_push_approval": false,
+        "required_review_thread_resolution": true,
+        "allowed_merge_methods": ["squash"]
+      }
+    },
+    {
+      "type": "required_status_checks",
+      "parameters": {
+        "strict_required_status_checks_policy": false,
+        "do_not_enforce_on_create": false,
+        "required_status_checks": [
+          { "context": "Go (fmt, vet, test, e2e)", "integration_id": 15368 },
+          { "context": "Go tests (macos-latest)", "integration_id": 15368 },
+          { "context": "Go tests (windows-latest)", "integration_id": 15368 },
+          { "context": "Web UI (typecheck, test, build)", "integration_id": 15368 },
+          { "context": "Playwright (mocked, real server, standalone)", "integration_id": 15368 },
+          { "context": "Compatibility (boto3, AWS CLI)", "integration_id": 15368 },
+          { "context": "Docker images", "integration_id": 15368 },
+          { "context": "Socket Security: Pull Request Alerts" },
+          { "context": "GitGuardian Security Checks" }
+        ]
+      }
+    }
+  ]
+}
