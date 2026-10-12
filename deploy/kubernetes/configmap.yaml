@@ -1,0 +1,50 @@
+# Static gos3 configuration (mounted at /etc/gos3/config.yaml, GOS3_CONFIG).
+# Per-pod values (public URL, DNS SRV domain) are set as environment
+# variables in the StatefulSet, which override this file. Runtime settings
+# changed through the admin API / web UI are stored in
+# /data/.gos3/settings.json and win over this file from then on.
+# Keep secrets out of this ConfigMap: root keys come from the Secret.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: gos3-config
+  labels:
+    app.kubernetes.io/name: gos3
+data:
+  config.yaml: |
+    server:
+      address: ":9000"
+      region: us-east-1
+      # Virtual-hosted-style addressing (<bucket>.s3.example.com) behind an
+      # Ingress with a wildcard host:
+      # domains: ["s3.example.com"]
+      # Behind an Ingress / reverse proxy: honour X-Forwarded-For /
+      # X-Forwarded-Proto, but only from the Ingress controller. The client is
+      # the rightmost X-Forwarded-For entry that is not one of these
+      # addresses. A whole pod network lets every pod in it choose its own
+      # aws:SourceIp: use it only when a NetworkPolicy lets nothing but the
+      # Ingress controller reach gos3 (see docs/deployment.md).
+      trust_proxy_headers: false
+      # trusted_proxies: ["10.244.0.0/16"]
+    storage:
+      backend: fs
+      path: /data
+      fsync_data: true
+    discovery:
+      enabled: true
+      # Multicast (mDNS, beacon) rarely crosses pod networks; servers find
+      # each other through the headless Service's _gos3._tcp SRV records
+      # (GOS3_DISCOVERY_DNS_SRV in the StatefulSet).
+      mdns: false
+      beacon: false
+      # Network scans from inside the cluster are rarely wanted.
+      allow_scan: false
+    logging:
+      level: info
+      format: json
+      access_log: true
+    metrics:
+      enabled: true
+      # Prometheus cannot sign requests: either set public: true and restrict
+      # access with a NetworkPolicy, or scrape through an authenticating proxy.
+      public: false

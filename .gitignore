@@ -1,0 +1,36 @@
+# Go
+/bin/
+# `go build ./cmd/gos3` in the repository root
+/gos3
+/gos3.exe
+/dist/
+*.test
+*.out
+coverage.*
+
+# runtime data
+/data/
+*.db
+
+# embedded UI build output (placeholder index.html is committed)
+/internal/webui/dist/*
+!/internal/webui/dist/.keep
+!/internal/webui/dist/index.html
+
+# Python (test/compat; its venv normally lives outside the repo)
+__pycache__/
+*.py[cod]
+.venv/
+.pytest_cache/
+
+# web
+node_modules/
+web/.nuxt/
+web/.output/
+web/.data/
+web/dist
+web/test-results/
+web/playwright-report/
+.DS_Store
+*.log
+.env

@@ -1,0 +1,241 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  NODE_VERSION: "22"
+  CI: "true"
+  NUXT_TELEMETRY_DISABLED: "1"
+  COREPACK_ENABLE_DOWNLOAD_PROMPT: "0"
+
+jobs:
+  go:
+    name: Go (fmt, vet, test, e2e)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: gofmt
+        run: |
+          unformatted="$(gofmt -l cmd internal test)"
+          if [ -n "$unformatted" ]; then
+            echo "::error::gofmt needed:"; echo "$unformatted"; exit 1
+          fi
+      - name: go mod tidy is clean
+        run: go mod tidy -diff
+      - name: go vet
+        run: go vet ./...
+      - name: govulncheck
+        run: go run golang.org/x/vuln/cmd/govulncheck@v1.8.0 ./...
+      - name: Unit tests (race)
+        run: go test -race -count=1 ./cmd/... ./internal/...
+      - name: End-to-end tests (race)
+        run: go test -race -count=1 ./test/e2e/...
+
+  go-platforms:
+    # Release archives are published for macOS and Windows too. The code
+    # cross-compiles and vets for both, but the suites have not run on these
+    # runners yet (file locking, renaming open files and multicast differ):
+    # make the job blocking once it has passed there.
+    name: Go tests (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    continue-on-error: true
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Unit tests
+        run: go test -count=1 ./cmd/... ./internal/...
+      - name: End-to-end tests
+        run: go test -count=1 ./test/e2e/...
+
+  web:
+    name: Web UI (typecheck, test, build)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    defaults:
+      run:
+        working-directory: web
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+      - uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5.0.0
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+      # For the THIRD_PARTY_NOTICES check (internal/tools/notices).
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Enable pnpm (corepack)
+        run: |
+          corepack enable
+          pnpm --version
+          echo "PNPM_STORE=$(pnpm store path --silent)" >> "$GITHUB_ENV"
+      - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: ${{ env.PNPM_STORE }}
+          key: pnpm-${{ runner.os }}-${{ hashFiles('web/pnpm-lock.yaml') }}
+          restore-keys: pnpm-${{ runner.os }}-
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm typecheck
+      - run: pnpm test
+      - name: Standalone build
+        run: pnpm build
+      - name: Embedded build
+        run: pnpm generate:embed
+      # Both builds above record the npm packages they ship in web/.notices.
+      - name: THIRD_PARTY_NOTICES is up to date
+        working-directory: .
+        run: go run ./internal/tools/notices -check
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: ui-embed
+          path: web/.output/public/
+          retention-days: 7
+
+  playwright:
+    name: Playwright (mocked, real server, standalone)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    needs: [go, web]
+    env:
+      PLAYWRIGHT_BROWSERS_PATH: ${{ github.workspace }}/.pw-browsers
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
+        with:
+          go-version-file: go.mod
+          cache: true
+      - uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5.0.0
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+      - name: Enable pnpm (corepack)
+        run: |
+          corepack enable
+          echo "PNPM_STORE=$(cd web && pnpm store path --silent)" >> "$GITHUB_ENV"
+      - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: ${{ env.PNPM_STORE }}
+          key: pnpm-${{ runner.os }}-${{ hashFiles('web/pnpm-lock.yaml') }}
+          restore-keys: pnpm-${{ runner.os }}-
+      - name: Build gos3 with the embedded UI
+        run: make build
+      - name: Install Chromium
+        working-directory: web
+        run: pnpm exec playwright install --with-deps chromium
+      - name: Mocked UI tests
+        working-directory: web
+        run: pnpm test:e2e
+      - name: Real-server tests (embedded UI in bin/gos3)
+        working-directory: web
+        env:
+          GOS3_BIN: ${{ github.workspace }}/bin/gos3
+          E2E_SKIP_UI_BUILD: "1"
+        run: pnpm test:e2e:real
+      - name: Standalone UI tests (cross-origin)
+        working-directory: web
+        env:
+          GOS3_BIN: ${{ github.workspace }}/bin/gos3
+        run: pnpm test:e2e:standalone
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        if: failure()
+        with:
+          name: playwright-results
+          path: |
+            web/test-results/
+            web/playwright-report/
+          retention-days: 7
+
+  compat:
+    name: Compatibility (boto3, AWS CLI)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    needs: [go]
+    env:
+      GOS3_COMPAT_VENV: ${{ github.workspace }}/.compat-venv
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
+        with:
+          go-version-file: go.mod
+          cache: true
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        id: python
+        with:
+          python-version: "3.13"
+      # A venv links to its interpreter's absolute path, so the key includes
+      # the exact Python version: a runner image with a new 3.13.x starts a
+      # fresh venv instead of restoring one with dangling links.
+      - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: ${{ env.GOS3_COMPAT_VENV }}
+          key: compat-venv-${{ runner.os }}-py${{ steps.python.outputs.python-version }}-${{ hashFiles('test/compat/requirements.txt') }}
+      - name: Run test/compat/run.sh
+        run: test/compat/run.sh
+
+  docker:
+    name: Docker images
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3.12.0
+      - name: Build gos3 image
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6.19.2
+        with:
+          context: .
+          load: true
+          tags: gos3:ci
+          build-args: |
+            VERSION=ci-${{ github.sha }}
+            COMMIT=${{ github.sha }}
+          cache-from: type=gha,scope=gos3
+          cache-to: type=gha,mode=max,scope=gos3
+      - name: Smoke test gos3 image
+        run: |
+          docker run -d --name gos3 -p 9000:9000 \
+            -e GOS3_ROOT_ACCESS_KEY=ciroot -e GOS3_ROOT_SECRET_KEY=ciroot-secret gos3:ci
+          for i in $(seq 1 30); do
+            status="$(docker inspect --format '{{.State.Health.Status}}' gos3)"
+            [ "$status" = healthy ] && break
+            sleep 2
+          done
+          docker logs gos3
+          [ "$status" = healthy ] || { echo "::error::container is $status"; exit 1; }
+          curl -fsS http://127.0.0.1:9000/_gos3/ready
+          curl -fsS http://127.0.0.1:9000/_gos3/info | grep -q '"ui"'
+          curl -fsS http://127.0.0.1:9000/_gos3/ui/ | grep -qi '<html'
+          docker rm -f gos3
+      - name: Build standalone UI image
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6.19.2
+        with:
+          context: .
+          file: deploy/docker/web.Dockerfile
+          load: true
+          tags: gos3-ui:ci
+          cache-from: type=gha,scope=gos3-ui
+          cache-to: type=gha,mode=max,scope=gos3-ui
+      - name: Validate docker-compose.yml
+        run: docker compose --profile ui config --quiet

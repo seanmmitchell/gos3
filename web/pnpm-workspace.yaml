@@ -1,0 +1,40 @@
+# pnpm settings for the web UI (a single package, not a workspace).
+
+# Supply-chain cooldown: only resolve package versions that were published at
+# least 14 days ago (value in minutes). Malicious or broken releases are
+# usually caught and pulled within days, and the dependency scanner on this
+# repository (Socket) flags versions younger than about two weeks. Raise a
+# dependency past the cooldown only for a security fix, via
+# minimumReleaseAgeExclude below.
+minimumReleaseAge: 20160
+minimumReleaseAgeExclude:
+  # Security fixes younger than the cooldown, pinned below in overrides.
+  - shell-quote
+  - source-map-js
+
+# Patched versions of vulnerable transitive dependencies.
+overrides:
+  # Nuxt devtools (disabled in nuxt.config.ts) pulls simple-git:
+  # GHSA-x6jw-m9v5-85vh, GHSA-858h-whjf-mvg5, GHSA-v5rq-49vh-5v5c.
+  simple-git: ^4.0.2
+  '@simple-git/argv-parser': ^2.0.1
+  # esbuild dev-server file read, via @nuxt/fonts.
+  fontless>esbuild: ^0.28.1
+  # GHSA-pqg4-j6r4-53mv (critical): quote() command injection, via Nuxt
+  # devtools' launch-editor. Oldest fixed release.
+  shell-quote: 1.11.0
+  # GHSA-68fv-2mgg-jv7q: event-loop DoS, via postcss. Oldest fixed release.
+  source-map-js: 1.2.2
+  # WebAssembly fallbacks, loaded only when the native binary is missing (a
+  # platform without a prebuilt one). Removed to keep unused code out of the
+  # dependency tree; every supported platform has the native package.
+  '@tailwindcss/oxide-wasm32-wasi': '-'
+  '@parcel/watcher-wasm': '-'
+
+# Only these packages may run install scripts.
+onlyBuiltDependencies:
+  - esbuild
+  - '@parcel/watcher'
+  - vue-demi
+  - '@tailwindcss/oxide'
+  - unrs-resolver

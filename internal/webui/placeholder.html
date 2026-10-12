@@ -1,0 +1,24 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="gos3-ui-placeholder" content="true">
+<title>gos3 — UI not built</title>
+<style>
+  :root { color-scheme: light dark; }
+  body { font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; max-width: 40rem; margin: 4rem auto; padding: 0 1rem; line-height: 1.5; }
+  code, pre { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+  pre { padding: .75rem 1rem; border-radius: .5rem; background: rgba(127,127,127,.15); overflow-x: auto; }
+</style>
+</head>
+<body>
+<h1>UI not built — run <code>make ui</code></h1>
+<p>This gos3 binary was built without the embedded web UI. The S3 API and the
+admin API work normally; only the browser interface is missing.</p>
+<p>To embed the UI, build it and rebuild the binary from the repository root:</p>
+<pre>make build      # = make ui + make build-go</pre>
+<p>Alternatively run the UI standalone (<code>cd web &amp;&amp; pnpm install &amp;&amp; pnpm dev</code>)
+and connect it to this server.</p>
+</body>
+</html>
