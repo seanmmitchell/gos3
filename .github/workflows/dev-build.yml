@@ -1,0 +1,55 @@
+name: Dev build
+
+# Every push to dev builds what the next release would ship: archives for all
+# platforms (bin-<os>-<arch> artifacts of this run, kept 30 days) and the
+# multi-arch image ghcr.io/<owner>/<repo>:dev, also tagged dev-<commit>. The
+# version is the next patch release as a prerelease, e.g.
+# v0.1.1-dev.42+0123456789ab. Nothing is published on the Releases page. See
+# docs/releasing.md.
+
+on:
+  push:
+    branches: [dev]
+
+permissions:
+  contents: read
+
+# Only the newest dev commit matters; a newer push replaces a running build.
+concurrency:
+  group: dev-build
+  cancel-in-progress: true
+
+jobs:
+  version:
+    name: Version
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      commit: ${{ steps.version.outputs.commit }}
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          fetch-depth: 0
+      - id: version
+        run: |
+          version="$(.github/scripts/release-version.sh dev "$GITHUB_RUN_NUMBER")"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "commit=$(git rev-parse --short=12 HEAD)" >> "$GITHUB_OUTPUT"
+          echo "Dev build $version"
+
+  build:
+    name: Build
+    needs: version
+    permissions:
+      contents: read
+      packages: write
+    uses: ./.github/workflows/build.yml
+    with:
+      ref: ${{ github.sha }}
+      version: ${{ needs.version.outputs.version }}
+      image-tags: |
+        type=raw,value=dev
+        type=raw,value=dev-${{ needs.version.outputs.commit }}
+      cache-scope: dev
+      retention-days: 30

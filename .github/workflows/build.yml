@@ -1,0 +1,201 @@
+name: Build
+
+# Reusable build shared by release.yml (tagged releases from main) and
+# dev-build.yml (every push to dev): runs the Go tests, builds the embedded web
+# UI, cross-compiles gos3 with the UI embedded for every release platform and,
+# when image-tags is set, pushes a multi-arch image to ghcr.io/<owner>/<repo>.
+# The archives are uploaded as bin-<os>-<arch> artifacts for the caller.
+
+on:
+  workflow_call:
+    inputs:
+      ref:
+        description: Commit, branch or tag to build.
+        required: true
+        type: string
+      version:
+        description: Version stamped into the binaries, e.g. v1.2.3 or v1.2.4-dev.7+0123456789ab.
+        required: true
+        type: string
+      image-tags:
+        description: docker/metadata-action tags for the ghcr.io image; empty skips the image.
+        required: false
+        type: string
+        default: ""
+      image-latest:
+        description: docker/metadata-action "latest" flavor (auto, true or false).
+        required: false
+        type: string
+        default: "false"
+      cache-scope:
+        description: Buildx cache scope, so release and dev builds keep separate caches.
+        required: false
+        type: string
+        default: gos3
+      retention-days:
+        description: Days to keep the bin-* artifacts.
+        required: false
+        type: number
+        default: 3
+
+permissions:
+  contents: read
+
+env:
+  NODE_VERSION: "22"
+  CI: "true"
+  NUXT_TELEMETRY_DISABLED: "1"
+  COREPACK_ENABLE_DOWNLOAD_PROMPT: "0"
+  REF: ${{ inputs.ref }}
+  VERSION: ${{ inputs.version }}
+
+jobs:
+  # Nothing is built or published unless the commit passes the Go checks (the
+  # full matrix, including the web and Playwright suites, runs in ci.yml on
+  # every pull request and is required before anything reaches dev or main).
+  test:
+    name: Go (vet, test, e2e)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          ref: ${{ env.REF }}
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
+        with:
+          go-version-file: go.mod
+          cache: true
+      - run: go vet ./...
+      - run: go test -race -count=1 ./cmd/... ./internal/...
+      - run: go test -race -count=1 ./test/e2e/...
+
+  ui:
+    name: Build embedded UI
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    needs: test
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          ref: ${{ env.REF }}
+      - uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5.0.0
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+      - name: Test and build (pnpm generate:embed)
+        working-directory: web
+        run: |
+          corepack enable
+          pnpm install --frozen-lockfile
+          pnpm typecheck
+          pnpm test
+          pnpm generate:embed
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: ui-embed
+          path: web/.output/public/
+          retention-days: 3
+
+  binaries:
+    name: gos3 ${{ matrix.goos }}/${{ matrix.goarch }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    needs: ui
+    strategy:
+      fail-fast: true
+      matrix:
+        goos: [linux, darwin, windows]
+        goarch: [amd64, arm64]
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          ref: ${{ env.REF }}
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
+        with:
+          go-version-file: go.mod
+          cache: true
+      - uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5.0.0
+        with:
+          name: ui-embed
+          path: ui-embed
+      - name: Embed the UI
+        # Same steps as `make ui`: replace the placeholder with the build.
+        run: |
+          dist=internal/webui/dist
+          find "$dist" -mindepth 1 -maxdepth 1 ! -name .keep -exec rm -rf {} +
+          cp -R ui-embed/. "$dist/"
+          test -f "$dist/index.html" || cp "$dist/200.html" "$dist/index.html"
+      - name: Build
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          CGO_ENABLED: "0"
+        run: |
+          pkg=github.com/seanmmitchell/gos3/internal/version
+          commit="$(git rev-parse --short=12 HEAD)"
+          date="$(git log -1 --format=%cI HEAD)"
+          ext=""; [ "$GOOS" = windows ] && ext=".exe"
+          name="gos3_${VERSION#v}_${GOOS}_${GOARCH}"
+          mkdir -p "build/$name" dist
+          go build -trimpath \
+            -ldflags "-s -w -X $pkg.Version=$VERSION -X $pkg.Commit=$commit -X $pkg.Date=$date" \
+            -o "build/$name/gos3$ext" ./cmd/gos3
+          cp LICENSE THIRD_PARTY_NOTICES README.md "build/$name/"
+          if [ "$GOOS" = windows ]; then
+            (cd build && zip -qr "../dist/$name.zip" "$name")
+          else
+            tar -C build -czf "dist/$name.tar.gz" "$name"
+          fi
+          ls -l dist
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: bin-${{ matrix.goos }}-${{ matrix.goarch }}
+          path: dist/*
+          retention-days: ${{ inputs.retention-days }}
+
+  image:
+    name: Container image (ghcr.io)
+    if: inputs.image-tags != ''
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    # Only publish an image for a commit whose binaries built.
+    needs: binaries
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          ref: ${{ env.REF }}
+      - name: Build metadata
+        id: vars
+        run: |
+          echo "commit=$(git rev-parse --short=12 HEAD)" >> "$GITHUB_OUTPUT"
+          echo "date=$(git log -1 --format=%cI HEAD)" >> "$GITHUB_OUTPUT"
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3.12.0
+      - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3.7.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - id: meta
+        uses: docker/metadata-action@c299e40c65443455700f0fdfc63efafe5b349051 # v5.10.0
+        with:
+          images: ghcr.io/${{ github.repository }}
+          tags: ${{ inputs.image-tags }}
+          flavor: |
+            latest=${{ inputs.image-latest }}
+      - uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6.19.2
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          build-args: |
+            VERSION=${{ env.VERSION }}
+            COMMIT=${{ steps.vars.outputs.commit }}
+            DATE=${{ steps.vars.outputs.date }}
+          cache-from: type=gha,scope=gos3-${{ inputs.cache-scope }}
+          cache-to: type=gha,mode=max,scope=gos3-${{ inputs.cache-scope }}
+          provenance: true
+          sbom: true

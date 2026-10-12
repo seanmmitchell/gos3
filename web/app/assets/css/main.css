@@ -1,0 +1,20 @@
+@import "tailwindcss";
+@import "@nuxt/ui";
+
+/* Only scan our own sources (and Nuxt UI) for Tailwind classes. */
+@source "../../../app";
+
+@theme static {
+  /* System font stacks — no remote fonts (the embedded UI must work offline). */
+  --font-sans: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, "Noto Sans", sans-serif, "Apple Color Emoji", "Segoe UI Emoji";
+  --font-mono: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
+}
+
+:root {
+  --ui-radius: 0.375rem;
+}
+
+/* Tabular figures for sizes / counters. */
+.tabular-nums {
+  font-variant-numeric: tabular-nums;
+}

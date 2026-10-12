@@ -1,0 +1,20 @@
+# Client stack for the gos3 Python / AWS CLI compatibility suite. run.sh
+# installs the hash-locked requirements.txt compiled from this file.
+#
+# Every version, including the transitive ones, must be at least 14 days old
+# (the supply-chain cooldown also enforced for npm and Go). Regenerate with:
+#
+#   uv pip compile --universal --python-version 3.10 --generate-hashes \
+#     --exclude-newer "$(date -u -d '14 days ago' +%FT%TZ)" \
+#     test/compat/requirements.in -o test/compat/requirements.txt
+#
+# boto3 and botocore are released in lockstep; keep them on the same version.
+awscli==1.46.1
+boto3==1.43.103
+botocore[crt]==1.43.103
+s3transfer==0.19.2
+# awscrt provides CRC32C and CRC64NVME checksums for botocore.
+awscrt==0.36.0
+pytest==9.1.1
+requests==2.34.2
+urllib3==2.8.0

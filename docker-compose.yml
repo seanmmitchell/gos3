@@ -1,0 +1,103 @@
+# gos3 two-node demo.
+#
+#   docker compose up -d --build            # two gos3 nodes
+#   docker compose --profile ui up -d --build   # + the standalone web UI
+#
+#   node 1: http://localhost:9001  (embedded UI: http://localhost:9001/_gos3/ui/)
+#   node 2: http://localhost:9002
+#   standalone UI (profile "ui"): http://localhost:3000
+#
+# The published ports listen on 127.0.0.1 only, because both nodes share
+# the well-known demo root credentials below (override them with
+# GOS3_ROOT_ACCESS_KEY / GOS3_ROOT_SECRET_KEY in the environment or an .env
+# file). To reach the demo from other machines, set your own keys AND
+# GOS3_DEMO_BIND=0.0.0.0 (or a specific host address). They find each other through the UDP multicast beacon on the shared
+# network, with static seeds as a fallback where multicast is unavailable;
+# the Discovery page of either node lists the other one. Peers are advertised
+# with their container addresses, which the host browser may not reach
+# (Docker Desktop): add servers through the published localhost ports.
+#
+# Data lives in the named volumes gos3-1-data / gos3-2-data
+# (`docker compose down -v` deletes it).
+
+x-gos3: &gos3
+  build:
+    context: .
+    args:
+      VERSION: ${GOS3_VERSION:-dev}
+  image: gos3:${GOS3_VERSION:-dev}
+  restart: unless-stopped
+  networks: [gos3]
+
+x-gos3-env: &gos3-env
+  GOS3_ROOT_ACCESS_KEY: ${GOS3_ROOT_ACCESS_KEY:-gos3admin}
+  GOS3_ROOT_SECRET_KEY: ${GOS3_ROOT_SECRET_KEY:-gos3admin-secret}
+  GOS3_DISCOVERY_ENABLED: "true"
+  GOS3_DISCOVERY_BEACON: "true"
+  # mDNS works too, but the beacon is enough on one bridge network.
+  GOS3_DISCOVERY_MDNS: "false"
+  GOS3_LOG_LEVEL: info
+
+services:
+  gos3-1:
+    <<: *gos3
+    hostname: gos3-1
+    environment:
+      <<: *gos3-env
+      GOS3_NAME: node-1
+      GOS3_DISCOVERY_SEEDS: http://gos3-2:9000
+    ports:
+      - "${GOS3_DEMO_BIND:-127.0.0.1}:9001:9000"
+    volumes:
+      - gos3-1-data:/data
+
+  gos3-2:
+    <<: *gos3
+    hostname: gos3-2
+    environment:
+      <<: *gos3-env
+      GOS3_NAME: node-2
+      GOS3_DISCOVERY_SEEDS: http://gos3-1:9000
+    ports:
+      - "${GOS3_DEMO_BIND:-127.0.0.1}:9002:9000"
+    volumes:
+      - gos3-2-data:/data
+
+  # Standalone web UI (Node). The browser talks to the nodes directly through
+  # the published ports, so both are preset with their localhost URLs; the
+  # nodes' default CORS policy (allowed_origins "*") admits the UI origin.
+  # Its local discovery (beacon query / scan) runs inside the compose network.
+  # It is off by default in the image (the Node server has no
+  # authentication) and turned on here because the port is published on
+  # 127.0.0.1 only; set GOS3_UI_LOCAL_DISCOVERY=false when you change
+  # GOS3_DEMO_BIND. Those routes only answer when the UI is opened via an IP
+  # address or localhost; list any DNS name you open it with in
+  # GOS3_UI_ALLOWED_HOSTS.
+  ui:
+    profiles: [ui]
+    build:
+      context: .
+      dockerfile: deploy/docker/web.Dockerfile
+    image: gos3-ui:${GOS3_VERSION:-dev}
+    restart: unless-stopped
+    networks: [gos3]
+    environment:
+      NUXT_PUBLIC_SERVERS: >-
+        [{"id":"node-1","name":"node-1","endpoint":"http://localhost:9001","kind":"gos3"},
+        {"id":"node-2","name":"node-2","endpoint":"http://localhost:9002","kind":"gos3"}]
+      GOS3_UI_LOCAL_DISCOVERY: ${GOS3_UI_LOCAL_DISCOVERY:-true}
+      GOS3_UI_ALLOWED_HOSTS: ${GOS3_UI_ALLOWED_HOSTS:-}
+    ports:
+      - "${GOS3_DEMO_BIND:-127.0.0.1}:3000:3000"
+    depends_on:
+      gos3-1:
+        condition: service_healthy
+      gos3-2:
+        condition: service_healthy
+
+networks:
+  gos3: {}
+
+volumes:
+  gos3-1-data: {}
+  gos3-2-data: {}
