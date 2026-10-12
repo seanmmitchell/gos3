@@ -34,8 +34,9 @@ if ! "$venv/bin/python" -c '' 2>/dev/null || ! cmp -s "$here/requirements.txt" "
 	fi
 	log "creating venv $venv"
 	python3 -m venv --clear "$venv"
-	"$venv/bin/python" -m pip install --quiet --upgrade pip
-	"$venv/bin/python" -m pip install --quiet -r "$here/requirements.txt"
+	# requirements.txt is hash-locked (see requirements.in); the venv's bundled
+	# pip installs it as-is, without first upgrading to an unpinned pip.
+	"$venv/bin/python" -m pip install --quiet --require-hashes -r "$here/requirements.txt"
 	cp "$here/requirements.txt" "$stamp"
 else
 	log "reusing venv $venv"

@@ -1,9 +1,11 @@
 # Weekly update pull requests for GitHub Actions, container base images, Go
-# modules and the web UI's npm packages.
+# modules, the web UI's npm packages and the compatibility suite's Python
+# packages.
 #
 # Every ecosystem waits 14 days after a release before proposing it (the same
 # supply-chain cooldown web/pnpm-workspace.yaml enforces with
-# minimumReleaseAge), so freshly published, possibly malicious or broken
+# minimumReleaseAge and test/compat/requirements.in documents for the
+# compiled Python lock), so freshly published, possibly malicious or broken
 # versions are never picked up automatically. Security updates are not
 # delayed by the cooldown.
 version: 2
@@ -43,3 +45,13 @@ updates:
     groups:
       nuxt:
         patterns: ["nuxt", "@nuxt/*", "vue", "vue-router", "vite", "vitest"]
+  - package-ecosystem: pip
+    directory: /test/compat
+    schedule:
+      interval: weekly
+    cooldown:
+      default-days: 14
+    groups:
+      # boto3 and botocore are released in lockstep and must stay matched.
+      aws-clients:
+        patterns: ["awscli", "awscrt", "boto3", "botocore", "s3transfer"]

@@ -450,12 +450,16 @@ Supply-chain rules:
   14 days old, which gives the ecosystem time to catch malicious or broken
   releases. The web UI enforces this with pnpm's `minimumReleaseAge` in
   `web/pnpm-workspace.yaml`, and Dependabot applies the same cooldown to
-  update pull requests for npm, Go modules, GitHub Actions and container
-  images. Go dependencies are pinned to releases that were at least 14 days
-  old when chosen. The only exceptions are security fixes younger than the
-  cooldown: they are listed in `minimumReleaseAgeExclude` and pinned to the
-  oldest fixed release in `overrides` (currently `shell-quote` 1.11.0 and
-  `source-map-js` 1.2.2).
+  update pull requests for npm, Go modules, Python packages, GitHub Actions
+  and container images. Go dependencies are pinned to releases that were at
+  least 14 days old when chosen. The compatibility suite's Python packages,
+  transitive ones included, are compiled with a 14-day cut-off into the
+  hash-locked `test/compat/requirements.txt`. The only exceptions are
+  security fixes younger than the cooldown: the npm ones are listed in
+  `minimumReleaseAgeExclude` and pinned to the oldest fixed release in
+  `overrides` (currently `shell-quote` 1.11.0 and `source-map-js` 1.2.2),
+  and the Go ones are the oldest fixed release in `go.mod` (currently
+  `golang.org/x/net` v0.60.0).
 - **Small module graph.** `github.com/minio/minio-go/v7` (a test-only client)
   stays on v7.1.x: v7.2 and later declare their linter toolchain as module
   requirements, which would add about 200 modules to gos3's module graph.
