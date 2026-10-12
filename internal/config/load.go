@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"math"
 	"net"
+	"net/netip"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -16,7 +17,7 @@ import (
 	"strings"
 	"time"
 
-	"gopkg.in/yaml.v3"
+	"go.yaml.in/yaml/v3"
 
 	"github.com/seanmmitchell/gos3/internal/clientip"
 	"github.com/seanmmitchell/gos3/internal/discovery"
@@ -32,6 +33,13 @@ const (
 	DefaultShutdownTimeout = 30 * time.Second
 	DefaultLifecycleEvery  = time.Hour
 	DefaultCORSMaxAge      = 3600
+	// DefaultMaxConnections is the default server.max_connections (no
+	// limit: the process's file descriptor limit applies).
+	DefaultMaxConnections = 0
+	// MinRootSecretLen is the root secret key length below which gos3
+	// warns at startup (a short secret can be brute-forced offline from a
+	// single captured signed request).
+	MinRootSecretLen = 16
 
 	// BackendFS and BackendMemory are the StorageConfig.Backend values.
 	BackendFS     = "fs"
@@ -81,6 +89,7 @@ func Default() Config {
 			MaxObjectSize:   DefaultMaxObjectSize,
 			PublicInfo:      true,
 			ShutdownTimeout: DefaultShutdownTimeout,
+			MaxConnections:  DefaultMaxConnections,
 		},
 		Storage: StorageConfig{
 			Backend:   BackendFS,
@@ -227,6 +236,10 @@ func (c *Config) Normalize() {
 	}
 	c.Server.Domains = trimList(c.Server.Domains)
 	c.Server.TrustedProxies = trimList(c.Server.TrustedProxies)
+	c.Server.AllowedHosts = trimList(c.Server.AllowedHosts)
+	for i, h := range c.Server.AllowedHosts {
+		c.Server.AllowedHosts[i] = strings.TrimSuffix(strings.ToLower(h), ".")
+	}
 	c.CORS.AllowedOrigins = trimList(c.CORS.AllowedOrigins)
 	c.CORS.AllowedHeaders = trimList(c.CORS.AllowedHeaders)
 	c.CORS.ExposeHeaders = trimList(c.CORS.ExposeHeaders)
@@ -276,6 +289,18 @@ func (c Config) Validate() error {
 	if _, err := clientip.ParsePrefixes(c.Server.TrustedProxies); err != nil {
 		return fmt.Errorf("server.trusted_proxies%w", err)
 	}
+	if c.Server.TrustProxyHeaders && len(c.Server.TrustedProxies) == 0 {
+		return errors.New("server.trust_proxy_headers is on but server.trusted_proxies is empty: list the addresses " +
+			"of your reverse proxies (e.g. [\"127.0.0.1\", \"10.0.0.5\"], GOS3_TRUSTED_PROXIES); otherwise any client " +
+			"that reaches gos3 directly could choose its own aws:SourceIp and aws:SecureTransport with " +
+			"X-Forwarded-For / X-Forwarded-Proto")
+	}
+	if err := validateAllowedHosts(c.Server.AllowedHosts); err != nil {
+		return err
+	}
+	if c.Server.MaxConnections < 0 {
+		return fmt.Errorf("server.max_connections: must not be negative (0 = no limit), got %d", c.Server.MaxConnections)
+	}
 	switch c.Storage.Backend {
 	case BackendFS:
 		if c.Storage.Path == "" {
@@ -287,6 +312,12 @@ func (c Config) Validate() error {
 	}
 	if err := validateRootCredentials(c.Auth.RootAccessKey, c.Auth.RootSecretKey); err != nil {
 		return err
+	}
+	if IsDemoSecret(c.Auth.RootSecretKey) && !c.Auth.InsecureDemoCredentials {
+		return fmt.Errorf("auth.root_secret_key: %q is a published example secret: anyone can sign requests with it, "+
+			"including any website you visit (through your browser, which can reach this server). Choose your own "+
+			"(\"gos3 keygen\" prints a random pair), or set %s=true for a throwaway local demo",
+			c.Auth.RootSecretKey, EnvInsecureDemoCredentials)
 	}
 	if iv := c.Lifecycle.Interval; iv != 0 {
 		if lo, hi := MinLifecycleSeconds*time.Second, MaxLifecycleSeconds*time.Second; iv < lo || iv > hi || iv%time.Second != 0 {
@@ -353,6 +384,61 @@ func validateRootCredentials(ak, sk string) error {
 	}
 	if len(sk) < 8 || len(sk) > 128 || strings.IndexFunc(sk, func(r rune) bool { return r <= ' ' || r > '~' }) >= 0 {
 		return errors.New("auth.root_secret_key: must be 8-128 printable ASCII characters without spaces")
+	}
+	return nil
+}
+
+// EnvInsecureDemoCredentials is the environment variable of
+// auth.insecure_demo_credentials.
+const EnvInsecureDemoCredentials = "GOS3_INSECURE_DEMO_CREDENTIALS"
+
+// demoSecrets are root secret keys published in gos3's own documentation
+// and demo files (README, docs, docker-compose.yml) and in those of other
+// S3 servers, compared case-insensitively.
+var demoSecrets = []string{
+	"change-me-now",    // README / docs quickstart
+	"gos3admin-secret", // docker-compose.yml demo
+	"minioadmin",       // MinIO default
+	"wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY", // AWS documentation example
+	"wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY",
+	"changeme", "change-me", "password", "secretkey", "secret-key",
+}
+
+// IsDemoSecret reports whether secret is a root secret key published in
+// documentation or demo files (auth.insecure_demo_credentials is required
+// to use one).
+func IsDemoSecret(secret string) bool {
+	for _, d := range demoSecrets {
+		if strings.EqualFold(secret, d) {
+			return true
+		}
+	}
+	return false
+}
+
+// validateAllowedHosts checks server.allowed_hosts: "*" alone, or host
+// names, "*.<domain>" wildcards and IP addresses (no scheme or port).
+func validateAllowedHosts(hosts []string) error {
+	if len(hosts) > MaxListEntries {
+		return fmt.Errorf("server.allowed_hosts: at most %d entries allowed", MaxListEntries)
+	}
+	for i, h := range hosts {
+		if h == "*" {
+			if len(hosts) > 1 {
+				return errors.New("server.allowed_hosts: \"*\" (any host) must be the only entry")
+			}
+			continue
+		}
+		ip := h
+		if strings.HasPrefix(ip, "[") && strings.HasSuffix(ip, "]") {
+			ip = ip[1 : len(ip)-1]
+		}
+		if a, err := netip.ParseAddr(ip); err == nil && a.Zone() == "" {
+			continue
+		}
+		if name := strings.TrimPrefix(h, "*."); !ValidHostname(name) {
+			return fmt.Errorf("server.allowed_hosts[%d]: %q is not a host name, \"*.<domain>\" wildcard or IP address (no scheme or port)", i, h)
+		}
 	}
 	return nil
 }
@@ -459,6 +545,7 @@ func (c Config) Redacted() Config {
 	}
 	c.Server.Domains = slices.Clone(c.Server.Domains)
 	c.Server.TrustedProxies = slices.Clone(c.Server.TrustedProxies)
+	c.Server.AllowedHosts = slices.Clone(c.Server.AllowedHosts)
 	c.CORS = cloneCORS(c.CORS)
 	c.Discovery.Seeds = slices.Clone(c.Discovery.Seeds)
 	c.Discovery.DNSSRV = slices.Clone(c.Discovery.DNSSRV)

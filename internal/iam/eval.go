@@ -82,6 +82,11 @@ type evalCtx struct {
 	raw      map[string][]string
 	lower    map[string][]string // lazily built, lower-cased keys + derived keys
 	now      time.Time
+
+	// principalKey is the access key ID that bare principal entries may
+	// match: id.AccessKey, or "" when that ID is ambiguous (see
+	// usablePrincipalKey).
+	principalKey string
 }
 
 func newEvalCtx(req *AuthzRequest, now time.Time) *evalCtx {
@@ -92,6 +97,8 @@ func newEvalCtx(req *AuthzRequest, now time.Time) *evalCtx {
 		bucket:  req.Bucket,
 		raw:     req.Conditions,
 		now:     now,
+
+		principalKey: req.Identity.AccessKey,
 	}
 	switch {
 	case c.isAdmin:
@@ -206,6 +213,17 @@ func (c *evalCtx) resourceMatches(patterns []string) bool {
 	return false
 }
 
+// namesNamespace reports whether some pattern is "*" or in the request's
+// namespace (admin ARNs for admin actions, any other pattern for s3).
+func (c *evalCtx) namesNamespace(patterns []string) bool {
+	for _, p := range patterns {
+		if p == "*" || strings.HasPrefix(p, adminARNPrefix) == c.isAdmin {
+			return true
+		}
+	}
+	return false
+}
+
 // principalMatches reports whether p names the request identity. broad
 // selects how account principals (arn:<p>:iam::<acct>:root or a 12-digit
 // account ID) are read: gos3 has a single account, so in the broad reading
@@ -224,7 +242,7 @@ func (c *evalCtx) principalMatches(p *Principal, broad bool) bool {
 		return true
 	}
 	for _, v := range p.AWS {
-		if principalEntryMatches(v, c.id, broad) {
+		if principalEntryMatches(v, c.id, c.principalKey, broad) {
 			return true
 		}
 	}
@@ -232,11 +250,12 @@ func (c *evalCtx) principalMatches(p *Principal, broad bool) bool {
 }
 
 // principalEntryMatches matches one principal entry: "*", a user name, an
-// access key ID, arn:<p>:iam::<any>:user/[path/]<name>, or an account
-// principal arn:<p>:iam::<any>:root / 12-digit account ID (the root
-// identity, or with broad every authenticated identity; see
-// principalMatches).
-func principalEntryMatches(v string, id auth.Identity, broad bool) bool {
+// access key ID (key, "" for none), arn:<p>:iam::<any>:user/[path/]<name>,
+// or an account principal arn:<p>:iam::<any>:root / 12-digit account ID
+// (the root identity, or with broad every authenticated identity; see
+// principalMatches). A 12-digit entry is only ever the account principal:
+// it is never compared with user names or access key IDs.
+func principalEntryMatches(v string, id auth.Identity, key string, broad bool) bool {
 	if v == "*" {
 		return true
 	}
@@ -260,10 +279,25 @@ func principalEntryMatches(v string, id auth.Identity, broad bool) bool {
 		}
 		return name != "" && name == id.User
 	}
-	if isAccountID(v) && (id.IsRoot || broad) {
-		return true
+	if isAccountID(v) {
+		return id.IsRoot || broad
 	}
-	return v == id.User || v == id.AccessKey
+	return v == id.User || (key != "" && v == key)
+}
+
+// usablePrincipalKey returns the access key ID of id that bare principal
+// entries may match, or "" if the ID could be mistaken for another
+// principal (a user name, a reserved name or an account ID; only keys from
+// an older iam.json can be, see keyIDConflict) or belongs to another user.
+func usablePrincipalKey(st *state, id auth.Identity) string {
+	ak := id.AccessKey
+	if ak == "" || keyIDConflict(st, ak) != "" {
+		return ""
+	}
+	if k := st.keys[ak]; k != nil && k.User != id.User {
+		return ""
+	}
+	return ak
 }
 
 func isAccountID(s string) bool {
@@ -315,6 +349,14 @@ func (c *evalCtx) statementApplies(st *Statement, resourcePolicy bool) bool {
 		}
 	case len(st.NotResource) > 0:
 		if c.resourceMatches(st.NotResource) {
+			return false
+		}
+		// An Allow's NotResource only covers the namespaces it names
+		// (s3 or admin), so "all of S3 except bucket X" written with
+		// Action "*" grants no admin action (and an admin-only list no s3
+		// action). A Deny keeps the AWS reading and applies to everything
+		// not listed.
+		if st.Effect == "Allow" && !c.namesNamespace(st.NotResource) {
 			return false
 		}
 	default:
@@ -403,8 +445,10 @@ func (m *Manager) authorize(req AuthzRequest) Decision {
 	}
 
 	var policies []*NamedPolicy
+	principalKey := ""
 	if !id.IsAnonymous {
 		st := m.snapshot()
+		principalKey = usablePrincipalKey(st, id)
 		u := st.resolveUser(id)
 		if u != nil {
 			if u.Disabled {
@@ -420,6 +464,7 @@ func (m *Manager) authorize(req AuthzRequest) Decision {
 	}
 
 	c := newEvalCtx(&req, m.now())
+	c.principalKey = principalKey
 	allowReason := ""
 	for _, p := range policies {
 		for i := range p.Document.Statement {

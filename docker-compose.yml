@@ -1,17 +1,21 @@
 # gos3 two-node demo.
 #
-#   docker compose up -d --build            # two gos3 nodes
-#   docker compose --profile ui up -d --build   # + the standalone web UI
+#   make demo                               # random root keys in .env, then the line below
+#   docker compose --profile ui up -d --build   # two gos3 nodes + the standalone web UI
+#   docker compose up -d --build            # two gos3 nodes only
 #
 #   node 1: http://localhost:9001  (embedded UI: http://localhost:9001/_gos3/ui/)
 #   node 2: http://localhost:9002
 #   standalone UI (profile "ui"): http://localhost:3000
 #
-# The published ports listen on 127.0.0.1 only, because both nodes share
-# the well-known demo root credentials below (override them with
-# GOS3_ROOT_ACCESS_KEY / GOS3_ROOT_SECRET_KEY in the environment or an .env
-# file). To reach the demo from other machines, set your own keys AND
-# GOS3_DEMO_BIND=0.0.0.0 (or a specific host address). They find each other through the UDP multicast beacon on the shared
+# Both nodes use the root keys GOS3_ROOT_ACCESS_KEY / GOS3_ROOT_SECRET_KEY
+# from the environment or the .env file next to this one. There are no
+# default keys: `make demo` writes a random pair to .env on first use, or
+# append your own (`gos3 keygen >> .env`). The published ports listen on
+# 127.0.0.1 only; to reach the demo from other machines, set
+# GOS3_DEMO_BIND=0.0.0.0 (or a specific host address).
+#
+# The nodes find each other through the UDP multicast beacon on the shared
 # network, with static seeds as a fallback where multicast is unavailable;
 # the Discovery page of either node lists the other one. Peers are advertised
 # with their container addresses, which the host browser may not reach
@@ -30,8 +34,8 @@ x-gos3: &gos3
   networks: [gos3]
 
 x-gos3-env: &gos3-env
-  GOS3_ROOT_ACCESS_KEY: ${GOS3_ROOT_ACCESS_KEY:-gos3admin}
-  GOS3_ROOT_SECRET_KEY: ${GOS3_ROOT_SECRET_KEY:-gos3admin-secret}
+  GOS3_ROOT_ACCESS_KEY: ${GOS3_ROOT_ACCESS_KEY:?set GOS3_ROOT_ACCESS_KEY and GOS3_ROOT_SECRET_KEY (make demo writes random ones to .env)}
+  GOS3_ROOT_SECRET_KEY: ${GOS3_ROOT_SECRET_KEY:?set GOS3_ROOT_ACCESS_KEY and GOS3_ROOT_SECRET_KEY (make demo writes random ones to .env)}
   GOS3_DISCOVERY_ENABLED: "true"
   GOS3_DISCOVERY_BEACON: "true"
   # mDNS works too, but the beacon is enough on one bridge network.
@@ -66,13 +70,13 @@ services:
   # Standalone web UI (Node). The browser talks to the nodes directly through
   # the published ports, so both are preset with their localhost URLs; the
   # nodes' default CORS policy (allowed_origins "*") admits the UI origin.
-  # Its local discovery (beacon query / scan) runs inside the compose network.
-  # It is off by default in the image (the Node server has no
-  # authentication) and turned on here because the port is published on
-  # 127.0.0.1 only; set GOS3_UI_LOCAL_DISCOVERY=false when you change
-  # GOS3_DEMO_BIND. Those routes only answer when the UI is opened via an IP
-  # address or localhost; list any DNS name you open it with in
-  # GOS3_UI_ALLOWED_HOSTS.
+  # Its local discovery (beacon query / scan from inside the compose
+  # network) is off, as in the image: the Node server has no authentication,
+  # so anyone who can reach port 3000 could use it to probe the networks the
+  # Docker host reaches. Turn it on with GOS3_UI_LOCAL_DISCOVERY=true only
+  # while the port is published on 127.0.0.1 (the default GOS3_DEMO_BIND).
+  # Those routes only answer when the UI is opened via an IP address or
+  # localhost; list any DNS name you open it with in GOS3_UI_ALLOWED_HOSTS.
   ui:
     profiles: [ui]
     build:
@@ -85,7 +89,7 @@ services:
       NUXT_PUBLIC_SERVERS: >-
         [{"id":"node-1","name":"node-1","endpoint":"http://localhost:9001","kind":"gos3"},
         {"id":"node-2","name":"node-2","endpoint":"http://localhost:9002","kind":"gos3"}]
-      GOS3_UI_LOCAL_DISCOVERY: ${GOS3_UI_LOCAL_DISCOVERY:-true}
+      GOS3_UI_LOCAL_DISCOVERY: ${GOS3_UI_LOCAL_DISCOVERY:-false}
       GOS3_UI_ALLOWED_HOSTS: ${GOS3_UI_ALLOWED_HOSTS:-}
     ports:
       - "${GOS3_DEMO_BIND:-127.0.0.1}:3000:3000"

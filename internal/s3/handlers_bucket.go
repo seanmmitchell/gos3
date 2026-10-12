@@ -232,6 +232,11 @@ func (s *Server) handleCreateBucket(w http.ResponseWriter, r *http.Request, rc *
 	if err != nil {
 		return err
 	}
+	// The (optional) body may have taken long: the caller must still be
+	// allowed to create the bucket.
+	if err := s.revalidateWrite(rc, func() error { return s.reauthorizeOp(ctx, r, rc, nil) }); err != nil {
+		return err
+	}
 
 	// Extra permissions AWS requires for the optional settings.
 	var extra []string

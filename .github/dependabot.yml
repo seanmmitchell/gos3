@@ -24,6 +24,10 @@ updates:
       interval: weekly
     cooldown:
       default-days: 14
+      # Go point releases are mostly security fixes for the standard library
+      # that the image links in: propose them without waiting. (The
+      # Dockerfile rejects an image older than go.mod's go line.)
+      exclude: ["golang"]
   - package-ecosystem: gomod
     directory: /
     target-branch: dev

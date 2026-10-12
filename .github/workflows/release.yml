@@ -4,9 +4,11 @@ name: Release
 # the SemVer bump. The workflow tags main's head as the next version (the
 # newest vMAJOR.MINOR.PATCH tag, bumped), tests and builds it with build.yml,
 # pushes the multi-arch image to ghcr.io/<owner>/<repo> and publishes a GitHub
-# release with the archives, checksums and generated notes. Started again on a
-# commit that already carries a release tag, it rebuilds that release instead
-# of bumping, so a failed run can simply be repeated. See docs/releasing.md.
+# release with the archives, checksums and generated notes. The archives and
+# the image carry signed build provenance attestations. Started again on a
+# commit that already carries a release tag whose release is not published
+# yet, it rebuilds that release instead of bumping, so a failed run can
+# simply be repeated. See docs/releasing.md.
 
 on:
   workflow_dispatch:
@@ -29,8 +31,14 @@ jobs:
     name: Tag the release
     runs-on: ubuntu-latest
     timeout-minutes: 5
+    # The release-tag-creation ruleset lets only repository admins and deploy
+    # keys create v* tags. The tag is pushed with the deploy key in the
+    # RELEASE_DEPLOY_KEY secret of the "release" environment, which only runs
+    # on main (both set up by .github/rulesets/apply.sh), so GITHUB_TOKEN
+    # needs no write access and a workflow on another branch cannot tag.
+    environment: release
     permissions:
-      contents: write
+      contents: read
     outputs:
       tag: ${{ steps.tag.outputs.tag }}
     steps:
@@ -39,16 +47,36 @@ jobs:
         run: |
           echo "::error::Run the Release workflow on main, not $GITHUB_REF."
           exit 1
+      - name: The release deploy key is configured
+        env:
+          HAVE_KEY: ${{ secrets.RELEASE_DEPLOY_KEY != '' }}
+        run: |
+          if [ "$HAVE_KEY" != true ]; then
+            echo "::error::The release environment has no RELEASE_DEPLOY_KEY secret; run .github/rulesets/apply.sh (docs/releasing.md)."
+            exit 1
+          fi
+      # Checked out over SSH with the deploy key, which `git push` below uses.
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
         with:
           fetch-depth: 0
+          ssh-key: ${{ secrets.RELEASE_DEPLOY_KEY }}
+          persist-credentials: true
       - name: Create the tag
         id: tag
         env:
           BUMP: ${{ inputs.bump }}
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
         run: |
           tag="$(.github/scripts/release-version.sh next "$BUMP")"
           if git rev-parse -q --verify "refs/tags/$tag" >/dev/null; then
+            # A published release is never rebuilt: its assets and image tags
+            # would be replaced by a second, different build.
+            draft="$(gh release view "$tag" --json isDraft --jq .isDraft 2>/dev/null || echo missing)"
+            if [ "$draft" = false ]; then
+              echo "::error::$tag is already released; merge a new change into main to release again."
+              exit 1
+            fi
             echo "$tag already tags $(git rev-parse --short=12 HEAD); rebuilding it."
           else
             git config user.name "github-actions[bot]"
@@ -62,9 +90,13 @@ jobs:
   build:
     name: Build
     needs: version
+    # id-token and attestations: only build.yml's image job uses them, to
+    # attest the image's build provenance.
     permissions:
       contents: read
       packages: write
+      id-token: write
+      attestations: write
     uses: ./.github/workflows/build.yml
     with:
       ref: ${{ needs.version.outputs.tag }}
@@ -75,7 +107,8 @@ jobs:
         type=semver,pattern={{major}}.{{minor}},value=${{ needs.version.outputs.tag }}
         type=semver,pattern={{major}},value=${{ needs.version.outputs.tag }},enable=${{ !startsWith(needs.version.outputs.tag, 'v0.') }}
       image-latest: auto
-      cache-scope: release
+      # Caches are writable by any job on dev; a release restores none.
+      use-cache: false
 
   release:
     name: GitHub release
@@ -84,8 +117,12 @@ jobs:
     needs: [version, build]
     permissions:
       contents: write
+      id-token: write
+      attestations: write
     env:
       TAG: ${{ needs.version.outputs.tag }}
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
     steps:
       - uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5.0.0
         with:
@@ -97,13 +134,24 @@ jobs:
         run: |
           sha256sum gos3_* > checksums.txt
           cat checksums.txt
-      - name: Create or update the release
-        env:
-          GH_TOKEN: ${{ github.token }}
-          GH_REPO: ${{ github.repository }}
+      # Verify with: gh attestation verify gos3_<version>_<os>_<arch>.tar.gz
+      #   --repo <owner>/<repo> --source-ref refs/heads/main (docs/releasing.md)
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: dist/gos3_*
+      # The release is created as a draft, completed, then published, so a
+      # failed run leaves a draft to finish rather than a partial release.
+      # Assets of a published release are never replaced (the version job
+      # refuses to rebuild one; with release immutability on, GitHub refuses
+      # too).
+      - name: Create, upload and publish the release
         run: |
-          if gh release view "$TAG" >/dev/null 2>&1; then
-            gh release upload "$TAG" dist/* --clobber
-          else
-            gh release create "$TAG" dist/* --verify-tag --title "gos3 $TAG" --generate-notes
-          fi
+          draft="$(gh release view "$TAG" --json isDraft --jq .isDraft 2>/dev/null || echo missing)"
+          case $draft in
+            missing) gh release create "$TAG" --verify-tag --draft --title "gos3 $TAG" --generate-notes ;;
+            true) echo "Completing the draft release $TAG." ;;
+            *) echo "::error::$TAG is already published."; exit 1 ;;
+          esac
+          gh release upload "$TAG" dist/* --clobber
+          gh release edit "$TAG" --draft=false

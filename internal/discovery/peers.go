@@ -3,6 +3,7 @@ package discovery
 import (
 	"cmp"
 	"fmt"
+	"net/netip"
 	"slices"
 	"strings"
 	"sync"
@@ -12,17 +13,36 @@ import (
 )
 
 // Bounds that keep the peer table small no matter what the network sends.
+// Every field of an entry is bounded (the stored identity document by
+// maxStoredInfo, the addresses by maxAddressesPerPeer normalised base
+// URLs), so the entry counts below bound the table's memory and the size
+// of GET /_gos3/admin/v1/discovery: about 10 KiB per entry at most.
 const (
-	maxPeers = 4096
+	maxPeers = 1024
 	// maxUnverifiedPeers bounds the entries created from sightings that no
 	// /_gos3/info probe confirmed yet (anyone on the link can announce).
-	maxUnverifiedPeers  = 256
-	maxAddressesPerPeer = 32
+	maxUnverifiedPeers = 256
+	// maxAutoPeers bounds the verified peers known only from
+	// unauthenticated announcements (beacon, mDNS): one host can serve any
+	// number of IDs, so these never take the room of peers found through
+	// seeds, DNS SRV, the admin probe or scans.
+	maxAutoPeers = 512
+	// maxPeersPerHost bounds the unverified entries, and separately the
+	// verified peers known only from announcements, charged to one sender
+	// (an IPv4 address or an IPv6 /64).
+	maxPeersPerHost     = 16
+	maxAddressesPerPeer = 16
 	maxIDLen            = 64
 	maxFieldLen         = 256
-	maxFeatures         = 64
-	maxEndpointsAll     = 64
-	maxErrorLen         = 512
+	maxFeatures         = 32
+	maxFeatureLen       = 64
+	maxEndpointsAll     = 16
+	// maxEndpointLen bounds each endpoint URL; longer ones are dropped.
+	maxEndpointLen = 512
+	// maxStoredInfo bounds the strings of a stored identity document;
+	// trailing endpoints.all and features entries are dropped to fit.
+	maxStoredInfo = 4 << 10
+	maxErrorLen   = 512
 )
 
 // validID reports whether id is a plausible server ID: 1-64 characters of
@@ -60,6 +80,8 @@ func cleanField(s string, n int) string {
 
 // sanitizeInfo bounds and cleans every field of an Info document received
 // from the network. It assumes Service and ID were validated.
+// Endpoints.All keeps only base URLs (see NormalizeBaseURL), and the
+// document's strings together stay within maxStoredInfo bytes.
 func sanitizeInfo(in Info) Info {
 	out := Info{
 		Service:    in.Service,
@@ -70,28 +92,62 @@ func sanitizeInfo(in Info) Info {
 		Region:     cleanField(in.Region, maxFieldLen),
 		StartedAt:  in.StartedAt,
 		Endpoints: Endpoints{
-			S3:    cleanField(in.Endpoints.S3, maxURLLen),
-			Admin: cleanField(in.Endpoints.Admin, maxURLLen),
-			UI:    cleanField(in.Endpoints.UI, maxURLLen),
+			S3:    cleanEndpoint(in.Endpoints.S3),
+			Admin: cleanEndpoint(in.Endpoints.Admin),
+			UI:    cleanEndpoint(in.Endpoints.UI),
 		},
 	}
 	for _, a := range in.Endpoints.All {
 		if len(out.Endpoints.All) >= maxEndpointsAll {
 			break
 		}
-		if a = cleanField(a, maxURLLen); a != "" {
-			out.Endpoints.All = append(out.Endpoints.All, a)
+		if a = cleanEndpoint(a); a != "" {
+			if _, err := NormalizeBaseURL(a); err == nil {
+				out.Endpoints.All = append(out.Endpoints.All, a)
+			}
 		}
 	}
 	for _, f := range in.Features {
 		if len(out.Features) >= maxFeatures {
 			break
 		}
-		if f = cleanField(f, 64); f != "" {
+		if f = cleanField(f, maxFeatureLen); f != "" {
 			out.Features = append(out.Features, f)
 		}
 	}
+	// The scalar fields alone are well below maxStoredInfo.
+	for infoSize(out) > maxStoredInfo {
+		if n := len(out.Endpoints.All); n > 0 {
+			out.Endpoints.All = out.Endpoints.All[:n-1]
+		} else if n := len(out.Features); n > 0 {
+			out.Features = out.Features[:n-1]
+		} else {
+			break
+		}
+	}
 	return out
+}
+
+// cleanEndpoint cleans an endpoint URL like cleanField; a URL longer than
+// maxEndpointLen is dropped rather than cut into a different URL.
+func cleanEndpoint(s string) string {
+	if s = cleanField(s, maxURLLen); len(s) > maxEndpointLen {
+		return ""
+	}
+	return s
+}
+
+// infoSize returns the total length of the strings of info.
+func infoSize(info Info) int {
+	n := len(info.Service) + len(info.ID) + len(info.Name) + len(info.Version) + len(info.APIVersion) +
+		len(info.Region) + len(info.Endpoints.S3) + len(info.Endpoints.Admin) + len(info.Endpoints.UI)
+	for _, a := range info.Endpoints.All {
+		n += len(a)
+	}
+	for _, f := range info.Features {
+		n += len(f)
+	}
+	return n
 }
 
 // candidate is an unverified sighting of a (possible) peer produced by a
@@ -110,6 +166,10 @@ type peerEntry struct {
 	info      Info      // last verified identity document
 	lastProbe time.Time // last /_gos3/info probe (success or failure)
 	probeURL  string    // last address that answered a probe
+	// host is the sender the entry counts against for maxPeersPerHost
+	// (see hostKey): the sighting's first address while unverified, then
+	// the address that answered the last probe.
+	host netip.Prefix
 
 	// Claims of this (verified) peer's ID by another address while its
 	// known addresses still answered (see Service.record).
@@ -134,7 +194,8 @@ const (
 type observeResult int
 
 const (
-	// observeRejected: our own ID, an invalid ID, or the table is full.
+	// observeRejected: our own ID, an invalid ID, or no room (the table or
+	// the sender's share of it is full).
 	observeRejected observeResult = iota
 	// observeStored: the peer was added or refreshed.
 	observeStored
@@ -182,26 +243,104 @@ func (t *peerTable) pinnedLocked(e *peerEntry) bool {
 	return false
 }
 
-// insertLocked adds a new entry, evicting the stalest non-seed entry
-// (unverified ones first) when the table is full. Unverified entries are
-// further bounded by maxUnverifiedPeers: a new one replaces the stalest
-// unverified entry. It reports whether the entry was added.
-func (t *peerTable) insertLocked(id string, e *peerEntry) bool {
-	if !e.peer.Verified && t.unverified >= maxUnverifiedPeers {
-		if !t.evictLocked(func(ve *peerEntry) bool { return !ve.peer.Verified }) {
+// trustedSource reports whether s finds peers on the operator's behalf
+// (seeds, DNS SRV, the admin probe and scans) rather than through
+// unauthenticated announcements (beacon, mDNS).
+func trustedSource(s Source) bool {
+	switch s {
+	case SourceStatic, SourceDNS, SourceProbe, SourceScan:
+		return true
+	}
+	return false
+}
+
+// trusted reports whether e was found through a trusted source.
+func (e *peerEntry) trusted() bool { return slices.ContainsFunc(e.peer.Sources, trustedSource) }
+
+// auto reports whether e is a verified peer known only from announcements.
+func (e *peerEntry) auto() bool { return e.peer.Verified && !e.trusted() }
+
+// hostKey returns the sender a base URL with an IP literal host is charged
+// to: the IPv4 address, or the /64 of an IPv6 address (one host can use a
+// whole /64). URLs with host names (which only trusted sources produce)
+// yield the zero Prefix and are not charged.
+func hostKey(addr string) netip.Prefix {
+	_, host, _, ok := urlHostPort(addr)
+	if !ok {
+		return netip.Prefix{}
+	}
+	ip, err := netip.ParseAddr(host)
+	if err != nil {
+		return netip.Prefix{}
+	}
+	ip = ip.WithZone("").Unmap()
+	bits := 32
+	if ip.Is6() {
+		bits = 64
+	}
+	p, _ := ip.Prefix(bits)
+	return p
+}
+
+// countLocked returns the number of entries accepted by pred.
+func (t *peerTable) countLocked(pred func(*peerEntry) bool) int {
+	n := 0
+	for _, e := range t.peers {
+		if pred(e) {
+			n++
+		}
+	}
+	return n
+}
+
+// admitUnverifiedLocked makes room for a new unverified entry charged to
+// host. Unverified entries only ever displace unverified entries: the
+// stalest one of the same host when it has maxPeersPerHost of them, else
+// the stalest one overall when there are maxUnverifiedPeers or the table
+// is full. It reports whether there is room.
+func (t *peerTable) admitUnverifiedLocked(host netip.Prefix) bool {
+	unverified := func(e *peerEntry) bool { return !e.peer.Verified }
+	sameHost := func(e *peerEntry) bool { return unverified(e) && e.host == host }
+	if host.IsValid() && t.countLocked(sameHost) >= maxPeersPerHost {
+		return t.evictLocked(sameHost)
+	}
+	if t.unverified >= maxUnverifiedPeers || len(t.peers) >= maxPeers {
+		return t.evictLocked(unverified)
+	}
+	return true
+}
+
+// admitVerifiedLocked reports whether a document fetched from addr through
+// src may be stored as a verified peer, either in the existing entry e or,
+// when e is nil, in a new one, making room for it when the table is full.
+// A peer that becomes verified while known only from announcements counts
+// against maxAutoPeers and against maxPeersPerHost for addr's host, and a
+// new one only displaces unverified entries. A peer found through a
+// trusted source may also displace the stalest of those verified peers.
+// Entries at seed URLs are never displaced.
+func (t *peerTable) admitVerifiedLocked(e *peerEntry, addr string, src Source) bool {
+	trusted := trustedSource(src) || (e != nil && e.trusted())
+	if !trusted && (e == nil || !e.peer.Verified) {
+		if t.countLocked((*peerEntry).auto) >= maxAutoPeers {
+			return false
+		}
+		host := hostKey(addr)
+		if host.IsValid() && t.countLocked(func(o *peerEntry) bool { return o.auto() && o.host == host }) >= maxPeersPerHost {
 			return false
 		}
 	}
-	if len(t.peers) >= maxPeers {
-		if !t.evictLocked(func(ve *peerEntry) bool { return !ve.peer.Verified || e.peer.Verified }) {
-			return false
-		}
+	if e != nil || len(t.peers) < maxPeers {
+		return true
 	}
+	return t.evictLocked(func(o *peerEntry) bool { return !o.peer.Verified || (trusted && o.auto()) })
+}
+
+// insertLocked adds the new entry e; the caller made room for it.
+func (t *peerTable) insertLocked(id string, e *peerEntry) {
 	t.peers[id] = e
 	if !e.peer.Verified {
 		t.unverified++
 	}
-	return true
 }
 
 // evictLocked removes the stalest non-seed entry accepted by eligible,
@@ -259,10 +398,14 @@ func (t *peerTable) observeInfo(info Info, addr string, src Source, now time.Tim
 		return clonePeer(e.peer), observeConflict
 	}
 	if !ok {
+		e = nil
+	}
+	if !t.admitVerifiedLocked(e, addr, src) {
+		return Peer{}, observeRejected
+	}
+	if e == nil {
 		e = &peerEntry{peer: Peer{ID: info.ID, FirstSeen: now}}
-		if !t.insertLocked(info.ID, e) {
-			return Peer{}, observeRejected
-		}
+		t.insertLocked(info.ID, e)
 	}
 	t.storeLocked(e, info, addr, src, now)
 	return clonePeer(e.peer), observeStored
@@ -290,21 +433,23 @@ func (t *peerTable) vouchedLocked(e *peerEntry, addr string, src Source) bool {
 
 // storeLocked writes a verified document fetched from addr into e. The
 // addresses of an entry that was not verified yet came from unauthenticated
-// sightings and are replaced by addr.
+// sightings and are replaced by addr. This (a successful probe) is the only
+// thing that refreshes a verified peer's LastSeen.
 func (t *peerTable) storeLocked(e *peerEntry, info Info, addr string, src Source, now time.Time) {
 	p := &e.peer
 	if !p.Verified {
 		t.unverified--
 		p.Addresses = nil
 	}
+	// The record and the peer share the (never modified in place) lists.
 	e.info = info
 	e.info.Endpoints = cloneEndpoints(info.Endpoints)
 	e.info.Features = slices.Clone(info.Features)
 	p.Name = info.Name
 	p.Version = info.Version
 	p.Region = info.Region
-	p.Endpoints = cloneEndpoints(info.Endpoints)
-	p.Features = slices.Clone(info.Features)
+	p.Endpoints = e.info.Endpoints
+	p.Features = e.info.Features
 	if src != "" {
 		addSource(p, src)
 	}
@@ -318,6 +463,7 @@ func (t *peerTable) storeLocked(e *peerEntry, info Info, addr string, src Source
 	}
 	e.lastProbe = now
 	e.probeURL = addr
+	e.host = hostKey(addr)
 }
 
 func conflictText(addr string, n int) string {
@@ -387,10 +533,14 @@ func (t *peerTable) move(info Info, addr string, src Source, now time.Time, self
 	defer t.mu.Unlock()
 	e, ok := t.peers[info.ID]
 	if !ok {
+		e = nil
+	}
+	if !t.admitVerifiedLocked(e, addr, src) {
+		return Peer{}, false
+	}
+	if e == nil {
 		e = &peerEntry{peer: Peer{ID: info.ID, FirstSeen: now}}
-		if !t.insertLocked(info.ID, e) {
-			return Peer{}, false
-		}
+		t.insertLocked(info.ID, e)
 	}
 	e.peer.Addresses = nil
 	e.conflicts, e.conflictAt, e.conflictAddr = 0, time.Time{}, ""
@@ -408,10 +558,16 @@ func sameInfo(a, b Info) bool {
 		slices.Equal(a.Features, b.Features)
 }
 
-// hint records an unverified sighting (c.id must be set). It creates an unverified entry for
-// unknown IDs and refreshes LastSeen of known ones. It reports whether the
-// sighting's addresses should be probed: always for unverified or unhealthy
-// peers, and for verified peers only when an address is new.
+// hint records an unverified sighting (c.id must be set). It creates an
+// unverified entry for unknown IDs and refreshes unverified ones. It reports
+// whether the sighting's addresses should be probed: always for unverified
+// or unhealthy peers, and for verified peers only when an address is new.
+//
+// Anyone can announce any ID, so a sighting never refreshes a verified
+// peer: its LastSeen moves only with successful probes (storeLocked), and
+// a peer that stops answering expires even while its ID is announced. The
+// sighting's mechanism is added to the peer's sources only when it points
+// at one of the peer's known addresses.
 func (t *peerTable) hint(h candidate, now time.Time, selfID string) bool {
 	if !validID(h.id) || h.id == selfID {
 		return false
@@ -420,6 +576,13 @@ func (t *peerTable) hint(h candidate, now time.Time, selfID string) bool {
 	defer t.mu.Unlock()
 	e, ok := t.peers[h.id]
 	if !ok {
+		var host netip.Prefix
+		if len(h.urls) > 0 {
+			host = hostKey(h.urls[0])
+		}
+		if !t.admitUnverifiedLocked(host) {
+			return false
+		}
 		e = &peerEntry{peer: Peer{
 			ID:        h.id,
 			Name:      cleanField(h.name, maxFieldLen),
@@ -427,15 +590,13 @@ func (t *peerTable) hint(h candidate, now time.Time, selfID string) bool {
 			Region:    cleanField(h.region, maxFieldLen),
 			FirstSeen: now,
 			Healthy:   true,
-		}}
-		if !t.insertLocked(h.id, e) {
-			return false
-		}
+		}, host: host}
+		t.insertLocked(h.id, e)
 	}
 	p := &e.peer
-	addSource(p, h.source)
-	p.LastSeen = now
 	if !p.Verified {
+		addSource(p, h.source)
+		p.LastSeen = now
 		if h.name != "" {
 			p.Name = cleanField(h.name, maxFieldLen)
 		}
@@ -450,15 +611,15 @@ func (t *peerTable) hint(h candidate, now time.Time, selfID string) bool {
 		}
 		return true
 	}
-	if !p.Healthy {
-		return true
-	}
+	newAddr := false
 	for _, a := range h.urls {
-		if !slices.Contains(p.Addresses, a) {
-			return true
+		if slices.Contains(p.Addresses, a) {
+			addSource(p, h.source)
+		} else {
+			newAddr = true
 		}
 	}
-	return false
+	return !p.Healthy || newAddr
 }
 
 // probeFailed marks peer id unhealthy with err.
@@ -533,6 +694,18 @@ func (t *peerTable) expire(now time.Time) {
 type probeTarget struct {
 	id   string
 	urls []string // last good address first
+}
+
+// reprobeInterval is how often verified peers are re-probed: every
+// reprobeEvery, or twice per TTL when that is shorter, so that a live peer
+// is re-verified (refreshing LastSeen) before it would expire.
+func (t *peerTable) reprobeInterval() time.Duration {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.ttl <= 0 {
+		return reprobeEvery
+	}
+	return min(reprobeEvery, t.ttl/2)
 }
 
 // due returns verified peers whose last probe is at least every ago.

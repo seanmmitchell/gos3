@@ -51,6 +51,8 @@ type UploadListParams struct {
 
 // UploadListResult is a page of ListUploads.
 type UploadListResult struct {
+	// Uploads are the listed uploads, their Meta trimmed to what a listing
+	// reports (see ListingMeta).
 	Uploads        []UploadInfo
 	CommonPrefixes []string
 	IsTruncated    bool
@@ -124,6 +126,7 @@ func ListUploads(ctx context.Context, b Backend, bucket string, p UploadListPara
 				restart = true
 				return ErrStopWalk
 			}
+			u.Meta = ListingMeta(u.Meta)
 			res.Uploads = append(res.Uploads, u)
 			res.NextKeyMarker, res.NextUploadIDMarker = u.Key, u.UploadID
 			return nil

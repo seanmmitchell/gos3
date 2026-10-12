@@ -74,6 +74,32 @@ type reqContext struct {
 	bucketInfo   storage.BucketInfo
 	bucketErr    error
 	bucketLoaded bool
+
+	// anonChecked and anonErr cache the result of
+	// Server.checkAnonymousRequest.
+	anonChecked bool
+	anonErr     error
+}
+
+// unknownHostKey is the context key of WithUnknownHost.
+type unknownHostKey struct{}
+
+// WithUnknownHost marks a request context: the request's Host header is
+// not one of the names this server is known by (see server.allowed_hosts).
+// The S3 handler refuses anonymous access to such requests, so that a
+// website using DNS rebinding (its own host name resolving to this server)
+// cannot use a visitor's browser to read or write data that is anonymously
+// accessible only from the visitor's network (aws:SourceIp conditions,
+// LAN-only public buckets). Signed requests are not affected: the
+// signature covers the Host the client meant.
+func WithUnknownHost(ctx context.Context) context.Context {
+	return context.WithValue(ctx, unknownHostKey{}, true)
+}
+
+// unknownHost reports whether ctx was marked by WithUnknownHost.
+func unknownHost(ctx context.Context) bool {
+	v, _ := ctx.Value(unknownHostKey{}).(bool)
+	return v
 }
 
 // versionID returns the versionId query parameter ("" if absent).

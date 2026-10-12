@@ -88,8 +88,9 @@ type StringOrSlice []string
 // Principal is a policy principal: "*" or {"AWS": "..."|[...]}.
 // gos3 matches AWS principals against IAM user names, access keys, "*" and
 // ARNs of the form arn:aws:iam::<anything>:user/<name> or :root (the
-// account principal). Service and Federated principals are accepted and
-// kept but match no gos3 identity.
+// account principal, also written as a bare 12-digit account ID, which
+// never matches a user name or access key). Service and Federated
+// principals are accepted and kept but match no gos3 identity.
 type Principal struct {
 	Any bool          // "*" or {"AWS":"*"}
 	AWS StringOrSlice // user names / ARNs
@@ -223,6 +224,8 @@ type Manager struct {
 
 	mu sync.RWMutex
 	st *state // copy-on-write: replaced wholesale by mutations
+
+	warned sync.Map // ids already logged by warnOnce
 }
 
 var _ auth.CredentialProvider = (*Manager)(nil)
@@ -256,7 +259,8 @@ func (m *Manager) GetUser(ctx context.Context, name string) (User, error) {
 }
 
 // CreateUser creates a user. Names must match [A-Za-z0-9+=,.@_-]{1,64};
-// "root" and "anonymous" are reserved. All policies must exist.
+// "root" and "anonymous" are reserved, and a name may not be a 12-digit
+// account ID or equal an existing access key ID. All policies must exist.
 func (m *Manager) CreateUser(ctx context.Context, spec UserSpec) (User, error) {
 	return m.createUser(ctx, spec)
 }
@@ -273,15 +277,16 @@ func (m *Manager) DeleteUser(ctx context.Context, name string) error { return m.
 // the secret (the only time it is exposed). accessKey/secretKey may be
 // supplied by the caller (empty = generate: 20-char uppercase alnum access
 // key, 40-char URL-safe secret). Caller supplied access keys must be 3..128
-// characters of [A-Za-z0-9._-] and secrets 8..128 printable ASCII
-// characters. A user may have at most 10 keys.
+// characters of [A-Za-z0-9._-] and must not equal a user name, a reserved
+// name or a 12-digit account ID; caller supplied secrets must be 16..128
+// printable ASCII characters. A user may have at most 10 keys.
 func (m *Manager) CreateAccessKey(ctx context.Context, user, description, accessKey, secretKey string) (AccessKey, error) {
 	return m.createAccessKey(ctx, user, description, accessKey, secretKey)
 }
 
 // UpdateAccessKey sets the status (KeyActive or KeyInactive) of a key.
 func (m *Manager) UpdateAccessKey(ctx context.Context, accessKey, status string) error {
-	return m.updateAccessKey(ctx, accessKey, status)
+	return m.updateAccessKey(ctx, "", accessKey, status)
 }
 
 // AccessKeyOwner returns the name of the user owning an IAM access key,
@@ -292,7 +297,7 @@ func (m *Manager) AccessKeyOwner(ctx context.Context, accessKey string) (string,
 
 // DeleteAccessKey deletes an access key.
 func (m *Manager) DeleteAccessKey(ctx context.Context, accessKey string) error {
-	return m.deleteAccessKey(ctx, accessKey)
+	return m.deleteAccessKey(ctx, "", accessKey)
 }
 
 // ListPolicies returns the built-in policies (Builtin=true, read-only)

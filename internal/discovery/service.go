@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"net/netip"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -276,6 +277,11 @@ func (s *Service) verify(ctx context.Context, c candidate, timeout time.Duration
 	if c.id != "" {
 		// An unauthenticated sighting (anyone can announce any ID) never
 		// marks a verified peer unhealthy: its own addresses are re-probed.
+		if slices.ContainsFunc(c.urls, func(u string) bool { return onThisHost(u, hostNets.isLocal) }) {
+			// The sender named addresses of this host: a fixed text, so
+			// the peer table tells nobody which local ports are open.
+			msg = sightingNotVerified
+		}
 		s.table.sightingFailed(c.id, msg, now)
 		return
 	}
@@ -284,6 +290,21 @@ func (s *Service) verify(ctx context.Context, c candidate, timeout time.Duration
 			s.table.probeFailed(id, msg, now)
 		}
 	}
+}
+
+// sightingNotVerified is the error recorded for a sighting that named a
+// loopback or local address and could not be verified.
+const sightingNotVerified = "could not be verified"
+
+// onThisHost reports whether the base URL addr points at a loopback or
+// local address (by IP literal).
+func onThisHost(addr string, isLocal func(netip.Addr) bool) bool {
+	_, host, _, ok := urlHostPort(addr)
+	if !ok {
+		return false
+	}
+	ip, err := netip.ParseAddr(host)
+	return err == nil && isLocal(ip)
 }
 
 // record stores info, fetched from addr, in the peer table and returns the
@@ -390,11 +411,12 @@ func (s *Service) runCore(ctx context.Context) {
 	}
 }
 
-// maintain expires stale peers and re-probes verified peers every 30 s.
+// maintain expires stale peers and re-probes verified peers every 30 s
+// (twice per peer TTL when that is shorter).
 func (s *Service) maintain(ctx context.Context) {
 	now := s.now()
 	s.table.expire(now)
-	due := s.table.due(now, reprobeEvery)
+	due := s.table.due(now, s.table.reprobeInterval())
 	sem := make(chan struct{}, reprobeConcurrency)
 	var wg sync.WaitGroup
 	for _, d := range due {
@@ -532,35 +554,28 @@ func (s *Service) runMDNSBrowse(ctx context.Context) {
 	}
 }
 
-// throttle limits how often the same candidate URL is probed.
+// throttle limits how often the same candidate URL is probed. It tracks at
+// most maxThrottleEntries URLs; a new URL replaces the one probed longest
+// ago, so a flood of new URLs never re-enables the URLs probed most
+// recently.
 type throttle struct {
 	mu     sync.Mutex
 	window time.Duration
-	last   map[string]time.Time
+	last   *lru[string, time.Time]
 }
 
 func newThrottle(window time.Duration) *throttle {
-	return &throttle{window: window, last: make(map[string]time.Time)}
+	return &throttle{window: window, last: newLRU[string, time.Time](maxThrottleEntries)}
 }
 
 // allow reports whether key may be probed now and records the attempt.
 func (t *throttle) allow(key string, now time.Time) bool {
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	if ts, ok := t.last[key]; ok && now.Sub(ts) < t.window && !now.Before(ts) {
+	if ts, ok := t.last.get(key); ok && now.Sub(ts) < t.window && !now.Before(ts) {
 		return false
 	}
-	if len(t.last) >= maxThrottleEntries {
-		for k, ts := range t.last {
-			if now.Sub(ts) >= t.window {
-				delete(t.last, k)
-			}
-		}
-		if len(t.last) >= maxThrottleEntries {
-			clear(t.last)
-		}
-	}
-	t.last[key] = now
+	t.last.put(key, now)
 	return true
 }
 

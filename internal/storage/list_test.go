@@ -633,3 +633,53 @@ func TestComputeBucketUsage(t *testing.T) {
 		t.Fatalf("missing bucket: %v", err)
 	}
 }
+
+// TestListingInfoTrimmed: listings keep only the fixed-size fields of each
+// entry, not the content headers, user metadata and tags a writer chose.
+func TestListingInfoTrimmed(t *testing.T) {
+	m := memory.New()
+	defer m.Close()
+	if err := m.CreateBucket(ctx, "b", storage.CreateBucketOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	meta := storage.ObjectMeta{
+		ETag: "e", ContentType: strings.Repeat("t", 4096), ContentDisposition: "d", CacheControl: "c",
+		UserMeta: map[string]string{"k": "v"}, Tags: map[string]string{"a": "b"}, StorageClass: "GLACIER",
+		Checksums: map[string]string{"CRC32": "AAAAAA=="}, ChecksumType: "FULL_OBJECT", PartSizes: []int64{1},
+	}
+	w, err := m.NewObjectWriter(ctx, "b", "k")
+	if err != nil {
+		t.Fatal(err)
+	}
+	w.Write([]byte("x"))
+	if _, err := w.Commit(ctx, meta, storage.CommitOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := m.CreateMultipartUpload(ctx, "b", "k", meta, ""); err != nil {
+		t.Fatal(err)
+	}
+	check := func(what string, got storage.ObjectMeta) {
+		t.Helper()
+		if got.ContentType != "" || got.ContentDisposition != "" || got.CacheControl != "" || got.UserMeta != nil || got.Tags != nil || got.PartSizes != nil {
+			t.Errorf("%s: metadata not trimmed: %+v", what, got)
+		}
+		if got.ETag != "e" || got.StorageClass != "GLACIER" || got.Checksums["CRC32"] == "" || got.ChecksumType != "FULL_OBJECT" {
+			t.Errorf("%s: listed fields lost: %+v", what, got)
+		}
+	}
+	lr, err := storage.ListObjects(ctx, m, "b", storage.ListParams{})
+	if err != nil || len(lr.Objects) != 1 {
+		t.Fatalf("ListObjects: %v %+v", err, lr)
+	}
+	check("ListObjects", lr.Objects[0].ObjectMeta)
+	vr, err := storage.ListObjectVersions(ctx, m, "b", storage.VersionListParams{})
+	if err != nil || len(vr.Versions) != 1 {
+		t.Fatalf("ListObjectVersions: %v %+v", err, vr)
+	}
+	check("ListObjectVersions", vr.Versions[0].ObjectMeta)
+	ur, err := storage.ListUploads(ctx, m, "b", storage.UploadListParams{MaxUploads: 10})
+	if err != nil || len(ur.Uploads) != 1 {
+		t.Fatalf("ListUploads: %v %+v", err, ur)
+	}
+	check("ListUploads", ur.Uploads[0].Meta)
+}

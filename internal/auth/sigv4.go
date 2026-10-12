@@ -679,7 +679,15 @@ func (v *Verifier) authenticatePresigned(r *http.Request, params []queryParam) (
 		Service:  cred.service,
 		SignedAt: t,
 	}
-	if mode != PayloadUnsigned {
+	// PayloadMode (the s3:x-amz-content-sha256 condition key) comes only
+	// from signed data: the query hash, or the header when the URL's
+	// signed headers cover it. An unsigned header still selects how the
+	// body is verified (mode), but anyone holding the URL can set it, so
+	// it must not satisfy a "signed payload required" policy.
+	switch {
+	case payloadHash != PayloadUnsigned:
+		res.PayloadMode = payloadHash
+	case signedSet["x-amz-content-sha256"] && mode != PayloadUnsigned:
 		res.PayloadMode = mode
 	}
 	signer := &chunkSigner{key: key, amzDate: q[amzDate], scope: cred.scope(), prevSig: q[amzSignature]}
@@ -691,6 +699,7 @@ func (v *Verifier) authenticatePresigned(r *http.Request, params []queryParam) (
 
 // authenticateAnonymous builds the Result for unauthenticated requests,
 // still honouring a declared payload hash or unsigned aws-chunked encoding.
+// PayloadMode stays empty: nothing about an anonymous request is signed.
 func (v *Verifier) authenticateAnonymous(r *http.Request) (*Result, error) {
 	res := &Result{Identity: Anonymous, Method: MethodAnonymous}
 	mode := r.Header.Get("X-Amz-Content-Sha256")
@@ -706,9 +715,6 @@ func (v *Verifier) authenticateAnonymous(r *http.Request) (*Result, error) {
 	}
 	if kind == payloadStreamingSigned || kind == payloadStreamingSignedTrailer {
 		return nil, s3err.ErrAccessDenied.WithMessage("%s", "Signed streaming payloads ("+mode+") require AWS Signature Version 4 authentication.")
-	}
-	if mode != PayloadUnsigned {
-		res.PayloadMode = mode
 	}
 	if err := setBody(res, r, kind, mode, nil); err != nil {
 		return nil, err

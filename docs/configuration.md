@@ -65,7 +65,9 @@ changed while running.
 | `server.public_info` | `GOS3_PUBLIC_INFO` | | `true` | `publicInfo` | Serve `GET /_gos3/info` without authentication. When false, any valid signature is required. |
 | `server.shutdown_timeout` | `GOS3_SHUTDOWN_TIMEOUT` | | `30s` | | How long in-flight requests may run after SIGINT/SIGTERM before connections are closed. |
 | `server.trust_proxy_headers` | `GOS3_TRUST_PROXY_HEADERS` | | `false` | | Use `X-Forwarded-For` for the client address (`aws:SourceIp`, access logs) and `X-Forwarded-Proto` for `aws:SecureTransport`, on the S3 API, the admin API and the `/_gos3/*` system endpoints. The client is the rightmost `X-Forwarded-For` entry (all header lines) that is not in `server.trusted_proxies`; the last `X-Forwarded-Proto` value counts. Enable it only behind a reverse proxy; see [deployment.md](deployment.md#reverse-proxy). |
-| `server.trusted_proxies` | `GOS3_TRUSTED_PROXIES` | | `[]` | | Reverse proxies (single addresses such as `192.0.2.10`, or CIDR prefixes such as `10.0.5.0/28`, IPv4 or IPv6) whose forwarding headers are honoured when `trust_proxy_headers` is on. List only proxies, never a subnet that also holds clients: a client whose address is listed is skipped like a proxy hop and can choose its `aws:SourceIp`. Requests whose peer address is not in the list are taken at face value. `X-Forwarded-For` is walked from the right past these addresses: the first other entry is the client; an invalid entry stops the walk at the last trusted hop (or the peer address). Empty: every peer is trusted and the rightmost entry is the client, which is right only for a single proxy that gos3 can be reached through exclusively. An invalid entry is a configuration error. The variable takes a comma-separated list. |
+| `server.trusted_proxies` | `GOS3_TRUSTED_PROXIES` | | `[]` | | Reverse proxies (single addresses such as `192.0.2.10`, or CIDR prefixes such as `10.0.5.0/28`, IPv4 or IPv6) whose forwarding headers are honoured when `trust_proxy_headers` is on. List only proxies, never a subnet that also holds clients: a client whose address is listed is skipped like a proxy hop and can choose its `aws:SourceIp`. Requests whose peer address is not in the list are taken at face value. `X-Forwarded-For` is walked from the right past these addresses: the first other entry is the client; an invalid entry stops the walk at the last trusted hop (or the peer address). **Required** when `trust_proxy_headers` is on: an empty list is a configuration error (before v0.2 it trusted every peer, which let any client that reaches gos3 directly choose its `aws:SourceIp` and `aws:SecureTransport`). An invalid entry is a configuration error. The variable takes a comma-separated list. Your proxy must *set* (not append to) `X-Forwarded-Proto`. |
+| `server.allowed_hosts` | `GOS3_ALLOWED_HOSTS` | `--allowed-host` (repeatable) | `[]` | | Extra host names (the `Host` header, without port) that clients use to reach the server, besides the ones it knows itself: IP addresses, `localhost` and `*.localhost`, the OS host name, its first label and `<label>.local`, the host of `server.address`, `server.public_url` and `server.domains` (with their bucket subdomains). `*.example.com` allows every subdomain; `["*"]` turns the check off. **Empty** (default): requests for any other host name are served only when they are signed; anonymous S3 requests, the web UI and public metrics answer `403` / `421 Misdirected Request`, and the first request for each such name is logged. This stops DNS-rebinding websites from using a visitor's browser against LAN-only data. **Non-empty**: every request for another host name is refused with `421`, signed ones included, so a signature captured by a foreign endpoint cannot be relayed to this server. `/_gos3/info`, `/_gos3/health` and `/_gos3/ready` and the admin API are served for any host only while the list is empty. See [security.md](security.md#dns-rebinding-and-the-host-header). |
+| `server.max_connections` | `GOS3_MAX_CONNECTIONS` | | `0` (no limit) | | Opt-in cap on simultaneously open client connections. At the cap a new connection closes the longest-idle keep-alive connection to make room, or is closed itself when every connection is busy; accepting never blocks, so idle connections cannot lock out health probes. There is no per-address limit (reverse proxies funnel many clients through one address). |
 
 ### `storage`
 
@@ -82,13 +84,20 @@ changed while running.
 | `auth.root_access_key` | `GOS3_ROOT_ACCESS_KEY` | | Root access key: 3–128 characters of `[A-Za-z0-9._-]`. |
 | `auth.root_secret_key` | `GOS3_ROOT_SECRET_KEY` | | Root secret key: 8–128 printable ASCII characters without spaces. |
 | `auth.strict_region` | `GOS3_STRICT_REGION` | `false` | Reject signatures whose credential scope names a region other than `server.region`. By default any region is accepted. |
+| `auth.insecure_demo_credentials` | `GOS3_INSECURE_DEMO_CREDENTIALS` | `false` | Allow a root secret key that is published as an example: `change-me-now`, `gos3admin-secret`, `minioadmin`, the AWS documentation example key and a few generic ones (`changeme`, `password`, ...). Without it gos3 refuses to start with such a key, because anyone can sign requests with it, including any website opened in a browser that can reach the server. For throwaway local demos only. |
 
 The root keys have no flags, so they never show up in process listings. Set
-both or neither. When neither is set, gos3 generates a pair on first start,
-logs it **once** as a warning (and in the startup banner), and stores it in
-`<data>/.gos3/root-credentials.json` (mode 0600) for later starts. Without a
-data directory (memory backend, no path) new keys are generated on every
-start. `gos3 keygen` prints a random pair you can use instead. See
+both or neither. A configured secret shorter than 16 characters is accepted
+with a warning: one captured signed request is enough to guess a short
+secret offline. When neither key is set, gos3 generates a pair on first
+start and stores it in `<data>/.gos3/root-credentials.json` (mode 0600; an
+owner-only ACL on Windows) for later starts. The secret key is never
+written to the log: the startup banner shows it only when standard error is
+a terminal, and otherwise names the file to read it from. Without a data
+directory (memory backend, no path) new keys are generated on every start;
+without a terminal they are written to a private temporary file (named in
+the banner and the log) that is deleted on exit. `gos3 keygen` prints a
+random pair you can use instead. See
 [security.md](security.md#root-credentials).
 
 ### `ui`
@@ -128,7 +137,11 @@ browsers that do not honour `*`. A standalone web UI only needs its origin in
 
 For S3 requests, the `*` entry admits only signed requests (an
 `Authorization` header or a presigned URL); explicitly listed origins also
-apply to anonymous requests. See [security.md](security.md#cors).
+apply to anonymous requests. Anonymous requests that change data and come
+from another origin are refused unless a bucket CORS rule (or an explicitly
+listed global origin) allows the origin and method. The `*` default stays
+because the standalone web UI and other browser clients connect
+cross-origin with signed requests. See [security.md](security.md#cors).
 
 ### `discovery`
 
@@ -268,6 +281,7 @@ codes are 0 (success), 1 (error) and 2 (usage error).
 | `--region REGION` | `server.region` |
 | `--public-url URL` | `server.public_url` |
 | `--domain DOMAIN` (repeatable) | `server.domains` |
+| `--allowed-host HOST` (repeatable) | `server.allowed_hosts` |
 | `--tls-cert FILE`, `--tls-key FILE` | `server.tls_cert`, `server.tls_key` |
 | `--cors-origin ORIGIN` (repeatable) | `cors.allowed_origins` |
 | `--seed URL` (repeatable) | `discovery.seeds` |

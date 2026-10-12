@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"maps"
 	"slices"
 	"strings"
@@ -30,6 +31,14 @@ func (m *Manager) lookupCredentials(accessKey string) (string, auth.Identity, er
 	st := m.snapshot()
 	k := st.keys[accessKey]
 	if k == nil || k.Key.Status != KeyActive {
+		return "", auth.Identity{}, s3err.ErrInvalidAccessKeyID
+	}
+	if why := keyIDConflict(st, accessKey); why != "" {
+		// Only an iam.json written before the namespaces were separated can
+		// hold such a key: refuse it rather than let it match bucket-policy
+		// principals naming the user, root or the account.
+		m.warnOnce("conflict:"+accessKey, "iam: refusing access key: its ID is ambiguous in bucket-policy principals; "+
+			"delete it and create a new key", "accessKey", accessKey, "user", k.User, "reason", why)
 		return "", auth.Identity{}, s3err.ErrInvalidAccessKeyID
 	}
 	u := st.users[k.User]
@@ -114,12 +123,18 @@ func (m *Manager) createUser(ctx context.Context, spec UserSpec) (User, error) {
 	if isDotSegment(spec.Name) {
 		return User{}, wrapf(ErrInvalidName, fmt.Sprintf("user name %q is not allowed", spec.Name))
 	}
+	if isAccountID(spec.Name) {
+		// A bare 12-digit principal names the account, never a user.
+		return User{}, wrapf(ErrInvalidName, "user names must not be 12-digit account IDs")
+	}
 	if err := checkDescription(spec.Description); err != nil {
 		return User{}, err
 	}
 	var out User
 	err := m.mutate(func(st *state) error {
-		if st.users[spec.Name] != nil {
+		// A name taken by an access key (see keyIDConflict) is reported like
+		// an existing user, so the answer does not tell which one it is.
+		if st.users[spec.Name] != nil || st.keys[spec.Name] != nil || spec.Name == m.opts.RootAccessKey {
 			return ErrUserExists
 		}
 		pols := dedupe(spec.Policies)
@@ -222,8 +237,11 @@ func (m *Manager) createAccessKey(ctx context.Context, user, description, access
 	if accessKey != "" && !validAccessKey(accessKey) {
 		return AccessKey{}, wrapf(ErrInvalidKey, "access keys must be 3-128 characters of [A-Za-z0-9._-]")
 	}
-	if secretKey != "" && !validSecretKey(secretKey) {
-		return AccessKey{}, wrapf(ErrInvalidKey, "secret keys must be 8-128 printable ASCII characters without spaces")
+	if accessKey != "" && (isReservedUserName(accessKey) || isAccountID(accessKey)) {
+		return AccessKey{}, wrapf(ErrInvalidKey, "access keys must not be a reserved user name (root, anonymous) or a 12-digit account ID")
+	}
+	if secretKey != "" && !validNewSecretKey(secretKey) {
+		return AccessKey{}, wrapf(ErrInvalidKey, fmt.Sprintf("secret keys must be %d-128 printable ASCII characters without spaces", minNewSecretKeyLen))
 	}
 	if secretKey == "" {
 		var err error
@@ -248,7 +266,7 @@ func (m *Manager) createAccessKey(ctx context.Context, user, description, access
 				if err != nil {
 					return err
 				}
-				if st.keys[g] == nil && g != m.opts.RootAccessKey {
+				if st.keys[g] == nil && g != m.opts.RootAccessKey && keyIDConflict(st, g) == "" {
 					ak = g
 					break
 				}
@@ -258,6 +276,8 @@ func (m *Manager) createAccessKey(ctx context.Context, user, description, access
 			}
 		} else if st.keys[ak] != nil || ak == m.opts.RootAccessKey {
 			return ErrKeyExists
+		} else if keyIDConflict(st, ak) != "" {
+			return wrapf(ErrInvalidKey, "access keys must not equal a user name")
 		}
 		key := AccessKey{
 			AccessKey:   ak,
@@ -280,7 +300,11 @@ func (m *Manager) createAccessKey(ctx context.Context, user, description, access
 	return out, nil
 }
 
-func (m *Manager) updateAccessKey(ctx context.Context, accessKey, status string) error {
+// updateAccessKey sets the status of a key. A non-empty owner binds the
+// change to that user: if the key does not belong to owner when the change
+// is applied (it was deleted and re-created for someone else after the
+// caller was authorized against owner), ErrKeyNotFound is returned.
+func (m *Manager) updateAccessKey(ctx context.Context, owner, accessKey, status string) error {
 	if err := ctxErr(ctx); err != nil {
 		return err
 	}
@@ -293,7 +317,7 @@ func (m *Manager) updateAccessKey(ctx context.Context, accessKey, status string)
 	}
 	return m.mutate(func(st *state) error {
 		k := st.keys[accessKey]
-		if k == nil {
+		if k == nil || (owner != "" && k.User != owner) {
 			return ErrKeyNotFound
 		}
 		nk := *k
@@ -314,7 +338,8 @@ func (m *Manager) accessKeyOwner(ctx context.Context, accessKey string) (string,
 	return k.User, nil
 }
 
-func (m *Manager) deleteAccessKey(ctx context.Context, accessKey string) error {
+// deleteAccessKey deletes a key; owner binds it like updateAccessKey.
+func (m *Manager) deleteAccessKey(ctx context.Context, owner, accessKey string) error {
 	if err := ctxErr(ctx); err != nil {
 		return err
 	}
@@ -323,7 +348,7 @@ func (m *Manager) deleteAccessKey(ctx context.Context, accessKey string) error {
 	}
 	return m.mutate(func(st *state) error {
 		k := st.keys[accessKey]
-		if k == nil {
+		if k == nil || (owner != "" && k.User != owner) {
 			return ErrKeyNotFound
 		}
 		delete(st.keys, accessKey)
@@ -335,6 +360,33 @@ func (m *Manager) deleteAccessKey(ctx context.Context, accessKey string) error {
 		}
 		return nil
 	})
+}
+
+// UpdateUserAccessKey is UpdateAccessKey for a key that must belong to
+// owner: the ownership check and the change are one atomic step, so a
+// caller authorized against owner cannot change a key that was meanwhile
+// re-created under the same ID for another user (ErrKeyNotFound).
+func (m *Manager) UpdateUserAccessKey(ctx context.Context, owner, accessKey, status string) error {
+	if owner == "" {
+		return ErrKeyNotFound
+	}
+	return m.updateAccessKey(ctx, owner, accessKey, status)
+}
+
+// DeleteUserAccessKey is DeleteAccessKey for a key that must belong to
+// owner (checked atomically; see UpdateUserAccessKey).
+func (m *Manager) DeleteUserAccessKey(ctx context.Context, owner, accessKey string) error {
+	if owner == "" {
+		return ErrKeyNotFound
+	}
+	return m.deleteAccessKey(ctx, owner, accessKey)
+}
+
+// warnOnce logs msg at Warn level the first time it is called with id.
+func (m *Manager) warnOnce(id, msg string, args ...any) {
+	if _, seen := m.warned.LoadOrStore(id, true); !seen {
+		slog.Warn(msg, args...)
+	}
 }
 
 func (m *Manager) listPolicies(ctx context.Context) ([]NamedPolicy, error) {

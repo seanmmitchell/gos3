@@ -526,13 +526,17 @@ func TestMDNSBrowserDropsRoutedDatagrams(t *testing.T) {
 	feed("10.0.0.9:5353", 255, serviceRRs("onlink", "o.local.", 9000, "10.0.0.9", "id0000000000000c")...)
 	feed("10.0.0.10:5353", 0, serviceRRs("unknown", "u.local.", 9000, "10.0.0.10", "id0000000000000d")...) // TTL not reported
 	feed("10.0.0.1:5353", 64, serviceRRs("local", "l.local.", 9001, "127.0.0.1", "id0000000000000e")...)   // this host
+	// TTL missing although the socket reports it: unchecked, dropped
+	// unless from this host.
+	b.receive(mdnsReceived{data: response(t, serviceRRs("missing", "m.local.", 9000, "10.0.0.11", "id0000000000000f")...), src: src("10.0.0.11:5353"), ttlMissing: true})
+	b.receive(mdnsReceived{data: response(t, serviceRRs("local2", "l2.local.", 9002, "127.0.0.1", "id00000000000010")...), src: src("10.0.0.1:5353"), ttlMissing: true})
 
 	var got []string
 	for _, c := range b.candidates() {
 		got = append(got, c.id)
 	}
 	slices.Sort(got)
-	if want := []string{"id0000000000000c", "id0000000000000d", "id0000000000000e"}; !slices.Equal(got, want) {
+	if want := []string{"id0000000000000c", "id0000000000000d", "id0000000000000e", "id00000000000010"}; !slices.Equal(got, want) {
 		t.Errorf("candidates = %v, want %v", got, want)
 	}
 }

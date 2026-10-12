@@ -8,7 +8,7 @@ worker and upgrades.
 | Endpoint | Meaning | Response |
 |---|---|---|
 | `GET /_gos3/health` | Liveness: the process serves HTTP. | `200 {"status":"ok"}` |
-| `GET /_gos3/ready` | Readiness: storage answers (bucket listing within 5 s), and the server is not shutting down. | `200 {"status":"ok"}` or `503 {"status":"unavailable","error":"…"}` |
+| `GET /_gos3/ready` | Readiness: storage answers (bucket listing within 5 s), and the server is not shutting down. | `200 {"status":"ok"}`, or `503 {"status":"unavailable","error":"storage unavailable"}` (`"shutting down"` during shutdown). The result is reused for 2 s; the storage error is logged when readiness changes, not returned. |
 
 Both are unauthenticated. `gos3 healthcheck [--ready] [--url URL]` wraps them
 and exits 0 when healthy; the container image uses it as its `HEALTHCHECK`.
@@ -70,8 +70,15 @@ gos3 logs to stderr with Go's `log/slog`, as `text` (default) or `json`
 
 - Startup prints a banner with the endpoints, UI and admin URLs, the region,
   the storage backend, and where the root credentials came from. A generated
-  secret is shown only when it was just generated. With JSON logs the banner is
-  one structured line.
+  secret is shown only when it was just generated **and** standard error is a
+  terminal; otherwise the banner names the file holding it
+  (`<data>/.gos3/root-credentials.json`, or a temporary file deleted on exit
+  for a server without a data directory). The secret is never written to the
+  log. With JSON logs the banner is one structured line (with
+  `credentialsFile`).
+- A warning names each unknown `Host` the server is asked for (the first
+  request per name; see `server.allowed_hosts` in
+  [configuration.md](configuration.md#server)).
 - **Access log**: one line per request (S3 and admin) with `request_id`, `op`,
   `method`, `path`, `status`, `bytes_in`, `bytes_out`, `duration_ms`,
   `remote`, `bucket`, `key`, `auth` (signing method), `user` and `access_key`,
@@ -210,7 +217,10 @@ manager a longer stop timeout than `shutdown_timeout`; the systemd unit uses
 
 1. Read the release notes.
 2. Back up the data directory (see above).
-3. Replace the binary or image, and restart.
+3. Verify the new archive or image with `gh attestation verify`
+   ([releasing.md](releasing.md#verifying-a-release)).
+4. Replace the binary or image (on Kubernetes, raise `newTag`, and `digest`
+   if you pin one, in `kustomization.yaml`), and restart.
 
 The fs metadata database records a format version. A gos3 version that does
 not understand it refuses to start rather than risk the data, so rolling back

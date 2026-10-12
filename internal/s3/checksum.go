@@ -362,6 +362,13 @@ func (p *payloadReader) finish() error {
 // Close closes the underlying body.
 func (p *payloadReader) Close() error { return p.closer.Close() }
 
+// verified reports whether the payload is checked against a digest the
+// client sent: Content-MD5, an x-amz-checksum-* header or a checksum
+// trailer (the check itself happens at EOF).
+func (p *payloadReader) verified() bool {
+	return p.contentMD5 != nil || len(p.declared) > 0 || len(p.trailers) > 0
+}
+
 // Size returns the number of payload bytes read.
 func (p *payloadReader) Size() int64 { return p.n }
 

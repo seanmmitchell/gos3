@@ -49,9 +49,25 @@ func (s *Server) Serve(ctx context.Context, ln net.Listener) error {
 		TLSConfig:         s.tlsConfig,
 		ErrorLog:          log.New(httpErrorWriter{s.log}, "", 0),
 		BaseContext:       func(net.Listener) context.Context { return reqCtx },
+		ConnContext:       connContext,
+		// HTTP/2 (offered with TLS): fewer concurrent streams per
+		// connection than net/http's 250, dead connections detected by
+		// pings, and a connection whose writes make no progress closed.
+		// Stalled streams are aborted by writeGuard.
+		HTTP2: &http.HTTP2Config{
+			MaxConcurrentStreams: http2MaxStreams,
+			SendPingTimeout:      http2PingAfter,
+			PingTimeout:          http2PingTimeout,
+			WriteByteTimeout:     responseWriteIdle,
+		},
 	}
 
 	s.addr.Store(ln.Addr().String())
+	if n := s.cfg.Server.MaxConnections; n > 0 {
+		lim := newConnLimiter(n, func(msg string, args ...any) { s.log.Debug(msg, args...) })
+		hs.ConnState = lim.connState
+		ln = limitedListener{Listener: ln, l: lim}
+	}
 	if err := s.disc.Start(s.lifeCtx); err != nil {
 		s.log.Error("discovery: start failed", "err", err)
 	}

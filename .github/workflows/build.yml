@@ -1,10 +1,11 @@
 name: Build
 
 # Reusable build shared by release.yml (tagged releases from main) and
-# dev-build.yml (every push to dev): runs the Go tests, builds the embedded web
-# UI, cross-compiles gos3 with the UI embedded for every release platform and,
-# when image-tags is set, pushes a multi-arch image to ghcr.io/<owner>/<repo>.
-# The archives are uploaded as bin-<os>-<arch> artifacts for the caller.
+# dev-build.yml (every push to dev): runs the Go and web tests, builds the
+# embedded web UI, cross-compiles gos3 with the UI embedded for every release
+# platform and, when image-tags is set, pushes a multi-arch image to
+# ghcr.io/<owner>/<repo> with a signed build provenance attestation. The
+# archives are uploaded as bin-<os>-<arch> artifacts for the caller.
 
 on:
   workflow_call:
@@ -27,8 +28,19 @@ on:
         required: false
         type: string
         default: "false"
+      use-cache:
+        # GitHub Actions caches are shared across branches: a run on main
+        # restores entries written by runs on the default branch (dev), and
+        # any code running in a dev job (tests, npm or pip packages, tools)
+        # can write cache entries. Go does not re-verify a restored module or
+        # build cache, nor BuildKit a restored layer, so release builds must
+        # not restore caches at all (release.yml sets false).
+        description: Restore and save the Go module/build caches and the BuildKit layer cache.
+        required: false
+        type: boolean
+        default: true
       cache-scope:
-        description: Buildx cache scope, so release and dev builds keep separate caches.
+        description: Buildx cache scope (when use-cache is true).
         required: false
         type: string
         default: gos3
@@ -51,8 +63,8 @@ env:
 
 jobs:
   # Nothing is built or published unless the commit passes the Go checks (the
-  # full matrix, including the web and Playwright suites, runs in ci.yml on
-  # every pull request and is required before anything reaches dev or main).
+  # full matrix, including the Playwright suites, runs in ci.yml on every pull
+  # request and is required before anything reaches dev or main).
   test:
     name: Go (vet, test, e2e)
     runs-on: ubuntu-latest
@@ -61,13 +73,38 @@ jobs:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
         with:
           ref: ${{ env.REF }}
+          persist-credentials: false
       - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
         with:
           go-version-file: go.mod
-          cache: true
+          cache: ${{ inputs.use-cache }}
       - run: go vet ./...
       - run: go test -race -count=1 ./cmd/... ./internal/...
       - run: go test -race -count=1 ./test/e2e/...
+
+  # The web unit tests run in their own job: test-only packages (vitest,
+  # happy-dom, @nuxt/test-utils, ...) never run in the job that produces the
+  # UI embedded into the binaries.
+  ui-test:
+    name: Web UI (typecheck, test)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          ref: ${{ env.REF }}
+          persist-credentials: false
+      - uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5.0.0
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          package-manager-cache: false
+      - name: Typecheck and test
+        working-directory: web
+        run: |
+          corepack enable
+          pnpm install --frozen-lockfile
+          pnpm typecheck
+          pnpm test
 
   ui:
     name: Build embedded UI
@@ -78,16 +115,18 @@ jobs:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
         with:
           ref: ${{ env.REF }}
+          persist-credentials: false
       - uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5.0.0
         with:
           node-version: ${{ env.NODE_VERSION }}
-      - name: Test and build (pnpm generate:embed)
+          package-manager-cache: false
+      # Production dependencies only: `nuxt generate` needs none of the
+      # devDependencies, so their code never runs next to the shipped UI.
+      - name: Build (pnpm generate:embed)
         working-directory: web
         run: |
           corepack enable
-          pnpm install --frozen-lockfile
-          pnpm typecheck
-          pnpm test
+          pnpm install --frozen-lockfile --prod
           pnpm generate:embed
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
@@ -99,7 +138,7 @@ jobs:
     name: gos3 ${{ matrix.goos }}/${{ matrix.goarch }}
     runs-on: ubuntu-latest
     timeout-minutes: 20
-    needs: ui
+    needs: [ui, ui-test]
     strategy:
       fail-fast: true
       matrix:
@@ -109,10 +148,11 @@ jobs:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
         with:
           ref: ${{ env.REF }}
+          persist-credentials: false
       - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
         with:
           go-version-file: go.mod
-          cache: true
+          cache: ${{ inputs.use-cache }}
       - uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5.0.0
         with:
           name: ui-embed
@@ -136,6 +176,7 @@ jobs:
           ext=""; [ "$GOOS" = windows ] && ext=".exe"
           name="gos3_${VERSION#v}_${GOOS}_${GOARCH}"
           mkdir -p "build/$name" dist
+          go mod verify
           go build -trimpath \
             -ldflags "-s -w -X $pkg.Version=$VERSION -X $pkg.Commit=$commit -X $pkg.Date=$date" \
             -o "build/$name/gos3$ext" ./cmd/gos3
@@ -159,13 +200,18 @@ jobs:
     timeout-minutes: 45
     # Only publish an image for a commit whose binaries built.
     needs: binaries
+    # id-token and attestations: sign the build provenance attestation
+    # (Sigstore, via the job's OIDC token) and store it with the repository.
     permissions:
       contents: read
       packages: write
+      id-token: write
+      attestations: write
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
         with:
           ref: ${{ env.REF }}
+          persist-credentials: false
       - name: Build metadata
         id: vars
         run: |
@@ -184,7 +230,8 @@ jobs:
           tags: ${{ inputs.image-tags }}
           flavor: |
             latest=${{ inputs.image-latest }}
-      - uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+      - id: push
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: .
           platforms: linux/amd64,linux/arm64
@@ -195,7 +242,23 @@ jobs:
             VERSION=${{ env.VERSION }}
             COMMIT=${{ steps.vars.outputs.commit }}
             DATE=${{ steps.vars.outputs.date }}
-          cache-from: type=gha,scope=gos3-${{ inputs.cache-scope }}
-          cache-to: type=gha,mode=max,scope=gos3-${{ inputs.cache-scope }}
-          provenance: true
+          # Without use-cache (releases), nothing is read from or written to
+          # the GitHub Actions cache and every layer is rebuilt.
+          no-cache: ${{ !inputs.use-cache }}
+          cache-from: ${{ inputs.use-cache && format('type=gha,scope=gos3-{0}', inputs.cache-scope) || '' }}
+          cache-to: ${{ inputs.use-cache && format('type=gha,mode=max,scope=gos3-{0}', inputs.cache-scope) || '' }}
+          provenance: mode=max
           sbom: true
+      # Verify with: gh attestation verify oci://ghcr.io/<owner>/<repo>:<tag>
+      #   --repo <owner>/<repo> --source-ref refs/heads/main (docs/releasing.md)
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-name: ghcr.io/${{ github.repository }}
+          subject-digest: ${{ steps.push.outputs.digest }}
+          push-to-registry: true
+          # Storage records exist only for organization-owned repositories.
+          create-storage-record: false
+      - name: Log out of ghcr.io
+        if: always()
+        run: docker logout ghcr.io

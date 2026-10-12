@@ -316,8 +316,8 @@ func (s *Service) Probe(ctx context.Context, baseURL string) (Peer, error) {
 // given) × Ports × Schemes. The number of hosts is bounded by
 // Config.MaxScanHosts (ErrTooManyHosts); malformed requests yield
 // ErrInvalidScan and a disabled scan (Config.AllowScan false) ErrScanDisabled.
-// Found peers are de-duplicated by ID, exclude this server, and are sorted by
-// Name then ID. When ctx is cancelled the partial result is returned with
+// Found peers are de-duplicated by ID, exclude this server, are sorted by
+// Name then ID, and are bounded like the peer table (at most 1024). When ctx is cancelled the partial result is returned with
 // ctx.Err().
 func (s *Service) Scan(ctx context.Context, req ScanRequest) (ScanResult, error) {
 	return s.scan(ctx, req)

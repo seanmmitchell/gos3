@@ -247,14 +247,17 @@ func TestGlobalWildcardCORSSignedOnly(t *testing.T) {
 		"Action":["s3:GetObject","s3:PutObject"],"Resource":"arn:aws:s3:::lan/*","Condition":{"IpAddress":{"aws:SourceIp":"127.0.0.0/8"}}}]}`)
 	evil := http.Header{"Origin": {"https://evil.example"}}
 
-	// Unsigned actual requests: served, but without Access-Control-*.
+	// Unsigned actual requests: reads are served, but without
+	// Access-Control-*; writes from another origin are refused (hiding the
+	// response would not undo them, see checkAnonymousRequest).
 	for _, m := range []string{"GET", "PUT"} {
 		var body []byte
+		want := 200
 		if m == "PUT" {
-			body = []byte("x")
+			body, want = []byte("x"), 403
 		}
 		resp := e.anon(m, "/lan/k", body, evil)
-		if resp.StatusCode != 200 {
+		if resp.StatusCode != want {
 			t.Fatalf("anonymous %s: %d %s", m, resp.StatusCode, resp.Data)
 		}
 		if got := resp.Header.Get("Access-Control-Allow-Origin"); got != "" {

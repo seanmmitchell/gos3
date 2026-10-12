@@ -254,6 +254,9 @@ type beacon struct {
 	ifaces []net.Interface // multicast interfaces to send on
 	local  *localNets      // which senders are on this host or link
 	limit  *sourceLimiter  // announces taken per sender
+	qlimit *sourceLimiter  // queries answered per sender
+	// Announces taken and query replies sent, over all senders.
+	announces, replyRate *rateLimiter
 
 	sendMu   sync.Mutex
 	nonceMu  sync.Mutex
@@ -283,7 +286,10 @@ func newBeacon(o beaconOptions, uconn, mconn net.PacketConn, dests func() []net.
 		mconn:         mconn,
 		dests:         dests,
 		local:         hostNets,
-		limit:         newSourceLimiter(),
+		limit:         newSourceLimiter(sourceBurst, sourceRefill),
+		qlimit:        newSourceLimiter(queryBurst, queryRefill),
+		announces:     newRateLimiter(announceBurst, announceRefill),
+		replyRate:     newRateLimiter(replyBurst, replyRefill),
 		replySem:      make(chan struct{}, maxPendingReplies),
 	}
 }
@@ -457,10 +463,12 @@ func (b *beacon) readLoop(ctx context.Context, c net.PacketConn) {
 // handle processes one received datagram. Datagrams from senders that are
 // neither on this host nor on a directly connected subnet are dropped: the
 // group port also receives unicast datagrams, and beacons never cross a
-// router legitimately (TTL 1).
+// router legitimately (TTL 1). So are datagrams from a broadcast or subnet
+// network address: such a source is spoofed, and a reply would reach every
+// host of the link.
 func (b *beacon) handle(ctx context.Context, data []byte, src net.Addr) {
 	srcIP, ok := ipFromAddr(src)
-	if !ok || !b.local.onLink(srcIP) {
+	if !ok || !b.local.onLink(srcIP) || b.local.isBroadcast(srcIP) {
 		b.logger.Debug("beacon: dropping datagram from a sender that is not on the local link", "from", addrString(src))
 		return
 	}
@@ -478,8 +486,9 @@ func (b *beacon) handle(ctx context.Context, data []byte, src net.Addr) {
 		if m.ID == selfID {
 			return
 		}
-		if !b.limit.allow(srcIP, b.now()) {
-			b.logger.Debug("beacon: too many announces from sender, dropping", "from", addrString(src))
+		now := b.now()
+		if !b.limit.allow(srcIP, now) || !b.announces.allow(now) {
+			b.logger.Debug("beacon: too many announces, dropping", "from", addrString(src))
 			return
 		}
 		b.sink.candidate(candidate{
@@ -491,6 +500,11 @@ func (b *beacon) handle(ctx context.Context, data []byte, src net.Addr) {
 		if !b.advertise || b.ownNonce(m.Nonce) {
 			return
 		}
+		now := b.now()
+		if !b.qlimit.allow(srcIP, now) || !b.replyRate.allow(now) {
+			b.logger.Debug("beacon: too many queries, dropping", "from", addrString(src))
+			return
+		}
 		b.scheduleReply(ctx, src)
 	case beaconBye:
 		if m.ID != selfID {
@@ -499,51 +513,39 @@ func (b *beacon) handle(ctx context.Context, data []byte, src net.Addr) {
 	}
 }
 
-// Per-sender announce budget: a burst of sourceBurst announces, refilled
-// at one per sourceRefill. Servers announce every beacon interval (≥ 1 s)
-// and on queries, so this only throttles floods.
+// Per-sender budgets (token buckets): announces get a burst of sourceBurst,
+// refilled at one per sourceRefill. Servers announce every beacon interval
+// (≥ 1 s) and on queries, so this only throttles floods. Queries are sent
+// once per start or browse, so a sender gets queryBurst replies, then one
+// per queryRefill.
 const (
 	sourceBurst      = 32
 	sourceRefill     = 250 * time.Millisecond
+	queryBurst       = 4
+	queryRefill      = time.Second
 	maxSourceEntries = 1024
 )
 
-// sourceLimiter is a token bucket per sender address.
-type sourceLimiter struct {
-	mu      sync.Mutex
-	buckets map[netip.Addr]*tokenBucket
-}
+// Global budgets over all senders (spoofed source addresses each get their
+// own per-sender bucket): announces handed to discovery and replies to
+// queries.
+const (
+	announceBurst  = 256
+	announceRefill = time.Second / 128
+	replyBurst     = maxPendingReplies
+	replyRefill    = time.Second / 20
+)
 
+// tokenBucket holds tokens refilled at one per refill up to burst.
 type tokenBucket struct {
 	tokens float64
 	at     time.Time
 }
 
-func newSourceLimiter() *sourceLimiter {
-	return &sourceLimiter{buckets: make(map[netip.Addr]*tokenBucket)}
-}
-
-// allow takes one token of src's bucket.
-func (l *sourceLimiter) allow(src netip.Addr, now time.Time) bool {
-	l.mu.Lock()
-	defer l.mu.Unlock()
-	b, ok := l.buckets[src]
-	if !ok {
-		if len(l.buckets) >= maxSourceEntries {
-			for k, v := range l.buckets {
-				if now.Sub(v.at) > sourceBurst*sourceRefill {
-					delete(l.buckets, k)
-				}
-			}
-			if len(l.buckets) >= maxSourceEntries {
-				clear(l.buckets)
-			}
-		}
-		b = &tokenBucket{tokens: sourceBurst, at: now}
-		l.buckets[src] = b
-	}
+// take refills b up to now and takes one token.
+func (b *tokenBucket) take(now time.Time, burst int, refill time.Duration) bool {
 	if d := now.Sub(b.at); d > 0 {
-		b.tokens = min(sourceBurst, b.tokens+float64(d)/float64(sourceRefill))
+		b.tokens = min(float64(burst), b.tokens+float64(d)/float64(refill))
 		b.at = now
 	}
 	if b.tokens < 1 {
@@ -551,6 +553,57 @@ func (l *sourceLimiter) allow(src netip.Addr, now time.Time) bool {
 	}
 	b.tokens--
 	return true
+}
+
+// rateLimiter is one token bucket shared by all senders. It is safe for
+// concurrent use.
+type rateLimiter struct {
+	mu     sync.Mutex
+	burst  int
+	refill time.Duration
+	b      *tokenBucket
+}
+
+func newRateLimiter(burst int, refill time.Duration) *rateLimiter {
+	return &rateLimiter{burst: burst, refill: refill}
+}
+
+// allow takes one token.
+func (l *rateLimiter) allow(now time.Time) bool {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.b == nil {
+		l.b = &tokenBucket{tokens: float64(l.burst), at: now}
+	}
+	return l.b.take(now, l.burst, l.refill)
+}
+
+// sourceLimiter is a token bucket per sender address. At most
+// maxSourceEntries senders are tracked; a new sender replaces the least
+// recently active one (whose bucket has usually refilled anyway), so many
+// (spoofed) senders never reset the bucket of an active one. It is safe for
+// concurrent use.
+type sourceLimiter struct {
+	mu      sync.Mutex
+	burst   int
+	refill  time.Duration
+	buckets *lru[netip.Addr, *tokenBucket]
+}
+
+func newSourceLimiter(burst int, refill time.Duration) *sourceLimiter {
+	return &sourceLimiter{burst: burst, refill: refill, buckets: newLRU[netip.Addr, *tokenBucket](maxSourceEntries)}
+}
+
+// allow takes one token of src's bucket.
+func (l *sourceLimiter) allow(src netip.Addr, now time.Time) bool {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	b, ok := l.buckets.get(src)
+	if !ok {
+		b = &tokenBucket{tokens: float64(l.burst), at: now}
+		l.buckets.put(src, b)
+	}
+	return b.take(now, l.burst, l.refill)
 }
 
 // scheduleReply answers a query with a unicast announce after a random

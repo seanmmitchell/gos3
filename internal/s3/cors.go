@@ -3,11 +3,14 @@ package s3
 import (
 	"context"
 	"encoding/xml"
+	"log/slog"
 	"net/http"
 	"net/url"
 	"slices"
 	"strconv"
 	"strings"
+
+	"golang.org/x/net/http/httpguts"
 
 	"github.com/seanmmitchell/gos3/internal/config"
 	"github.com/seanmmitchell/gos3/internal/s3err"
@@ -63,7 +66,13 @@ type CORSRule struct {
 // (PutBucketCors body or stored config): MalformedXML for structural
 // problems (no rules, more than 100 rules, a rule without AllowedMethod or
 // AllowedOrigin, oversized document), InvalidRequest for unsupported
-// methods and multiple wildcards in an origin or header.
+// methods, multiple wildcards in an origin or header, and values that are
+// not valid in the response headers they end up in: AllowedHeader and
+// ExposeHeader must be HTTP header names (tokens; AllowedHeader may hold a
+// '*' wildcard), AllowedOrigin may not contain spaces or control
+// characters and ID no control characters. Without the character checks
+// a stored CR/LF would reach Access-Control-* response headers, where only
+// the HTTP stack's own sanitising stops header injection.
 func parseCORSConfiguration(data []byte) (*CORSConfiguration, error) {
 	if len(data) > maxCORSConfigSize {
 		return nil, s3err.ErrMaxMessageLengthExceeded
@@ -89,6 +98,9 @@ func (c *CORSConfiguration) validate() error {
 		if len(r.ID) > maxCORSRuleIDLen {
 			return s3err.ErrInvalidArgument.WithMessage("The ID of a CORS rule must be at most 255 characters.")
 		}
+		if strings.ContainsFunc(r.ID, isControl) {
+			return s3err.ErrInvalidRequest.WithMessage("The ID of a CORS rule may not contain control characters.")
+		}
 		if len(r.AllowedMethods) == 0 || len(r.AllowedOrigins) == 0 {
 			return s3err.ErrMalformedXML
 		}
@@ -104,6 +116,9 @@ func (c *CORSConfiguration) validate() error {
 			if o == "" || strings.Count(o, "*") > 1 {
 				return s3err.ErrInvalidRequest.WithMessage("AllowedOrigin %q can not have more than one wildcard.", o)
 			}
+			if strings.ContainsFunc(o, func(c rune) bool { return c == ' ' || isControl(c) }) {
+				return s3err.ErrInvalidRequest.WithMessage("AllowedOrigin %q contains invalid characters.", o)
+			}
 			r.AllowedOrigins[j] = o
 		}
 		for j, h := range r.AllowedHeaders {
@@ -111,12 +126,18 @@ func (c *CORSConfiguration) validate() error {
 			if strings.Count(h, "*") > 1 {
 				return s3err.ErrInvalidRequest.WithMessage("AllowedHeader %q can not have more than one wildcard.", h)
 			}
+			if h != "" && !httpguts.ValidHeaderFieldName(h) {
+				return s3err.ErrInvalidRequest.WithMessage("AllowedHeader %q is not a valid header name.", h)
+			}
 			r.AllowedHeaders[j] = h
 		}
 		for j, h := range r.ExposeHeaders {
 			h = strings.TrimSpace(h)
 			if strings.Contains(h, "*") {
 				return s3err.ErrInvalidRequest.WithMessage("ExposeHeader %q contains wildcard. We currently do not support wildcard for ExposeHeader.", h)
+			}
+			if h != "" && !httpguts.ValidHeaderFieldName(h) {
+				return s3err.ErrInvalidRequest.WithMessage("ExposeHeader %q is not a valid header name.", h)
 			}
 			r.ExposeHeaders[j] = h
 		}
@@ -126,6 +147,10 @@ func (c *CORSConfiguration) validate() error {
 	}
 	return nil
 }
+
+// isControl reports whether c is an ASCII control character (including
+// DEL), which HTTP header values may not carry (horizontal tab aside).
+func isControl(c rune) bool { return c < 0x20 || c == 0x7f }
 
 // match returns the first rule allowing origin, method and every requested
 // header (nil if none).
@@ -247,16 +272,32 @@ func globalCORS(c config.CORSConfig) *CORSConfiguration {
 // corsConfigFor returns the CORS configuration that applies to a request:
 // the bucket's when it has one, else the global settings (also used for
 // service-level requests and nonexistent buckets). Nil when neither exists.
+//
+// A stored bucket configuration that no longer validates (it was stored
+// before a validation rule was added, such as the header-name and origin
+// character checks) disables CORS for the bucket: no CORS headers are
+// sent and preflights are refused, as if the bucket had a configuration
+// that matches nothing. It neither fails the bucket's requests nor falls
+// back to the global rules, which could allow more than the bucket owner
+// configured. A warning is logged each time the document is parsed (once
+// per stored version, the result is cached); PutBucketCors or
+// DeleteBucketCors repairs it.
 func (s *Server) corsConfigFor(ctx context.Context, bucket string, settings config.Settings) *CORSConfiguration {
 	if bucket != "" {
 		raw, err := s.backend.GetBucketConfig(ctx, bucket, storage.ConfigCORS)
 		if err == nil && len(raw) > 0 {
 			v, perr := s.configs.get(bucket, storage.ConfigCORS, raw, func(b []byte) (any, error) {
-				return parseCORSConfiguration(b)
+				c, err := parseCORSConfiguration(b)
+				if err != nil {
+					s.log.LogAttrs(ctx, slog.LevelWarn, "s3: stored bucket CORS configuration is invalid; CORS is disabled for the bucket",
+						slog.String("bucket", bucket), slog.String("error", err.Error()))
+				}
+				return c, err
 			})
-			if perr == nil {
-				return v.(*CORSConfiguration)
+			if perr != nil {
+				return nil
 			}
+			return v.(*CORSConfiguration)
 		}
 	}
 	return globalCORS(settings.CORS)

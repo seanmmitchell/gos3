@@ -63,8 +63,11 @@ var (
 	_ storage.ConditionalDeleter = (*Backend)(nil)
 )
 var (
-	_ storage.ConditionalDeleter = (*Backend)(nil)
-	_ storage.UploadWalker       = (*Backend)(nil)
+	_ storage.ConditionalDeleter     = (*Backend)(nil)
+	_ storage.UploadWalker           = (*Backend)(nil)
+	_ storage.ConditionalMetaUpdater = (*Backend)(nil)
+	_ storage.ConfigViewer           = (*Backend)(nil)
+	_ storage.CheckedDeleter         = (*Backend)(nil)
 )
 
 // New returns an empty in-memory backend.
@@ -479,6 +482,21 @@ func (b *Backend) GetBucketConfig(ctx context.Context, bucketName, key string) (
 		return nil, fmt.Errorf("%w: %s/%s", storage.ErrConfigNotFound, bucketName, key)
 	}
 	return bytes.Clone(data), nil
+}
+
+// ViewBucketConfig calls fn with a stored configuration document, without
+// copying it, under the bucket's read lock (see storage.ConfigViewer).
+func (b *Backend) ViewBucketConfig(ctx context.Context, bucketName, key string, fn func([]byte) error) error {
+	bk, err := b.rlockBucket(ctx, bucketName)
+	if err != nil {
+		return err
+	}
+	defer bk.mu.RUnlock()
+	data, ok := bk.configs[key]
+	if !ok {
+		return fmt.Errorf("%w: %s/%s", storage.ErrConfigNotFound, bucketName, key)
+	}
+	return fn(data)
 }
 
 // PutBucketConfig stores a copy of a configuration document.

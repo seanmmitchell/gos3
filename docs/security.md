@@ -11,6 +11,9 @@ the settings to review before you expose a server.
 - [ ] Serve HTTPS: either `server.tls_cert` / `tls_key`, or a TLS-terminating
       reverse proxy (see [deployment.md](deployment.md#reverse-proxy)).
 - [ ] Restrict `cors.allowed_origins` to the web UI origins you use.
+- [ ] List the host names clients use in `server.allowed_hosts` (see
+      [DNS rebinding](#dns-rebinding-and-the-host-header)), so requests
+      for any other name are refused, signed ones included.
 - [ ] Decide on discovery: `discovery.advertise`, `discovery.allow_scan`, and
       `server.public_info`.
 - [ ] Keep the data directory private (mode 0700) and back it up; it contains
@@ -35,7 +38,12 @@ the settings to review before you expose a server.
   passwords. A secret key the user saves with "remember" is kept in the
   browser's `localStorage`, so use that only on trusted devices. Any script
   running on the UI's origin could read it, which is why object responses
-  are sandboxed (see [Object responses](#object-responses)).
+  are sandboxed (see [Object responses](#object-responses)) and the
+  embedded UI is served with a Content-Security-Policy whose `script-src`
+  allows only the UI's own files and the hashes of its build's inline
+  scripts (no `unsafe-inline`/`unsafe-eval`), so injected markup cannot run
+  script. `connect-src` stays open to any http(s) origin because the UI
+  talks to every S3 endpoint the user adds.
 
 ### Root credentials
 
@@ -45,9 +53,17 @@ policies.
 
 | Configuration | Behaviour |
 |---|---|
-| `GOS3_ROOT_ACCESS_KEY` + `GOS3_ROOT_SECRET_KEY` (or `auth.root_*` in YAML) | Used as given. The secret is never logged. |
-| Not set, with a data directory | Generated on first start with a random 20-character access key and 40-character secret. They are logged **once** as a warning and shown in the startup banner, then saved to `<data>/.gos3/root-credentials.json` (mode 0600) and reused on later starts. Only the access key is logged after that. |
-| Not set, memory backend without a data path | New keys on every start, logged each time. |
+| `GOS3_ROOT_ACCESS_KEY` + `GOS3_ROOT_SECRET_KEY` (or `auth.root_*` in YAML) | Used as given. The secret is never logged. A secret shorter than 16 characters is accepted with a warning. A published example secret (`change-me-now`, `gos3admin-secret`, `minioadmin`, the AWS documentation key, ...) is refused unless `auth.insecure_demo_credentials` / `GOS3_INSECURE_DEMO_CREDENTIALS=true` is set. |
+| Not set, with a data directory | Generated on first start with a random 20-character access key and 40-character secret, saved to `<data>/.gos3/root-credentials.json` (mode 0600) and reused on later starts. The secret is **never logged**: the startup banner shows it only when standard error is a terminal, otherwise it names the file. The log names the access key and the file. |
+| Not set, memory backend without a data path | New keys on every start. On a terminal the banner shows the secret; otherwise it is written to a private temporary file (named in the banner and the log) that is deleted on exit. |
+
+Logs end up in systems (journald, `docker logs`, Kubernetes log stacks) that
+many more people can read than the data directory, so no secret is written
+there. Published example keys are refused because the default CORS policy
+admits signed requests from any origin: any website a user opens could sign
+requests with a published key and drive the server through the user's
+browser (even one bound to `127.0.0.1`). A short secret can be guessed
+offline from a single captured signed request, especially over plain HTTP.
 
 To rotate the root keys, set new ones in the environment and restart. If you
 want to switch from generated keys to configured ones, delete
@@ -72,6 +88,50 @@ needs no grant (deleting is refused only by an explicit Deny of
 `admin:DeleteOwnAccessKey` or `admin:*`). When a key leaks, check the log
 for keys it created; disabling the user (`PATCH /users/{name}` with
 `"disabled": true`) revokes all of the user's keys at once.
+
+Revocation also stops requests already in flight. Authentication and
+authorization happen before a request body is read, and a body may arrive
+slowly, so every write with a body (PutObject, PostObject, UploadPart,
+CompleteMultipartUpload, PutObjectAcl, PutObjectTagging,
+PutObjectRetention, PutObjectLegalHold, DeleteObjects, CreateBucket and
+every bucket configuration write: policy, ACL, public access block,
+ownership controls, CORS, lifecycle, versioning, encryption, object lock,
+tagging and the rest) checks again right
+before it commits that its access key is still active and belongs to the
+same enabled user, and fails with `AccessDenied` otherwise. A write that has
+been in flight for more than 5 seconds also repeats its authorization
+decisions against the current policies, ACLs, ownership controls and public
+access block, so a policy change or a newly enabled `BlockPublicAcls`
+applies to it as well. That repeated decision evaluates the clock-derived
+condition keys (`aws:CurrentTime`, `aws:EpochTime`, `s3:signatureAge`,
+`s3:object-lock-remaining-retention-days`) as of the request's start, so a
+long upload that was allowed when it started is not refused merely for
+taking long. Reads already streaming a response are not cut off.
+
+Generated keys have a 20-character ID and a 40-character random secret. A
+secret chosen through the admin API must be at least 16 characters: any
+SigV4 signature (a shared presigned URL, a logged request) lets an attacker
+test guesses of the secret offline, so prefer generated secrets. Keys stored
+by earlier versions with shorter secrets keep working. gos3 does not
+throttle failed signature checks, and, as on AWS, `InvalidAccessKeyId`
+versus `SignatureDoesNotMatch` tells a caller whether an access key ID
+exists; rate-limit authentication failures at a reverse proxy if the
+endpoint is exposed.
+
+Bucket-policy principals name users by name and keys by ID, so the two
+namespaces are kept apart: a key ID cannot equal a user name, `root`,
+`anonymous` or a 12-digit account ID, a user name cannot equal a key ID or
+a 12-digit account ID, and a bare 12-digit principal only ever names the
+account. Keys in an older `iam.json` that break this rule are refused at
+authentication and logged at startup and on first use; replace them.
+Choosing a key's ID (`"accessKey"` in `POST /users/{name}/keys`) needs
+`admin:CreateAccessKey` at service level, so a delegated administrator can
+only create keys with generated IDs. Principals, `arn:gos3:admin:::user/…`
+resources and `aws:username` / `aws:userid` are bound to the user **name**,
+which can be reused: a user created with the name of a deleted user (or a
+key re-created with a deleted key's ID) inherits every bucket-policy
+statement and delegation that named it. Remove a deleted user's name from
+bucket policies and admin policies, or do not reuse names.
 
 Creating a user through the admin API needs `admin:CreateUser`; creating it
 with policies attached also needs `admin:UpdateUser`, and with an initial
@@ -98,7 +158,8 @@ the holder give itself any permission:
   `admin:CreateAccessKey`): create a user with the `admin` policy and use it.
 - `admin:PutPolicy`: rewrite a policy attached to yourself to allow `*`.
 - `admin:CreateAccessKey`: create a key (with a secret you choose) for an
-  administrator and sign as them.
+  administrator and sign as them. Choosing the key's ID always needs this
+  action at service level, even when it is otherwise scoped.
 - `admin:UpdateAccessKey`: reactivate an administrator key that was
   deactivated, for example after it leaked.
 - `admin:UpdateConfig`: change CORS, discovery and the public URL; treat it
@@ -135,7 +196,11 @@ policies that grant admin actions. A Deny with
 `"ForAnyValue:StringEquals": {"admin:PolicyName": "admin"}` on
 `admin:UpdateUser` and `admin:CreateUser` blocks attaching `admin` whatever
 else is allowed. `*` and `arn:gos3:admin:::*` keep matching every admin
-resource, and s3 ARNs such as `arn:aws:s3:::*` never grant admin actions. The
+resource, and s3 ARNs such as `arn:aws:s3:::*` never grant admin actions,
+neither as `Resource` nor as `NotResource`: an Allow of `"Action": "*"` with
+`"NotResource": ["arn:aws:s3:::secret/*"]` grants every s3 action outside
+`secret` but no admin action (an Allow's `NotResource` covers only the
+namespaces it lists; a Deny's applies to everything not listed). The
 UI's capability flags (`GET /whoami`) reflect only unscoped grants.
 
 Setting an ACL or tags while writing an object needs more than
@@ -151,7 +216,21 @@ evaluated with the copied tags as `s3:RequestObjectTag/<key>` keys. Copying
 an untagged source, or `REPLACE` without tags, needs only `s3:GetObject` and
 `s3:PutObject`. A principal limited to `s3:PutObject` (such as the built-in
 `writeonly` policy) can therefore neither publish an object through an ACL
-nor plant tags that `s3:ExistingObjectTag` conditions rely on. The
+nor plant tags that `s3:ExistingObjectTag` conditions rely on.
+
+When a decision depends on the object itself (`s3:ExistingObjectTag/*`
+conditions, or an object ACL for reads), the operation acts on exactly the
+version that was evaluated: reads open that version, and deletes and ACL,
+tagging, retention and legal hold updates are made conditional on it,
+atomically in the storage backend. If another object took its place in the
+meantime (in unversioned and versioning-suspended buckets an overwrite
+reuses the version ID `null`), the request fails with `AccessDenied`
+instead of acting on an object the decision never saw. Each entry of a
+DeleteObjects request is decided on a fresh lookup of its object.
+CompleteMultipartUpload checks the upload's canned ACL against the bucket's
+current `BlockPublicAcls` (refusing a public ACL) and ownership controls
+(dropping the ACL when ACLs are disabled), not only when the upload was
+created. The
 `s3:RequestObjectTag/<key>` and `s3:RequestObjectTagKeys` condition keys are
 evaluated for these uploads, for PutObjectTagging (from the XML body) and for
 PostObject (from the `tagging` field).
@@ -182,10 +261,20 @@ The data directory (default `./data`, `/data` in the container) holds:
 | `.gos3/server-id` | random server ID | public |
 
 Keep the directory owned by the gos3 user with mode 0700, and treat backups as
-secret too. On Windows the modes above do not apply: files inherit the ACLs of
-the data directory, so put it somewhere only the gos3 account (and
-administrators) can read, not in a shared location such as `C:\ProgramData`
-with default permissions. **gos3 does not encrypt objects.** Bucket default encryption and
+secret too. With the fs backend, gos3 also removes group and other access
+from an existing `.gos3`, its `data/`, `tmp/`, `uploads/` and `orphans/`
+directories and `meta.db` at startup (logging a warning), so a directory
+pre-created by a volume mount or restored from a backup with looser modes
+does not stay readable. For every backend the same is done for `.gos3`
+itself, `root-credentials.json`, `iam.json` and `settings.json`. On Windows
+the modes above do not apply; instead gos3 gives `.gos3` a protected ACL
+(no inherited entries) that grants access only to the account running gos3,
+SYSTEM and Administrators, inherited by everything inside, and writes the
+secret files with the same ACL. If that fails (for example on a file system
+without ACLs) it logs a warning: then put the data directory somewhere only
+the gos3 account (and administrators) can read, not in a shared location
+such as `C:\ProgramData` with default permissions. Object data outside
+`.gos3` keeps the data directory's ACL. **gos3 does not encrypt objects.** Bucket default encryption and
 `x-amz-server-side-encryption` headers are accepted and reported for client
 compatibility only. Use full-disk or file system encryption if you need
 encryption at rest. SSE-C is rejected (`NotImplemented`).
@@ -224,11 +313,18 @@ of discarding them. See [operations.md](operations.md#the-data-directory).
   appends to it. List only the proxies themselves, never a subnet that also
   holds clients: a client whose own address is in `trusted_proxies` is
   skipped like a proxy hop, so it can choose its `aws:SourceIp` again.
-  With an empty `trusted_proxies` every peer is trusted: a
-  client that can reach gos3 without the proxy can then fake
-  `aws:SourceIp` and `aws:SecureTransport`. The setting applies to the S3
-  API, the admin API and the `/_gos3/*` endpoints (conditions and access
-  logs alike).
+  `trust_proxy_headers` with an empty `trusted_proxies` is a configuration
+  error (it used to trust every peer, so a client that could reach gos3
+  without the proxy could fake `aws:SourceIp` and `aws:SecureTransport`).
+  The proxy must *set* `X-Forwarded-Proto` (not append to a client-sent
+  one). The setting applies to the S3 API, the admin API and the
+  `/_gos3/*` endpoints (conditions and access logs alike).
+- Where TLS terminates at gos3, `aws:SecureTransport` and `s3:TlsVersion`
+  come from the connection, not from the request: an HTTP/2 client that
+  sends the `:scheme http` pseudo-header over TLS cannot drop
+  `s3:TlsVersion` from the condition context.
+- gos3 logs a warning at startup when it serves plain HTTP on a
+  non-loopback address without `trust_proxy_headers`.
 
 ### Timeouts
 
@@ -247,10 +343,25 @@ These limits are fixed (not configurable):
   file, and the bodies of DeleteObjects (at most about 6.2 MiB; the keys to
   authorize are in it), PutObjectTagging, PutObjectRetention and
   PutObjectLegalHold (at most 64 KiB; their condition keys come from the
-  body). Every other S3 request is authorized before its body is read.
+  body). Every other S3 request is authorized before its body is read, and
+  re-validated before it commits (see [IAM users and keys](#iam-users-and-keys)).
 - Slow CopyObject, UploadPartCopy and CompleteMultipartUpload calls keep the
   connection alive with whitespace (see
   [s3-compatibility.md](s3-compatibility.md#other-differences-from-aws)).
+- Every write of a response (in pieces of at most 64 KiB) must make progress
+  within 2 minutes; otherwise the request is aborted (HTTP/1.1: the
+  connection is closed; HTTP/2: the stream is reset). Downloads of any size
+  keep working as long as the client reads at least about 550 bytes/s. A
+  client that stops reading, or never opens its HTTP/2 flow-control window,
+  cannot hold handlers, buffers and open files forever.
+- HTTP/2 connections allow 100 concurrent streams (net/http's default is
+  250), are pinged after 30 s of silence and closed when a write to them
+  makes no progress for 2 minutes.
+- `server.max_connections` (off by default) caps the open client
+  connections: at the cap a new connection replaces the longest-idle
+  keep-alive connection, or is closed when all are busy. Without it the
+  process's file descriptor limit applies. Internet-facing servers should
+  sit behind a proxy with connection and rate limits.
 
 ### Request size limits
 
@@ -263,7 +374,31 @@ CompleteMultipartUpload documents are parsed as they arrive: the 1001st
 `<Object>` or the 10001st `<Part>` ends the request at once, and nesting
 depth, element count and the size of a single tag are bounded, so the work
 and memory a request causes stay proportional to a valid one, also for an
-anonymous DeleteObjects that is rejected per key afterwards.
+anonymous DeleteObjects that is rejected per key afterwards. A DeleteObjects
+`<Key>`, `<VersionId>` or `<ETag>` longer than 1024 bytes ends the request
+too, so per-key errors never echo more than a valid key, and the
+DeleteResult is streamed as the keys are processed (each write with a 60 s
+deadline) rather than built in memory. DeleteObjects also requires
+`Content-MD5` or an `x-amz-checksum-*` header (or trailer), verified against
+the body, as AWS does; a web page cannot send such a header cross-origin
+without a CORS preflight, so it cannot make a visitor's browser delete
+objects in a bucket that its network position (an `aws:SourceIp` policy) or
+anonymous access lets it write to.
+
+Object metadata is bounded as on AWS: user metadata (`x-amz-meta-*`) to
+2 KiB, and all metadata returned as response headers (the content headers
+`Content-Type`, `Content-Encoding`, `Content-Disposition`,
+`Content-Language`, `Cache-Control`, `Expires`, the website redirect and the
+user metadata) to 8 KiB together (`MetadataTooLarge`), on PutObject,
+CopyObject (including metadata copied from the source), PostObject and
+CreateMultipartUpload. Names and values must be valid HTTP header names and
+values (no control characters); this matters for PostObject, whose form
+fields are not restricted by HTTP. Listings keep only the fixed-size fields
+of each entry in memory, so a page of 1000 entries costs the same whatever
+metadata the objects carry. Lifecycle rule prefixes are limited to 1024
+bytes, and parsed lifecycle configurations (looked up on object reads to
+report `x-amz-expiration`) are cached within a 64 MiB budget and recognised
+by a hash of the stored document, without copying it per request.
 
 ## Object responses
 
@@ -279,7 +414,11 @@ access, so HTML applications cannot be hosted in a bucket and opened directly
 
 Only a `Content-Type` that parses as exactly `application/pdf`, sent as a
 single header value without a comma, is exempt from the sandbox; such
-responses are served as the bare `application/pdf` (parameters are dropped).
+responses are served as the bare `application/pdf` (parameters are dropped)
+and always with `Content-Disposition: attachment` (keeping a stored file
+name), whatever the stored disposition or a `response-content-disposition`
+override says, so a PDF is downloaded rather than rendered inline on the UI's
+origin.
 Browsers use the last type of a comma-separated list, so a list such as
 `application/pdf, text/html` is always sandboxed.
 
@@ -301,20 +440,70 @@ already has a secret key. Under the global `*` rule:
   PostObject authenticates from its form fields and accepts forms without a
   policy signature anonymously.
 
-Websites therefore cannot use a visitor's browser to read or write
-anonymously accessible data, such as buckets restricted by `aws:SourceIp`
-or reachable only on the LAN, and see the response. The embedded and
-standalone web UIs are unaffected, because they sign every request.
+Websites therefore cannot use a visitor's browser to read anonymously
+accessible data, such as buckets restricted by `aws:SourceIp` or reachable
+only on the LAN, and see the response. Hiding the response does not stop a
+write, though: browsers send HTML form posts (including PostObject uploads)
+and `no-cors` requests with a `text/plain` body without a preflight. gos3
+therefore refuses (`403 AccessDenied`) anonymous requests that change data
+(any method but GET, HEAD and OPTIONS) when a browser sends them for another
+origin (`Sec-Fetch-Site: same-site` or `cross-site`, or an `Origin` that is
+not the request's host, `null` included), unless the bucket's CORS
+configuration or an explicitly listed global origin allows that origin and
+method. Clients that are not browsers send neither header and are not
+affected. Anonymous reads (GET, HEAD) carry
+`Cross-Origin-Resource-Policy: same-site`, so other sites cannot load
+LAN-only objects as `<script>`, stylesheets or images (reading what a
+script defines, measuring images, or probing which keys exist); a bucket
+CORS rule that allows GET, or an explicitly listed global origin, lifts it.
+Signed requests, presigned URLs included, never get it. The embedded and
+standalone web UIs are unaffected, because they sign every request. The
+global `*` default stays for that reason: browser clients connect
+cross-origin with signed requests, and a page can only sign if it already
+has a secret key (which is why published example keys are refused, see
+[Root credentials](#root-credentials)).
 
 Explicitly listed global origins (`cors.allowed_origins`, `--cors-origin`, or
 **Settings → CORS**) and bucket CORS configurations, including a bucket rule
 with `*`, still apply to anonymous requests. Bucket CORS configurations take
 precedence for their bucket. To serve a public bucket to scripts on other
 sites, set a bucket CORS configuration. Browser POST-policy uploads
-(PostObject) under the global `*` rule still store the object, but their
-response is not readable cross-origin; use a bucket CORS rule for them too.
+(PostObject) from another origin are refused under the global `*` rule; a
+bucket CORS rule that allows the origin and `POST` admits them.
+Bucket CORS values must be valid in the headers they are sent in
+(`AllowedHeader`/`ExposeHeader` header names, no spaces or control
+characters in `AllowedOrigin`); a stored configuration that no longer
+validates (written by an older version) disables CORS for its bucket, with
+a warning in the log, until it is replaced or deleted. Requests to the
+bucket are otherwise unaffected.
 In production, list the origins of the web UIs you use rather than relying
 on `*`. `/_gos3/info` always answers with `Access-Control-Allow-Origin: *`.
+
+### DNS rebinding and the Host header
+
+A website can make its own host name resolve to a gos3 server (DNS
+rebinding). The visitor's browser then talks to gos3 *same-origin* with the
+attacker's page, so CORS never applies. gos3 therefore checks the `Host`
+header. Known names are IP addresses, `localhost` and `*.localhost`, the OS
+host name (its first label and `<label>.local`), the hosts of
+`server.address`, `server.public_url` and `server.domains` (with bucket
+subdomains), and the entries of `server.allowed_hosts`.
+
+- With `server.allowed_hosts` empty (the default), requests for any other
+  name are served only when signed: the signature covers the `Host`, and a
+  rebinding page has no key. Anonymous S3 requests get `403 AccessDenied`;
+  the web UI, the root redirect and public metrics answer `421 Misdirected
+  Request`; `/_gos3/info`, `/_gos3/health`, `/_gos3/ready` and the admin
+  API (always signed) are served. The first request for each unknown name
+  is logged as a warning.
+- With `server.allowed_hosts` set, every request for another name is
+  refused with `421`, signed ones included. A request that the web UI
+  signed for a wrong or malicious endpoint (`Host: evil.example`) then
+  cannot be relayed to the real server.
+- `server.allowed_hosts: ["*"]` turns the check off.
+
+Behind a reverse proxy that passes the client's `Host` through, set
+`server.public_url` or list the name in `server.allowed_hosts`.
 
 ## Public access evaluation
 
@@ -338,7 +527,7 @@ count as public. Statements that also carry another restricting key
 
 | Endpoint | Default access | Reveals |
 |---|---|---|
-| `/_gos3/health`, `/_gos3/ready` | anonymous | `{"status":"ok"}`, and for `/ready` a storage error message |
+| `/_gos3/health`, `/_gos3/ready` | anonymous | `{"status":"ok"}`; `/ready` answers `503` with `"storage unavailable"` (the storage error itself is only logged, once per state change) and reuses its result for 2 s |
 | `/_gos3/info` | anonymous (`server.public_info: true`) | server ID, name, version, region, endpoint URLs, features; no secrets |
 | `/_gos3/metrics` | `admin:GetStats` (`metrics.public: false`) | request counts and latencies per operation, bucket count |
 | `/_gos3/ui/` | anonymous (static files) | the UI code; no data until you sign in |
@@ -355,8 +544,12 @@ then cannot verify it.
   `server.public_info: false` does not stop these announcements: also set
   `discovery.advertise: false` to hide them.
 - Beacon datagrams are accepted only from this host or a directly connected
-  subnet, are rate-limited per sender, and can only make a server probe the
-  sender's own IP (announced host names are never resolved). See
+  subnet (never from a broadcast or subnet network address), are
+  rate-limited per sender and in total, and can only make a server probe the
+  sender's own IP (announced host names are never resolved). Queries are
+  rate-limited too, so a server cannot be used to flood the link with
+  announces. If the network interfaces cannot be listed, only datagrams from
+  this host are accepted. See
   [discovery.md](discovery.md#3-udp-multicast-beacon).
 - The mDNS responder (UDP 5353) answers only senders on this host or a
   directly connected subnet, and only questions about the server's own
@@ -364,7 +557,12 @@ then cannot verify it.
   rate-limits each sender like the beacon (50 responses per second in
   total), multicasts answers to the group with TTL 255 and keeps every
   response to one packet of at most 1400 bytes, so it cannot be used to
-  reflect or amplify traffic towards other networks. It runs whatever the
+  reflect or amplify traffic towards other networks. Queries from other
+  hosts must arrive with TTL 255 (RFC 6762 §11), which drops datagrams
+  forwarded from off the link with a spoofed on-link source; this check
+  also runs on Windows. On a platform where the TTL cannot be read, a
+  warning is logged and other hosts are answered by link-local multicast
+  only, never by unicast. It runs whatever the
   listen address and `server.public_info` are: on hosts with a routable
   address, also firewall UDP 5353 from outside the local network, or set
   `discovery.mdns: false`. mDNS answers are accepted only from on-link
@@ -378,11 +576,29 @@ then cannot verify it.
   endpoints, addresses) while that peer still answers at its known
   addresses; such a claim is shown in the peer's `error` and logged. See
   [discovery.md](discovery.md#peer-identity).
+- The peer table is bounded in memory: at most 1024 peers with a stored
+  identity document of at most 4 KiB each, so `GET
+  /_gos3/admin/v1/discovery` stays a few MiB at most. Peers known only from
+  announcements are limited to 512, and to 16 per sender address (IPv6: per
+  /64); unverified sightings to 256 and 16 per sender. A flood of fake
+  servers from one host therefore cannot fill the table, and never
+  displaces verified peers or peers found through seeds, DNS SRV, the admin
+  probe or scans. Announcements never keep a verified peer alive: only a
+  successful probe does.
+- An announcement that names this host's own loopback or local addresses
+  is accepted only from a sender on this host. If the operating system
+  delivers packets from the network whose source is one of the host's own
+  addresses (Linux drops them by default), an on-link attacker could make
+  the server fetch `/_gos3/info` from local ports; a failed check of such an
+  address is recorded only as `could not be verified`, so the peer table
+  does not reveal which local ports are open.
 - Discovery probes (admin API probe, scans, seeds, DNS SRV, verification of
   announcements) never connect to cloud metadata endpoints
-  (`169.254.169.254`, `169.254.170.2`, `169.254.170.23`, `fd00:ec2::254`,
-  `100.100.100.200`) or to unspecified, multicast or broadcast addresses,
-  checked after DNS resolution. Peer errors hold a fixed category, never
+  (`169.254.169.254`, `169.254.170.2`, `169.254.170.23`, `169.254.0.23`,
+  `168.63.129.16`, `192.0.0.192`, `fd00:ec2::254`, `fd00:ec2::23`,
+  `fd20:ce::254`, `100.100.100.200`, also in IPv4-mapped, IPv4-compatible or NAT64 `64:ff9b::/96` and
+  `64:ff9b:1::/48` form) or to unspecified, multicast or broadcast
+  addresses, checked after DNS resolution. Peer errors hold a fixed category, never
   text the probed service sent.
 - **Scans** (`POST /_gos3/admin/v1/discovery/scan`) need `admin:ScanNetwork`
   and `discovery.allow_scan: true` (the default). They are limited to
@@ -404,36 +620,81 @@ then cannot verify it.
 - The standalone web UI's Node server can perform local discovery (mDNS,
   beacon, scans, probes) from the UI host. It has no authentication, so
   this is **off unless `GOS3_UI_LOCAL_DISCOVERY=true`** (the container image
-  leaves it off; the compose demo turns it on because it publishes the UI on
-  `127.0.0.1` only). When on, anyone who can reach the server can make it
+  and the compose demo leave it off). When on, anyone who can reach the server can make it
   probe and scan, so enable it only on a trusted interface. Against DNS
   rebinding and other websites, its `/api/discovery/*` routes answer 403
-  unless the `Host` is an IP address, `localhost`/`*.localhost` or a name in
+  unless the `Host` (and any `X-Forwarded-Host` / `Forwarded: host=`) is an
+  IP address, `localhost`/`*.localhost` or a name in
   `GOS3_UI_ALLOWED_HOSTS`, and refuse a foreign `Origin` (one that matches
-  neither the `Host` nor a name listed in `GOS3_UI_ALLOWED_HOSTS`) or
-  `Sec-Fetch-Site: cross-site`/`same-site`. It never connects to cloud
-  metadata addresses (`169.254.169.254`, `169.254.170.2`, `169.254.170.23`,
-  `fd00:ec2::254`, `100.100.100.200`), unspecified, multicast or broadcast
-  addresses: literals are refused up front, and host names are checked
+  neither the `Host` nor a name listed in `GOS3_UI_ALLOWED_HOSTS`),
+  `Sec-Fetch-Site: cross-site`/`same-site`, and a browser
+  `GET /api/discovery/local` without `Sec-Fetch-Site` (older browsers)
+  that lacks the `X-Gos3-Discovery` header. Like gos3, its mDNS and beacon discovery accept datagrams only
+  from on-link senders (only loopback when the interfaces cannot be listed)
+  and only ever probe the sender's own address, and a
+  host claiming the ID of a server already verified in the same result
+  cannot take over its entry (the claim is reported in `error`; two
+  addresses count as one server only when they were observed together or
+  each document advertises the other's address). As for gos3, a host on
+  the link that spoofs the UI host's own address as the source of a beacon
+  or mDNS answer can still make it probe its loopback and local addresses
+  (a fixed `GET /_gos3/info`, never returned to that host). Identity
+  documents are validated and bounded (16 KiB, cleaned and clipped fields,
+  at most 64 features and 64 `endpoints.all` entries). It never connects to
+  cloud metadata addresses (`169.254.169.254`, `169.254.170.2`,
+  `169.254.170.23`, `169.254.0.23`, `168.63.129.16`, `192.0.0.192`,
+  `100.100.100.200`, `fd00:ec2::254`, `fd00:ec2::23`, `fd20:ce::254`),
+  unspecified, multicast or broadcast addresses, including their
+  IPv4-mapped, IPv4-compatible and NAT64 (`64:ff9b::/96`, `64:ff9b:1::/48`)
+  forms: literals are refused up front, and host names are checked
   against the addresses they resolve to when the connection is made (DNS
   rebinding cannot bypass it). Probe failures report only a coarse reason
   (unreachable, timed out, `HTTP <status>`, authentication required, not a
   gos3 server). At most 2 scans, 4 local discoveries and 8 probes run at
   once per UI server (`429 TooManyRequests`), each taking its slot before
   the request body is read; bodies are capped at 8 KiB (probe) and 64 KiB
-  (scan) with `413`. Its probes read at most 64 KiB of `/_gos3/info` (with
+  (scan) with `413`. Its probes read at most 16 KiB of `/_gos3/info` (with
   or without `Content-Length`); local discovery keeps at most 2048 mDNS
-  records and 1024 beacon candidates and verifies at most 256 URLs.
+  records and 1024 beacon candidates (16 per sender) and verifies at most
+  256 URLs. Socket errors are reported as fixed texts (details go to the
+  server log).
+- The standalone UI's Node server sends the embedded UI's security headers
+  (the same Content-Security-Policy with per-page inline-script hashes,
+  `frame-ancestors 'none'`, `X-Frame-Options: DENY`,
+  `Referrer-Policy: no-referrer`, `nosniff`) plus a restrictive
+  `Permissions-Policy`. Its `servers.json` is served by a route behind the
+  Host check, not as a static file. When presets are configured
+  (`NUXT_PUBLIC_SERVERS`), and always for `servers.json`, it answers `421`
+  to a `Host` a DNS-rebinding
+  site could use (anything but IP addresses, `localhost`, names that cannot
+  exist in public DNS such as single labels, `.local`, `.lan`, `.internal`,
+  `.home.arpa`, and names in `GOS3_UI_ALLOWED_HOSTS`). Builds refuse presets
+  that contain secret keys (`GOS3_UI_ALLOW_PRESET_SECRETS=true` overrides).
 
 ## Admin API notes
 
-- `DELETE /_gos3/admin/v1/buckets/{name}?force=true` deletes every version,
-  including versions under object lock retention or legal hold. It needs
-  `admin:ForceDeleteBucket`, which only `admin` grants by default.
+- `DELETE /_gos3/admin/v1/buckets/{name}?force=true` deletes every version.
+  It needs `admin:ForceDeleteBucket` on the bucket, which only `admin` grants
+  by default, and it honours object lock like S3 DeleteObject: a bucket with
+  any version under a legal hold or unexpired COMPLIANCE retention is refused
+  (`409`) before anything is deleted, whoever asks, root included. Unexpired
+  GOVERNANCE retention is refused too unless the request adds
+  `bypassGovernanceRetention=true` and the caller's identity policies allow
+  `s3:BypassGovernanceRetention` on each locked object (`403` otherwise), so a
+  key with only `admin:ForceDeleteBucket` cannot destroy locked data. Remove
+  legal holds through the S3 API first; COMPLIANCE data stays until its
+  retention expires.
 - `PUT /_gos3/admin/v1/config` (`admin:UpdateConfig`) can change CORS,
   discovery and the public URL. Treat it like root access (see
   [Scoping admin permissions](#scoping-admin-permissions) for the other
   admin-equivalent actions).
+- Admin requests are authorized before their body is read. Once the body
+  has arrived, the request is refused (403 `AccessDenied`, nothing changed)
+  if the signing key was meanwhile deleted or deactivated or its user
+  disabled, and a request in flight for more than 5 seconds has its route
+  action authorized again against the current policies (time condition keys
+  as of the request's start), as S3 writes are. There is no absolute
+  deadline for the body beyond the server's idle read timeout.
 - Admin requests are recorded in metrics (op `Admin`) and in the access log.
   The log contains paths only, never query strings, so presigned URL signatures
   are not logged.
@@ -451,7 +712,8 @@ Supply-chain rules:
   releases. The web UI enforces this with pnpm's `minimumReleaseAge` in
   `web/pnpm-workspace.yaml`, and Dependabot applies the same cooldown to
   update pull requests for npm, Go modules, Python packages, GitHub Actions
-  and container images. Go dependencies are pinned to releases that were at
+  and container images (except the golang base image: Go point releases
+  carry standard library security fixes). Go dependencies are pinned to releases that were at
   least 14 days old when chosen. The compatibility suite's Python packages,
   transitive ones included, are compiled with a 14-day cut-off into the
   hash-locked `test/compat/requirements.txt`. The only exceptions are
@@ -474,6 +736,11 @@ Supply-chain rules:
 - **Install scripts.** Only the packages listed in `onlyBuiltDependencies`
   may run install scripts.
 - **Scanning.** CI runs `govulncheck`; `pnpm audit` covers the web UI.
+- **Release builds.** Releases are built without GitHub Actions caches (which
+  any job on `dev` can write), the shipped UI is built without the test-only
+  npm packages, and archives and images carry signed build provenance
+  attestations (`gh attestation verify`). See
+  [releasing.md](releasing.md#build-integrity).
 - **License notices.** `THIRD_PARTY_NOTICES` reproduces the licenses of
   everything gos3 ships: the Go standard library, the Go modules linked into
   the binary on every release platform, and the npm packages that the web UI

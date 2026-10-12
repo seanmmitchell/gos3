@@ -60,6 +60,11 @@ func lockBucketState(bucket string) func() {
 // validating Content-MD5 and x-amz-checksum-* headers or trailers when the
 // client sent them (InvalidDigest / BadDigest on mismatch). A larger body
 // yields MaxMessageLengthExceeded.
+//
+// Every bucket configuration write reads its body here, after the core
+// authorized it, so the request is re-validated once the body is in
+// (revalidateWrite): a body that took long cannot change a bucket's
+// policy, ACL or other settings after the caller's access was revoked.
 func (s *Server) readConfigBody(r *http.Request, rc *reqContext, max int64) ([]byte, error) {
 	if n := rc.contentLength(); n > max {
 		return nil, s3err.ErrMaxMessageLengthExceeded
@@ -68,7 +73,15 @@ func (s *Server) readConfigBody(r *http.Request, rc *reqContext, max int64) ([]b
 	if err != nil {
 		return nil, err
 	}
-	return readBody(p, max)
+	data, err := readBody(p, max)
+	if err != nil {
+		return nil, err
+	}
+	ctx := r.Context()
+	if err := s.revalidateWrite(rc, func() error { return s.reauthorizeOp(ctx, r, rc, nil) }); err != nil {
+		return nil, err
+	}
+	return data, nil
 }
 
 // decodeConfigBody reads a configuration body (see readConfigBody) and

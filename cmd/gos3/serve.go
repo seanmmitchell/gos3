@@ -2,10 +2,12 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"flag"
 	"fmt"
 	"io"
 	"log/slog"
+	"os"
 	"strconv"
 	"strings"
 	"text/tabwriter"
@@ -67,6 +69,7 @@ func addConfigFlags(fs *flag.FlagSet) *configFlags {
 	str("region", "server.region", "region reported to clients (default us-east-1)")
 	str("public-url", "server.public_url", "externally reachable base URL, e.g. https://s3.example.com")
 	list("domain", "server.domains", "virtual-host domain (repeatable): <bucket>.<domain> addresses a bucket")
+	list("allowed-host", "server.allowed_hosts", "extra host name clients use to reach the server (repeatable; \"*.example.com\" wildcards, \"*\" = no Host check)")
 	str("tls-cert", "server.tls_cert", "TLS certificate file (PEM); enables HTTPS together with --tls-key")
 	str("tls-key", "server.tls_key", "TLS private key file (PEM)")
 	list("cors-origin", "cors.allowed_origins", "allowed CORS origin (repeatable; default \"*\")")
@@ -129,6 +132,20 @@ func cmdServe(ctx context.Context, args []string, stdout, stderr io.Writer) erro
 	if err != nil {
 		return err
 	}
+	// A generated secret key is shown only on a terminal: anything else
+	// (docker, journald, Kubernetes) collects and keeps the output.
+	showSecret := isTerminal(stderr)
+	credsFile := srv.RootCredentialsFile()
+	if srv.CredentialsSource() == config.CredentialsEphemeral && !showSecret {
+		f, err := writeEphemeralCredentials(srv)
+		if err != nil {
+			_ = srv.Close()
+			return err
+		}
+		defer os.Remove(f)
+		credsFile = f
+		logger.Warn("root credentials: the temporary keys were written to a private file, deleted on exit", "file", f)
+	}
 	go func() {
 		select {
 		case <-srv.Ready():
@@ -138,9 +155,10 @@ func cmdServe(ctx context.Context, args []string, stdout, stderr io.Writer) erro
 		if ctl.JSON() {
 			info := srv.Info()
 			logger.Info("gos3 ready", "url", srv.URL(), "endpoints", info.Endpoints.All, "ui", info.Endpoints.UI,
-				"backend", srv.BackendName(), "data", srv.DataPath(), "credentials", srv.CredentialsSource())
+				"backend", srv.BackendName(), "data", srv.DataPath(), "credentials", srv.CredentialsSource(),
+				"credentialsFile", credsFile)
 		} else {
-			printBanner(stderr, srv)
+			printBanner(stderr, srv, showSecret, credsFile)
 		}
 		if onServerReady != nil {
 			onServerReady(srv)
@@ -149,8 +167,42 @@ func cmdServe(ctx context.Context, args []string, stdout, stderr io.Writer) erro
 	return srv.Run(ctx)
 }
 
-// printBanner prints the human-friendly startup summary.
-func printBanner(w io.Writer, srv *server.Server) {
+// isTerminal reports whether w is a terminal (a character device; /dev/null
+// counts too, which is harmless).
+func isTerminal(w io.Writer) bool {
+	f, ok := w.(*os.File)
+	if !ok {
+		return false
+	}
+	fi, err := f.Stat()
+	return err == nil && fi.Mode()&os.ModeCharDevice != 0
+}
+
+// writeEphemeralCredentials writes the root credentials of a server
+// without a data directory to a new private file (mode 0600, or an
+// owner-only ACL on Windows) in the temporary directory and returns its
+// path. Without a terminal it is the only place the temporary secret key
+// can be read from.
+func writeEphemeralCredentials(srv *server.Server) (string, error) {
+	f, err := os.CreateTemp("", "gos3-root-credentials-*.json")
+	if err != nil {
+		return "", fmt.Errorf("writing the temporary root credentials: %w", err)
+	}
+	path := f.Name()
+	_ = f.Close()
+	ak, sk := srv.RootCredentials()
+	data, _ := json.MarshalIndent(map[string]string{"accessKey": ak, "secretKey": sk}, "", "  ")
+	if err := config.WriteFileAtomic(path, append(data, '\n'), 0o600); err != nil {
+		_ = os.Remove(path)
+		return "", fmt.Errorf("writing the temporary root credentials: %w", err)
+	}
+	return path, nil
+}
+
+// printBanner prints the human-friendly startup summary. A generated
+// secret key is printed only with showSecret (the output is a terminal);
+// otherwise the banner points to credsFile.
+func printBanner(w io.Writer, srv *server.Server, showSecret bool, credsFile string) {
 	info := srv.Info()
 	local := srv.URL()
 	ak, sk := srv.RootCredentials()
@@ -194,11 +246,19 @@ func printBanner(w io.Writer, srv *server.Server) {
 	case config.CredentialsStored:
 		fmt.Fprintf(tw, "  Secret key\t(generated earlier, stored in %s)\n", srv.RootCredentialsFile())
 	case config.CredentialsGenerated:
-		fmt.Fprintf(tw, "  Secret key\t%s\n", sk)
-		fmt.Fprintf(tw, "  \t(generated now, stored in %s; set GOS3_ROOT_ACCESS_KEY/GOS3_ROOT_SECRET_KEY to choose your own)\n", srv.RootCredentialsFile())
+		if showSecret {
+			fmt.Fprintf(tw, "  Secret key\t%s\n", sk)
+			fmt.Fprintf(tw, "  \t(generated now, stored in %s; set GOS3_ROOT_ACCESS_KEY/GOS3_ROOT_SECRET_KEY to choose your own)\n", credsFile)
+		} else {
+			fmt.Fprintf(tw, "  Secret key\t(generated now, stored in %s; not shown: the output is not a terminal)\n", credsFile)
+		}
 	case config.CredentialsEphemeral:
-		fmt.Fprintf(tw, "  Secret key\t%s\n", sk)
-		fmt.Fprintf(tw, "  \t(temporary: valid until this process exits)\n")
+		if showSecret {
+			fmt.Fprintf(tw, "  Secret key\t%s\n", sk)
+			fmt.Fprintf(tw, "  \t(temporary: valid until this process exits)\n")
+		} else {
+			fmt.Fprintf(tw, "  Secret key\t(temporary, in %s until this process exits; not shown: the output is not a terminal)\n", credsFile)
+		}
 	}
 	_ = tw.Flush()
 	b.WriteString("\n  Press Ctrl-C to stop.\n\n")

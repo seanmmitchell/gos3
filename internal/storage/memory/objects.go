@@ -276,6 +276,22 @@ func (b *Backend) OpenObject(ctx context.Context, bucketName, key, versionID str
 // Addressing a delete marker yields ErrObjectNotFound (wrapped with a
 // "delete marker" message).
 func (b *Backend) UpdateObjectMeta(ctx context.Context, bucketName, key, versionID string, fn func(*storage.ObjectMeta) error) (storage.ObjectInfo, error) {
+	return b.updateObjectMeta(ctx, bucketName, key, versionID, nil, fn)
+}
+
+// UpdateObjectMetaIf is UpdateObjectMeta made conditional on check, which is
+// called with the addressed version under the bucket's write lock (see
+// storage.ConditionalMetaUpdater).
+func (b *Backend) UpdateObjectMetaIf(ctx context.Context, bucketName, key, versionID string, check func(storage.ObjectInfo) error, fn func(*storage.ObjectMeta) error) (storage.ObjectInfo, error) {
+	if check == nil {
+		return storage.ObjectInfo{}, errors.New("memory: nil update check")
+	}
+	return b.updateObjectMeta(ctx, bucketName, key, versionID, check, fn)
+}
+
+// updateObjectMeta implements UpdateObjectMeta and, with a non-nil check,
+// UpdateObjectMetaIf.
+func (b *Backend) updateObjectMeta(ctx context.Context, bucketName, key, versionID string, check func(storage.ObjectInfo) error, fn func(*storage.ObjectMeta) error) (storage.ObjectInfo, error) {
 	if fn == nil {
 		return storage.ObjectInfo{}, errors.New("memory: nil update function")
 	}
@@ -291,6 +307,11 @@ func (b *Backend) UpdateObjectMeta(ctx context.Context, bucketName, key, version
 	v := obj.versions[i]
 	if v.deleteMarker {
 		return storage.ObjectInfo{}, fmt.Errorf("%w: %s/%s version %q is a delete marker", storage.ErrObjectNotFound, bk.info.Name, key, v.id)
+	}
+	if check != nil {
+		if err := check(v.info(bk.info.Name, key, i == len(obj.versions)-1)); err != nil {
+			return storage.ObjectInfo{}, err
+		}
 	}
 	m := cloneMeta(v.meta)
 	if err := fn(&m); err != nil {
@@ -319,16 +340,34 @@ func (b *Backend) DeleteObjectIf(ctx context.Context, bucketName, key, versionID
 	if check == nil {
 		return storage.DeleteResult{}, errors.New("memory: nil delete check")
 	}
+	return b.deleteChecked(ctx, bucketName, key, versionID, func(o storage.ObjectInfo, _ bool) error { return check(o) }, false)
+}
+
+// DeleteObjectChecked is DeleteObjectIf whose check is also consulted
+// when the key has no versions (see storage.CheckedDeleter).
+func (b *Backend) DeleteObjectChecked(ctx context.Context, bucketName, key, versionID string, check func(storage.ObjectInfo, bool) error) (storage.DeleteResult, error) {
+	if check == nil {
+		return storage.DeleteResult{}, errors.New("memory: nil delete check")
+	}
+	return b.deleteChecked(ctx, bucketName, key, versionID, check, true)
+}
+
+// deleteChecked implements DeleteObjectIf and, with absentOK,
+// DeleteObjectChecked.
+func (b *Backend) deleteChecked(ctx context.Context, bucketName, key, versionID string, check func(storage.ObjectInfo, bool) error, absentOK bool) (storage.DeleteResult, error) {
 	bk, err := b.lockBucket(ctx, bucketName)
 	if err != nil {
 		return storage.DeleteResult{}, err
 	}
 	defer bk.mu.Unlock()
 	obj, i, err := findVersion(bk, key, versionID)
-	if err != nil {
-		return storage.DeleteResult{}, err
+	switch {
+	case err == nil:
+		err = check(obj.versions[i].info(bk.info.Name, key, i == len(obj.versions)-1), true)
+	case absentOK && versionID == "" && errors.Is(err, storage.ErrObjectNotFound):
+		err = check(storage.ObjectInfo{}, false)
 	}
-	if err := check(obj.versions[i].info(bk.info.Name, key, i == len(obj.versions)-1)); err != nil {
+	if err != nil {
 		return storage.DeleteResult{}, err
 	}
 	return b.deleteLocked(bk, key, versionID)
