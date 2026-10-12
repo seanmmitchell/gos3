@@ -1,7 +1,7 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import { choosePartSize, copySourceHeader, decodeHeaderValue, encodeHeaderValue, S3Client, S3Error } from '~/utils/s3/client'
 import { md5Base64 } from '~/utils/s3/hash'
-import { buildS3Url, encodeKey, hasDotSegment, normalizeEndpoint } from '~/utils/s3/url'
+import { buildS3Url, encodeKey, hasDotSegment, isUnaddressableBucket, normalizeEndpoint } from '~/utils/s3/url'
 
 const MiB = 1024 * 1024
 const NS = 'xmlns="http://s3.amazonaws.com/doc/2006-03-01/"'
@@ -443,5 +443,31 @@ describe('upload cancellation races (review fix)', () => {
     expect(calls.some(c => c.method === 'PUT')).toBe(false)
     expect(calls.some(c => c.method === 'POST' && c.url.includes('uploadId=UP9'))).toBe(false)
     expect(calls.some(c => c.method === 'DELETE' && c.url.includes('uploadId=UP9'))).toBe(true)
+  })
+})
+
+describe('bucket names that would change the request path (gap-2)', () => {
+  it('detects them', () => {
+    for (const b of ['.', '..', 'a/b', '../x', 'a\\b', 'a\nb', 'a\u0000']) expect(isUnaddressableBucket(b), JSON.stringify(b)).toBe(true)
+    for (const b of ['my.bucket', '...', 'a..b', 'Legacy_Bucket', '%2E%2E', 'b']) expect(isUnaddressableBucket(b), b).toBe(false)
+  })
+
+  it('buildS3Url refuses them instead of resolving to another path', () => {
+    // Before the fix '..' removed itself and the base path: /_gos3/admin/v1/... on the server root.
+    expect(() => buildS3Url({ endpoint: 'https://proxy/s3', forcePathStyle: true }, '..', '_gos3/admin/v1/users/alice')).toThrow(TypeError)
+    expect(() => buildS3Url({ endpoint: 'http://h:9000', forcePathStyle: true }, '.', 'k')).toThrow(TypeError)
+    expect(() => buildS3Url({ endpoint: 'http://h:9000', forcePathStyle: true }, '', 'k')).toThrow(TypeError)
+    // An encoded-looking name is just a name: its '%' is encoded, so nothing is resolved.
+    expect(buildS3Url({ endpoint: 'http://h:9000', forcePathStyle: true }, '%2E%2E', 'k').pathname).toBe('/%252E%252E/k')
+    expect(buildS3Url({ endpoint: 'http://h:9000', forcePathStyle: true }).pathname).toBe('/')
+  })
+
+  it('S3Client never sends requests for them', async () => {
+    const { client, calls } = makeClient(() => new Response(null, { status: 200 }))
+    expect(() => client.url('..', 'k')).toThrow(S3Error)
+    await expect(client.headObject('..', '_gos3/admin/v1/users/alice')).rejects.toMatchObject({ code: 'InvalidBucketName', status: 0 })
+    await expect(client.deleteObject('.', 'k')).rejects.toMatchObject({ code: 'InvalidBucketName' })
+    await expect(client.presignGetUrl('..', 'k')).rejects.toMatchObject({ code: 'InvalidBucketName' })
+    expect(calls).toHaveLength(0)
   })
 })

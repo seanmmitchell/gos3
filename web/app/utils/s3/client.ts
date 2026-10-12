@@ -93,7 +93,7 @@ import {
   parseTagging,
   parseVersioning
 } from './parsers'
-import { buildS3Url, encodeKey, encodeRfc3986, hasDotSegment, normalizeEndpoint, type Query } from './url'
+import { buildS3Url, encodeKey, encodeRfc3986, hasDotSegment, isUnaddressableBucket, normalizeEndpoint, type Query } from './url'
 import { tryParseXml, unquoteETag } from './xml'
 
 export { S3Error } from './errors'
@@ -322,6 +322,20 @@ export function unaddressableKeyError(key: string): S3Error {
   })
 }
 
+/**
+ * The error thrown for bucket names that would change the request path
+ * ('.', '..', names with '/' or '\'; see isUnaddressableBucket). The request
+ * is not sent.
+ */
+export function invalidBucketError(bucket: string): S3Error {
+  return new S3Error({
+    code: 'InvalidBucketName',
+    message: `“${bucket}” is not a valid bucket name; the request was not sent.`,
+    status: 0,
+    details: { BucketName: bucket }
+  })
+}
+
 function isRetryable(e: unknown): boolean {
   if (!(e instanceof S3Error)) return false
   if (e.code === 'Aborted') return false
@@ -408,6 +422,7 @@ export class S3Client {
    * for keys with '.' / '..' segments: the URL would address another object.
    */
   url(bucket?: string, key?: string, query?: Query): URL {
+    if (bucket !== undefined && isUnaddressableBucket(bucket)) throw invalidBucketError(bucket)
     if (key && hasDotSegment(key)) throw unaddressableKeyError(key)
     return buildS3Url({ endpoint: this.endpoint, forcePathStyle: this.forcePathStyle }, bucket, key, query)
   }

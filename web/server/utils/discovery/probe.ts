@@ -2,11 +2,16 @@
 // bounded-concurrency worker pool, used by local discovery, probe and scan.
 import type { Info } from '~/types/admin'
 import { BLOCKED_ADDRESS_CODE, BlockedAddressError, guardedFetch } from './netguard'
-import { isInfo } from './peers'
+import { parseInfo } from './peers'
 
 export const INFO_PATH = '/_gos3/info'
 export const VERIFY_TIMEOUT_MS = 1500
-const MAX_INFO_BYTES = 64 * 1024
+/**
+ * Largest identity document read. A real one is well under 2 KiB; the cap
+ * bounds what a hostile host can make a scan or discovery hold in memory
+ * (the parsed document is bounded further by parseInfo).
+ */
+export const MAX_INFO_BYTES = 16 * 1024
 
 export type FetchFn = (input: string, init?: RequestInit) => Promise<Response>
 
@@ -69,7 +74,8 @@ export async function readLimited(res: Response, limit: number): Promise<string>
 }
 
 /**
- * Fetches and validates the identity document of baseUrl. Throws ProbeError
+ * Fetches, validates and sanitises (parseInfo) the identity document of
+ * baseUrl. Throws ProbeError
  * with a coarse category (see ProbeErrorKind). The default fetch refuses
  * blocked destinations at connect time (./netguard.ts).
  */
@@ -122,8 +128,9 @@ export async function fetchInfo(baseUrl: string, opts: { timeoutMs?: number, sig
     } catch {
       throw new ProbeError('not-gos3')
     }
-    if (!isInfo(json)) throw new ProbeError('not-gos3')
-    return json
+    const info = parseInfo(json)
+    if (!info) throw new ProbeError('not-gos3')
+    return info
   } finally {
     clearTimeout(timer)
     opts.signal?.removeEventListener('abort', onAbort)

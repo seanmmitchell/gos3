@@ -287,8 +287,15 @@ export class AdminClient {
     this.datetime = opts.datetime
   }
 
-  /** Absolute URL of an admin API path (e.g. '/users'). */
+  /**
+   * Absolute URL of an admin API path (e.g. '/users'). Throws AdminError
+   * 'InvalidArgument' for a path with '.' / '..' segments (e.g. a user name
+   * '..'), which the URL parser would resolve to another endpoint.
+   */
   url(path: string, query?: RequestOptions['query'], raw = false): string {
+    if (path.split(/[?#]/, 1)[0]!.split('/').some(s => s === '.' || s === '..')) {
+      throw new AdminError('InvalidArgument', `Invalid admin API path “${path}”; the request was not sent.`, 0)
+    }
     const u = new URL(this.endpoint + (raw ? '' : ADMIN_PREFIX) + path)
     for (const [k, v] of Object.entries(query ?? {})) if (v !== undefined) u.searchParams.set(k, String(v))
     return u.toString()
@@ -449,9 +456,20 @@ export class AdminClient {
     return this.request('GET', `/buckets/${enc(name)}`)
   }
 
-  /** force=true deletes all versions, uploads and configs first. */
-  deleteBucket(name: string, opts: { force?: boolean } = {}): Promise<void> {
-    return this.request('DELETE', `/buckets/${enc(name)}`, { query: { force: opts.force ? 'true' : undefined }, expect: 'none' })
+  /**
+   * force=true deletes all versions, uploads and configs first. Object lock
+   * is honoured: 409 when versions are under legal hold or COMPLIANCE
+   * retention, or under GOVERNANCE retention unless
+   * bypassGovernanceRetention (only sent with force) is set.
+   */
+  deleteBucket(name: string, opts: { force?: boolean, bypassGovernanceRetention?: boolean } = {}): Promise<void> {
+    return this.request('DELETE', `/buckets/${enc(name)}`, {
+      query: {
+        force: opts.force ? 'true' : undefined,
+        bypassGovernanceRetention: opts.force && opts.bypassGovernanceRetention ? 'true' : undefined
+      },
+      expect: 'none'
+    })
   }
 
   // Discovery --------------------------------------------------------------

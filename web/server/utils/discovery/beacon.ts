@@ -2,14 +2,15 @@
 // and turning announces into probe candidates. Pure functions; the socket
 // handling lives in ./local.ts.
 import { randomBytes } from 'node:crypto'
-import { isIP } from 'node:net'
+import { isBlockedAddress } from './netguard'
+import { canonicalIp, hostNets, isLoopbackIp } from './netlocal'
 import { baseUrl, DEFAULT_PORT } from './targets'
 
 export const BEACON_PROTO = 'gos3-beacon/1'
 export const BEACON_GROUP = '239.255.73.83'
 export const BEACON_PORT = 7373
 export const MAX_BEACON_SIZE = 1400
-const MAX_BEACON_URLS = 16
+export const MAX_BEACON_URLS = 16
 const MAX_FIELD_LEN = 128
 const MAX_NONCE_LEN = 64
 const MAX_URL_LEN = 2048
@@ -118,23 +119,21 @@ export function decodeBeacon(data: Uint8Array | string): BeaconMessage | null {
   }
 }
 
-function isWildcardHost(host: string): boolean {
-  return host === '' || host === '0.0.0.0' || host === '::' || host === '[::]'
-}
-
-function isLoopbackHost(host: string): boolean {
-  const h = host.replace(/^\[|\]$/g, '').toLowerCase()
-  return h === 'localhost' || h === '::1' || /^127\./.test(h)
-}
-
 /**
  * Turns the URLs of an announce received from srcIp into probe candidates.
- * Wildcard hosts, and loopback hosts announced from a non-loopback source,
- * are replaced by the source IP (keeping scheme and port). Without any usable
- * URL, the source IP with the default port is used.
+ * Nothing in a datagram is authenticated, so discovery only ever probes the
+ * sender (as the gos3 server, docs/discovery.md "Security notes"): every
+ * URL's host is replaced by the source IP, keeping scheme and port and
+ * dropping any path, except that a sender on this host (isLocal) may also
+ * announce loopback and local addresses, which then stay. Host names are
+ * never resolved. Without any usable URL the source IP with the default
+ * port is used; without a usable source address there are no candidates.
+ * At most MAX_BEACON_URLS candidates result.
  */
-export function beaconCandidateUrls(urls: readonly string[] | undefined, srcIp: string | undefined): string[] {
-  const src = srcIp && isIP(srcIp) && !isWildcardHost(srcIp) && !/^2(2[4-9]|3\d)\./.test(srcIp) ? srcIp : undefined
+export function beaconCandidateUrls(urls: readonly string[] | undefined, srcIp: string | undefined, isLocal: (ip: string) => boolean = ip => hostNets.isLocal(ip)): string[] {
+  const src = srcIp ? canonicalIp(srcIp) : undefined
+  if (!src || isBlockedAddress(src)) return []
+  const srcLocal = isLocal(src)
   const out: string[] = []
   const add = (u: string) => {
     if (out.length < MAX_BEACON_URLS && !out.includes(u)) out.push(u)
@@ -144,11 +143,10 @@ export function beaconCandidateUrls(urls: readonly string[] | undefined, srcIp: 
     // "http://:9000" (host omitted) is not a valid WHATWG URL; handle it first.
     const hostless = /^(https?):\/\/:(\d{1,5})\/?$/i.exec(raw.trim())
     let scheme: string
-    let host: string
+    let host = ''
     let port: number
     if (hostless) {
       scheme = hostless[1]!.toLowerCase()
-      host = ''
       port = Number(hostless[2])
     } else {
       let u: URL
@@ -161,14 +159,15 @@ export function beaconCandidateUrls(urls: readonly string[] | undefined, srcIp: 
       scheme = u.protocol.slice(0, -1)
       host = u.hostname
       port = u.port ? Number(u.port) : scheme === 'https' ? 443 : 80
-      if (!isWildcardHost(host) && !(isLoopbackHost(host) && src && !isLoopbackHost(src))) {
-        add(`${scheme}://${u.host}${u.pathname.replace(/\/+$/, '')}`)
-        continue
-      }
     }
     if (port < 1 || port > 65535) continue
-    if (src) add(baseUrl(scheme, src, port))
+    const ip = host ? canonicalIp(host) : undefined
+    if (ip && !isBlockedAddress(ip) && (ip === src || (srcLocal && (isLoopbackIp(ip) || isLocal(ip))))) {
+      add(baseUrl(scheme, ip, port))
+      continue
+    }
+    add(baseUrl(scheme, src, port))
   }
-  if (out.length === 0 && src) add(baseUrl('http', src, DEFAULT_PORT))
+  if (out.length === 0) add(baseUrl('http', src, DEFAULT_PORT))
   return out
 }

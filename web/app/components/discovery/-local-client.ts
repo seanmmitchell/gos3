@@ -5,6 +5,13 @@
 import type { Info, Peer, ScanRequest, ScanResult } from '~/types/admin'
 import { AdminError, isGos3Info, parseAdminError, type FetchLike } from '~/utils/admin/client'
 
+/**
+ * Header sent with every /api/discovery/* request. The UI server refuses
+ * browser requests to GET /api/discovery/local that carry neither this
+ * header nor Sec-Fetch-Site.
+ */
+export const DISCOVERY_REQUEST_HEADER = 'X-Gos3-Discovery'
+
 export interface LocalCapabilities {
   localDiscovery: boolean
   mdns: boolean
@@ -59,7 +66,13 @@ export class LocalDiscoveryClient {
     try {
       res = await this.fetchFn(new Request(this.url(path), {
         method,
-        headers: body !== undefined ? { 'content-type': 'application/json', accept: 'application/json' } : { accept: 'application/json' },
+        headers: {
+          'accept': 'application/json',
+          // Marks the request as coming from this UI (a cross-site page cannot
+          // set it without a CORS preflight the server refuses).
+          [DISCOVERY_REQUEST_HEADER]: '1',
+          ...(body !== undefined ? { 'content-type': 'application/json' } : {})
+        },
         body: body !== undefined ? JSON.stringify(body) : undefined,
         signal: ctrl.signal,
         cache: 'no-store'

@@ -2,7 +2,7 @@
 /** Aggregated discovery results (Discover page): one row per server ID. */
 import type { TableColumn } from '@nuxt/ui'
 import { useConnectionsStore } from '~/stores/connections'
-import { findConfigured, type DiscoveredServer } from './-aggregate'
+import { findConfigured, findIdClaim, type DiscoveredServer } from './-aggregate'
 
 withDefaults(defineProps<{
   servers: readonly DiscoveredServer[]
@@ -13,6 +13,7 @@ const emit = defineEmits<{ add: [server: DiscoveredServer] }>()
 
 const store = useConnectionsStore()
 const configured = (s: DiscoveredServer) => findConfigured(s, store.connections)
+const idClaim = (s: DiscoveredServer) => findIdClaim(s, store.connections)
 
 const columns: TableColumn<DiscoveredServer>[] = [
   { accessorKey: 'name', header: 'Server' },
@@ -41,6 +42,12 @@ const FINDER_ICONS = {
         <p class="flex flex-wrap items-center gap-1.5 font-medium text-highlighted">
           {{ row.original.name }}
           <UBadge v-if="configured(row.original)" label="Configured" color="success" variant="subtle" size="sm" />
+          <UTooltip v-if="idClaim(row.original)" :text="`Reports the server ID of ${idClaim(row.original)!.name} (${idClaim(row.original)!.endpoint}) but was found at another address. Server IDs are not authenticated: it may be the same server under another address, or a host spoofing it.`">
+            <UBadge :label="`ID of ${idClaim(row.original)!.name}`" color="warning" variant="subtle" size="sm" icon="i-lucide-shield-question" data-testid="id-claim-badge" />
+          </UTooltip>
+          <UTooltip v-if="row.original.conflict" text="Another host claims this server ID from a different address. Server IDs are not authenticated: check which address is the real server before adding it.">
+            <UBadge label="ID conflict" color="warning" variant="subtle" size="sm" icon="i-lucide-shield-question" data-testid="id-conflict-badge" />
+          </UTooltip>
         </p>
         <p class="font-mono text-xs text-muted">
           {{ row.original.id }}
@@ -69,6 +76,9 @@ const FINDER_ICONS = {
       <ul class="space-y-0.5">
         <li v-for="a in row.original.addresses" :key="a" class="font-mono text-xs">
           {{ a }}
+        </li>
+        <li v-for="a in row.original.conflictAddresses ?? []" :key="`conflict:${a}`" class="font-mono text-xs text-warning" :title="`Also claims this server ID: ${a}`">
+          {{ a }} (conflicting)
         </li>
       </ul>
     </template>

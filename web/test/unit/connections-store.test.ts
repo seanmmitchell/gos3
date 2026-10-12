@@ -374,11 +374,37 @@ describe('connections store: presets & embedded', () => {
     expect(s.byId('nas')).toMatchObject({ name: 'NAS', source: 'preset', region: 'eu-west-1', remember: false })
     s.setCredentials('nas', { accessKeyId: 'AK', secretAccessKey: 'SK' })
 
-    // restart with a changed preset
+    // restart with a changed preset (same endpoint): the user's keys stay
     setActivePinia(createPinia())
     const s2 = useConnectionsStore()
-    await s2.init({ presets: [{ id: 'nas', name: 'NAS 2', endpoint: 'http://nas:9001' }], skipServersJson: true, fetch: noFetch })
-    expect(s2.byId('nas')).toMatchObject({ name: 'NAS 2', endpoint: 'http://nas:9001', accessKeyId: 'AK', secretAccessKey: 'SK' })
+    await s2.init({ presets: [{ id: 'nas', name: 'NAS 2', endpoint: 'http://NAS:9000/', region: 'eu-west-2' }], skipServersJson: true, fetch: noFetch })
+    expect(s2.byId('nas')).toMatchObject({ name: 'NAS 2', region: 'eu-west-2', accessKeyId: 'AK', secretAccessKey: 'SK' })
+  })
+
+  it('never signs a user-entered secret for a preset endpoint that changed', async () => {
+    const s = useConnectionsStore()
+    await s.init({ presets: [{ id: 'nas', name: 'NAS', endpoint: 'http://nas:9000' }], skipServersJson: true, fetch: noFetch })
+    s.setCredentials('nas', { accessKeyId: 'AK', secretAccessKey: 'SK', remember: true })
+
+    setActivePinia(createPinia())
+    const s2 = useConnectionsStore()
+    await s2.init({ presets: [{ id: 'nas', name: 'NAS', endpoint: 'http://evil:9000' }], skipServersJson: true, fetch: noFetch })
+    const c = s2.byId('nas')!
+    expect(c.endpoint).toBe('http://evil:9000')
+    expect(c.secretAccessKey).toBe('')
+    expect(c.accessKeyId).toBe('AK')
+    expect(s2.hasCredentials(c)).toBe(false)
+    // ...and not in storage either (it was remembered).
+    expect(localStorage.getItem(LOCAL_STORAGE_KEY)).not.toContain('"SK"')
+  })
+
+  it('ignores secret keys in presets (they are public) with a warning', async () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
+    const s = useConnectionsStore()
+    await s.init({ presets: [{ id: 'nas', endpoint: 'http://nas:9000', accessKeyId: 'AK', secretAccessKey: 'PUBLIC-SECRET' }], skipServersJson: true, fetch: noFetch })
+    expect(s.byId('nas')).toMatchObject({ accessKeyId: 'AK', secretAccessKey: '' })
+    expect(warn).toHaveBeenCalledWith(expect.stringMatching(/preset "nas" contains a secret key/))
+    expect(JSON.stringify(warn.mock.calls)).not.toContain('PUBLIC-SECRET')
   })
 
   it('derives preset ids from endpoints and remembers dismissed presets', async () => {

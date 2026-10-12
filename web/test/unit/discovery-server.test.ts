@@ -157,8 +157,9 @@ describe('beacon messages', () => {
     expect(beaconCandidateUrls(['https://:9443'], '10.0.0.7')).toEqual(['https://10.0.0.7:9443'])
     // loopback announced from a remote host → source IP
     expect(beaconCandidateUrls(['http://127.0.0.1:9000'], '10.0.0.8')).toEqual(['http://10.0.0.8:9000'])
-    // loopback from loopback stays
-    expect(beaconCandidateUrls(['http://localhost:9000'], '127.0.0.1')).toEqual(['http://localhost:9000'])
+    // loopback literals from this host stay; names are never kept
+    expect(beaconCandidateUrls(['http://127.0.0.1:9000'], '127.0.0.1')).toEqual(['http://127.0.0.1:9000'])
+    expect(beaconCandidateUrls(['http://localhost:9000'], '127.0.0.1')).toEqual(['http://127.0.0.1:9000'])
     // nothing usable → source IP + default port
     expect(beaconCandidateUrls([], '10.0.0.9')).toEqual(['http://10.0.0.9:9000'])
     expect(beaconCandidateUrls(undefined, undefined)).toEqual([])
@@ -181,8 +182,11 @@ describe('mDNS answers', () => {
     expect(decodeTxt(undefined)).toEqual({})
   })
 
+  // Every address is the sender's own (or local, for a sender on this host).
+  const nets = { advertisedBy: (ip: string, src: string) => src === 'local' || ip === src }
+
   it('builds candidates from PTR → SRV/TXT/A', () => {
-    const c = parseMdnsRecords(records)
+    const c = parseMdnsRecords(records, 'local', nets)
     expect(c).toHaveLength(1)
     expect(c[0]).toMatchObject({
       instance: 'nas-b3f1c2._gos3._tcp.local',
@@ -195,12 +199,12 @@ describe('mDNS answers', () => {
     expect(c[0]!.txt.id).toBe('b3f1c2d4e5f60718')
   })
 
-  it('falls back to the target host and reports missing records', () => {
-    const partial = records.slice(0, 3)
-    expect(parseMdnsRecords(partial)[0]!.urls).toEqual(['http://nas.local:9000'])
+  it('never falls back to the target host name and reports missing records', () => {
+    const partial = records.slice(0, 4)
+    expect(parseMdnsRecords(partial, 'local', nets)).toEqual([])
     expect(missingMdnsNames(partial)).toEqual({ srv: [], a: ['nas.local'] })
     expect(missingMdnsNames(records.slice(0, 1))).toEqual({ srv: ['nas-b3f1c2._gos3._tcp.local'], a: [] })
-    expect(parseMdnsRecords(records.slice(0, 1))).toEqual([])
+    expect(parseMdnsRecords(records.slice(0, 1), 'local', nets)).toEqual([])
   })
 })
 
@@ -214,12 +218,15 @@ describe('peers', () => {
   })
 
   it('merges sightings of the same server', () => {
-    const a = peerFromInfo(INFO, 'http://10.0.0.5:9000', 'mdns', now)
-    const b = peerFromInfo(INFO, 'http://192.168.1.20:9000', 'beacon', new Date('2026-10-09T12:00:05Z'))
+    // The document advertises both addresses (multi-homed host).
+    const multi: Info = { ...INFO, endpoints: { ...INFO.endpoints, all: ['http://10.0.0.5:9000', 'http://192.168.1.20:9000'] } }
+    const a = peerFromInfo(multi, 'http://10.0.0.5:9000', 'mdns', now)
+    const b = peerFromInfo(multi, 'http://192.168.1.20:9000', 'beacon', new Date('2026-10-09T12:00:05Z'))
     const u = peerFromSighting({ id: INFO.id, name: 'nas?', urls: ['http://10.9.9.9:9000'], source: 'beacon', error: 'timeout' }, new Date('2026-10-09T12:00:09Z'))
     const m = mergePeer(mergePeer(a, b), u)
     expect(m.sources).toEqual(['mdns', 'beacon'])
-    expect(m.addresses).toEqual(['http://10.0.0.5:9000', 'http://192.168.1.20:9000', 'http://10.9.9.9:9000'])
+    // the unverified sighting's (unauthenticated) address is not added
+    expect(m.addresses).toEqual(['http://10.0.0.5:9000', 'http://192.168.1.20:9000'])
     expect(m.name).toBe('nas') // verified identity wins over the unverified hint
     expect(m.verified && m.healthy).toBe(true)
     expect(m.error).toBeUndefined()
