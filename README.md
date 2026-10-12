@@ -326,7 +326,7 @@ More in [docs/security.md](docs/security.md).
 
 ## Development
 
-Requirements: Go ≥ 1.25, Node.js 22 with corepack (pnpm), and optionally Docker
+Requirements: Go ≥ 1.26, Node.js 22 with corepack (pnpm), and optionally Docker
 and Python 3 (for the compatibility suite). `go.mod` names the toolchain used
 for builds (`toolchain go1.26.9`, a supported release with current security
 fixes); with the default `GOTOOLCHAIN=auto` the go command downloads it.
