@@ -854,17 +854,17 @@ func (s *Server) finalizeMultipartObject(ctx context.Context, r *http.Request, r
 	} else if meta.MultipartRetentionSource == "explicit" && !meta.RetainUntil.After(created) {
 		return s3err.ErrInvalidArgument.WithMessage("The retain until date must be in the future!")
 	}
-	if err := s.authorizeMultipartPublication(ctx, r, rc, meta, current, retentionSource, config); err != nil {
+	if err := s.authorizeObjectPublication(ctx, r, rc, meta, current, retentionSource, config); err != nil {
 		return err
 	}
 	meta.MultipartRetentionSource = ""
 	return nil
 }
 
-// authorizeMultipartPublication evaluates the current caller's permissions
+// authorizeObjectPublication evaluates the current caller's permissions
 // against IAM and the bucket configuration in the backend's commit snapshot.
 // It does not read the storage backend, which is locked by the caller.
-func (s *Server) authorizeMultipartPublication(ctx context.Context, r *http.Request, rc *reqContext,
+func (s *Server) authorizeObjectPublication(ctx context.Context, r *http.Request, rc *reqContext,
 	meta, current *storage.ObjectMeta, retentionSource string, config func(string) []byte) error {
 	id := rc.identity
 	if id.IsRoot && !id.IsAnonymous {
