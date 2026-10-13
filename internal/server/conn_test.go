@@ -191,6 +191,18 @@ func TestMaxConnections(t *testing.T) {
 	if err := get(idle); err != nil {
 		t.Fatal(err)
 	}
+	// net/http reports the connection idle only after the response is
+	// finished, which the client may see first: wait for the server to
+	// count it idle, or the new client races it and is (rightly) refused.
+	lim := srv.limiter.Load()
+	if lim == nil {
+		t.Fatal("no connection limiter")
+	}
+	for deadline := time.Now().Add(5 * time.Second); lim.idleConns() == 0; time.Sleep(time.Millisecond) {
+		if time.Now().After(deadline) {
+			t.Fatal("the first connection never became idle")
+		}
+	}
 	start := time.Now()
 	if err := get(newClient()); err != nil {
 		t.Fatalf("new client while a connection is idle: %v", err)

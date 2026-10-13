@@ -161,6 +161,13 @@ func (l *connLimiter) connState(c net.Conn, st http.ConnState) {
 	}
 }
 
+// idleConns returns the number of connections counted as idle.
+func (l *connLimiter) idleConns() int {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return len(l.idle)
+}
+
 // admit reports whether a newly accepted connection may be served, closing
 // the longest-idle keep-alive connection to make room when the cap is
 // reached.
