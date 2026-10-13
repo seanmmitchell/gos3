@@ -187,6 +187,19 @@ func (s *Server) handleCopyObject(w http.ResponseWriter, r *http.Request, rc *re
 	if err := s.prepareNewObject(ctx, r, rc, bi, rc.key, &meta, opts); err != nil {
 		return err
 	}
+	cond.BeforePublish = func(m, current *storage.ObjectMeta, created time.Time, config func(string) []byte) error {
+		if err := s.checkCredentialsCurrent(rc); err != nil {
+			return err
+		}
+		if err := publishObjectRetention(m, created, config, opts.retentionSet); err != nil {
+			return err
+		}
+		retentionSource := "default"
+		if opts.retentionSet {
+			retentionSource = "explicit"
+		}
+		return s.authorizeObjectPublication(ctx, r, rc, m, current, retentionSource, config)
+	}
 	if algo == "" {
 		algo = sourceChecksumAlgorithm(info.Checksums)
 	}
@@ -223,7 +236,47 @@ func (s *Server) handleCopyObject(w http.ResponseWriter, r *http.Request, rc *re
 			m.ETag = hex.EncodeToString(hasher.md5.Sum(nil))
 			m.Checksums = map[string]string{algo: base64.StdEncoding.EncodeToString(hasher.sum.Sum(nil))}
 			m.ChecksumType = ChecksumTypeFullObject
-			return nil
+			// A copy may outlive its source read and destination write grants.
+			if err := s.checkCredentialsCurrent(rc); err != nil {
+				return err
+			}
+			// Reauthorize the version actually copied. A newer source version
+			// must not supply its ACL or tags to this decision.
+			currentSource, err := s.backend.GetObjectInfo(ctx, src.Bucket, src.Key, info.VersionID)
+			if err != nil || currentSource.DeleteMarker || currentSource.ETag != info.ETag ||
+				currentSource.Size != info.Size || !currentSource.LastModified.Equal(info.LastModified) {
+				return s3err.ErrAccessDenied
+			}
+			if rc.authzObjects == nil {
+				rc.authzObjects = make(map[objectRef]authzObject)
+			}
+			rc.authzObjects[objectRef{src.Bucket, src.Key, src.VersionID}] = authzObject{
+				info: currentSource, found: true,
+			}
+			conds := s.requestTimeConditions(r, rc, nil)
+			if err := s.authorizeTarget(ctx, r, rc, authzTarget{
+				Action: objectReadAction(src.VersionID), Bucket: src.Bucket, Key: src.Key,
+				VersionID: src.VersionID, ObjectRead: true, Conditions: conds,
+			}); err != nil {
+				return err
+			}
+			if tagDir == directiveCopy && len(m.Tags) > 0 {
+				action := "s3:GetObjectTagging"
+				if src.VersionID != "" {
+					action = "s3:GetObjectVersionTagging"
+				}
+				if err := s.authorizeTarget(ctx, r, rc, authzTarget{
+					Action: action, Bucket: src.Bucket, Key: src.Key,
+					VersionID: src.VersionID, Conditions: conds,
+				}); err != nil {
+					return err
+				}
+			}
+			delete(rc.authzObjects, objectRef{rc.bucket, rc.key, ""})
+			if err := s.reauthorizeOp(ctx, r, rc, nil); err != nil {
+				return err
+			}
+			return s.authorizeNewObject(ctx, r, rc, rc.bucket, rc.key, m.Tags, opts, conds)
 		})
 		if err != nil {
 			return longResult{err: err}
