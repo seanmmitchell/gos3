@@ -1045,7 +1045,7 @@ func (s *Server) handleCompleteMultipartUpload(w http.ResponseWriter, r *http.Re
 	// Completion continues when the client goes away, like in S3: the
 	// backend commit is atomic and the upload is gone afterwards.
 	return s.respondWithKeepAlive(w, r, rc, early, trailers, func() longResult {
-		info, err := s.backend.CompleteMultipartUpload(workCtx, bucket, key, up.UploadID, plan.partNumbers, plan.meta, cond)
+		info, err := s.completeMultipartUpload(workCtx, bucket, key, up.UploadID, plan.partNumbers, plan.meta, cond)
 		if err != nil {
 			if errors.Is(err, storage.ErrPreconditionFailed) {
 				return longResult{err: s.commitError(workCtx, err, bucket, key, cond)}

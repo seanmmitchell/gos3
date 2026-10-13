@@ -15,6 +15,7 @@ import type {
   AccessKey,
   AccessKeyStatus,
   AdminErrorCode,
+  BucketCompression,
   BucketSummary,
   CreateAccessKeyRequest,
   CreateUserRequest,
@@ -470,6 +471,25 @@ export class AdminClient {
       },
       expect: 'none'
     })
+  }
+
+  /** The bucket's compression setting, its effect and the server's policy. */
+  getBucketCompression(name: string): Promise<BucketCompression> {
+    return this.request('GET', `/buckets/${enc(name)}/compression`)
+  }
+
+  /**
+   * Sets the bucket's compression. 409 Conflict when it contradicts the
+   * administrator's compression.mode (enabling while "disabled",
+   * disabling while "enforced").
+   */
+  putBucketCompression(name: string, enabled: boolean): Promise<BucketCompression> {
+    return this.request('PUT', `/buckets/${enc(name)}/compression`, { body: { enabled } })
+  }
+
+  /** Removes the bucket's setting: back to the server default (204, idempotent). */
+  deleteBucketCompression(name: string): Promise<void> {
+    return this.request('DELETE', `/buckets/${enc(name)}/compression`, { expect: 'none' })
   }
 
   // Discovery --------------------------------------------------------------

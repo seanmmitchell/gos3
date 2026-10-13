@@ -306,6 +306,10 @@ ListObjectsV2, ListParts and GetObjectAttributes.
   bucket, and `BucketAlreadyOwnedByYou` is returned to the bucket's creator
   and to root, while other users get `BucketAlreadyExists`.
 - **Storage classes** are accepted and reported but have no effect.
+- **Compression** (a gos3 feature, see [operations.md](operations.md#compression))
+  is invisible to S3 clients: objects stored compressed return the same
+  bytes, ETag, checksums, sizes and ranges. It is configured through the
+  admin API and the web UI, not through an S3 API.
 - **No replication between gos3 servers.** Every server stores its own data.
   Discovery only finds servers; it does not cluster them.
 - With slow CopyObject and CompleteMultipartUpload calls (over about 5 s),

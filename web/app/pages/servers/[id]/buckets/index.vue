@@ -130,8 +130,17 @@ const usageNote = computed(() => (data.value && showUsage.value ? usageAgeNote(d
 const totals = computed(() => {
   const list = data.value?.rows ?? []
   if (!showUsage.value) return null
-  return list.reduce((acc, r) => ({ objects: acc.objects + (r.usage?.objects ?? 0), bytes: acc.bytes + (r.usage?.bytes ?? 0) }), { objects: 0, bytes: 0 })
+  const t = list.reduce((acc, r) => ({ objects: acc.objects + (r.usage?.objects ?? 0), bytes: acc.bytes + (r.usage?.bytes ?? 0) }), { objects: 0, bytes: 0 })
+  // Stored (physical) bytes only when every usage reports them (servers with compression).
+  const usages = list.map(r => r.usage).filter(u => !!u)
+  const storedBytes = usages.length && usages.every(u => u.storedBytes !== undefined)
+    ? usages.reduce((sum, u) => sum + (u.storedBytes ?? 0), 0)
+    : undefined
+  return { ...t, storedBytes }
 })
+
+// Compression saving of all buckets ("" without compressed data or on servers without it).
+const storedNote = computed(() => (totals.value ? formatStoredNote(totals.value.bytes, totals.value.storedBytes) : ''))
 
 // ---------------------------------------------------------------------------
 // Actions
@@ -259,7 +268,7 @@ const isAccessDenied = computed(() => {
     <CommonPageHeader
       title="Buckets"
       icon="i-lucide-database"
-      :description="data ? `${data.rows.length} bucket${data.rows.length === 1 ? '' : 's'} on ${connection?.name ?? 'this server'}${totals ? ` · ${formatNumber(totals.objects)} object${totals.objects === 1 ? '' : 's'} · ${formatBytes(totals.bytes)}${usageNote}` : ''}` : `Buckets on ${connection?.name ?? 'this server'}`"
+      :description="data ? `${data.rows.length} bucket${data.rows.length === 1 ? '' : 's'} on ${connection?.name ?? 'this server'}${totals ? ` · ${formatNumber(totals.objects)} object${totals.objects === 1 ? '' : 's'} · ${formatBytes(totals.bytes)}${storedNote ? ` · ${storedNote}` : ''}${usageNote}` : ''}` : `Buckets on ${connection?.name ?? 'this server'}`"
     >
       <template #actions>
         <UButton
@@ -409,7 +418,12 @@ const isAccessDenied = computed(() => {
           <span class="tabular-nums">{{ row.original.usage ? formatNumber(row.original.usage.objects) : '—' }}</span>
         </template>
         <template #bytes-cell="{ row }">
-          <CommonByteSize v-if="row.original.usage" :bytes="row.original.usage.bytes" class="tabular-nums" />
+          <template v-if="row.original.usage">
+            <CommonByteSize :bytes="row.original.usage.bytes" class="tabular-nums" />
+            <span v-if="formatStoredNote(row.original.usage.bytes, row.original.usage.storedBytes)" class="block text-xs text-dimmed">
+              {{ formatStoredNote(row.original.usage.bytes, row.original.usage.storedBytes) }}
+            </span>
+          </template>
           <span v-else class="text-muted">—</span>
         </template>
         <template #region-cell="{ row }">

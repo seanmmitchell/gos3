@@ -53,12 +53,15 @@ func (a *api) uptimeSeconds(inf discovery.Info) int64 {
 
 // usageJSON is storage.BucketUsage with the API's JSON names.
 type usageJSON struct {
-	Objects        int64 `json:"objects"`
-	Bytes          int64 `json:"bytes"`
-	Versions       int64 `json:"versions"`
-	VersionBytes   int64 `json:"versionBytes"`
-	DeleteMarkers  int64 `json:"deleteMarkers"`
-	PendingUploads int64 `json:"pendingUploads"`
+	Objects            int64 `json:"objects"`
+	Bytes              int64 `json:"bytes"`
+	StoredBytes        int64 `json:"storedBytes"`
+	Versions           int64 `json:"versions"`
+	VersionBytes       int64 `json:"versionBytes"`
+	StoredVersionBytes int64 `json:"storedVersionBytes"`
+	CompressedVersions int64 `json:"compressedVersions"`
+	DeleteMarkers      int64 `json:"deleteMarkers"`
+	PendingUploads     int64 `json:"pendingUploads"`
 }
 
 // bucketUsageJSON is the usage of a BucketSummary: the counters plus when
@@ -71,12 +74,15 @@ type bucketUsageJSON struct {
 
 func toUsageJSON(u storage.BucketUsage) *usageJSON {
 	return &usageJSON{
-		Objects:        u.Objects,
-		Bytes:          u.Bytes,
-		Versions:       u.Versions,
-		VersionBytes:   u.VersionBytes,
-		DeleteMarkers:  u.DeleteMarkers,
-		PendingUploads: u.PendingUploads,
+		Objects:            u.Objects,
+		Bytes:              u.Bytes,
+		StoredBytes:        u.StoredBytes,
+		Versions:           u.Versions,
+		VersionBytes:       u.VersionBytes,
+		StoredVersionBytes: u.StoredVersionBytes,
+		CompressedVersions: u.CompressedVersions,
+		DeleteMarkers:      u.DeleteMarkers,
+		PendingUploads:     u.PendingUploads,
 	}
 }
 
@@ -184,8 +190,11 @@ func (a *api) storageTotals(ctx context.Context) (storageTotals, error) {
 			t.Buckets++
 			t.Objects += u.Objects
 			t.Bytes += u.Bytes
+			t.StoredBytes += u.StoredBytes
 			t.Versions += u.Versions
 			t.VersionBytes += u.VersionBytes
+			t.StoredVersionBytes += u.StoredVersionBytes
+			t.CompressedVersions += u.CompressedVersions
 			t.DeleteMarkers += u.DeleteMarkers
 			t.PendingUploads += u.PendingUploads
 		}
@@ -214,7 +223,10 @@ func (a *api) getConfig(rc *reqCtx) (int, any, error) {
 }
 
 func (a *api) putConfig(rc *reqCtx) (int, any, error) {
-	var in config.Settings
+	// A document without "compression" (from a client that predates it)
+	// keeps the current compression policy; fields it does send replace
+	// the current ones. Every other section must be complete.
+	in := config.Settings{Compression: a.d.Settings.Get().Compression}
 	if err := rc.decodeBody(&in, false); err != nil {
 		var ae *apiError
 		if errors.As(err, &ae) && ae.Code == codeInvalidRequest && ae.Status == http.StatusBadRequest {
@@ -260,5 +272,6 @@ func normalizeSettings(s config.Settings) config.Settings {
 	s.CORS.ExposeHeaders = nn(s.CORS.ExposeHeaders)
 	s.Discovery.Seeds = nn(s.Discovery.Seeds)
 	s.Discovery.DNSSRV = nn(s.Discovery.DNSSRV)
+	s.Compression.SkipContentTypes = nn(s.Compression.SkipContentTypes)
 	return s
 }

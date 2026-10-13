@@ -135,4 +135,43 @@ metrics:
   enabled: true
   # Without authentication (otherwise admin:GetStats is required) (runtime).
   public: false
+
+compression:
+  # Transparent compression of object data (runtime). optional: each
+  # bucket decides (admin API / web UI, off by default); enforced: every
+  # bucket compresses new objects; disabled: nothing new is compressed.
+  mode: optional
+  # DEFLATE level, 1 (fastest) to 9 (smallest).
+  level: 1
+  # Objects smaller than this (when their size is known) stay uncompressed.
+  min_size: 4096
+  # Media types stored uncompressed because they are compressed already
+  # ("video/*" and "prefix*" wildcards).
+  skip_content_types:
+    - image/jpeg
+    - image/png
+    - image/gif
+    - image/webp
+    - image/avif
+    - image/heic
+    - image/heif
+    - image/jxl
+    - video/*
+    - audio/*
+    - font/woff
+    - font/woff2
+    - application/zip
+    - application/gzip
+    - application/x-gzip
+    - application/zstd
+    - application/x-bzip2
+    - application/x-xz
+    - application/x-7z-compressed
+    - application/x-rar-compressed
+    - application/vnd.rar
+    - application/x-lz4
+    - application/java-archive
+    - application/epub+zip
+    - application/vnd.openxmlformats-officedocument.*
+    - application/vnd.oasis.opendocument.*
 `

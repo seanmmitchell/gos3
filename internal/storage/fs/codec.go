@@ -41,6 +41,15 @@ import (
 // for nil, else count+1 maps.
 const recordFormatVersionV1 byte = 3
 
+// recordFormatVersionV2 is recordFormatVersionV1 followed by
+//
+//	str   Compression
+//	varint StoredSize
+//
+// It is used only for records with Compression set, so databases without
+// compressed objects stay readable by builds that predate it.
+const recordFormatVersionV2 byte = 4
+
 var errShortRecord = errors.New("truncated record")
 
 type encoder struct{ b []byte }
@@ -195,7 +204,11 @@ func (d *decoder) strMap() map[string]string {
 func encodeVersionRecord(r *versionRecord) []byte {
 	m := &r.Meta
 	e := encoder{b: make([]byte, 0, 128+len(r.VersionID)+len(m.ETag)+len(m.ContentType))}
-	e.b = append(e.b, recordFormatVersionV1)
+	format := recordFormatVersionV1
+	if r.Compression != "" {
+		format = recordFormatVersionV2
+	}
+	e.b = append(e.b, format)
 	e.str(r.VersionID)
 	var flags byte
 	if r.DeleteMarker {
@@ -238,12 +251,17 @@ func encodeVersionRecord(r *versionRecord) []byte {
 	e.str(m.RetentionMode)
 	e.time(m.RetainUntil)
 	e.str(m.WebsiteRedirect)
+	if format == recordFormatVersionV2 {
+		e.str(r.Compression)
+		e.varint(r.StoredSize)
+	}
 	return e.b
 }
 
 // decodeVersionRecord parses the payload (after the format byte) of an
-// encodeVersionRecord result.
-func decodeVersionRecord(data []byte, r *versionRecord) error {
+// encodeVersionRecord result; v2 tells whether the format byte was
+// recordFormatVersionV2.
+func decodeVersionRecord(data []byte, r *versionRecord, v2 bool) error {
 	d := decoder{b: data}
 	m := &r.Meta
 	r.VersionID = d.str()
@@ -283,6 +301,14 @@ func decodeVersionRecord(data []byte, r *versionRecord) error {
 	m.RetentionMode = d.str()
 	m.RetainUntil = d.time()
 	m.WebsiteRedirect = d.str()
+	r.Compression, r.StoredSize = "", 0
+	if v2 {
+		r.Compression = d.str()
+		r.StoredSize = d.varint()
+		if d.err == nil && (r.Compression == "" || r.StoredSize < 0) {
+			d.fail(errors.New("invalid compression fields"))
+		}
+	}
 	if d.err == nil && len(d.b) != 0 {
 		d.fail(fmt.Errorf("%d trailing bytes", len(d.b)))
 	}

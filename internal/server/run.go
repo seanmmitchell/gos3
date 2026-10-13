@@ -67,6 +67,7 @@ func (s *Server) Serve(ctx context.Context, ln net.Listener) error {
 		lim := newConnLimiter(n, func(msg string, args ...any) { s.log.Debug(msg, args...) })
 		hs.ConnState = lim.connState
 		ln = limitedListener{Listener: ln, l: lim}
+		s.limiter.Store(lim)
 	}
 	if err := s.disc.Start(s.lifeCtx); err != nil {
 		s.log.Error("discovery: start failed", "err", err)

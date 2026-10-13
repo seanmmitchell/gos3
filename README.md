@@ -27,6 +27,10 @@ Run `gos3 serve`, point the AWS CLI, an SDK, `mc` or rclone at it, and open
   of current and noncurrent versions, delete markers and stale multipart uploads.
 - **Checksums**: CRC32, CRC32C, CRC64NVME, SHA-1 and SHA-256, as headers or
   trailers, full-object or composite for multipart uploads, plus MD5/ETag.
+- **Compression**: transparent, seekable DEFLATE compression of object data,
+  enabled per bucket, or enforced or disabled server-wide by the
+  administrator. Already-compressed media types are skipped. See
+  [docs/operations.md](docs/operations.md#compression).
 - **Web UI**: embedded in the binary or run standalone to manage many gos3
   and other S3 servers. It has an object browser with uploads, versions,
   metadata and share links, bucket settings, users and policies, server

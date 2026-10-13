@@ -208,13 +208,14 @@ func (s *Server) commitError(ctx context.Context, err error, bucket, key string,
 	return s3err.ErrPreconditionFailed.With("Condition", "If-None-Match")
 }
 
-// storeObject streams src into a new version of bucket/key and commits it
+// storeObject streams src (size bytes, -1 = unknown) into a new version of
+// bucket/key, compressed as the compression policy says, and commits it
 // with meta and cond. finish runs after src reached EOF and before the
 // commit (to set ETag and checksums computed while streaming). The writer
 // is aborted on any error.
-func (s *Server) storeObject(ctx context.Context, bucket, key string, src io.Reader, meta storage.ObjectMeta,
+func (s *Server) storeObject(ctx context.Context, bucket, key string, src io.Reader, size int64, meta storage.ObjectMeta,
 	cond storage.CommitOptions, finish func(*storage.ObjectMeta) error) (storage.ObjectInfo, error) {
-	ow, err := s.backend.NewObjectWriter(ctx, bucket, key)
+	ow, err := s.newObjectWriter(ctx, bucket, key, s.objectCompression(ctx, bucket, meta, size))
 	if err != nil {
 		return storage.ObjectInfo{}, bucketError(err, bucket)
 	}
@@ -595,7 +596,7 @@ func (s *Server) handlePutObject(w http.ResponseWriter, r *http.Request, rc *req
 	if err != nil {
 		return err
 	}
-	info, err := s.storeObject(ctx, rc.bucket, rc.key, p, meta, cond, func(m *storage.ObjectMeta) error {
+	info, err := s.storeObject(ctx, rc.bucket, rc.key, p, p.declaredSize(), meta, cond, func(m *storage.ObjectMeta) error {
 		m.ETag = p.ETag()
 		m.Checksums = p.Checksums()
 		m.ChecksumType = p.ChecksumType()

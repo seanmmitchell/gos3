@@ -198,6 +198,9 @@ func (a *api) routes() []route {
 		{"GET", "/buckets", "ListBuckets", service, a.listBuckets},
 		{"GET", "/buckets/{name}", "GetBucket", bucket, a.getBucket},
 		{"DELETE", "/buckets/{name}", "ForceDeleteBucket", bucket, a.deleteBucket},
+		{"GET", "/buckets/{name}/compression", "GetBucketCompression", bucket, a.getBucketCompression},
+		{"PUT", "/buckets/{name}/compression", "PutBucketCompression", bucket, a.putBucketCompression},
+		{"DELETE", "/buckets/{name}/compression", "PutBucketCompression", bucket, a.deleteBucketCompression},
 		// Discovery
 		{"GET", "/discovery", "GetDiscovery", service, a.getDiscovery},
 		{"POST", "/discovery/probe", "ProbeNetwork", service, a.probe},

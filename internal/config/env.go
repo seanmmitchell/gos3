@@ -71,6 +71,10 @@ var envVars = []EnvVar{
 	{"GOS3_LIFECYCLE_INTERVAL", "lifecycle.interval", "lifecycle pass interval (duration)", duration(func(c *Config) *time.Duration { return &c.Lifecycle.Interval })},
 	{"GOS3_METRICS_ENABLED", "metrics.enabled", "serve /_gos3/metrics (bool)", boolean(func(c *Config) *bool { return &c.Metrics.Enabled })},
 	{"GOS3_METRICS_PUBLIC", "metrics.public", "serve metrics without auth (bool)", boolean(func(c *Config) *bool { return &c.Metrics.Public })},
+	{"GOS3_COMPRESSION_MODE", "compression.mode", "optional (buckets decide), enforced or disabled", str(func(c *Config) *string { return &c.Compression.Mode })},
+	{"GOS3_COMPRESSION_LEVEL", "compression.level", "DEFLATE level, 1 (fastest) to 9 (smallest)", integer(func(c *Config) *int { return &c.Compression.Level })},
+	{"GOS3_COMPRESSION_MIN_SIZE", "compression.min_size", "store smaller objects uncompressed, bytes or 4KiB-style", size(func(c *Config) *int64 { return &c.Compression.MinSize })},
+	{"GOS3_COMPRESSION_SKIP_CONTENT_TYPES", "compression.skip_content_types", "media types stored uncompressed (\"video/*\" wildcards), comma-separated", list(func(c *Config) *[]string { return &c.Compression.SkipContentTypes })},
 }
 
 // EnvVars returns the documented GOS3_* environment variables.

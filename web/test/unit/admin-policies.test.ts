@@ -91,7 +91,7 @@ describe('IAM policy templates', () => {
 
 describe('admin actions, resources and condition keys', () => {
   it('lists every admin action, including the new self-service and probe actions', () => {
-    for (const a of ['admin:ProbeNetwork', 'admin:CreateOwnAccessKey', 'admin:DeleteOwnAccessKey', 'admin:GetDiscovery', 'admin:ScanNetwork', 'admin:UpdateUser', 'admin:GetPolicy', 'admin:GetBucket']) {
+    for (const a of ['admin:ProbeNetwork', 'admin:CreateOwnAccessKey', 'admin:DeleteOwnAccessKey', 'admin:GetDiscovery', 'admin:ScanNetwork', 'admin:UpdateUser', 'admin:GetPolicy', 'admin:GetBucket', 'admin:GetBucketCompression', 'admin:PutBucketCompression']) {
       expect(ADMIN_ACTIONS).toContain(a)
       expect(SIMULATOR_ACTIONS).toContain(a)
     }
@@ -102,7 +102,8 @@ describe('admin actions, resources and condition keys', () => {
   it('maps admin actions to their per-target resource type', () => {
     for (const a of ['admin:CreateUser', 'admin:GetUser', 'admin:UpdateUser', 'admin:DeleteUser', 'admin:CreateAccessKey', 'admin:UpdateAccessKey', 'admin:DeleteAccessKey']) expect(adminResourceType(a)).toBe('user')
     for (const a of ['admin:GetPolicy', 'admin:PutPolicy', 'admin:DeletePolicy']) expect(adminResourceType(a)).toBe('policy')
-    for (const a of ['admin:GetBucket', 'admin:ForceDeleteBucket']) expect(adminResourceType(a)).toBe('bucket')
+    for (const a of ['admin:GetBucket', 'admin:ForceDeleteBucket', 'admin:GetBucketCompression', 'admin:PutBucketCompression']) expect(adminResourceType(a)).toBe('bucket')
+    expect(ADMIN_RESOURCE_FORMS.find(f => f.type === 'bucket')!.description).toMatch(/GetBucketCompression, PutBucketCompression/)
     for (const a of ['admin:ListUsers', 'admin:ProbeNetwork', 'admin:CreateOwnAccessKey', 'admin:UpdateConfig', 's3:GetObject']) expect(adminResourceType(a)).toBeUndefined()
     expect(adminResourceType(' Admin:updateuser ')).toBe('user')
     expect(isAdminAction('admin:GetStats')).toBe(true)

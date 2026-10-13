@@ -2,11 +2,11 @@
 import type { BucketSummary } from '~/types/admin'
 import type { ObjectLockConfiguration, VersioningStatus } from '~/types/s3'
 import { S3Error } from '~/utils/s3/errors'
-import { BUCKET_TABS, canShowBucketUsage, resolveBucketTab, type BucketSettingsTab } from '~/components/admin/-capabilities'
+import { bucketTabs, canShowBucketUsage, resolveBucketTab, type BucketSettingsTab } from '~/components/admin/-capabilities'
 
 /**
- * Bucket settings with one tab per S3 bucket sub-resource (synced with
- * `?tab=`). Shared state — versioning, object lock and the admin
+ * Bucket settings with one tab per S3 bucket sub-resource, plus gos3-only
+ * ones such as compression (synced with `?tab=`). Shared state — versioning, object lock and the admin
  * BucketSummary — is loaded here and refreshed when a tab changes it.
  */
 const route = useRoute()
@@ -18,13 +18,14 @@ const { capabilities } = useWhoAmI()
 
 useHead({ title: () => `${bucket.value} · Settings` })
 
+const tabs = computed(() => bucketTabs(connection.value?.kind, capabilities.value))
 const tab = computed<BucketSettingsTab>({
-  get: () => resolveBucketTab(route.query.tab),
+  get: () => resolveBucketTab(route.query.tab, tabs.value),
   set: (v) => {
     void router.replace({ query: { ...route.query, tab: v === 'overview' ? undefined : v } })
   }
 })
-const tabItems = BUCKET_TABS.map(t => ({ label: t.label, value: t.value, icon: t.icon }))
+const tabItems = computed(() => tabs.value.map(t => ({ label: t.label, value: t.value, icon: t.icon })))
 
 // --- shared state ----------------------------------------------------------
 const versioning = ref<VersioningStatus | null>(null)
@@ -136,6 +137,7 @@ const lockEnabled = computed(() => !!objectLock.value?.enabled)
         <BucketSettingsLifecycleTab v-else-if="tab === 'lifecycle'" :bucket="bucket" :versioning="versioning" @changed="loadSummary" />
         <BucketSettingsTagsTab v-else-if="tab === 'tags'" :bucket="bucket" @changed="loadSummary" />
         <BucketSettingsEncryptionTab v-else-if="tab === 'encryption'" :bucket="bucket" @changed="loadSummary" />
+        <BucketSettingsCompressionTab v-else-if="tab === 'compression'" :bucket="bucket" @changed="loadSummary" />
         <BucketSettingsObjectLockTab v-else-if="tab === 'object-lock'" :bucket="bucket" :versioning="versioning" @changed="refreshShared" />
         <BucketSettingsAccessTab v-else-if="tab === 'access'" :bucket="bucket" @changed="loadSummary" />
         <BucketSettingsDangerZoneTab v-else-if="tab === 'danger'" :bucket="bucket" />
