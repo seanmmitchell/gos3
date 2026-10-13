@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/seanmmitchell/gos3/internal/auth"
+	"github.com/seanmmitchell/gos3/internal/compression"
 	"github.com/seanmmitchell/gos3/internal/iam"
 	"github.com/seanmmitchell/gos3/internal/storage"
 )
@@ -22,15 +23,18 @@ const aclPrivate = "private"
 
 // bucketSummary is the BucketSummary document of docs/admin-api.md.
 type bucketSummary struct {
-	Name       string           `json:"name"`
-	CreatedAt  time.Time        `json:"createdAt"`
-	Region     string           `json:"region"`
-	Versioning string           `json:"versioning"`
-	ObjectLock bool             `json:"objectLock"`
-	Owner      string           `json:"owner"`
-	Configs    bucketConfigs    `json:"configs"`
-	Public     bool             `json:"public"`
-	Usage      *bucketUsageJSON `json:"usage"`
+	Name       string        `json:"name"`
+	CreatedAt  time.Time     `json:"createdAt"`
+	Region     string        `json:"region"`
+	Versioning string        `json:"versioning"`
+	ObjectLock bool          `json:"objectLock"`
+	Owner      string        `json:"owner"`
+	Configs    bucketConfigs `json:"configs"`
+	Public     bool          `json:"public"`
+	// Compression is the bucket's compression setting and whether new
+	// objects are compressed under the server's policy.
+	Compression bucketCompressionSummary `json:"compression"`
+	Usage       *bucketUsageJSON         `json:"usage"`
 }
 
 // bucketConfigs flags which configuration documents a bucket has.
@@ -52,7 +56,7 @@ var allConfigKeys = []string{
 	storage.ConfigEncryption, storage.ConfigObjectLock, storage.ConfigACL, storage.ConfigWebsite,
 	storage.ConfigOwnership, storage.ConfigNotification, storage.ConfigLogging,
 	storage.ConfigPublicAccessBlock, storage.ConfigReplication, storage.ConfigAccelerate,
-	storage.ConfigRequestPayment,
+	storage.ConfigRequestPayment, storage.ConfigCompression,
 }
 
 // listUsageConcurrency bounds parallel usage computations for GET /buckets.
@@ -160,6 +164,14 @@ func (a *api) summarize(rc *reqCtx, info storage.BucketInfo, withUsage bool) (*b
 		return nil, err
 	}
 	s.Public = iam.IsPublicPolicy(pol) || iam.IsPublicACL(acl)
+	cs, err := compression.Load(rc.ctx, a.d.Backend, info.Name)
+	if err != nil {
+		return nil, err
+	}
+	s.Compression = bucketCompressionSummary{
+		Enabled:   cs.Enabled,
+		Effective: compression.Effective(a.d.Settings.Get().Compression, cs),
+	}
 	if withUsage {
 		u, at, err := a.bucketUsage(rc.ctx, info.Name)
 		switch {

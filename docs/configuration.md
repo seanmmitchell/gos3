@@ -184,6 +184,18 @@ API). [discovery.md](discovery.md) describes the protocol.
 | `metrics.enabled` | `GOS3_METRICS_ENABLED` | `true` | | Serve Prometheus metrics at `/_gos3/metrics` (404 when disabled). |
 | `metrics.public` | `GOS3_METRICS_PUBLIC` | `false` | `metricsPublic` | Serve metrics without authentication. Otherwise a signed request with `admin:GetStats` is required. |
 
+### `compression`
+
+The server-wide compression policy. Compression is transparent to clients;
+see [operations.md](operations.md#compression).
+
+| YAML key | Env | Default | Runtime | Description |
+|---|---|---|---|---|
+| `compression.mode` | `GOS3_COMPRESSION_MODE` | `optional` | `compression.mode` | `optional`: each bucket's setting decides (off unless enabled through the admin API or the web UI). `enforced`: every bucket compresses new objects and cannot opt out. `disabled`: nothing new is compressed and buckets cannot enable it. Stored objects stay readable whatever the mode. |
+| `compression.level` | `GOS3_COMPRESSION_LEVEL` | `1` | `compression.level` | DEFLATE level, 1 (fastest) to 9 (smallest). |
+| `compression.min_size` | `GOS3_COMPRESSION_MIN_SIZE` | `4096` | `compression.minSize` | Objects smaller than this (when the size is known before the upload, i.e. not for chunked uploads without a length) are stored uncompressed. Bytes or `4KiB`-style. |
+| `compression.skip_content_types` | `GOS3_COMPRESSION_SKIP_CONTENT_TYPES` | compressed images, `video/*`, `audio/*`, `font/woff*`, archives, zip-based document formats (see `gos3 config print`) | `compression.skipContentTypes` | Media types stored uncompressed because they are compressed already: `type/subtype`, `type/*` or a prefix ending in `*` (case-insensitive, parameters ignored), at most 256. `[]` compresses every type. Objects with a compressing `Content-Encoding` (`gzip`, `br`, `zstd`, …) are never compressed again. |
+
 ### Other
 
 | Env | Flag | Description |
@@ -231,6 +243,7 @@ The runtime subset is the `Settings` document of the admin API:
 | `logging.*` | `logging.*` |
 | `lifecycle.enabled`, `lifecycle.intervalSeconds` | `lifecycle.enabled`, `lifecycle.interval` |
 | `metricsPublic` | `metrics.public` |
+| `compression.*` | `compression.*` (`minSize` = `min_size`, `skipContentTypes` = `skip_content_types`) |
 
 How it behaves:
 
@@ -248,7 +261,8 @@ How it behaves:
   `gos3 config print` lists them.
 - Changes apply immediately and need no restart: log level and format, the
   access log, CORS, domains, region, discovery (only the mechanisms whose
-  settings changed are restarted) and the lifecycle worker. With
+  settings changed are restarted), the lifecycle worker and the compression
+  policy (from the next write on). With
   `auth.strict_region`, signature checks follow a region change immediately.
 - A corrupt or invalid `settings.json` stops the server at startup with an
   error that names the file.

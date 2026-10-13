@@ -4,6 +4,7 @@ import { AdminError } from '~/utils/admin/client'
 import { useConnectionsStore } from '~/stores/connections'
 import { identityPending, settingsPageMode } from '~/components/admin/-capabilities'
 import {
+  COMPRESSION_MODES,
   emptySettingsForm,
   formToSettings,
   isFormDirty,
@@ -15,11 +16,13 @@ import {
   validateSettingsForm,
   type SettingsForm
 } from '~/components/admin/-settings-form'
+import { COMPRESSION_MODE_TEXT } from '~/components/bucket-settings/-compression'
 
 /**
  * Runtime server settings (GET/PUT /config): general, CORS, discovery,
- * logging and lifecycle worker. Durations are edited in seconds (the API
- * uses nanoseconds). Dirty tracking, client validation, server
+ * logging, lifecycle worker and the compression policy (hidden for servers
+ * that do not report one). Durations are edited in seconds (the API uses
+ * nanoseconds). Dirty tracking, client validation, server
  * InvalidSettings messages and a leave-page guard.
  */
 useHead({ title: 'Server settings' })
@@ -75,7 +78,7 @@ const errors = computed(() => (ready.value ? validateSettingsForm(form.value) : 
 const errorCount = computed(() => Object.keys(errors.value).length)
 const shownErrors = computed(() => (submitted.value ? errors.value : {}))
 /** List editors validate as items are added; other fields after the first save attempt. */
-const LIVE_FIELDS = new Set(['domains', 'cors.allowedOrigins', 'cors.allowedHeaders', 'cors.exposeHeaders', 'discovery.seeds', 'discovery.dnsSrv'])
+const LIVE_FIELDS = new Set(['domains', 'cors.allowedOrigins', 'cors.allowedHeaders', 'cors.exposeHeaders', 'discovery.seeds', 'discovery.dnsSrv', 'compression.skipContentTypes'])
 function err(path: string): string | undefined {
   return submitted.value || LIVE_FIELDS.has(path) ? errors.value[path] : undefined
 }
@@ -131,6 +134,7 @@ onBeforeUnmount(() => window.removeEventListener('beforeunload', onBeforeUnload)
 
 const levelItems: { label: string, value: string }[] = LOG_LEVELS.map(l => ({ label: l, value: l }))
 const formatItems: { label: string, value: string }[] = LOG_FORMATS.map(f => ({ label: f, value: f }))
+const compressionModeItems: { label: string, description: string, value: string }[] = COMPRESSION_MODES.map(m => ({ value: m, ...COMPRESSION_MODE_TEXT[m] }))
 </script>
 
 <template>
@@ -335,6 +339,53 @@ const formatItems: { label: string, value: string }[] = LOG_FORMATS.map(f => ({ 
             </div>
           </UCard>
         </div>
+
+        <!-- Compression (servers that report a compression policy) -->
+        <UCard v-if="form.compression">
+          <template #header>
+            <div class="flex items-center justify-between gap-2">
+              <div>
+                <h2 class="font-semibold text-highlighted">
+                  Compression
+                </h2>
+                <p class="text-sm text-muted">
+                  Server-wide policy for storing new objects compressed (DEFLATE). Clients read objects back unchanged, with the same ETags, checksums and sizes. Existing objects are not rewritten.
+                </p>
+              </div>
+              <UBadge v-if="sectionErrors('compression')" :label="`${sectionErrors('compression')} issue(s)`" color="error" variant="subtle" size="sm" />
+            </div>
+          </template>
+          <div class="space-y-4">
+            <UFormField name="compression.mode" :error="err('compression.mode')">
+              <URadioGroup
+                v-model="form.compression.mode"
+                :items="compressionModeItems"
+                legend="Mode (administrator policy for all buckets)"
+                orientation="horizontal"
+                variant="card"
+                :ui="{ fieldset: 'grid gap-2 md:grid-cols-3', item: 'w-full' }"
+                :disabled="readonly"
+              />
+            </UFormField>
+            <div class="grid gap-4 md:grid-cols-2">
+              <UFormField label="Level" name="compression.level" help="1 = fastest (default), 9 = smallest." :error="err('compression.level')">
+                <UInputNumber v-model="form.compression.level" :min="SETTINGS_LIMITS.minCompressionLevel" :max="SETTINGS_LIMITS.maxCompressionLevel" :step="1" class="w-full" :disabled="readonly || form.compression.mode === 'disabled'" />
+              </UFormField>
+              <UFormField label="Minimum size (bytes)" name="compression.minSize" :help="`Smaller objects are stored as is (= ${formatBytes(form.compression.minSize || 0)}).`" :error="err('compression.minSize')">
+                <UInputNumber v-model="form.compression.minSize" :min="0" :max="SETTINGS_LIMITS.maxCompressionMinSize" :step="1024" class="w-full" :disabled="readonly || form.compression.mode === 'disabled'" />
+              </UFormField>
+              <UFormField
+                label="Skipped content types"
+                name="compression.skipContentTypes"
+                help="Already compressed media stored as is: type/subtype, type/* or a prefix ending in *. Objects with a Content-Encoding are never compressed."
+                :error="err('compression.skipContentTypes')"
+                class="md:col-span-2"
+              >
+                <AdminListInput v-model="form.compression.skipContentTypes" placeholder="image/jpeg" :disabled="readonly || form.compression.mode === 'disabled'" />
+              </UFormField>
+            </div>
+          </div>
+        </UCard>
       </fieldset>
 
       <!-- Sticky save bar -->

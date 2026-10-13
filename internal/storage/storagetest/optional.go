@@ -23,6 +23,7 @@ func optionalTests() []testCase {
 		{"UpdateObjectMetaIf", testUpdateObjectMetaIf},
 		{"UpdateObjectMetaIfRace", testUpdateObjectMetaIfRace},
 		{"ViewBucketConfig", testViewBucketConfig},
+		{"Compression", testCompression},
 	}
 }
 

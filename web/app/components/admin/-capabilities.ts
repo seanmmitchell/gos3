@@ -24,7 +24,8 @@ export const NO_CAPS: Readonly<Capabilities> = Object.freeze({
   discovery: false,
   scan: false,
   probe: false,
-  createOwnKeys: false
+  createOwnKeys: false,
+  manageCompression: false
 })
 
 /** True when the connection is gos3 and the identity has `cap`. */
@@ -137,6 +138,29 @@ export function canForceDeleteBucket(kind: ConnectionKind | undefined, caps: Cap
   return hasCapability(kind, caps, 'manageBuckets')
 }
 
+/**
+ * Bucket compression settings (admin API GET/PUT/DELETE
+ * /buckets/{name}/compression):
+ * - manage:      admin:PutBucketCompression allowed at service level
+ * - try:         not allowed server-wide. A grant scoped to the bucket
+ *                (arn:gos3:admin:::bucket/<name>) does not show in the
+ *                capabilities, so the controls stay usable and the
+ *                server's 403 is shown, like the other bucket tabs do
+ * - unavailable: generic S3, or a gos3 server without compression support
+ *                (its /whoami has no manageCompression)
+ */
+export type BucketCompressionAccess = 'manage' | 'try' | 'unavailable'
+
+export function bucketCompressionAccess(kind: ConnectionKind | undefined, caps: Capabilities | null | undefined): BucketCompressionAccess {
+  if (kind !== 'gos3' || !caps || caps.manageCompression === undefined) return 'unavailable'
+  return caps.manageCompression ? 'manage' : 'try'
+}
+
+/** Changing bucket compression is known to be allowed (admin:PutBucketCompression). */
+export function canManageCompression(kind: ConnectionKind | undefined, caps: Capabilities | null | undefined): boolean {
+  return bucketCompressionAccess(kind, caps) === 'manage'
+}
+
 /** Bucket usage / owner / public flag come from the gos3 admin API. */
 export function canShowBucketUsage(kind: ConnectionKind | undefined, caps: Capabilities | null | undefined): boolean {
   return kind === 'gos3' && !!caps?.admin
@@ -150,6 +174,7 @@ export type BucketSettingsTab =
   | 'lifecycle'
   | 'tags'
   | 'encryption'
+  | 'compression'
   | 'object-lock'
   | 'access'
   | 'danger'
@@ -161,8 +186,9 @@ export interface BucketTabDef {
 }
 
 /**
- * Bucket settings tabs. Every tab maps to plain S3 bucket sub-resources, so
- * all of them are shown for gos3 and generic S3 alike; per-bucket
+ * Bucket settings tabs. Every tab but "compression" maps to plain S3 bucket
+ * sub-resources, so they are shown for gos3 and generic S3 alike;
+ * "compression" is a gos3 admin API feature (see bucketTabs). Per-bucket
  * permissions are not knowable up front and each tab handles AccessDenied.
  */
 export const BUCKET_TABS: readonly BucketTabDef[] = [
@@ -173,15 +199,26 @@ export const BUCKET_TABS: readonly BucketTabDef[] = [
   { value: 'lifecycle', label: 'Lifecycle', icon: 'i-lucide-timer' },
   { value: 'tags', label: 'Tags', icon: 'i-lucide-tags' },
   { value: 'encryption', label: 'Encryption', icon: 'i-lucide-lock' },
+  { value: 'compression', label: 'Compression', icon: 'i-lucide-file-archive' },
   { value: 'object-lock', label: 'Object lock', icon: 'i-lucide-shield-alert' },
   { value: 'access', label: 'Access', icon: 'i-lucide-key-round' },
   { value: 'danger', label: 'Danger zone', icon: 'i-lucide-triangle-alert' }
 ]
 
-/** Normalises a `?tab=` query value to a known tab (default overview). */
-export function resolveBucketTab(v: unknown): BucketSettingsTab {
+/** Tabs that only some servers offer, with the rule that decides. */
+const TAB_AVAILABLE: Partial<Record<BucketSettingsTab, (kind: ConnectionKind | undefined, caps: Capabilities | null | undefined) => boolean>> = {
+  compression: (kind, caps) => bucketCompressionAccess(kind, caps) !== 'unavailable'
+}
+
+/** The bucket settings tabs a connection offers (BUCKET_TABS minus gos3-only ones it lacks). */
+export function bucketTabs(kind: ConnectionKind | undefined, caps: Capabilities | null | undefined): readonly BucketTabDef[] {
+  return BUCKET_TABS.filter(t => TAB_AVAILABLE[t.value]?.(kind, caps) ?? true)
+}
+
+/** Normalises a `?tab=` query value to one of `tabs` (default overview). */
+export function resolveBucketTab(v: unknown, tabs: readonly BucketTabDef[] = BUCKET_TABS): BucketSettingsTab {
   const s = Array.isArray(v) ? v[0] : v
-  return BUCKET_TABS.find(t => t.value === s)?.value ?? 'overview'
+  return tabs.find(t => t.value === s)?.value ?? 'overview'
 }
 
 /**

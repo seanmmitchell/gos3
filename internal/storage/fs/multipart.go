@@ -17,6 +17,7 @@ import (
 	"go.etcd.io/bbolt"
 
 	"github.com/seanmmitchell/gos3/internal/storage"
+	"github.com/seanmmitchell/gos3/internal/storage/compress"
 )
 
 // MaxPartNumber is the largest part number accepted (S3 allows 1..10000).
@@ -406,11 +407,22 @@ var errPartsChanged = errors.New("fs: multipart upload parts changed during comp
 // completion starts over (a bounded number of times), so the committed
 // object always consists of the parts current at commit time.
 func (b *Backend) CompleteMultipartUpload(ctx context.Context, bucket, key, uploadID string, partNumbers []int, meta storage.ObjectMeta, opts storage.CommitOptions) (storage.ObjectInfo, error) {
+	return b.CompleteMultipartUploadWith(ctx, bucket, key, uploadID, partNumbers, meta, opts, storage.WriteOptions{})
+}
+
+// CompleteMultipartUploadWith is CompleteMultipartUpload with write
+// options: with wopts.Compression the parts are compressed into the new
+// data file as they are concatenated (see storage.CompressingBackend).
+func (b *Backend) CompleteMultipartUploadWith(ctx context.Context, bucket, key, uploadID string, partNumbers []int,
+	meta storage.ObjectMeta, opts storage.CommitOptions, wopts storage.WriteOptions) (storage.ObjectInfo, error) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
+	if err := checkCompression(wopts.Compression); err != nil {
+		return storage.ObjectInfo{}, err
+	}
 	for attempt := 1; ; attempt++ {
-		info, err := b.completeOnce(ctx, bucket, key, uploadID, partNumbers, meta, opts)
+		info, err := b.completeOnce(ctx, bucket, key, uploadID, partNumbers, meta, opts, wopts.Compression)
 		if errors.Is(err, errPartsChanged) && attempt < completeRetries {
 			continue
 		}
@@ -424,7 +436,8 @@ func (b *Backend) CompleteMultipartUpload(ctx context.Context, bucket, key, uplo
 // completeOnce is one attempt of CompleteMultipartUpload. It returns
 // errPartsChanged when a listed part was replaced or vanished while the
 // upload still exists.
-func (b *Backend) completeOnce(ctx context.Context, bucket, key, uploadID string, partNumbers []int, meta storage.ObjectMeta, opts storage.CommitOptions) (storage.ObjectInfo, error) {
+func (b *Backend) completeOnce(ctx context.Context, bucket, key, uploadID string, partNumbers []int,
+	meta storage.ObjectMeta, opts storage.CommitOptions, comp storage.Compression) (storage.ObjectInfo, error) {
 	if err := b.begin(ctx); err != nil {
 		return storage.ObjectInfo{}, err
 	}
@@ -480,8 +493,15 @@ func (b *Backend) completeOnce(ctx context.Context, bucket, key, uploadID string
 	}
 
 	t := b.newTemp()
+	cw, err := newCompressor(t, comp)
+	if err != nil {
+		return storage.ObjectInfo{}, err
+	}
 	for i, file := range files {
-		if err := b.appendPart(ctx, t, uploadID, file, sizes[i], partNumbers[i]); err != nil {
+		if err := b.appendPart(ctx, t, cw, uploadID, file, sizes[i], partNumbers[i]); err != nil {
+			if cw != nil {
+				cw.Abandon()
+			}
 			t.discard()
 			if errors.Is(err, errPartsChanged) {
 				// The part file vanished: the part was replaced (retry) or
@@ -494,6 +514,11 @@ func (b *Backend) completeOnce(ctx context.Context, bucket, key, uploadID string
 			return storage.ObjectInfo{}, err
 		}
 	}
+	size, compression, stored, err := sealData(t, cw, comp.Algorithm)
+	if err != nil {
+		t.discard()
+		return storage.ObjectInfo{}, err
+	}
 	dataID, path, err := b.finishData(t, bucketID)
 	if err != nil {
 		return storage.ObjectInfo{}, err
@@ -505,13 +530,15 @@ func (b *Backend) completeOnce(ctx context.Context, bucket, key, uploadID string
 		afterPartsCopied(uploadID)
 	}
 	info, err := b.commitObject(commitReq{
-		bucket:   bucket,
-		bucketID: bucketID,
-		key:      key,
-		dataID:   dataID,
-		size:     t.size,
-		meta:     cloneMeta(meta),
-		opts:     opts,
+		bucket:      bucket,
+		bucketID:    bucketID,
+		key:         key,
+		dataID:      dataID,
+		size:        size,
+		compression: compression,
+		storedSize:  stored,
+		meta:        cloneMeta(meta),
+		opts:        opts,
 		pre: func(tx *bbolt.Tx, bb *bbolt.Bucket) error {
 			up, err := loadUpload(bb, key, uploadID)
 			if err != nil {
@@ -541,10 +568,11 @@ func (b *Backend) completeOnce(ctx context.Context, bucket, key, uploadID string
 	return info, nil
 }
 
-// appendPart copies one part file into t, verifying its size. The copy goes
-// file to file (copy_file_range on Linux), so the context is checked between
+// appendPart copies one part file into t, or through the compressor cw
+// into t when cw is not nil, verifying its size. An uncompressed copy goes
+// file to file (copy_file_range on Linux). The context is checked between
 // parts.
-func (b *Backend) appendPart(ctx context.Context, t *tmpFile, uploadID, file string, size int64, n int) error {
+func (b *Backend) appendPart(ctx context.Context, t *tmpFile, cw *compress.Writer, uploadID, file string, size int64, n int) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
@@ -557,6 +585,16 @@ func (b *Backend) appendPart(ctx context.Context, t *tmpFile, uploadID, file str
 		return fmt.Errorf("fs: open part %d: %w", n, err)
 	}
 	defer f.Close()
+	if cw != nil {
+		copied, err := io.Copy(cw, io.LimitReader(f, size+1))
+		if err != nil {
+			return fmt.Errorf("fs: copy part %d: %w", n, err)
+		}
+		if copied != size {
+			return fmt.Errorf("%w: part %d of upload %q has %d bytes, expected %d", errCorrupt, n, uploadID, copied, size)
+		}
+		return nil
+	}
 	// Bypass t's buffer: flush it, then copy straight into the file.
 	if err := t.open(); err != nil {
 		return err

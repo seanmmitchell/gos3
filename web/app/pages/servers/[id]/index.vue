@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import type { Stats } from '~/types/admin'
+import type { Stats, StorageStats } from '~/types/admin'
 import { overviewMode } from '~/components/admin/-capabilities'
 import { fillMinutes, type TrafficSeries } from '~/components/admin/-metrics'
 
@@ -129,13 +129,19 @@ const endpoints = computed(() => {
   return out
 })
 
+/** "… incl. versions", after the compression saving of the current versions when there is one. */
+function storedHint(s: StorageStats): string {
+  const note = formatStoredNote(s.bytes, s.storedBytes)
+  return `${note ? `${note} · ` : ''}${formatBytes(s.versionBytes)} incl. versions`
+}
+
 const storageCards = computed(() => {
   const s = stats.value?.storage
   if (!s) return []
   return [
     { label: 'Buckets', value: formatNumber(s.buckets), icon: 'i-lucide-database' },
     { label: 'Objects', value: formatNumber(s.objects), icon: 'i-lucide-files', hint: `${formatNumber(s.versions)} versions` },
-    { label: 'Stored', value: formatBytes(s.bytes), icon: 'i-lucide-hard-drive', hint: `${formatBytes(s.versionBytes)} incl. versions` },
+    { label: 'Stored', value: formatBytes(s.bytes), icon: 'i-lucide-hard-drive', hint: storedHint(s) },
     { label: 'Delete markers', value: formatNumber(s.deleteMarkers), icon: 'i-lucide-eraser', hint: `${formatNumber(s.pendingUploads)} pending uploads` }
   ]
 })

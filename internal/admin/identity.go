@@ -34,6 +34,9 @@ type capabilities struct {
 	Scan           bool `json:"scan"`           // admin:ScanNetwork
 	Probe          bool `json:"probe"`          // admin:ProbeNetwork
 	CreateOwnKeys  bool `json:"createOwnKeys"`  // admin:CreateOwnAccessKey (never root)
+	// ManageCompression: admin:PutBucketCompression (bucket compression
+	// settings).
+	ManageCompression bool `json:"manageCompression"`
 }
 
 // adminActions are every admin:* action used by the API; "admin" in
@@ -43,7 +46,7 @@ var adminActions = []string{
 	"ListUsers", "CreateUser", "GetUser", "UpdateUser", "DeleteUser",
 	"CreateAccessKey", "UpdateAccessKey", "DeleteAccessKey",
 	"ListPolicies", "GetPolicy", "PutPolicy", "DeletePolicy", "SimulatePolicy",
-	"ListBuckets", "GetBucket", "ForceDeleteBucket",
+	"ListBuckets", "GetBucket", "ForceDeleteBucket", "GetBucketCompression", "PutBucketCompression",
 	"GetDiscovery", "ScanNetwork", "ProbeNetwork",
 }
 
@@ -73,17 +76,18 @@ func (a *api) whoami(rc *reqCtx) (int, any, error) {
 		IsRoot:    rc.id.IsRoot,
 		Policies:  names,
 		Capabilities: capabilities{
-			Admin:          anyAllowed,
-			ViewInfo:       allowed["ServerInfo"],
-			ViewStats:      allowed["GetStats"],
-			ManageConfig:   allowed["UpdateConfig"],
-			ManageUsers:    allowed["CreateUser"],
-			ListUsers:      allowed["ListUsers"],
-			ManagePolicies: allowed["PutPolicy"],
-			ManageBuckets:  allowed["ForceDeleteBucket"],
-			Discovery:      allowed["GetDiscovery"],
-			Scan:           allowed["ScanNetwork"],
-			Probe:          allowed["ProbeNetwork"],
+			Admin:             anyAllowed,
+			ViewInfo:          allowed["ServerInfo"],
+			ViewStats:         allowed["GetStats"],
+			ManageConfig:      allowed["UpdateConfig"],
+			ManageUsers:       allowed["CreateUser"],
+			ListUsers:         allowed["ListUsers"],
+			ManagePolicies:    allowed["PutPolicy"],
+			ManageBuckets:     allowed["ForceDeleteBucket"],
+			Discovery:         allowed["GetDiscovery"],
+			Scan:              allowed["ScanNetwork"],
+			Probe:             allowed["ProbeNetwork"],
+			ManageCompression: allowed["PutBucketCompression"],
 			// Root has no IAM keys to manage (POST /whoami/keys answers 400).
 			CreateOwnKeys: !rc.id.IsRoot && a.authorize(rc, actionCreateOwnKey, "", nil).Allowed,
 		},

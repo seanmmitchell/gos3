@@ -70,6 +70,9 @@ const (
 	ConfigReplication       = "replication"
 	ConfigAccelerate        = "accelerate"
 	ConfigRequestPayment    = "request-payment"
+	// ConfigCompression is the gos3 bucket compression setting (JSON, see
+	// the admin API), not an S3 configuration.
+	ConfigCompression = "compression"
 )
 
 // BucketInfo describes a bucket.
@@ -131,6 +134,23 @@ type ObjectInfo struct {
 	DeleteMarker bool
 	Size         int64
 	LastModified time.Time
+	// Compression is the algorithm the backend stored the data with (see
+	// CompressingBackend; "" = stored as is). It is set by the backend
+	// and transparent to readers: Size and OpenObject are always about
+	// the uncompressed content.
+	Compression string
+	// StoredSize is the number of bytes the backend stores for the data
+	// when Compression is set (0 otherwise; see PhysicalSize).
+	StoredSize int64
+}
+
+// PhysicalSize is the number of bytes stored for the object's data: Size,
+// or StoredSize for compressed data.
+func (o ObjectInfo) PhysicalSize() int64 {
+	if o.Compression != "" {
+		return o.StoredSize
+	}
+	return o.Size
 }
 
 // CommitOptions are atomic preconditions evaluated against the current latest

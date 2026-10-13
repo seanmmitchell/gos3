@@ -128,3 +128,43 @@ type UploadWalker interface {
 	// concurrently.
 	WalkMultipartUploads(ctx context.Context, bucket, prefix string, after UploadPosition, fn func(UploadInfo) error) error
 }
+
+// CompressionDeflate is the compression algorithm of the built-in
+// backends: DEFLATE in independently compressed blocks (package
+// internal/storage/compress), so that reads can seek without inflating
+// everything before the requested range.
+const CompressionDeflate = "deflate"
+
+// Compression asks a CompressingBackend to store an object's data
+// compressed. The zero value means no compression.
+type Compression struct {
+	Algorithm string // CompressionDeflate, or "" for none
+	Level     int    // algorithm level (DEFLATE: 1 fastest to 9 smallest)
+}
+
+// Enabled reports whether c asks for compression.
+func (c Compression) Enabled() bool { return c.Algorithm != "" }
+
+// WriteOptions are backend-level options for writing an object version.
+type WriteOptions struct {
+	Compression Compression
+}
+
+// CompressingBackend stores object data compressed on request.
+// Compression is transparent: ObjectInfo.Size, ETags, checksums and the
+// content returned by OpenObject are those of the uncompressed data, and
+// OpenObject's reader seeks in uncompressed offsets. ObjectInfo.Compression
+// and StoredSize report how a version is stored. Versions are read the
+// same way whether or not they were stored compressed, so the setting can
+// change at any time.
+//
+// The methods are Backend.NewObjectWriter and
+// Backend.CompleteMultipartUpload with write options. A backend may store
+// a version uncompressed although compression was requested (e.g. an
+// empty object); it reports that in ObjectInfo.Compression. It returns an
+// error for an algorithm or level it does not support.
+type CompressingBackend interface {
+	NewObjectWriterWith(ctx context.Context, bucket, key string, opts WriteOptions) (ObjectWriter, error)
+	CompleteMultipartUploadWith(ctx context.Context, bucket, key, uploadID string, partNumbers []int,
+		meta ObjectMeta, opts CommitOptions, wopts WriteOptions) (ObjectInfo, error)
+}

@@ -76,7 +76,8 @@ function initialState(): MockState {
       discovery: { enabled: true, advertise: true, mdns: true, beacon: true, beaconGroup: '239.255.73.83:7373', beaconInterval: 10_000_000_000, seeds: null, dnsSrv: null, peerTtl: 60_000_000_000, allowScan: true, maxScanHosts: 1024 },
       logging: { level: 'info', format: 'text', accessLog: true },
       lifecycle: { enabled: true, intervalSeconds: 3600 },
-      metricsPublic: false
+      metricsPublic: false,
+      compression: { mode: 'optional', level: 1, minSize: 4096, skipContentTypes: ['image/jpeg', 'video/*'] }
     },
     lifecycle: null,
     cors: null

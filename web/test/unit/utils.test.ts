@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { formatBytes, formatDate, formatDuration, formatNumber, formatPercent, formatRelativeTime, formatSeconds, nsToSeconds, secondsToNs, truncateMiddle } from '~/utils/format'
+import { formatBytes, formatDate, formatDuration, formatNumber, formatPercent, formatRelativeTime, formatSeconds, formatStoredNote, nsToSeconds, savedPercent, secondsToNs, truncateMiddle } from '~/utils/format'
 import { asFolderPrefix, baseName, extName, isFolderKey, joinKey, parentPrefix, prefixBreadcrumbs, routeParamToKey, validateBucketName, validateObjectKey } from '~/utils/paths'
 import { appRoutes, routeParam } from '~/utils/routes'
 import { completeConnection, endpointSlug, hasCredentials, parseConnectionList, sameEndpoint, toConnectionInput } from '~/utils/connections'
@@ -46,6 +46,20 @@ describe('format', () => {
     expect(formatRelativeTime('garbage', now)).toBe('—')
     expect(formatDate('')).toBe('—')
     expect(truncateMiddle('abcdefghij', 5)).toBe('ab…ij')
+  })
+
+  it('describes compression savings (logical vs stored bytes)', () => {
+    expect(savedPercent(1000, 250)).toBe(75)
+    expect(savedPercent(1000, 1000)).toBeUndefined()
+    expect(savedPercent(1000, 1200)).toBeUndefined()
+    expect(savedPercent(0, 0)).toBeUndefined()
+    expect(savedPercent(1000, undefined)).toBeUndefined()
+    expect(savedPercent(null, 10)).toBeUndefined()
+    const gib = 1024 ** 3
+    expect(formatStoredNote(1.2 * gib, 300 * 1024 ** 2)).toBe('stored 300 MiB, 75.6% saved')
+    expect(formatStoredNote(4 * gib, gib)).toBe('stored 1 GiB, 75% saved')
+    expect(formatStoredNote(gib, gib)).toBe('')
+    expect(formatStoredNote(gib, undefined)).toBe('')
   })
 })
 

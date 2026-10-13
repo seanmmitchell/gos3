@@ -13,6 +13,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/seanmmitchell/gos3/internal/storage"
+	"github.com/seanmmitchell/gos3/internal/storage/compress"
 )
 
 // errWriterDone is returned when writing to or committing a writer that was
@@ -40,10 +41,27 @@ type objectWriter struct {
 	mu   sync.Mutex
 	buf  []byte
 	done bool
+	// zw compresses into buf when the version is stored compressed.
+	zw          *compress.Writer
+	compression string
 }
+
+// The optional storage interface implemented by NewObjectWriterWith and
+// CompleteMultipartUploadWith.
+var _ storage.CompressingBackend = (*Backend)(nil)
 
 // NewObjectWriter starts writing a new version of bucket/key.
 func (b *Backend) NewObjectWriter(ctx context.Context, bucketName, key string) (storage.ObjectWriter, error) {
+	return b.NewObjectWriterWith(ctx, bucketName, key, storage.WriteOptions{})
+}
+
+// NewObjectWriterWith is NewObjectWriter with write options: with
+// opts.Compression the data is kept in the compress package's format (see
+// storage.CompressingBackend).
+func (b *Backend) NewObjectWriterWith(ctx context.Context, bucketName, key string, opts storage.WriteOptions) (storage.ObjectWriter, error) {
+	if err := checkCompression(opts.Compression); err != nil {
+		return nil, err
+	}
 	if err := validKey(key); err != nil {
 		return nil, err
 	}
@@ -52,7 +70,14 @@ func (b *Backend) NewObjectWriter(ctx context.Context, bucketName, key string) (
 		return nil, err
 	}
 	bk.mu.RUnlock()
-	return &objectWriter{b: b, bk: bk, key: key}, nil
+	w := &objectWriter{b: b, bk: bk, key: key}
+	if opts.Compression.Enabled() {
+		w.compression = opts.Compression.Algorithm
+		if w.zw, err = compress.NewWriter((*appendWriter)(&w.buf), opts.Compression.Level); err != nil {
+			return nil, err
+		}
+	}
+	return w, nil
 }
 
 func (w *objectWriter) Write(p []byte) (int, error) {
@@ -61,8 +86,41 @@ func (w *objectWriter) Write(p []byte) (int, error) {
 	if w.done {
 		return 0, errWriterDone
 	}
+	if w.zw != nil {
+		return w.zw.Write(p)
+	}
 	w.buf = append(w.buf, p...)
 	return len(p), nil
+}
+
+// appendWriter is an io.Writer appending to a byte slice.
+type appendWriter []byte
+
+func (a *appendWriter) Write(p []byte) (int, error) {
+	*a = append(*a, p...)
+	return len(p), nil
+}
+
+// checkCompression validates c before any data is written.
+func checkCompression(c storage.Compression) error {
+	switch c.Algorithm {
+	case "":
+		return nil
+	case storage.CompressionDeflate:
+		if !compress.ValidLevel(c.Level) {
+			return fmt.Errorf("memory: invalid deflate level %d", c.Level)
+		}
+		return nil
+	default:
+		return fmt.Errorf("memory: unsupported compression algorithm %q", c.Algorithm)
+	}
+}
+
+// stored is how the data of a new version is kept: compressed (algorithm
+// set, size = content size) or as is (zero value).
+type stored struct {
+	compression string
+	size        int64
 }
 
 func (w *objectWriter) Commit(ctx context.Context, meta storage.ObjectMeta, opts storage.CommitOptions) (storage.ObjectInfo, error) {
@@ -72,6 +130,17 @@ func (w *objectWriter) Commit(ctx context.Context, meta storage.ObjectMeta, opts
 		return storage.ObjectInfo{}, errWriterDone
 	}
 	w.done = true
+	var enc stored
+	if w.zw != nil {
+		if err := w.zw.Close(); err != nil {
+			w.buf = nil
+			w.mu.Unlock()
+			return storage.ObjectInfo{}, err
+		}
+		if w.zw.Size() > 0 {
+			enc = stored{compression: w.compression, size: w.zw.Size()}
+		}
+	}
 	data := slices.Clip(w.buf)
 	w.buf = nil
 	w.mu.Unlock()
@@ -80,12 +149,15 @@ func (w *objectWriter) Commit(ctx context.Context, meta storage.ObjectMeta, opts
 		return storage.ObjectInfo{}, err
 	}
 	defer w.bk.mu.Unlock()
-	return w.b.commitLocked(w.bk, w.key, data, meta, opts)
+	return w.b.commitLocked(w.bk, w.key, data, enc, meta, opts)
 }
 
 func (w *objectWriter) Abort() error {
 	w.mu.Lock()
 	defer w.mu.Unlock()
+	if !w.done && w.zw != nil {
+		w.zw.Abandon()
+	}
 	w.done = true
 	w.buf = nil
 	return nil
@@ -122,10 +194,11 @@ func checkPreconditions(obj *object, opts storage.CommitOptions) error {
 	return nil
 }
 
-// commitLocked publishes data as a new version of key in bk, applying
-// conditional checks and versioning semantics. bk must be write-locked; data
-// is taken over by the backend and must not be modified afterwards.
-func (b *Backend) commitLocked(bk *bucket, key string, data []byte, meta storage.ObjectMeta, opts storage.CommitOptions) (storage.ObjectInfo, error) {
+// commitLocked publishes data (stored as enc says) as a new version of key
+// in bk, applying conditional checks and versioning semantics. bk must be
+// write-locked; data is taken over by the backend and must not be modified
+// afterwards.
+func (b *Backend) commitLocked(bk *bucket, key string, data []byte, enc stored, meta storage.ObjectMeta, opts storage.CommitOptions) (storage.ObjectInfo, error) {
 	obj, _ := bk.objects.Get(key)
 	if err := checkPreconditions(obj, opts); err != nil {
 		return storage.ObjectInfo{}, err
@@ -133,7 +206,7 @@ func (b *Backend) commitLocked(bk *bucket, key string, data []byte, meta storage
 	if data == nil {
 		data = []byte{}
 	}
-	v := &version{meta: cloneMeta(meta), data: data}
+	v := &version{meta: cloneMeta(meta), data: data, compression: enc.compression, size: enc.size}
 	b.addVersionLocked(bk, key, obj, v)
 	return v.info(bk.info.Name, key, true), nil
 }
@@ -266,6 +339,13 @@ func (b *Backend) OpenObject(ctx context.Context, bucketName, key, versionID str
 	info := v.info(bk.info.Name, key, i == len(obj.versions)-1)
 	if v.deleteMarker {
 		return info, nil, nil
+	}
+	if v.compression != "" {
+		z, err := compress.NewReader(bytes.NewReader(v.data), int64(len(v.data)))
+		if err != nil {
+			return storage.ObjectInfo{}, nil, fmt.Errorf("memory: open %s/%s: %w", bucketName, key, err)
+		}
+		return info, z, nil
 	}
 	return info, newObjectReader(v.data), nil
 }

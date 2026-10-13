@@ -14,6 +14,7 @@ import (
 	"go.etcd.io/bbolt"
 
 	"github.com/seanmmitchell/gos3/internal/storage"
+	"github.com/seanmmitchell/gos3/internal/storage/compress"
 )
 
 // errWriterDone is returned when writing to or committing a writer that was
@@ -30,8 +31,12 @@ type commitReq struct {
 	key      string
 	dataID   string // "" for empty objects
 	size     int64
-	meta     storage.ObjectMeta
-	opts     storage.CommitOptions
+	// compression and storedSize describe a compressed data file
+	// (versionRecord.Compression, StoredSize).
+	compression string
+	storedSize  int64
+	meta        storage.ObjectMeta
+	opts        storage.CommitOptions
 	// pre runs first inside the transaction (multipart: verify and remove
 	// the upload). Its error aborts the commit.
 	pre func(tx *bbolt.Tx, bb *bbolt.Bucket) error
@@ -66,6 +71,8 @@ func (b *Backend) commitObject(req commitReq) (storage.ObjectInfo, error) {
 			LastModified: time.Now().UTC(),
 			DataID:       req.dataID,
 			Meta:         req.meta,
+			Compression:  req.compression,
+			StoredSize:   req.storedSize,
 		}
 		unlink, err = addVersion(br, bb, req.key, &rec)
 		if err != nil {
@@ -113,6 +120,52 @@ func (b *Backend) finishData(t *tmpFile, bucketID string) (dataID, path string, 
 	return dataID, path, nil
 }
 
+// --- compression ---
+
+// The optional storage interface implemented by NewObjectWriterWith and
+// CompleteMultipartUploadWith.
+var _ storage.CompressingBackend = (*Backend)(nil)
+
+// checkCompression validates c before any data is written.
+func checkCompression(c storage.Compression) error {
+	switch c.Algorithm {
+	case "":
+		return nil
+	case storage.CompressionDeflate:
+		if !compress.ValidLevel(c.Level) {
+			return fmt.Errorf("fs: invalid deflate level %d", c.Level)
+		}
+		return nil
+	default:
+		return fmt.Errorf("fs: unsupported compression algorithm %q", c.Algorithm)
+	}
+}
+
+// newCompressor returns a writer compressing into t as c asks (checked
+// with checkCompression), or nil when c asks for no compression.
+func newCompressor(t *tmpFile, c storage.Compression) (*compress.Writer, error) {
+	if !c.Enabled() {
+		return nil, nil
+	}
+	return compress.NewWriter(t, c.Level)
+}
+
+// sealData finishes the compressor cw (if any) writing into t and returns
+// the content size and the compression fields of the version record.
+// Empty content is stored as an empty, uncompressed object.
+func sealData(t *tmpFile, cw *compress.Writer, algorithm string) (size int64, compression string, stored int64, err error) {
+	if cw == nil {
+		return t.size, "", 0, nil
+	}
+	if err := cw.Close(); err != nil {
+		return 0, "", 0, err
+	}
+	if cw.Size() == 0 {
+		return 0, "", 0, nil
+	}
+	return cw.Size(), algorithm, t.size, nil
+}
+
 // --- object writer ---
 
 type objectWriter struct {
@@ -121,14 +174,29 @@ type objectWriter struct {
 	bucketID string
 	key      string
 
-	mu   sync.Mutex
-	t    *tmpFile
-	done bool
+	mu sync.Mutex
+	t  *tmpFile
+	// cw compresses into t when the version is stored compressed; w is
+	// where written data goes (cw or t).
+	cw          *compress.Writer
+	w           io.Writer
+	compression string
+	done        bool
 }
 
 // NewObjectWriter starts writing a new version of bucket/key. Data is
 // streamed to a temporary file; nothing is visible until Commit.
 func (b *Backend) NewObjectWriter(ctx context.Context, bucket, key string) (storage.ObjectWriter, error) {
+	return b.NewObjectWriterWith(ctx, bucket, key, storage.WriteOptions{})
+}
+
+// NewObjectWriterWith is NewObjectWriter with write options: with
+// opts.Compression the data file is written in the compress package's
+// format (see storage.CompressingBackend).
+func (b *Backend) NewObjectWriterWith(ctx context.Context, bucket, key string, opts storage.WriteOptions) (storage.ObjectWriter, error) {
+	if err := checkCompression(opts.Compression); err != nil {
+		return nil, err
+	}
 	if err := validKey(key); err != nil {
 		return nil, err
 	}
@@ -147,7 +215,15 @@ func (b *Backend) NewObjectWriter(ctx context.Context, bucket, key string) (stor
 	if err != nil {
 		return nil, err
 	}
-	return &objectWriter{b: b, bucket: bucket, bucketID: id, key: key, t: b.newTemp()}, nil
+	w := &objectWriter{b: b, bucket: bucket, bucketID: id, key: key, t: b.newTemp(), compression: opts.Compression.Algorithm}
+	if w.cw, err = newCompressor(w.t, opts.Compression); err != nil {
+		return nil, err
+	}
+	w.w = w.t
+	if w.cw != nil {
+		w.w = w.cw
+	}
+	return w, nil
 }
 
 func (w *objectWriter) Write(p []byte) (int, error) {
@@ -156,7 +232,15 @@ func (w *objectWriter) Write(p []byte) (int, error) {
 	if w.done {
 		return 0, errWriterDone
 	}
-	return w.t.Write(p)
+	return w.w.Write(p)
+}
+
+// discard drops the written data.
+func (w *objectWriter) discard() {
+	if w.cw != nil {
+		w.cw.Abandon()
+	}
+	w.t.discard()
 }
 
 func (w *objectWriter) Commit(ctx context.Context, meta storage.ObjectMeta, opts storage.CommitOptions) (storage.ObjectInfo, error) {
@@ -167,6 +251,11 @@ func (w *objectWriter) Commit(ctx context.Context, meta storage.ObjectMeta, opts
 	}
 	w.done = true
 	if err := w.b.begin(ctx); err != nil {
+		w.discard()
+		return storage.ObjectInfo{}, err
+	}
+	size, compression, stored, err := sealData(w.t, w.cw, w.compression)
+	if err != nil {
 		w.t.discard()
 		return storage.ObjectInfo{}, err
 	}
@@ -178,13 +267,15 @@ func (w *objectWriter) Commit(ctx context.Context, meta storage.ObjectMeta, opts
 		defer w.b.pending.done(path)
 	}
 	return w.b.commitObject(commitReq{
-		bucket:   w.bucket,
-		bucketID: w.bucketID,
-		key:      w.key,
-		dataID:   dataID,
-		size:     w.t.size,
-		meta:     cloneMeta(meta),
-		opts:     opts,
+		bucket:      w.bucket,
+		bucketID:    w.bucketID,
+		key:         w.key,
+		dataID:      dataID,
+		size:        size,
+		compression: compression,
+		storedSize:  stored,
+		meta:        cloneMeta(meta),
+		opts:        opts,
 	})
 }
 
@@ -195,7 +286,7 @@ func (w *objectWriter) Abort() error {
 		return nil
 	}
 	w.done = true
-	w.t.discard()
+	w.discard()
 	return nil
 }
 
@@ -274,12 +365,54 @@ func (b *Backend) OpenObject(ctx context.Context, bucket, key, versionID string)
 			_ = f.Close()
 			return storage.ObjectInfo{}, nil, fmt.Errorf("fs: stat data of %s/%s: %w", bucket, key, err)
 		}
-		if st.Size() != info.Size {
+		if want := info.PhysicalSize(); st.Size() != want {
 			_ = f.Close()
-			return storage.ObjectInfo{}, nil, fmt.Errorf("%w: data file of %s/%s has %d bytes, expected %d", errCorrupt, bucket, key, st.Size(), info.Size)
+			return storage.ObjectInfo{}, nil, fmt.Errorf("%w: data file of %s/%s has %d bytes, expected %d", errCorrupt, bucket, key, st.Size(), want)
 		}
-		return info, &fileReader{f: f}, nil
+		if info.Compression == "" {
+			return info, &fileReader{f: f}, nil
+		}
+		rd, err := openCompressed(f, info)
+		if err != nil {
+			_ = f.Close()
+			return storage.ObjectInfo{}, nil, fmt.Errorf("fs: open data of %s/%s: %w", bucket, key, err)
+		}
+		return info, rd, nil
 	}
+}
+
+// openCompressed returns a reader over the content of the compressed data
+// file f of the version info.
+func openCompressed(f *os.File, info storage.ObjectInfo) (io.ReadSeekCloser, error) {
+	if info.Compression != storage.CompressionDeflate {
+		return nil, fmt.Errorf("%w: unknown compression %q", errCorrupt, info.Compression)
+	}
+	z, err := compress.NewReader(f, info.StoredSize)
+	if err != nil {
+		return nil, err
+	}
+	if z.Size() != info.Size {
+		_ = z.Close()
+		return nil, fmt.Errorf("%w: compressed data holds %d bytes, expected %d", errCorrupt, z.Size(), info.Size)
+	}
+	return &compressedReader{Reader: z, f: f}, nil
+}
+
+// compressedReader is the reader OpenObject returns for compressed data:
+// a compress.Reader over the data file. Close closes both, idempotently.
+type compressedReader struct {
+	*compress.Reader
+	f      *os.File
+	closed sync.Once
+	err    error
+}
+
+func (r *compressedReader) Close() error {
+	r.closed.Do(func() {
+		_ = r.Reader.Close()
+		r.err = r.f.Close()
+	})
+	return r.err
 }
 
 // fileReader is the reader returned by OpenObject: an *os.File whose Close is
