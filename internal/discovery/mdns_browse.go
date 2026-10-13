@@ -311,13 +311,18 @@ type mdnsReceived struct {
 	data []byte
 	src  netip.AddrPort
 	ttl  int // IP TTL / IPv6 hop limit, 0 when unknown
+	// ttlMissing: the socket reports control messages but this datagram
+	// came without a TTL / hop limit.
+	ttlMissing bool
 }
 
 // receive handles one datagram read by a browse socket. A datagram from
 // another host that a router forwarded (TTL / hop limit below 255) is
-// dropped: its on-link source address is spoofed.
+// dropped: its on-link source address is spoofed. So is one from another
+// host whose TTL is missing although the socket reports it, rather than
+// letting the check pass on a missing value.
 func (b *mdnsBrowser) receive(p mdnsReceived) []dns.Question {
-	if b.local.routed(p.src.Addr(), p.ttl) {
+	if b.local.routed(p.src.Addr(), p.ttl) || (p.ttlMissing && !b.local.isLocal(p.src.Addr().WithZone(""))) {
 		return nil
 	}
 	return b.handle(p.data, p.src)
@@ -350,7 +355,7 @@ func runMDNSBrowse(ctx context.Context, timeout time.Duration, queriers, socks [
 					continue
 				}
 				select {
-				case ch <- mdnsReceived{data: append([]byte(nil), buf[:n]...), src: src, ttl: meta.ttl}:
+				case ch <- mdnsReceived{data: append([]byte(nil), buf[:n]...), src: src, ttl: meta.ttl, ttlMissing: s.cmsg && meta.ttl == 0}:
 				case <-done:
 					return
 				}

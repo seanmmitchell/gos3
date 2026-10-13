@@ -6,6 +6,8 @@ import (
 	"strconv"
 	"strings"
 
+	"golang.org/x/net/http/httpguts"
+
 	"github.com/seanmmitchell/gos3/internal/s3err"
 	"github.com/seanmmitchell/gos3/internal/storage"
 )
@@ -23,6 +25,8 @@ const userMetaPrefix = "x-amz-meta-"
 //   - x-amz-meta-* become UserMeta (lowercased names without the prefix,
 //     repeated headers joined with ","); names+values above 2 KiB =>
 //     MetadataTooLarge;
+//   - the stored metadata as a whole is checked by validateStoredMeta
+//     (total size, header-safe names and values).
 //   - x-amz-storage-class is validated (InvalidStorageClass), STANDARD => "";
 //   - x-amz-tagging is parsed as URL query and validated (InvalidArgument /
 //     InvalidTag);
@@ -79,7 +83,69 @@ func (s *Server) objectMetaFromHeaders(h http.Header) (storage.ObjectMeta, error
 		}
 		m.WebsiteRedirect = v
 	}
+	if err := validateStoredMeta(m); err != nil {
+		return m, err
+	}
 	return m, nil
+}
+
+// validateStoredMeta checks the metadata a new object stores and later
+// returns as response headers (GetObject, HeadObject):
+//
+//   - the content headers, the website redirect location and the user
+//     metadata (names and values) together are at most maxObjectMetaSize
+//     bytes (MetadataTooLarge), AWS's limit for all request headers of a
+//     PUT. Without it a writer could attach about 1 MiB (the server's
+//     header limit) to every object, which every GET and HEAD sends back
+//     and which multiplies the memory of a listing of such objects;
+//   - every value is a valid HTTP header field value (no control
+//     characters but horizontal tab) and every user metadata name is a
+//     valid header field name (InvalidArgument). Request headers already
+//     are, but PostObject form fields, which stand in for headers, are not
+//     restricted by HTTP: their values could otherwise store CR/LF and
+//     names with spaces, colons or markup.
+//
+// CopyObject calls it too for metadata copied from the source object, which
+// may predate these limits.
+func validateStoredMeta(m storage.ObjectMeta) error {
+	fields := [...]struct{ name, value string }{
+		{"Content-Type", m.ContentType}, {"Content-Encoding", m.ContentEncoding},
+		{"Content-Disposition", m.ContentDisposition}, {"Content-Language", m.ContentLanguage},
+		{"Cache-Control", m.CacheControl}, {"Expires", m.Expires},
+		{"x-amz-website-redirect-location", m.WebsiteRedirect},
+	}
+	size := 0
+	for _, f := range fields {
+		size += len(f.value)
+	}
+	for k, v := range m.UserMeta {
+		size += len(k) + len(v)
+	}
+	if size > maxObjectMetaSize {
+		return s3err.ErrMetadataTooLarge.With("MaxSizeAllowed", strconv.Itoa(maxObjectMetaSize))
+	}
+	for _, f := range fields {
+		if !httpguts.ValidHeaderFieldValue(f.value) {
+			return invalidHeaderValue(f.name)
+		}
+	}
+	for k, v := range m.UserMeta {
+		name := userMetaPrefix + k
+		if !httpguts.ValidHeaderFieldName(name) {
+			return s3err.ErrInvalidArgument.WithMessage("Invalid metadata name.").With("ArgumentName", truncateValue(name))
+		}
+		if !httpguts.ValidHeaderFieldValue(v) {
+			return invalidHeaderValue(name)
+		}
+	}
+	return nil
+}
+
+// invalidHeaderValue is the InvalidArgument error for a metadata value
+// that is not a valid HTTP header field value.
+func invalidHeaderValue(name string) error {
+	return s3err.ErrInvalidArgument.WithMessage("Invalid value for %s: control characters are not allowed.", truncateValue(name)).
+		With("ArgumentName", truncateValue(name))
 }
 
 // userMetaFromHeaders extracts x-amz-meta-* headers (nil when none).

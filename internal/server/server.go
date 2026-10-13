@@ -27,8 +27,10 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"net/netip"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -55,12 +57,15 @@ import (
 const ServerIDFileName = "server-id"
 
 // Timeouts of the HTTP listener and the public probes. There is deliberately
-// no global read/write timeout: object transfers may legitimately take hours.
+// no global read/write timeout: object transfers may legitimately take
+// hours. Instead request body reads (bodyguard.go, s3 countingBody) and
+// response writes (writeGuard) must make progress.
 const (
 	readHeaderTimeout = 30 * time.Second
 	idleTimeout       = 2 * time.Minute
 	maxHeaderBytes    = 1 << 20
 	readyTimeout      = 5 * time.Second
+	readyCacheTTL     = 2 * time.Second
 	metricsTimeout    = 5 * time.Second
 	urlCacheTTL       = 30 * time.Second
 )
@@ -113,6 +118,8 @@ type Server struct {
 	lifecycle   *lifecycle.Worker
 	tlsConfig   *tls.Config
 	bodyIdle    time.Duration // idle read timeout of bodies sent to gos3 endpoints
+	writeIdle   time.Duration // idle write timeout of responses (see writeGuard)
+	hosts       *hostPolicy   // which Host headers name this server
 	dirLock     *os.File      // exclusive lock on <systemDir>/lock (nil when ephemeral)
 
 	serverID    string
@@ -131,6 +138,10 @@ type Server struct {
 	urlKey     string
 	urlExpires time.Time
 	urls       []string
+
+	readyMu sync.Mutex // serializes backendReady
+	readyAt time.Time  // when backendReady last checked (zero: never)
+	readyOK bool
 
 	closeOnce sync.Once
 	closeErr  error
@@ -166,12 +177,19 @@ func New(cfg config.Config, logger *slog.Logger, opts ...Option) (_ *Server, err
 		startedAt:  time.Now().UTC().Truncate(time.Second),
 		ready:      make(chan struct{}),
 		bodyIdle:   systemBodyIdleTimeout,
+		writeIdle:  responseWriteIdle,
+		hosts:      newHostPolicy(cfg),
 	}
 	if s.clientIP, err = cfg.ClientIP(); err != nil {
 		return nil, fmt.Errorf("invalid configuration: %w", err)
 	}
 	if len(cfg.Server.TrustedProxies) > 0 && !cfg.Server.TrustProxyHeaders {
 		logger.Warn("server.trusted_proxies has no effect: X-Forwarded-For / X-Forwarded-Proto are ignored unless server.trust_proxy_headers is true")
+	}
+	if !cfg.TLSEnabled() && !loopbackAddress(cfg.Server.Address) && !cfg.Server.TrustProxyHeaders {
+		logger.Warn("serving plain HTTP on a non-loopback address: secret keys in admin API responses and signed " +
+			"requests (which can be replayed for up to 15 minutes) are visible to the network; set server.tls_cert / " +
+			"server.tls_key, or put gos3 behind a TLS-terminating reverse proxy")
 	}
 	s.lifeCtx, s.lifeCancel = context.WithCancel(context.Background())
 	defer func() {
@@ -197,6 +215,12 @@ func New(cfg config.Config, logger *slog.Logger, opts ...Option) (_ *Server, err
 		if err := os.MkdirAll(s.systemDir, 0o700); err != nil {
 			return nil, fmt.Errorf("creating system directory: %w", err)
 		}
+		// It holds the root credentials and the IAM secret keys.
+		if err := config.RestrictDir(s.systemDir); err != nil {
+			logger.Warn("could not restrict access to the system directory to this user; "+
+				"make sure other local users cannot read it", "dir", s.systemDir, "err", err)
+		}
+		tightenSystemPerms(s.systemDir, logger)
 		// The fs backend's metadata database is locked already, but the
 		// system state (iam.json, settings.json, ...) is used by every
 		// backend: lock it too.
@@ -349,6 +373,54 @@ func loadServerID(dir string, log *slog.Logger) (string, error) {
 		return "", fmt.Errorf("storing server ID: %w", err)
 	}
 	return id, nil
+}
+
+// tightenSystemPerms removes the group and other permission bits of the
+// system directory and of the secret files in it (root-credentials.json,
+// iam.json, settings.json) when they are set. MkdirAll and
+// config.WriteFileAtomic apply 0700/0600 only when they create a path; a
+// directory pre-created by an operator or a container volume, or restored
+// from a backup that did not keep modes, would otherwise stay readable by
+// other local users. Failures are logged, not fatal. Windows has no mode
+// bits (config.RestrictDir sets an ACL instead).
+func tightenSystemPerms(dir string, log *slog.Logger) {
+	if runtime.GOOS == "windows" {
+		return
+	}
+	for _, p := range []string{
+		dir,
+		filepath.Join(dir, config.RootCredentialsFileName),
+		filepath.Join(dir, iam.FileName),
+		filepath.Join(dir, config.SettingsFileName),
+	} {
+		fi, err := os.Stat(p)
+		if err != nil {
+			continue
+		}
+		perm := fi.Mode().Perm()
+		if perm&0o077 == 0 {
+			continue
+		}
+		if err := os.Chmod(p, perm&^0o077); err != nil {
+			log.Warn("cannot restrict permissions; other local users may read it", "path", p, "mode", perm.String(), "err", err)
+			continue
+		}
+		log.Warn("restricted permissions that allowed access by other local users", "path", p, "was", perm.String(), "now", (perm &^ 0o077).String())
+	}
+}
+
+// loopbackAddress reports whether a listen address ([host]:port) binds to
+// loopback only ("localhost", 127.0.0.0/8, ::1).
+func loopbackAddress(addr string) bool {
+	host, _, err := net.SplitHostPort(addr)
+	if err != nil {
+		return false
+	}
+	if strings.EqualFold(host, "localhost") {
+		return true
+	}
+	ip, err := netip.ParseAddr(host)
+	return err == nil && ip.IsLoopback()
 }
 
 // validServerID accepts the IDs discovery accepts: 1-64 characters of

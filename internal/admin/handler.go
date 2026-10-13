@@ -73,6 +73,17 @@ type reqCtx struct {
 	auth   *auth.Result
 	id     auth.Identity
 	action string // admin action, "" for endpoints open to any identity
+	// keyOwner is the owner of the {accessKey} path value that the route's
+	// action was authorized against (set by keyOwnerARN; "" when the key
+	// was unknown and the action was authorized at service level).
+	keyOwner string
+
+	start         time.Time // when the endpoint received the request
+	preAuthorized bool      // action was authorized on resource before the handler ran
+	resource      string    // the resource action was authorized against
+	// afterBody, when set, runs once readBody has read the whole body
+	// (api.revalidateAfterBody).
+	afterBody func() error
 }
 
 // handlerFunc is an authenticated endpoint. It returns the HTTP status and
@@ -196,12 +207,15 @@ func (a *api) routes() []route {
 
 // keyOwnerARN is the target of the {accessKey} routes: the user owning the
 // key, or service level for unknown keys (so a delegated administrator
-// cannot tell unknown keys from other users' keys).
+// cannot tell unknown keys from other users' keys). It records the owner
+// in rc.keyOwner so the handler can bind the change to it (see
+// updateAccessKey).
 func (a *api) keyOwnerARN(rc *reqCtx) string {
 	owner, err := a.d.IAM.AccessKeyOwner(rc.ctx, rc.r.PathValue("accessKey"))
 	if err != nil {
 		return ""
 	}
+	rc.keyOwner = owner
 	return iam.AdminUserARN(owner)
 }
 
@@ -299,16 +313,17 @@ func (a *api) endpoint(rt route) http.Handler {
 			writeError(w, e)
 			return
 		}
-		rc := &reqCtx{r: r, ctx: r.Context(), auth: res, id: res.Identity, action: action}
+		rc := &reqCtx{r: r, ctx: r.Context(), auth: res, id: res.Identity, action: action, start: a.now()}
+		rc.afterBody = func() error { return a.revalidateAfterBody(rc) }
 		if action != "" && !rt.res.inHandler {
-			resource := ""
 			if rt.res.resource != nil {
-				resource = rt.res.resource(rc)
+				rc.resource = rt.res.resource(rc)
 			}
-			if err := a.requireAction(rc, action, resource, nil); err != nil {
+			if err := a.requireAction(rc, action, rc.resource, nil); err != nil {
 				writeError(w, a.toAPIError(err))
 				return
 			}
+			rc.preAuthorized = true
 		}
 		status, body, err := rt.h(rc)
 		if err != nil {
@@ -521,6 +536,8 @@ func writeJSON(w http.ResponseWriter, status int, v any) {
 
 // readBody reads the (verified) request body, bounded by maxBodySize.
 // Signature / payload hash failures surface here (auth verifies at EOF).
+// Once the body is read, rc.afterBody re-checks that the caller may still
+// make the request (see api.revalidateAfterBody).
 func (rc *reqCtx) readBody() ([]byte, error) {
 	if rc.auth == nil || rc.auth.Body == nil {
 		return nil, nil
@@ -538,6 +555,11 @@ func (rc *reqCtx) readBody() ([]byte, error) {
 	}
 	if len(data) > maxBodySize {
 		return nil, badRequest("request body exceeds %d bytes", maxBodySize)
+	}
+	if rc.afterBody != nil {
+		if err := rc.afterBody(); err != nil {
+			return nil, err
+		}
 	}
 	return data, nil
 }

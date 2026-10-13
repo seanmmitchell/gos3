@@ -198,7 +198,7 @@ func TestUserCRUD(t *testing.T) {
 	}
 
 	// Delete removes keys.
-	k, err := m.CreateAccessKey(ctx, "bob", "", "BOBKEY", "bobsecret1")
+	k, err := m.CreateAccessKey(ctx, "bob", "", "BOBKEY", "bob-secret-0123456")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -221,7 +221,7 @@ func TestUserCRUD(t *testing.T) {
 	if _, err := m.CreateUser(ctx, UserSpec{Name: "bob"}); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := m.CreateAccessKey(ctx, "bob", "", "BOBKEY", "bobsecret1"); err != nil {
+	if _, err := m.CreateAccessKey(ctx, "bob", "", "BOBKEY", "bob-secret-0123456"); err != nil {
 		t.Fatalf("reuse key id: %v", err)
 	}
 }
@@ -241,8 +241,8 @@ func TestAccessKeyCRUD(t *testing.T) {
 	if k.AccessKey != "alice.key-1_X" || len(k.SecretKey) != 40 {
 		t.Fatalf("key = %+v", k)
 	}
-	k2, err := m.CreateAccessKey(ctx, "alice", "", "", "my-own-secret!")
-	if err != nil || k2.SecretKey != "my-own-secret!" || len(k2.AccessKey) != 20 {
+	k2, err := m.CreateAccessKey(ctx, "alice", "", "", "my-own-secret!-0123")
+	if err != nil || k2.SecretKey != "my-own-secret!-0123" || len(k2.AccessKey) != 20 {
 		t.Fatalf("caller secret: %+v %v", k2, err)
 	}
 
@@ -259,6 +259,7 @@ func TestAccessKeyCRUD(t *testing.T) {
 		{"bad key chars", "bob", "abc/def", "", ErrInvalidKey},
 		{"key spaces", "bob", "abc def", "", ErrInvalidKey},
 		{"short secret", "bob", "", "1234567", ErrInvalidKey},
+		{"secret under 16", "bob", "", "fifteen-chars-x", ErrInvalidKey},
 		{"long secret", "bob", "", strings.Repeat("s", 129), ErrInvalidKey},
 		{"secret space", "bob", "", "secret with space", ErrInvalidKey},
 		{"secret control", "bob", "", "secret\x00\x01xx", ErrInvalidKey},
@@ -503,7 +504,7 @@ func TestPersistence(t *testing.T) {
 		t.Fatal(err)
 	}
 	k1, _ := m.CreateAccessKey(ctx, "alice", "one", "", "")
-	k2, _ := m.CreateAccessKey(ctx, "alice", "two", "ALICE2", "alice-secret-2")
+	k2, _ := m.CreateAccessKey(ctx, "alice", "two", "ALICE2", "alice-secret-2-0123")
 	if err := m.UpdateAccessKey(ctx, k2.AccessKey, KeyInactive); err != nil {
 		t.Fatal(err)
 	}

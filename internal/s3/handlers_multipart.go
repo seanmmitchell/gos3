@@ -241,6 +241,10 @@ func (s *Server) handleUploadPart(w http.ResponseWriter, r *http.Request, rc *re
 	if _, err := copyBuffered(writerOnly{pw}, readerOnly{p}); err != nil {
 		return mapStorageError(err)
 	}
+	// The body may have taken long: the caller must still be allowed.
+	if err := s.revalidateWrite(rc, func() error { return s.reauthorizeOp(ctx, r, rc, nil) }); err != nil {
+		return err
+	}
 	part, err := pw.Commit(ctx, storage.PartMeta{ETag: p.ETag(), Checksums: p.Checksums()})
 	if err != nil {
 		return bucketError(err, rc.bucket)
@@ -766,6 +770,30 @@ func (s *Server) checkCompleteConditions(ctx context.Context, bucket, key string
 	return nil
 }
 
+// completedObjectACL returns the canned ACL a completed multipart object
+// gets: the one recorded by CreateMultipartUpload, checked again against
+// the bucket's current settings, since they may have changed while the
+// upload was in progress. A public ACL is refused (AccessDenied) once
+// BlockPublicAcls is enabled, as for PutObject. Once ACLs are disabled
+// (ObjectOwnership BucketOwnerEnforced) the ACL is dropped: it would be
+// ignored anyway, and failing would lose an upload that did nothing wrong.
+func (s *Server) completedObjectACL(ctx context.Context, bucket, acl string) (string, error) {
+	if acl == "" {
+		return "", nil
+	}
+	raw, err := s.bucketConfig(ctx, bucket, storage.ConfigOwnership)
+	if err != nil {
+		return "", err
+	}
+	if aclsDisabledByOwnership(raw) {
+		return "", nil
+	}
+	if err := s.checkObjectACLAllowed(ctx, bucket, acl); err != nil {
+		return "", err
+	}
+	return acl, nil
+}
+
 // handleCompleteMultipartUpload implements CompleteMultipartUpload: the
 // listed parts (strictly ascending, existing, matching ETags, all but the
 // last at least 5 MiB, optional per-part checksums matching) are
@@ -814,6 +842,14 @@ func (s *Server) handleCompleteMultipartUpload(w http.ResponseWriter, r *http.Re
 		return err
 	}
 	if err := s.checkCompleteConditions(ctx, rc.bucket, rc.key, cond); err != nil {
+		return err
+	}
+	if plan.meta.ACL, err = s.completedObjectACL(ctx, rc.bucket, plan.meta.ACL); err != nil {
+		return err
+	}
+	// The part list may have taken long to arrive: the caller must still
+	// be allowed to complete the upload.
+	if err := s.revalidateWrite(rc, func() error { return s.reauthorizeOp(ctx, r, rc, nil) }); err != nil {
 		return err
 	}
 

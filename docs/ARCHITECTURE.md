@@ -52,7 +52,12 @@ exported helpers in your own files are fine.
 
 ## Top-level routing (`internal/server`)
 
-One listener (default `:9000`, optional TLS) serves everything:
+One listener (default `:9000`, optional TLS) serves everything. Before
+routing, response writes get a progress deadline, the TLS state is taken from
+the connection, and the `Host` header is checked against the server's names
+(`server.allowed_hosts`; unknown hosts get no anonymous access, UI or public
+metrics, or are refused outright when the list is set; see
+docs/security.md#dns-rebinding-and-the-host-header):
 
 1. Virtual-hosted-style request (Host is `<bucket>.<domain>` for a configured
    domain) → **S3 handler**, always (even if the path starts with `/_gos3/`;
@@ -181,16 +186,31 @@ See the doc comments in `storage.go`. Key points:
 - Version IDs for versioned writes must be unique, URL-safe, ≤ 64 chars and
   never `null`.
 - Optional Backend extensions (`optional.go`), discovered by type
-  assertion; both built-in backends implement both:
+  assertion; both built-in backends implement all of them:
   - `ConditionalDeleter.DeleteObjectIf` looks up the addressed version and
     deletes it only if a check on it passes, atomically (same transaction or
-    lock). The S3 DeleteObject/DeleteObjects `If-Match` and object lock path
-    and the lifecycle worker use it; without it the S3 layer checks just
-    before the delete and the lifecycle worker skips permanent deletes (it
-    still adds delete markers).
+    lock). The S3 DeleteObject/DeleteObjects `If-Match`, object lock and
+    authorized-version (`s3:ExistingObjectTag`) paths and the lifecycle
+    worker use it; without it the S3 layer checks just before the delete and
+    the lifecycle worker skips permanent deletes (it still adds delete
+    markers).
+  - `CheckedDeleter.DeleteObjectChecked` is `DeleteObjectIf` whose check
+    is also consulted when the key has no versions (and the delete then
+    adds the delete marker of a versioned bucket), so a delete authorized
+    on "no object here" still creates its marker but not over an object
+    that appeared meanwhile.
+  - `ConditionalMetaUpdater.UpdateObjectMetaIf` is `UpdateObjectMeta` with
+    such a check, so ACL, tagging, retention and legal hold updates apply
+    to exactly the version that was authorized; without it the S3 layer
+    compares the metadata it can see in the update function.
+  - `ConfigViewer.ViewBucketConfig` lends a stored configuration document
+    to a callback without copying it (the S3 layer hashes lifecycle
+    documents per request to recognise the cached parse).
   - `UploadWalker.WalkMultipartUploads` walks in-progress uploads in listing
     order (key, Initiated, UploadID) from an `UploadPosition`, without loading
     all of a bucket's uploads.
+  `storage.ListObjects`, `ListObjectVersions` and `ListUploads` return
+  entries trimmed to the fields a listing reports (`storage.ListingInfo`).
   `uploads.go` builds on them: `storage.ListUploads` (S3
   ListMultipartUploads paging: prefix, delimiter, key/upload-ID markers),
   `storage.WalkMultipartUploads` and `storage.CountMultipartUploads`, each
@@ -313,7 +333,7 @@ seeds, DNS SRV and active scans; every candidate is verified by fetching
 
 ## Build, test & conventions
 
-- Go ≥ 1.25 (toolchain auto). `gofmt`, `go vet` clean. Std `log/slog`.
+- Go ≥ 1.26.9 (`go.mod`'s `go` line; toolchain auto). `gofmt`, `go vet` clean. Std `log/slog`.
   Stdlib `net/http` (Go 1.22+ mux patterns OK for the admin API).
 - Allowed third-party Go deps (already in go.mod): `go.etcd.io/bbolt`,
   `github.com/miekg/dns`, `gopkg.in/yaml.v3`, and for tests only

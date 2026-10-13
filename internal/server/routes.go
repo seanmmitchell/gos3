@@ -18,6 +18,7 @@ import (
 	"github.com/seanmmitchell/gos3/internal/clientip"
 	"github.com/seanmmitchell/gos3/internal/config"
 	"github.com/seanmmitchell/gos3/internal/iam"
+	"github.com/seanmmitchell/gos3/internal/s3"
 	"github.com/seanmmitchell/gos3/internal/s3err"
 	"github.com/seanmmitchell/gos3/internal/webui"
 )
@@ -38,10 +39,26 @@ const (
 const adminOp = "Admin"
 
 // ServeHTTP implements the top-level routing (see the package comment).
+// Before routing it bounds response writes (see writeGuard), takes the TLS
+// state from the connection (see withConnTLS) and checks the Host header
+// (see hostPolicy).
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	w, finish := s.guardWrites(w)
+	defer finish()
+	r = withConnTLS(r)
 	st := s.settings.Get()
+	known := s.hosts.known(r.Host, &st)
+	if !known {
+		s.hosts.warn(s.log, r.Host)
+		if s.hosts.strict {
+			w, r, done := s.guardBody(w, r)
+			defer done()
+			s.rejectHost(w, r, true)
+			return
+		}
+	}
 	// 1. Virtual-hosted-style requests always go to S3: "/_gos3/..." is then
-	// an object key.
+	// an object key. (Their host is always known.)
 	if isVirtualHost(r.Host, st.Domains) {
 		s.s3.ServeHTTP(w, r)
 		return
@@ -50,6 +67,10 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if p := r.URL.Path; p == "/_gos3" || strings.HasPrefix(p, SystemPrefix) {
 		w, r, done := s.guardBody(w, r)
 		defer done()
+		if !known && !hostIndependentPath(p, &st) {
+			s.rejectHost(w, r, false)
+			return
+		}
 		s.serveSystem(w, r, &st)
 		return
 	}
@@ -57,11 +78,19 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if s.ui != nil && st.UIRedirect && isBrowserRootRequest(r) {
 		w, r, done := s.guardBody(w, r)
 		defer done()
+		if !known {
+			s.rejectHost(w, r, false)
+			return
+		}
 		w.Header().Set("Cache-Control", "no-store")
 		http.Redirect(w, r, webui.Prefix, http.StatusFound)
 		return
 	}
-	// 4. S3.
+	// 4. S3. Anonymous requests for an unknown host are refused there
+	// (after authentication, which decides whether the request is signed).
+	if !known {
+		r = r.WithContext(s3.WithUnknownHost(r.Context()))
+	}
 	s.s3.ServeHTTP(w, r)
 }
 
@@ -121,8 +150,10 @@ func (s *Server) serveInfo(w http.ResponseWriter, r *http.Request, st *config.Se
 	writeJSON(w, http.StatusOK, s.Info())
 }
 
-// serveReady answers GET /_gos3/ready: 200 when the backend answers
-// ListBuckets in time, 503 when it does not or the server is shutting down.
+// serveReady answers GET /_gos3/ready: 200 when the backend answered
+// ListBuckets in time (see backendReady), 503 when it did not or the server
+// is shutting down. The endpoint is anonymous, so the storage error itself
+// is only logged.
 func (s *Server) serveReady(w http.ResponseWriter, r *http.Request) {
 	if !allowGet(w, r) {
 		return
@@ -131,14 +162,36 @@ func (s *Server) serveReady(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"status": "unavailable", "error": "shutting down"})
 		return
 	}
-	ctx, cancel := context.WithTimeout(r.Context(), readyTimeout)
-	defer cancel()
-	if _, err := s.backend.ListBuckets(ctx); err != nil {
-		s.log.Warn("readiness check failed", "err", err)
-		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"status": "unavailable", "error": err.Error()})
+	if !s.backendReady() {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"status": "unavailable", "error": "storage unavailable"})
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
+}
+
+// backendReady reports whether the backend answered ListBuckets within
+// readyTimeout. The result is reused for readyCacheTTL, and concurrent
+// callers share one check, so polling /_gos3/ready (anonymous) costs at
+// most one backend call per readyCacheTTL. Failures are logged when the
+// state changes, not on every request.
+func (s *Server) backendReady() bool {
+	s.readyMu.Lock()
+	defer s.readyMu.Unlock()
+	if !s.readyAt.IsZero() && time.Since(s.readyAt) < readyCacheTTL {
+		return s.readyOK
+	}
+	ctx, cancel := context.WithTimeout(s.lifeCtx, readyTimeout)
+	_, err := s.backend.ListBuckets(ctx)
+	cancel()
+	ok := err == nil
+	switch {
+	case !ok && (s.readyOK || s.readyAt.IsZero()):
+		s.log.Warn("readiness check failed: the storage backend did not answer", "err", err)
+	case ok && !s.readyOK && !s.readyAt.IsZero():
+		s.log.Info("readiness check: the storage backend answers again")
+	}
+	s.readyOK, s.readyAt = ok, time.Now()
+	return ok
 }
 
 // serveMetrics answers GET /_gos3/metrics in the Prometheus text format:

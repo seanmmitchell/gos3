@@ -14,7 +14,8 @@
 # Base images are pinned by digest (multi-arch index) so a retagged image
 # cannot change a release build; Dependabot (.github/dependabot.yml) proposes
 # tag and digest updates. To build on another Go or Node version, edit the tag
-# and the digest of the FROM line together.
+# and the digest of the FROM line together (the build stage checks that the
+# image's Go is at least go.mod's go line).
 
 # ---------------------------------------------------------------------------
 # Web UI: static SPA with base /_gos3/ui/ (web/.output/public)
@@ -28,7 +29,9 @@ ENV PATH=$PNPM_HOME:$PATH
 RUN corepack enable
 WORKDIR /src/web
 # Dependencies first (cached until the lockfile changes). `pnpm fetch` only
-# needs the lockfile; the offline install below links from the store.
+# needs the lockfile; the offline install below links from the store. Only
+# production dependencies are installed: `nuxt generate` needs none of the
+# devDependencies (test tools), so their code never runs in the image build.
 COPY web/package.json web/pnpm-lock.yaml web/pnpm-workspace.yaml ./
 RUN --mount=type=cache,id=gos3-pnpm,target=/pnpm/store \
     pnpm config set store-dir /pnpm/store && \
@@ -36,7 +39,7 @@ RUN --mount=type=cache,id=gos3-pnpm,target=/pnpm/store \
 COPY web/ ./
 RUN --mount=type=cache,id=gos3-pnpm,target=/pnpm/store \
     pnpm config set store-dir /pnpm/store && \
-    pnpm install --frozen-lockfile --offline && \
+    pnpm install --frozen-lockfile --offline --prod && \
     pnpm generate:embed && \
     test -f .output/public/index.html -o -f .output/public/200.html
 
@@ -51,6 +54,17 @@ ARG COMMIT=
 ARG DATE=
 WORKDIR /src
 COPY go.mod go.sum ./
+# The golang image sets GOTOOLCHAIN=local, so the image's own Go (and its
+# standard library) is what gets linked, not the version go.mod names. Fail
+# when it is older than go.mod's go line (the minimum Go with the standard
+# library's security fixes), with a clearer message than `go mod download`
+# would give. A newer image (a Dependabot update) passes.
+RUN want="$(tr -d '\r' <go.mod | sed -n 's/^go //p')"; \
+    have="$(cd / && go env GOVERSION)"; have="${have#go}"; \
+    if [ "$(printf '%s\n%s\n' "$want" "$have" | sort -V | head -n 1)" != "$want" ]; then \
+      echo "golang image has go$have but go.mod requires go >= $want: update the FROM line" >&2; \
+      exit 1; \
+    fi
 RUN --mount=type=cache,target=/go/pkg/mod go mod download
 COPY cmd/ cmd/
 COPY internal/ internal/
@@ -86,7 +100,7 @@ COPY --from=build --chown=65532:65532 /out/data /data
 COPY LICENSE THIRD_PARTY_NOTICES /usr/share/doc/gos3/
 # Every config key has a GOS3_* variable (`gos3 config env`). Root keys:
 # set GOS3_ROOT_ACCESS_KEY / GOS3_ROOT_SECRET_KEY, or let gos3 generate a
-# pair on first start (printed in the log, stored in /data/.gos3).
+# pair on first start (stored in /data/.gos3/root-credentials.json).
 ENV GOS3_ADDRESS=:9000 \
     GOS3_DATA=/data
 USER 65532:65532

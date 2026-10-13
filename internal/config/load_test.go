@@ -121,6 +121,7 @@ lifecycle:
 		"GOS3_PUBLIC_INFO":         "off",
 		"GOS3_MAX_OBJECT_SIZE":     "1GiB",
 		"GOS3_TRUST_PROXY_HEADERS": "yes",
+		"GOS3_TRUSTED_PROXIES":     "10.0.0.5",
 	}
 	c, err := load(file, env(vars), []Override{{"server.address", ":6000"}, {"GOS3_NAME", "from-flag"}})
 	if err != nil {

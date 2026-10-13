@@ -190,7 +190,9 @@ func Open(root string, opts Options) (*Backend, error) {
 		if err := os.MkdirAll(d, dirPerm); err != nil {
 			return nil, fmt.Errorf("fs: create %s: %w", d, err)
 		}
+		b.tightenPerm(d)
 	}
+	b.tightenPerm(b.orphanDir)
 
 	dbPath := filepath.Join(b.sysDir, "meta.db")
 	if err := b.checkMetadataPresent(dbPath); err != nil {
@@ -208,6 +210,7 @@ func Open(root string, opts Options) (*Backend, error) {
 		return nil, fmt.Errorf("fs: open metadata database %s: %w", dbPath, err)
 	}
 	b.db = db
+	b.tightenPerm(dbPath)
 	if err := b.initSchema(); err != nil {
 		_ = db.Close()
 		return nil, err
@@ -229,6 +232,33 @@ func Open(root string, opts Options) (*Backend, error) {
 		b.recover(ctx)
 	}()
 	return b, nil
+}
+
+// tightenPerm removes the group and other permission bits of path when it
+// exists with them set. MkdirAll and bbolt.Open only apply dirPerm/filePerm
+// when they create a path; a .gos3 directory or meta.db pre-created by an
+// operator or a container volume, or restored from a backup that did not
+// keep modes, would otherwise stay readable by other local users (meta.db
+// holds every key, metadata entry and bucket policy). A failure (e.g. a
+// mount point owned by another user) is logged, not fatal. Windows has no
+// mode bits to fix.
+func (b *Backend) tightenPerm(path string) {
+	if runtime.GOOS == "windows" {
+		return
+	}
+	fi, err := os.Stat(path)
+	if err != nil {
+		return
+	}
+	perm := fi.Mode().Perm()
+	if perm&0o077 == 0 {
+		return
+	}
+	if err := os.Chmod(path, perm&^0o077); err != nil {
+		b.log.Warn("fs: cannot restrict permissions; other local users may read it", "path", path, "mode", perm.String(), "err", err)
+		return
+	}
+	b.log.Warn("fs: restricted permissions that allowed access by other local users", "path", path, "was", perm.String(), "now", (perm &^ 0o077).String())
 }
 
 // checkMetadataPresent refuses to proceed when the metadata database is

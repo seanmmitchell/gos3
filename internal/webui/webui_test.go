@@ -65,14 +65,16 @@ func TestHandlerServesFilesAndFallback(t *testing.T) {
 				t.Errorf("Cache-Control %q, want %q", got, tt.wantCache)
 			}
 			for k, v := range map[string]string{
-				"X-Content-Type-Options":  "nosniff",
-				"X-Frame-Options":         "DENY",
-				"Referrer-Policy":         "no-referrer",
-				"Content-Security-Policy": "frame-ancestors 'none'",
+				"X-Content-Type-Options": "nosniff",
+				"X-Frame-Options":        "DENY",
+				"Referrer-Policy":        "no-referrer",
 			} {
 				if w.Header().Get(k) != v {
 					t.Errorf("%s = %q, want %q", k, w.Header().Get(k), v)
 				}
+			}
+			if csp := w.Header().Get("Content-Security-Policy"); !strings.HasPrefix(csp, "default-src 'self'; script-src 'self';") || !strings.HasSuffix(csp, "; frame-ancestors 'none'") {
+				t.Errorf("Content-Security-Policy = %q", csp)
 			}
 		})
 	}

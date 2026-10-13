@@ -1,6 +1,7 @@
 package s3
 
 import (
+	"context"
 	"crypto/rand"
 	"encoding/hex"
 	"errors"
@@ -13,6 +14,7 @@ import (
 	"strings"
 
 	"github.com/seanmmitchell/gos3/internal/auth"
+	"github.com/seanmmitchell/gos3/internal/config"
 	"github.com/seanmmitchell/gos3/internal/s3err"
 )
 
@@ -28,6 +30,10 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	h.Set("X-Amz-Id-2", s.hostID(rc.requestID))
 	h.Set("Server", s.serverHeader)
 	h.Set("Date", start.UTC().Format(http.TimeFormat))
+	// S3 responses (XML documents, errors, stored bucket policies, objects)
+	// are served from the embedded web UI's origin: browsers must never
+	// sniff one into HTML or script.
+	h.Set("X-Content-Type-Options", "nosniff")
 
 	var done func(op string, status int, bytesIn, bytesOut int64)
 	if s.metrics != nil {
@@ -220,6 +226,9 @@ func (s *Server) serve(w *responseWriter, r *http.Request, rc *reqContext) {
 		stripAWSChunked(r.Header)
 	}
 	rc.body = r.Body
+	if rc.identity.IsAnonymous && (r.Method == http.MethodGet || r.Method == http.MethodHead) {
+		s.setAnonymousResourcePolicy(w, r, rc, settings)
+	}
 
 	if !op.AuthzByHandler {
 		if err := s.authorizeOp(r.Context(), r, rc); err != nil {
@@ -374,6 +383,141 @@ func stripAWSChunked(h http.Header) {
 		return
 	}
 	h.Set("Content-Encoding", strings.Join(keep, ","))
+}
+
+// checkAnonymousRequest refuses anonymous requests that a website could
+// make a visitor's browser send, for data that is anonymously accessible
+// only because of where the browser is (aws:SourceIp conditions, buckets
+// reachable only on a LAN):
+//
+//   - requests whose Host is not one of the server's names (marked by
+//     WithUnknownHost: a DNS-rebinding page is same-origin with the server
+//     under its own host name, so CORS never applies);
+//   - cross-origin requests that change data (any method but GET, HEAD
+//     and OPTIONS) unless the bucket's CORS configuration, or a global CORS
+//     origin listed explicitly, allows the origin and method. Browsers send
+//     such "simple" requests (HTML form posts, including PostObject
+//     uploads, and no-cors fetches with a text/plain body) without a
+//     preflight, and CORS only hides the response, so without this check
+//     any website could blindly write or delete such data.
+//
+// Requests that are not from a browser carry neither Origin nor
+// Sec-Fetch-Site and are unaffected. The result is cached in rc (handlers
+// authorize several targets per request).
+func (s *Server) checkAnonymousRequest(ctx context.Context, r *http.Request, rc *reqContext) error {
+	if rc.anonChecked {
+		return rc.anonErr
+	}
+	rc.anonChecked = true
+	switch {
+	case unknownHost(r.Context()):
+		rc.authzReason = "anonymous request for a host that is not one of the server's names"
+		rc.anonErr = s3err.ErrAccessDenied.WithMessage(
+			"Anonymous requests are not accepted for host %q: it is not one of this server's names (see server.allowed_hosts).", r.Host)
+	case !safeMethod(r.Method) && crossOriginBrowserRequest(r) && !s.anonymousOriginAllowed(ctx, r, rc):
+		rc.authzReason = "anonymous cross-origin write from a browser"
+		rc.anonErr = s3err.ErrAccessDenied.WithMessage(
+			"Anonymous cross-origin requests that change data are allowed only for origins that the bucket's CORS configuration allows.")
+	}
+	return rc.anonErr
+}
+
+// safeMethod reports whether method only reads.
+func safeMethod(method string) bool {
+	return method == http.MethodGet || method == http.MethodHead || method == http.MethodOptions
+}
+
+// crossOriginBrowserRequest reports whether a browser sent r on behalf of
+// a page of another origin: Sec-Fetch-Site (sent by current browsers) says
+// same-site or cross-site, or, without it, the Origin header does not name
+// the host the request was sent to ("null" for sandboxed and opaque
+// origins). Requests without either header are not from a browser page.
+func crossOriginBrowserRequest(r *http.Request) bool {
+	switch strings.ToLower(strings.TrimSpace(r.Header.Get("Sec-Fetch-Site"))) {
+	case "same-origin", "none":
+		return false
+	case "same-site", "cross-site":
+		return true
+	}
+	origin := r.Header.Get("Origin")
+	return origin != "" && !sameOriginHost(origin, r.Host)
+}
+
+// sameOriginHost reports whether the host (and port) of origin is host,
+// ignoring case and the scheme's default port. The scheme is not compared:
+// behind a TLS-terminating proxy gos3 cannot tell which one the page used.
+func sameOriginHost(origin, host string) bool {
+	u, err := url.Parse(origin)
+	if err != nil || u.Host == "" {
+		return false
+	}
+	strip := func(h string) string {
+		h = strings.ToLower(h)
+		switch {
+		case u.Scheme == "http" && strings.HasSuffix(h, ":80"):
+			return strings.TrimSuffix(h, ":80")
+		case u.Scheme == "https" && strings.HasSuffix(h, ":443"):
+			return strings.TrimSuffix(h, ":443")
+		}
+		return h
+	}
+	return strip(u.Host) == strip(host)
+}
+
+// anonymousOriginAllowed reports whether the CORS configuration that
+// applies to r (the bucket's, else the global one) allows its Origin and
+// method for an anonymous request: the global "*" rule does not (see
+// corsSignedOnly).
+func (s *Server) anonymousOriginAllowed(ctx context.Context, r *http.Request, rc *reqContext) bool {
+	origin := r.Header.Get("Origin")
+	if origin == "" || origin == "null" {
+		return false
+	}
+	cfg := s.corsConfigFor(ctx, rc.bucket, s.settings.Get())
+	if cfg == nil {
+		return false
+	}
+	rule := cfg.match(origin, r.Method, nil)
+	return rule != nil && !corsSignedOnly(cfg, rule, origin)
+}
+
+// setAnonymousResourcePolicy adds "Cross-Origin-Resource-Policy:
+// same-site" to the response of an anonymous read, unless the CORS
+// configuration that applies opts in to cross-origin reads: a bucket CORS
+// rule allowing GET, or a global rule listing explicit origins. CORS does
+// not govern no-cors loads (<script>, <link rel=stylesheet>, <img>,
+// <video>): without the header any website could run an anonymously
+// readable script object in its own page and read what it defines,
+// measure images and media, and tell existing keys from missing ones by
+// load and error events, for data that is accessible only from the
+// visitor's network. Navigations, signed requests (presigned URLs
+// included) and CORS-mode fetches are not affected.
+func (s *Server) setAnonymousResourcePolicy(w http.ResponseWriter, r *http.Request, rc *reqContext, settings config.Settings) {
+	if cfg := s.corsConfigFor(r.Context(), rc.bucket, settings); cfg != nil && corsAllowsAnonymousReads(cfg) {
+		return
+	}
+	w.Header().Set("Cross-Origin-Resource-Policy", "same-site")
+}
+
+// corsAllowsAnonymousReads reports whether a CORS configuration allows GET
+// from some origin for anonymous requests (the global "*" origin does not;
+// see corsSignedOnly).
+func corsAllowsAnonymousReads(cfg *CORSConfiguration) bool {
+	for i := range cfg.Rules {
+		rule := &cfg.Rules[i]
+		if !rule.allowsMethod(http.MethodGet) {
+			continue
+		}
+		if !cfg.global {
+			return true
+		}
+		for _, o := range rule.AllowedOrigins {
+			if o != "*" {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // clientInfo returns the client IP and whether the connection is secure,

@@ -37,14 +37,24 @@ server:
   # The client is the rightmost X-Forwarded-For entry that is not one of
   # trusted_proxies; the last X-Forwarded-Proto value decides aws:SecureTransport.
   trust_proxy_headers: false
-  # Addresses (CIDRs or IPs) of the reverse proxies in front of gos3. With
-  # trust_proxy_headers, requests from other addresses are taken at face
-  # value. Empty: any peer is trusted and the rightmost entry is the client
-  # (fine for a single proxy that gos3 alone can be reached through). List
-  # only the proxies, never subnets that also hold clients: a listed client
-  # could choose its own aws:SourceIp.
+  # Addresses (CIDRs or IPs) of the reverse proxies in front of gos3;
+  # required with trust_proxy_headers. Requests from other addresses are
+  # taken at face value. List only the proxies, never subnets that also hold
+  # clients: a listed client could choose its own aws:SourceIp.
   # trusted_proxies: ["10.0.0.5", "192.0.2.10"]
   trusted_proxies: []
+  # Extra host names clients use to reach this server (Host header, no
+  # port). IP addresses, localhost, the OS host name (and <name>.local) and
+  # the hosts of address, public_url and domains are always known. Empty:
+  # requests for other host names are served only when signed (no anonymous
+  # access, web UI or public metrics: protects against DNS rebinding).
+  # Non-empty: requests for other host names are refused. "*.example.com"
+  # allows subdomains; ["*"] turns the check off.
+  allowed_hosts: []
+  # Maximum simultaneously open client connections (0 = no limit). At the
+  # limit a new connection closes the longest-idle keep-alive connection, or
+  # is refused when none is idle.
+  max_connections: 0
 
 storage:
   # fs (files under path) or memory (lost on exit).
@@ -59,12 +69,17 @@ storage:
 
 auth:
   # Root credentials. Prefer the environment (GOS3_ROOT_ACCESS_KEY /
-  # GOS3_ROOT_SECRET_KEY). When unset, a pair is generated on first start,
-  # logged once and stored in <path>/.gos3/root-credentials.json.
+  # GOS3_ROOT_SECRET_KEY). When unset, a pair is generated on first start
+  # and stored in <path>/.gos3/root-credentials.json (the secret is never
+  # logged; the startup banner shows it on a terminal).
   # root_access_key: ""
   # root_secret_key: ""
   # Reject signatures whose credential scope names another region.
   strict_region: false
+  # Allow a published example root secret key (README / docker-compose
+  # demo keys). Anyone can sign requests with those, including websites
+  # opened in a browser on this machine: throwaway local demos only.
+  insecure_demo_credentials: false
 
 ui:
   # Serve the embedded web UI at /_gos3/ui/.

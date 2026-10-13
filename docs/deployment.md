@@ -18,8 +18,18 @@ load balancer.
 ## Binary
 
 Release archives for Linux, macOS and Windows (amd64 and arm64) contain the
-binary with the UI embedded, plus `checksums.txt`. To build from source you
-need Go ≥ 1.25, Node.js 22 and pnpm (via corepack):
+binary with the UI embedded, plus `checksums.txt`. From the first release
+after 0.1.0, every archive and image has a signed build provenance
+attestation; check it before installing (see
+[releasing.md](releasing.md#verifying-a-release)):
+
+```sh
+gh attestation verify gos3_X.Y.Z_linux_amd64.tar.gz \
+  --repo seanmmitchell/gos3 --source-ref refs/heads/main
+```
+
+To build from source you need Go 1.26.9 or newer (`go.mod` requires it, for
+the standard library's security fixes), Node.js 22 and pnpm (via corepack):
 
 ```sh
 make build                    # web UI + bin/gos3 with the UI embedded
@@ -29,10 +39,13 @@ bin/gos3 serve --data /srv/gos3
 `make build-go` (or `go build ./cmd/gos3`) builds without rebuilding the UI;
 the binary then serves a placeholder at `/_gos3/ui/`.
 
-On first start without configured root keys, gos3 prints a generated access
-key and secret key in the banner and stores them in
-`<data>/.gos3/root-credentials.json`. See [configuration.md](configuration.md)
-for all settings and [security.md](security.md) before exposing the server.
+On first start without configured root keys, gos3 generates an access key
+and secret key and stores them in `<data>/.gos3/root-credentials.json`
+(mode 0600). The banner shows them when gos3 runs in a terminal; logs never
+contain the secret. `gos3 keygen` prints a random pair as
+`GOS3_ROOT_ACCESS_KEY=…` / `GOS3_ROOT_SECRET_KEY=…` lines for an env file.
+See [configuration.md](configuration.md) for all settings and
+[security.md](security.md) before exposing the server.
 
 ## Docker
 
@@ -43,10 +56,20 @@ runtime has no shell, runs as uid/gid 65532, and is about 25 MB.
 
 ```sh
 docker build -t gos3 .              # or: make docker (adds version build args)
-docker run -d --name gos3 -p 9000:9000 -v gos3-data:/data \
-  -e GOS3_ROOT_ACCESS_KEY=admin -e GOS3_ROOT_SECRET_KEY=change-me-now \
-  gos3
+docker run --rm gos3 keygen > gos3.env   # random root keys (keep the file private)
+docker run -d --name gos3 -p 127.0.0.1:9000:9000 -v gos3-data:/data \
+  --env-file gos3.env gos3
 docker logs gos3                    # banner: endpoints, UI URL, credentials source
+```
+
+`-p 127.0.0.1:9000:9000` publishes the port on the host's loopback only;
+drop the address (`-p 9000:9000`) to serve the network. The published images
+are `ghcr.io/seanmmitchell/gos3:X.Y.Z` (also `X.Y` and `latest`); deploy a
+version, not `latest`, and pin its digest after verifying it:
+
+```sh
+gh attestation verify oci://ghcr.io/seanmmitchell/gos3:X.Y.Z \
+  --repo seanmmitchell/gos3 --source-ref refs/heads/main
 ```
 
 Image defaults:
@@ -74,8 +97,11 @@ Notes:
 - **Bind mounts** must be writable by uid 65532:
   `install -d -o 65532 -g 65532 -m 0700 /srv/gos3`, then
   `-v /srv/gos3:/data`. Named volumes get the right owner automatically.
-- Without `GOS3_ROOT_*`, the generated keys are in `docker logs` (once) and in
-  the volume at `/data/.gos3/root-credentials.json`.
+- Without `GOS3_ROOT_*`, the generated keys are only in the volume, at
+  `/data/.gos3/root-credentials.json` (shown in the banner only with
+  `docker run -it`). The image has no shell; copy the file out with
+  `docker cp gos3:/data/.gos3/root-credentials.json .` and delete the copy
+  once you have stored the keys.
 - **Discovery across hosts** needs multicast, which Docker's default bridge
   network keeps local to the host. Use `--network host`, or seeds
   (`GOS3_DISCOVERY_SEEDS`) and DNS SRV. Set `GOS3_PUBLIC_URL` to the URL other
@@ -87,8 +113,13 @@ Notes:
   `gcr.io/distroless/static-debian12:nonroot`) and the Dockerfile frontend
   are pinned by digest, and the GitHub Actions in `.github/workflows` by
   commit SHA, so a retagged upstream image or action cannot change a release.
-  Dependabot proposes updates weekly. To build on another Go or Node
-  version, edit the tag and the digest of the `FROM` line together.
+  Dependabot proposes updates weekly (Go images without the 14-day
+  cooldown, since Go point releases carry standard library security fixes).
+  To build on another Go or Node version, edit the tag and the digest of the
+  `FROM` line together. The golang image builds with its own Go
+  (`GOTOOLCHAIN=local`), so the build fails when that Go is older than
+  `go.mod`'s `go` line (the minimum with current standard library fixes);
+  raise both together when the minimum goes up.
 
 The standalone web UI has its own image, `deploy/docker/web.Dockerfile`
 (`make docker-ui`); see [web-ui.md](web-ui.md#standalone-mode). Its local
@@ -101,18 +132,20 @@ example `-p 127.0.0.1:3000:3000`).
 `docker-compose.yml` is a two-node demo:
 
 ```sh
-docker compose up -d --build                  # gos3-1 on :9001, gos3-2 on :9002
-docker compose --profile ui up -d --build     # + standalone UI on :3000 (or: make demo)
-docker compose down -v                        # stop and delete the data volumes
+make demo                                     # random root keys in .env, then the next line
+docker compose --profile ui up -d --build     # gos3-1 on :9001, gos3-2 on :9002, standalone UI on :3000
+docker compose up -d --build                  # the two nodes only
+docker compose --profile ui down -v           # stop and delete the data volumes
 ```
 
-- Both nodes use the root keys `gos3admin` / `gos3admin-secret`. Override them
-  with `GOS3_ROOT_ACCESS_KEY` / `GOS3_ROOT_SECRET_KEY` in your shell or an
-  `.env` file.
-- Because those default keys are public, ports 9001, 9002 and 3000 are
-  published on **127.0.0.1 only**. To reach the demo from other machines, set
-  your own root keys and `GOS3_DEMO_BIND=0.0.0.0` (or one host address).
-  Docker's published ports usually bypass the host firewall.
+- Both nodes use the root keys `GOS3_ROOT_ACCESS_KEY` / `GOS3_ROOT_SECRET_KEY`
+  from your shell or the `.env` file next to `docker-compose.yml`. There are
+  no default keys: compose refuses to start without them. `make demo` appends
+  a random pair to `.env` when none is set (or run
+  `docker run --rm gos3 keygen >> .env`).
+- Ports 9001, 9002 and 3000 are published on **127.0.0.1 only**. To reach
+  the demo from other machines, set `GOS3_DEMO_BIND=0.0.0.0` (or one host
+  address). Docker's published ports usually bypass the host firewall.
 - The nodes find each other through the **UDP beacon** on the shared compose
   network, and each lists the other as a **seed** as a fallback. Open
   `http://localhost:9001/_gos3/ui/`, sign in and go to **Discovery**: the other
@@ -121,13 +154,14 @@ docker compose down -v                        # stop and delete the data volumes
   `http://172.18.0.3:9000`), which a browser on the host may not reach (Docker
   Desktop). Add the second node through its published port,
   `http://localhost:9002`.
-- The standalone UI is preset with both nodes (`NUXT_PUBLIC_SERVERS`), and its
-  local discovery finds them through the beacon inside the network. The
-  compose file turns local discovery on (`GOS3_UI_LOCAL_DISCOVERY`, default
-  `true` there, off in the image) because the UI is published on
-  `127.0.0.1`; set `GOS3_UI_LOCAL_DISCOVERY=false` if you change
-  `GOS3_DEMO_BIND`. Local discovery answers only when the UI is opened via an
-  IP address or `localhost`; if you open it through a DNS name, set
+- The standalone UI is preset with both nodes (`NUXT_PUBLIC_SERVERS`). Its
+  local discovery (finding the nodes through the beacon inside the network)
+  is off, as in the image, because its routes have no authentication. Turn
+  it on with `GOS3_UI_LOCAL_DISCOVERY=true` only while the UI is published
+  on `127.0.0.1` (the default `GOS3_DEMO_BIND`). Local discovery answers
+  only when the UI is opened via an IP address or `localhost`, and with
+  presets configured the console itself answers `421` for public DNS names
+  (DNS-rebinding protection); if you open it through such a name, set
   `GOS3_UI_ALLOWED_HOSTS=<name>` (passed through by the compose file).
 
 ## systemd
@@ -147,7 +181,11 @@ journalctl -u gos3 -f
 ```
 
 - `/etc/gos3/gos3.env` is read by systemd as root, so it can hold
-  `GOS3_ROOT_ACCESS_KEY` / `GOS3_ROOT_SECRET_KEY` at mode 0600.
+  `GOS3_ROOT_ACCESS_KEY` / `GOS3_ROOT_SECRET_KEY` at mode 0600
+  (`gos3 keygen | sudo tee -a /etc/gos3/gos3.env`). Without them, gos3
+  generates a pair on first start and stores it in
+  `/var/lib/gos3/.gos3/root-credentials.json`; the journal names the access
+  key and the file, never the secret.
 - For a YAML configuration, set `GOS3_CONFIG=/etc/gos3/config.yaml` in the
   env file. The service user must be able to read the YAML file, so make it
   0644 and keep secrets out of it.
@@ -172,8 +210,8 @@ journalctl -u gos3 -f
 ## Kubernetes
 
 `deploy/kubernetes/` contains a ConfigMap (the YAML configuration), an example
-Secret (root keys), a headless Service, a client Service and a StatefulSet,
-tied together by `kustomization.yaml`:
+Secret (root keys), a headless Service, a client Service, a StatefulSet and
+an optional NetworkPolicy example, tied together by `kustomization.yaml`:
 
 ```sh
 kubectl create namespace storage
@@ -185,18 +223,24 @@ kubectl -n storage port-forward svc/gos3 9000:9000
 ```
 
 The kustomization does **not** include `secret.example.yaml`, so its
-placeholder keys are never deployed. Without the Secret (its references are
-optional), each server generates its own root keys on first start and logs
-them once (`kubectl -n storage logs gos3-0`); creating the Secret later takes
-effect when the pods restart. The image tag is `latest`, which Kubernetes
-pulls on every pod start; pin a release with `newTag` in
-`kustomization.yaml` for reproducible deployments.
+placeholder keys are never deployed. The Secret is required: until it
+exists, the pods wait in `CreateContainerConfigError`. (Generated keys would
+only be stored on the PVC, and the image has no shell to read them with.)
+Changing the Secret takes effect when the pods restart.
+
+The image is pinned to a release with `newTag` in `kustomization.yaml`
+(and in `statefulset.yaml`); raise it when you upgrade. Do not use `latest`,
+which Kubernetes pulls again on every pod start, so whatever was pushed last
+runs. For an immutable reference, verify the release
+([releasing.md](releasing.md#verifying-a-release)) and add its `digest:`
+next to `newTag`.
 
 How it fits together:
 
 - **StatefulSet `gos3`**: each pod gets its own PVC (`data`, 20 Gi) mounted at
   `/data`, and runs as uid 65532 with a read-only root file system, all
-  capabilities dropped and the RuntimeDefault seccomp profile. Probes:
+  capabilities dropped, the RuntimeDefault seccomp profile and no service
+  account token (gos3 does not use the Kubernetes API). Probes:
   startup and liveness on `/_gos3/health`, readiness on `/_gos3/ready`. The pod
   name is the server name.
 - **Headless Service `gos3-headless`** has its port named **`gos3`**, so
@@ -213,6 +257,12 @@ How it fits together:
 - Runtime changes made in the UI are stored on the PVC
   (`/data/.gos3/settings.json`) and override the ConfigMap from then on (see
   [configuration.md](configuration.md#runtime-settings-settingsjson)).
+- **NetworkPolicy** (`networkpolicy.yaml`, not applied by default): only
+  the Ingress controller's namespace, a `monitoring` namespace and the gos3
+  pods themselves may connect to port 9000. Without a policy, every pod in
+  the cluster can reach the S3 and admin APIs. Adjust the namespace labels,
+  then uncomment it in `kustomization.yaml`; it needs a CNI that enforces
+  NetworkPolicy.
 - Metrics: Prometheus cannot sign requests. Either set `metrics.public: true`
   and restrict `/_gos3/metrics` with a NetworkPolicy, or scrape through a
   proxy that adds authentication.
@@ -225,6 +275,14 @@ How it fits together:
   do that only when a NetworkPolicy allows nothing but the Ingress
   controller to reach gos3, or when no policy relies on in-cluster source
   addresses.
+- **Host names.** gos3 knows its pod's headless DNS name
+  (`GOS3_PUBLIC_URL`), IP addresses and `localhost`; for any other `Host`
+  the web UI and anonymous reads answer `421` / `403`. List the Ingress host
+  in `server.allowed_hosts` (ConfigMap) or `GOS3_ALLOWED_HOSTS`
+  (StatefulSet; both have a commented example). A non-empty list refuses
+  every other name, signed requests included, so also list the Service
+  names in-cluster clients use (`gos3`, `gos3.<namespace>.svc.cluster.local`).
+  See [configuration.md](configuration.md) (`server.allowed_hosts`).
 - A standalone web UI deployed next to gos3 keeps its local discovery
   routes off unless `GOS3_UI_LOCAL_DISCOVERY=true`; leave them off when the
   UI is reachable through an Ingress, since they have no authentication.
@@ -253,8 +311,14 @@ gos3 can sit behind nginx, Caddy, Traefik or a cloud load balancer. The rules:
    `server.trusted_proxies`. Then `aws:SourceIp`, `aws:SecureTransport` and
    the access logs see the real client:
    - Forwarding headers are honoured only from a peer in `trusted_proxies`
-     (every peer when the list is empty). Requests that reach gos3 directly
-     are taken at face value.
+     (required: an empty list is a configuration error). Requests that
+     reach gos3 directly are taken at face value. The proxy must set (not
+     append to) `X-Forwarded-Proto`.
+   - Set `server.public_url` to the public URL, or list the host name in
+     `server.allowed_hosts`, when the proxy passes the client's `Host`
+     through: anonymous requests and the web UI are refused for host names
+     gos3 does not know (see
+     [security.md](security.md#dns-rebinding-and-the-host-header)).
    - The client is the **rightmost** `X-Forwarded-For` entry that is not in
      `trusted_proxies`. Each proxy appends the address it received the
      request from, so the entries to the right of that one were written by

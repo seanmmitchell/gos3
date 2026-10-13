@@ -56,7 +56,7 @@ ARNs, policy variables such as `${aws:username}` included):
 
 | Resource | Actions |
 |---|---|
-| `arn:gos3:admin:::user/<name>` | CreateUser (the new user's name), GetUser, UpdateUser, DeleteUser, CreateAccessKey (the target user), UpdateAccessKey / DeleteAccessKey (the key's owner; an unknown key is evaluated at service level) |
+| `arn:gos3:admin:::user/<name>` | CreateUser (the new user's name), GetUser, UpdateUser, DeleteUser, CreateAccessKey (the target user; choosing the access key ID also needs it at service level), UpdateAccessKey / DeleteAccessKey (the key's owner; an unknown key is evaluated at service level) |
 | `arn:gos3:admin:::policy/<name>` | GetPolicy, PutPolicy, DeletePolicy |
 | `arn:gos3:admin:::bucket/<name>` | GetBucket, ForceDeleteBucket |
 | service level | every other action (list actions, config, stats, discovery, simulate, self-service) |
@@ -65,7 +65,11 @@ The policy resources `*` and `arn:gos3:admin:::*` match every admin
 resource, service level included, so policies written before per-target
 resources existed keep their meaning. A service-level request matches only
 those two. s3 ARNs (`arn:aws:s3:::*`, `arn:*:*:::*`, …) never match admin
-resources and `arn:gos3:admin:::…` never matches s3 resources. New policy
+resources and `arn:gos3:admin:::…` never matches s3 resources. Likewise an
+Allow with `NotResource` covers only the namespaces its list names: `"Action":
+"*"` with `"NotResource": ["arn:aws:s3:::secret/*"]` grants every s3 action
+outside `secret` and no admin action (a Deny with `NotResource` applies to
+everything not listed, as on AWS). New policy
 documents may only use `arn:gos3:admin:::*` and
 `arn:gos3:admin:::<type>/<name>` with type `user`, `policy` or `bucket` (or
 a wildcard pattern of them); other `arn:gos3:` resources are 400
@@ -218,13 +222,13 @@ environment and flags for these fields.
 | Method | Path | Action | Response |
 |---|---|---|---|
 | GET | `/users` | ListUsers | `{"users": iam.User[]}` |
-| POST | `/users` | CreateUser | body `iam.UserSpec` (+ optional `"createKey": true`) → 201 `{"user": User, "key"?: AccessKey}`; the names `.` and `..` are 400 `InvalidName`. A non-empty `"policies"` also requires `admin:UpdateUser`, and `"createKey": true` also requires `admin:CreateAccessKey`; all three are evaluated on `user/<new name>` (with `admin:PolicyName`) before anything is created (otherwise 403 `AccessDenied`) |
+| POST | `/users` | CreateUser | body `iam.UserSpec` (+ optional `"createKey": true`) → 201 `{"user": User, "key"?: AccessKey}`; the names `.` and `..` and 12-digit names are 400 `InvalidName`, and a name equal to an access key ID is 409 `Conflict` like an existing user. A non-empty `"policies"` also requires `admin:UpdateUser`, and `"createKey": true` also requires `admin:CreateAccessKey`; all three are evaluated on `user/<new name>` (with `admin:PolicyName`) before anything is created (otherwise 403 `AccessDenied`) |
 | GET | `/users/{name}` | GetUser | `iam.User` |
 | PATCH | `/users/{name}` | UpdateUser | body `iam.UserUpdate` → `iam.User` |
 | DELETE | `/users/{name}` | DeleteUser | 204 |
-| POST | `/users/{name}/keys` | CreateAccessKey | body `{"description"?, "accessKey"?, "secretKey"?}` → 201 `iam.AccessKey` (incl. secret) |
-| PATCH | `/keys/{accessKey}` | UpdateAccessKey | body `{"status": "Active"\|"Inactive"}` → 204 |
-| DELETE | `/keys/{accessKey}` | DeleteAccessKey | 204 |
+| POST | `/users/{name}/keys` | CreateAccessKey | body `{"description"?, "accessKey"?, "secretKey"?}` → 201 `iam.AccessKey` (incl. secret). Omitted fields are generated (20-character ID, 40-character secret). A chosen `accessKey` (3–128 of `[A-Za-z0-9._-]`) also needs `admin:CreateAccessKey` at service level (`*` or `arn:gos3:admin:::*`; otherwise 403 `AccessDenied`) and must not equal a user name, `root`, `anonymous` or a 12-digit account ID (400 `InvalidName`; 409 if the key exists). A chosen `secretKey` must be 16–128 printable ASCII characters without spaces |
+| PATCH | `/keys/{accessKey}` | UpdateAccessKey | body `{"status": "Active"\|"Inactive"}` → 204. Applied only if the key still belongs to the owner it was authorized against, otherwise 404 |
+| DELETE | `/keys/{accessKey}` | DeleteAccessKey | 204 (404 if the key no longer belongs to the owner it was authorized against) |
 
 ### Policies
 | Method | Path | Action | Response |
@@ -240,7 +244,7 @@ environment and flags for these fields.
 |---|---|---|---|
 | GET | `/buckets` | ListBuckets | `{"buckets": BucketSummary[]}`; `?usage=true` includes usage (cached 30s) |
 | GET | `/buckets/{name}` | GetBucket | `BucketSummary` with usage |
-| DELETE | `/buckets/{name}?force=true` | ForceDeleteBucket | deletes all versions, delete markers, uploads and configs, then the bucket → 204. Without `force` behaves like S3 DeleteBucket (409 if not empty; in-progress uploads alone do not make a bucket non-empty, they are aborted with it). |
+| DELETE | `/buckets/{name}?force=true` | ForceDeleteBucket | deletes all versions, delete markers, uploads and configs, then the bucket → 204. Without `force` behaves like S3 DeleteBucket (409 if not empty; in-progress uploads alone do not make a bucket non-empty, they are aborted with it). Object lock is honoured: any version under legal hold or unexpired COMPLIANCE retention → 409 before anything is deleted; unexpired GOVERNANCE retention → 409 unless `bypassGovernanceRetention=true` is added (only with `force`, else 400), which also requires `s3:BypassGovernanceRetention` on each such object (identity policies; 403 otherwise). |
 
 ```jsonc
 // BucketSummary

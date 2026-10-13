@@ -30,6 +30,7 @@ jobs:
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
         with:
+          persist-credentials: false
           fetch-depth: 0
       - id: version
         run: |
@@ -41,9 +42,13 @@ jobs:
   build:
     name: Build
     needs: version
+    # id-token and attestations: build.yml's image job attests the image's
+    # build provenance (verifiable with --source-ref refs/heads/dev).
     permissions:
       contents: read
       packages: write
+      id-token: write
+      attestations: write
     uses: ./.github/workflows/build.yml
     with:
       ref: ${{ github.sha }}

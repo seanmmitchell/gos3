@@ -185,7 +185,8 @@ func (a *api) deleteOwnKey(rc *reqCtx) (int, any, error) {
 		return 0, nil, errorf(http.StatusConflict, codeConflict,
 			"cannot delete access key %q: it was used to sign this request", ak)
 	}
-	if err := a.d.IAM.DeleteAccessKey(rc.ctx, ak); err != nil {
+	// Ownership is checked again atomically with the deletion.
+	if err := a.d.IAM.DeleteUserAccessKey(rc.ctx, rc.id.User, ak); err != nil {
 		return 0, nil, err
 	}
 	return http.StatusNoContent, nil, nil

@@ -57,15 +57,21 @@ func TestTrustedProxiesWiring(t *testing.T) {
 		check(t, srv, ops, "10.1.2.3, 198.51.100.7", 403) // spoofed leftmost entry
 		check(t, srv, ops, "198.51.100.7, 10.1.2.3", 200) // proxy appended the office address
 	})
-	t.Run("empty trusted_proxies uses the rightmost entry", func(t *testing.T) {
-		srv, ops := setup(t)
-		check(t, srv, ops, "10.1.2.3, 198.51.100.7", 403)
-		check(t, srv, ops, "198.51.100.7, 10.1.2.3", 200)
-	})
 	t.Run("untrusted peer", func(t *testing.T) {
 		srv, ops := setup(t, "192.0.2.0/24")
 		check(t, srv, ops, "10.1.2.3", 403)
 	})
+}
+
+// TestNewRejectsTrustWithoutProxies: trust_proxy_headers with an empty
+// trusted_proxies would let every client choose its aws:SourceIp and
+// aws:SecureTransport; the configuration is refused.
+func TestNewRejectsTrustWithoutProxies(t *testing.T) {
+	cfg := testConfig()
+	cfg.Server.TrustProxyHeaders = true
+	if _, err := New(cfg, nil); err == nil || !strings.Contains(err.Error(), "server.trusted_proxies is empty") {
+		t.Fatalf("err = %v", err)
+	}
 }
 
 func TestNewRejectsInvalidTrustedProxies(t *testing.T) {

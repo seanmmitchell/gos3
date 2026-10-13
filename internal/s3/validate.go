@@ -20,6 +20,11 @@ const (
 	maxPartNumber     = 10000
 	minPartSize       = 5 << 20 // every part but the last
 	maxRedirectLength = 2 << 10
+
+	// maxObjectMetaSize bounds all metadata an object returns as response
+	// headers: content headers, website redirect and user metadata (see
+	// validateStoredMeta). It is AWS's limit for a PUT's request headers.
+	maxObjectMetaSize = 8 << 10
 )
 
 // validBucketName reports whether name is a valid bucket name for

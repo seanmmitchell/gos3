@@ -43,33 +43,41 @@ Run `gos3 serve`, point the AWS CLI, an SDK, `mc` or rclone at it, and open
 ### Binary
 
 Download an archive from the [releases](https://github.com/seanmmitchell/gos3/releases)
-(Linux, macOS, Windows; amd64 and arm64), or build it with Go ≥ 1.25, Node.js 22
-and pnpm:
+(Linux, macOS, Windows; amd64 and arm64); from releases after 0.1.0 on,
+`gh attestation verify <archive> --repo seanmmitchell/gos3 --source-ref refs/heads/main`
+checks that it was built by the Release workflow on `main` (see
+[verifying a release](docs/releasing.md#verifying-a-release)). Or build
+it with Go 1.26.9 or newer, Node.js 22 and pnpm:
 
 ```sh
 make build                      # web UI + bin/gos3 with the UI embedded
 bin/gos3 serve --data ./data
 ```
 
-The startup banner shows the S3 endpoint, the web UI URL and the root
-credentials. Without `GOS3_ROOT_ACCESS_KEY` / `GOS3_ROOT_SECRET_KEY`, a key pair
-is generated on first start, printed once, and stored in
-`./data/.gos3/root-credentials.json`. To choose your own:
+The startup banner shows the S3 endpoint, the web UI URL and where the root
+credentials come from. Without `GOS3_ROOT_ACCESS_KEY` / `GOS3_ROOT_SECRET_KEY`,
+a key pair is generated on first start and stored in
+`./data/.gos3/root-credentials.json` (the banner shows it when it runs in a
+terminal; the secret is never logged). To choose your own:
 
 ```sh
-GOS3_ROOT_ACCESS_KEY=admin GOS3_ROOT_SECRET_KEY=change-me-now bin/gos3 serve --data ./data
+export $(bin/gos3 keygen)       # random GOS3_ROOT_ACCESS_KEY / GOS3_ROOT_SECRET_KEY
+bin/gos3 serve --data ./data
 ```
 
 ### Docker
 
 ```sh
-docker run -d --name gos3 -p 9000:9000 -v gos3-data:/data \
-  -e GOS3_ROOT_ACCESS_KEY=admin -e GOS3_ROOT_SECRET_KEY=change-me-now \
-  ghcr.io/seanmmitchell/gos3:latest
+docker run --rm ghcr.io/seanmmitchell/gos3:0.1.0 keygen > gos3.env   # your root keys
+docker run -d --name gos3 -p 127.0.0.1:9000:9000 -v gos3-data:/data --env-file gos3.env \
+  ghcr.io/seanmmitchell/gos3:0.1.0
 ```
 
-`latest` is the newest release; `X.Y.Z` and `X.Y` pin a release, and `dev`
-follows the development branch.
+This publishes the port on this machine only; use `-p 9000:9000` to serve
+the network. `X.Y.Z` and `X.Y` are releases, `latest` is the newest release,
+and `dev` follows the development branch. Releases after 0.1.0 carry signed
+build provenance:
+`gh attestation verify oci://ghcr.io/seanmmitchell/gos3:X.Y.Z --repo seanmmitchell/gos3 --source-ref refs/heads/main`.
 
 To build the image yourself, run `docker build -t gos3 .` or `make docker`.
 The image runs as a non-root user (uid 65532), keeps its data in `/data`, and
@@ -78,15 +86,16 @@ has a health check.
 ### Docker Compose: two nodes with discovery
 
 ```sh
-docker compose up -d --build                # node-1 on :9001, node-2 on :9002
-docker compose --profile ui up -d --build   # + the standalone web UI on :3000
+make demo                                   # node-1 on :9001, node-2 on :9002, standalone UI on :3000
 ```
 
-Sign in at `http://localhost:9001/_gos3/ui/` with `gos3admin` /
-`gos3admin-secret` and open **Discovery**: the nodes find each other through the
-UDP beacon, with seeds as a fallback. Remove everything with
-`docker compose down -v`. Because these demo keys are public, the ports are
-published on 127.0.0.1 only; see
+`make demo` writes random root keys to `.env` on first use (or put your own
+`GOS3_ROOT_ACCESS_KEY` / `GOS3_ROOT_SECRET_KEY` there, then run
+`docker compose --profile ui up -d --build`). Sign in at
+`http://localhost:9001/_gos3/ui/` with the keys from `.env` and open
+**Discovery**: the nodes find each other through the UDP beacon, with seeds
+as a fallback. Remove everything with `docker compose --profile ui down -v`.
+The ports are published on 127.0.0.1 only; see
 [docs/deployment.md](docs/deployment.md#docker-compose) to expose the demo.
 
 ### Standalone web UI
@@ -141,7 +150,8 @@ precedence over the file, environment and flags. Every key is listed in
 Use the server URL as the endpoint, **path-style** addressing (unless you set
 up [virtual-host domains](docs/deployment.md#virtual-hosted-style-domains)),
 and region `us-east-1` (or whatever `server.region` is). The examples use
-`http://localhost:9000` and the keys `admin` / `change-me-now`.
+`http://localhost:9000` and the stand-in keys `admin` / `change-me-now`:
+use your server's keys instead.
 
 ### AWS CLI
 
@@ -290,8 +300,9 @@ specified in [docs/discovery.md](docs/discovery.md).
 ## Security notes
 
 - **Root credentials**: set `GOS3_ROOT_ACCESS_KEY` / `GOS3_ROOT_SECRET_KEY`, or
-  save the generated pair, which is logged **once**. Use IAM users for
-  applications.
+  use the generated pair stored in `<data>/.gos3/root-credentials.json` (the
+  secret is shown in the startup banner on a terminal, never in the log).
+  Published example secrets are refused. Use IAM users for applications.
 - **Sensitive files**: `<data>/.gos3/iam.json` holds every IAM user's secret
   key, and `root-credentials.json` holds generated root keys. Both have mode
   0600. Keep the data directory private, and treat backups as secret.
@@ -330,13 +341,15 @@ More in [docs/security.md](docs/security.md).
 
 ## Development
 
-Requirements: Go ≥ 1.26, Node.js 22 with corepack (pnpm), and optionally Docker
-and Python 3 (for the compatibility suite). `go.mod` names the toolchain used
-for builds (`toolchain go1.26.9`, a supported release with current security
-fixes); with the default `GOTOOLCHAIN=auto` the go command downloads it.
+Requirements: Go 1.26.9 or newer, Node.js 22 with corepack (pnpm), and
+optionally Docker and Python 3 (for the compatibility suite). `go.mod`
+requires Go 1.26.9 (`go 1.26.9`, a supported release with current security
+fixes for the standard library gos3 links); with the default
+`GOTOOLCHAIN=auto` an older go command downloads it, and with
+`GOTOOLCHAIN=local` it refuses to build.
 
 ```sh
-make dev          # in-memory server on :9000 (keys gos3dev / gos3dev-secret, CORS for :3000)
+make dev          # in-memory server on 127.0.0.1:9000 (discovery off, random secret printed, CORS for :3000)
 cd web && pnpm dev   # UI with hot reload on http://localhost:3000
 ```
 

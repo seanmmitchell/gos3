@@ -150,7 +150,8 @@ func TestSignatureAgeCondition(t *testing.T) {
 // TestGlobalWildcardCORSAnonymousPostObject: PostObject is not
 // authenticated by the core, so an Authorization header or presign query
 // parameters on it do not make an anonymous form upload "signed" for the
-// global "*" CORS rule.
+// global "*" CORS rule: the cross-origin anonymous upload is refused (see
+// checkAnonymousRequest) and gets no CORS headers.
 func TestGlobalWildcardCORSAnonymousPostObject(t *testing.T) {
 	e := newTestEnv(t, withSettings(func(s *config.Settings) {
 		s.CORS = config.CORSConfig{AllowedOrigins: []string{"*"}}
@@ -174,7 +175,7 @@ func TestGlobalWildcardCORSAnonymousPostObject(t *testing.T) {
 			h[k] = v
 		}
 		resp := e.anon("POST", tc.path, body, h)
-		if resp.StatusCode/100 != 2 {
+		if resp.StatusCode != 403 {
 			t.Fatalf("POST %s %v: %d %s", tc.path, tc.hdr, resp.StatusCode, resp.Data)
 		}
 		if got := resp.Header.Get("Access-Control-Allow-Origin"); got != "" {

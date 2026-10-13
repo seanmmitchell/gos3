@@ -54,9 +54,11 @@ interface (either family may be unavailable; advertising stops only when
 neither is). Every query is checked before it is answered:
 
 - Datagrams from senders that are neither on this host nor on a directly
-  connected subnet are dropped, as are datagrams from a broadcast or
-  unspecified source address. mDNS is link-local; the port also receives
-  unicast datagrams from anywhere that can reach it.
+  connected subnet are dropped, as are datagrams from a broadcast, subnet
+  network or unspecified source address. mDNS is link-local; the port also
+  receives unicast datagrams from anywhere that can reach it. When the
+  network interfaces cannot be listed (some sandboxes), only datagrams from
+  this host are accepted.
 - Only standard queries are read. Duplicate questions are collapsed and at
   most 8 distinct questions per query are considered.
 - Only questions about this server's own records are answered: PTR for
@@ -70,6 +72,12 @@ neither is). Every query is checked before it is answered:
   value means the datagram came from off the link with a spoofed on-link
   source, and it is dropped. Legacy tools that query with a lower TTL (for
   example `dig -p 5353`) therefore get answers only when run on this host.
+  The TTL is read through IP control messages (`WSARecvMsg` with
+  `IP_PKTINFO`/`IP_RECVTTL` on Windows). On a platform where it cannot be
+  read, a warning is logged once and queries from other hosts are answered
+  by multicast to the group only (never by unicast, see below); the same
+  applies to any single datagram that arrives without a TTL. The browser
+  drops such datagrams from other hosts.
 - Each sender is rate-limited with the beacon's token bucket (a burst of 32
   answered queries, then 4 per second), and all responses together are
   limited to 50 per second. A query whose answer is not sent (the same
@@ -80,7 +88,8 @@ neither is). Every query is checked before it is answered:
   second per interface (RFC 6762 §6). Questions with the unicast-response
   bit (§5.4) and legacy queries sent from a port other than 5353 (§6.7) are
   answered by unicast to the sender, which the checks above restrict to
-  this host and its directly connected subnets. Legacy replies repeat the
+  this host and its directly connected subnets (and, where the TTL cannot
+  be read, to this host: other hosts then get the multicast answer). Legacy replies repeat the
   query ID and question and carry TTLs of at most 10 s.
 - Every response is one packet of at most 1400 bytes (additional records
   are dropped first if it would be larger).
@@ -145,13 +154,23 @@ Receivers ignore their own ID. Because nothing in a datagram is
 authenticated, a server only ever probes the sender:
 
 - Datagrams are accepted only from senders on this host or on a directly
-  connected subnet (beacons never cross a router legitimately).
+  connected subnet (beacons never cross a router legitimately), and never
+  from a broadcast or subnet network address (a reply would reach the whole
+  link). When the network interfaces cannot be listed, only datagrams from
+  this host are accepted.
 - The host of every announced URL is replaced by the datagram's source IP,
   keeping the scheme and port. Only a sender on this host may announce
-  loopback and local addresses, which are then kept as they are. Host names
+  loopback and local addresses, which are then kept as they are (so that
+  several servers on one host find each other; a host that accepts packets
+  from the network carrying its own source address would let an on-link
+  sender name local ports too, see `could not be verified` below). Host names
   in announces are never resolved. An empty `urls` means the source IP with
   the default port.
-- Announces are rate-limited per sender: a burst of 32, then 4 per second.
+- Announces are rate-limited per sender (a burst of 32, then 4 per second)
+  and in total (a burst of 256, then 128 per second). Queries are answered
+  at most 4 times in a burst, then once per second, per sender, and 20
+  times per second in total. At most 1024 senders are tracked; a new one
+  replaces the least recently active one.
 - Unicast replies to queries are sent with TTL 1.
 - A `bye` is believed only when it comes from one of the peer's known
   addresses; otherwise a verified peer is re-probed instead of being marked
@@ -216,11 +235,21 @@ scan. The server's own address is probed but left out of `found`.
 - Probes use `GET <base>/_gos3/info` with a 5 s timeout and a 64 KiB limit;
   they never use HTTP proxies or follow redirects, and HTTPS certificates are
   verified (a peer with a self-signed certificate stays unverified with a TLS
-  error).
+  error). A failed check of a beacon or mDNS sighting that named a loopback
+  or local address of this host is recorded only as `could not be
+  verified`, so the table reveals nothing about local ports.
+- A stored identity document is bounded: `name`, `version` and `region` at
+  most 256 bytes, endpoint URLs at most 512 bytes (longer ones are
+  dropped), `endpoints.all` at most 16 base URLs, `features` at most 32
+  entries of 64 bytes, and all strings together at most 4 KiB (trailing
+  `endpoints.all`, then `features` entries are dropped to fit).
 - Probes never connect to cloud metadata addresses (`169.254.169.254`,
-  `169.254.170.2`, `169.254.170.23`, `fd00:ec2::254`, `100.100.100.200`),
+  `169.254.170.2`, `169.254.170.23`, `169.254.0.23`, `168.63.129.16`,
+  `192.0.0.192`, `fd00:ec2::254`, `fd00:ec2::23`, `fd20:ce::254`,
+  `100.100.100.200`),
   unspecified addresses (`0.0.0.0/8`, `::`), multicast addresses or
-  `255.255.255.255`, also in IPv4-mapped or NAT64 (`64:ff9b::/96`) form. The
+  `255.255.255.255`, also in IPv4-mapped, IPv4-compatible or NAT64 (`64:ff9b::/96`,
+  `64:ff9b:1::/48`) form. The
   check runs on the resolved address of every connection attempt, so a host
   name that resolves there is refused too (`address not allowed`). This
   applies to the admin API probe, scans, seeds, DNS SRV targets, candidate
@@ -253,14 +282,33 @@ verified record of an ID is kept while the peer still answers:
   itself advertises it (`endpoints.s3` or `endpoints.all`, e.g. the other
   interfaces of a multi-homed server), when it is a configured seed, or
   when it comes from a DNS SRV lookup of a configured domain.
-- The table holds at most 4096 peers (unverified sightings are evicted first),
-  of which at most 256 unverified ones (a new sighting replaces the stalest),
-  and at most 32 addresses per peer.
-- Verified peers are re-probed every 30 s; peers not seen (no sighting and no
-  successful probe) for `peerTtl` are removed. Seeds are never removed.
+- The table holds at most 1024 peers with at most 16 addresses each, so it
+  (and `GET /_gos3/admin/v1/discovery`) stays a few MiB at most. Within it:
+  - at most 256 unverified sightings, and at most 16 per sender address
+    (an IPv4 address or an IPv6 /64); a new sighting replaces the stalest
+    one of its sender, else the stalest one overall, and never a verified
+    peer;
+  - at most 512 verified peers known only from beacon or mDNS
+    announcements, and at most 16 per sender address (one host can serve
+    any number of IDs); further ones are not added;
+  - peers found through seeds, DNS SRV, the admin probe or a scan are not
+    limited by these shares. When the table is full, such a peer replaces
+    the stalest unverified sighting, else the stalest peer known only from
+    announcements.
+  A scan result is bounded the same way (at most 1024 peers).
+- Verified peers are re-probed every 30 s (twice per `peerTtl` when that is
+  shorter). Unverified sightings not seen again, and verified peers without
+  a successful probe, for `peerTtl` are removed: an announcement never
+  keeps a verified peer alive, since anyone can announce any ID. Seeds are
+  never removed.
 - `GET /_gos3/admin/v1/discovery` exposes the peer table to the UI, which
   merges peer tables from every connected gos3 server plus its own local
-  discovery into a single view.
+  discovery into a single view. Records with the same ID are merged only
+  when they describe the same host (they share an observed address, or
+  each advertises the other's); otherwise the UI flags an "ID conflict"
+  and never reuses saved credentials for it. "Add as server" prefills the
+  observed (verified) address; the advertised endpoint is shown only as an
+  unverified hint.
 
 ## Security notes
 

@@ -15,6 +15,7 @@ import (
 	"encoding/base64"
 	"io"
 	"io/fs"
+	"log/slog"
 	"mime"
 	"net/http"
 	"path"
@@ -79,17 +80,34 @@ func Handler() http.Handler { return NewHandler(FS()) }
 //     immutable); everything else, HTML in particular, is "no-cache" and
 //     revalidated with a content ETag.
 //   - Every response carries X-Content-Type-Options: nosniff,
-//     Referrer-Policy: no-referrer, X-Frame-Options: DENY and
-//     Content-Security-Policy: frame-ancestors 'none'.
+//     Referrer-Policy: no-referrer, X-Frame-Options: DENY and a
+//     Content-Security-Policy that only runs the UI's own scripts: its files
+//     and the inline scripts of its HTML pages, whose hashes NewHandler
+//     computes once from fsys (see contentSecurityPolicy).
+//   - servers.json (preset connections) is served without secret keys: every
+//     UI file is public, so NewHandler strips them and logs a warning; an
+//     invalid servers.json is not served.
 //
-// Requests whose path does not start with Prefix get a 404.
+// Requests whose path does not start with Prefix get a 404. Warnings go to
+// slog.Default().
 func NewHandler(fsys fs.FS) http.Handler {
-	return &handler{fsys: fsys}
+	log := slog.Default()
+	h := &handler{fsys: fsys, csp: contentSecurityPolicy(fsys, log)}
+	if data, ok := sanitizedPresets(fsys, log); ok {
+		h.overrides = map[string][]byte{presetsFile: data}
+	}
+	return h
 }
 
 type handler struct {
-	fsys  fs.FS
-	etags sync.Map // file name -> quoted ETag (the files never change)
+	fsys fs.FS
+	csp  string // Content-Security-Policy of every response
+	// overrides replaces the content of files of fsys (a nil slice hides
+	// the file). Keys are lower case and matched case-insensitively, so a
+	// case-insensitive fsys (os.DirFS on Windows or macOS) cannot serve
+	// the original under another spelling.
+	overrides map[string][]byte
+	etags     sync.Map // file name -> quoted ETag (the files never change)
 }
 
 func (h *handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -97,7 +115,7 @@ func (h *handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	hdr.Set("X-Content-Type-Options", "nosniff")
 	hdr.Set("Referrer-Policy", "no-referrer")
 	hdr.Set("X-Frame-Options", "DENY")
-	hdr.Set("Content-Security-Policy", "frame-ancestors 'none'")
+	hdr.Set("Content-Security-Policy", h.csp)
 
 	p := r.URL.Path
 	if p+"/" == Prefix {
@@ -158,24 +176,24 @@ func (h *handler) serveFile(w http.ResponseWriter, r *http.Request, name string,
 	if !fs.ValidPath(name) {
 		return false
 	}
-	f, err := h.fsys.Open(name)
-	if err != nil {
-		return false
-	}
-	defer f.Close()
-	st, err := f.Stat()
-	if err != nil || st.IsDir() {
-		return false
-	}
 	var content io.ReadSeeker
-	if rs, ok := f.(io.ReadSeeker); ok {
-		content = rs
-	} else {
-		data, err := io.ReadAll(f)
-		if err != nil {
+	if data, ok := h.overrides[strings.ToLower(name)]; ok {
+		if data == nil {
 			return false
 		}
 		content = bytes.NewReader(data)
+	} else if f, err := h.fsys.Open(name); err != nil {
+		return false
+	} else {
+		defer f.Close()
+		st, err := f.Stat()
+		if err != nil || st.IsDir() {
+			return false
+		}
+		content, err = readSeeker(f)
+		if err != nil {
+			return false
+		}
 	}
 	etag, err := h.etag(name, content)
 	if err != nil {
@@ -194,6 +212,18 @@ func (h *handler) serveFile(w http.ResponseWriter, r *http.Request, name string,
 	// conditional requests.
 	http.ServeContent(w, r, name, time.Time{}, content)
 	return true
+}
+
+// readSeeker returns f itself when it can seek, else its content in memory.
+func readSeeker(f fs.File) (io.ReadSeeker, error) {
+	if rs, ok := f.(io.ReadSeeker); ok {
+		return rs, nil
+	}
+	data, err := io.ReadAll(f)
+	if err != nil {
+		return nil, err
+	}
+	return bytes.NewReader(data), nil
 }
 
 // etag returns the cached content ETag of name, hashing content (and

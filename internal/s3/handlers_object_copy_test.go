@@ -386,12 +386,12 @@ func TestObjectDeleteObjectsRaw(t *testing.T) {
 	// Conditional per-key deletes with <ETag>.
 	info := e.putObject("bkt", "cond", []byte("x"), storage.ObjectMeta{})
 	body = `<Delete><Object><Key>cond</Key><ETag>"wrong"</ETag></Object></Delete>`
-	resp = e.signed("POST", "/bkt?delete", []byte(body), nil)
+	resp = e.signed("POST", "/bkt?delete", []byte(body), md5h(body))
 	if !strings.Contains(string(resp.Data), "<Code>PreconditionFailed</Code>") {
 		t.Errorf("conditional: %s", resp.Data)
 	}
 	body = `<Delete><Object><Key>cond</Key><ETag>"` + info.ETag + `"</ETag></Object></Delete>`
-	resp = e.signed("POST", "/bkt?delete", []byte(body), nil)
+	resp = e.signed("POST", "/bkt?delete", []byte(body), md5h(body))
 	if !strings.Contains(string(resp.Data), "<Deleted><Key>cond</Key></Deleted>") {
 		t.Errorf("conditional ok: %s", resp.Data)
 	}
@@ -402,11 +402,12 @@ func TestObjectDeleteObjectsLocked(t *testing.T) {
 	objLockBucket(t, e, "lock")
 	v := e.putObject("lock", "k", []byte("x"), storage.ObjectMeta{RetentionMode: "GOVERNANCE", RetainUntil: time.Now().Add(time.Hour)}).VersionID
 	body := `<Delete><Object><Key>k</Key><VersionId>` + v + `</VersionId></Object></Delete>`
-	resp := e.signed("POST", "/lock?delete", []byte(body), nil)
+	sum := base64.StdEncoding.EncodeToString(md5Sum16([]byte(body)))
+	resp := e.signed("POST", "/lock?delete", []byte(body), objHdr("Content-MD5", sum))
 	if !strings.Contains(string(resp.Data), "<Code>AccessDenied</Code>") {
 		t.Errorf("locked: %s", resp.Data)
 	}
-	resp = e.signed("POST", "/lock?delete", []byte(body), objHdr("X-Amz-Bypass-Governance-Retention", "true"))
+	resp = e.signed("POST", "/lock?delete", []byte(body), objHdr("X-Amz-Bypass-Governance-Retention", "true", "Content-MD5", sum))
 	if !strings.Contains(string(resp.Data), "<Deleted>") {
 		t.Errorf("bypass: %s", resp.Data)
 	}

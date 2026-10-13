@@ -7,7 +7,10 @@ PNPM    ?= pnpm
 BIN     ?= bin/gos3
 IMAGE   ?= gos3
 
-VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo dev)
+# Tag names may contain shell metacharacters (a fetched remote's tags are
+# followed automatically), so only version characters of `git describe` are
+# kept before VERSION is pasted into recipes.
+VERSION ?= $(shell (git describe --tags --always --dirty 2>/dev/null || echo dev) | tr -cd 'A-Za-z0-9._+-')
 COMMIT  ?= $(shell git rev-parse --short=12 HEAD 2>/dev/null)
 DATE    ?= $(shell date -u +%Y-%m-%dT%H:%M:%SZ)
 
@@ -18,11 +21,15 @@ UI_DIST        := internal/webui/dist
 UI_PLACEHOLDER := internal/webui/placeholder.html
 UI_BUILD       := web/.output/public
 
-# Root credentials of `make dev` (any 3+ char key / 8+ char secret).
-DEV_ACCESS_KEY ?= gos3dev
-DEV_SECRET_KEY ?= gos3dev-secret
-DEV_ADDRESS    ?= :9000
-DEV_UI_ORIGIN  ?= http://localhost:3000
+# `make dev`: root access key and secret key. An empty DEV_SECRET_KEY uses a
+# random secret generated once per checkout and kept in DEV_SECRET_FILE. The
+# server listens on loopback only: with another DEV_ADDRESS, anyone who can
+# reach it and knows the keys is root.
+DEV_ACCESS_KEY  ?= gos3dev
+DEV_SECRET_KEY  ?=
+DEV_SECRET_FILE ?= bin/.dev-secret-key
+DEV_ADDRESS     ?= 127.0.0.1:9000
+DEV_UI_ORIGIN   ?= http://localhost:3000
 
 .DEFAULT_GOAL := build
 .PHONY: help build build-go ui ui-clean notices test test-go test-web e2e lint fmt dev clean docker
@@ -76,22 +83,30 @@ lint: ## check formatting and run go vet
 fmt: ## format the Go code
 	gofmt -w cmd internal $$(test -d test && echo test)
 
-dev: ## run an ephemeral in-memory server for UI development (pair with `cd web && pnpm dev`)
-	@echo "gos3 dev server: http://localhost$(DEV_ADDRESS)  (memory backend, data is lost on exit)"
-	@echo "  access key: $(DEV_ACCESS_KEY)"
-	@echo "  secret key: $(DEV_SECRET_KEY)"
-	@echo "  CORS allows $(DEV_UI_ORIGIN); start the UI with: cd web && pnpm install && pnpm dev"
-	@echo "  then add the server http://localhost$(DEV_ADDRESS) with the keys above."
-	GOS3_ROOT_ACCESS_KEY=$(DEV_ACCESS_KEY) GOS3_ROOT_SECRET_KEY=$(DEV_SECRET_KEY) \
-		$(GO) run ./cmd/gos3 serve --backend memory --address $(DEV_ADDRESS) \
-		--cors-origin $(DEV_UI_ORIGIN) --log-level debug
+dev: ## run an ephemeral in-memory server on 127.0.0.1:9000 for UI development (pair with `cd web && pnpm dev`)
+	@secret='$(DEV_SECRET_KEY)'; \
+	if [ -z "$$secret" ]; then \
+		if [ ! -s '$(DEV_SECRET_FILE)' ]; then \
+			mkdir -p "$$(dirname '$(DEV_SECRET_FILE)')"; \
+			(umask 077 && od -An -tx1 -N16 /dev/urandom | tr -d ' \n' > '$(DEV_SECRET_FILE)'); \
+		fi; \
+		secret="$$(cat '$(DEV_SECRET_FILE)')"; \
+	fi; \
+	echo "gos3 dev server: http://$(DEV_ADDRESS)  (memory backend, data is lost on exit; discovery off)"; \
+	echo "  access key: $(DEV_ACCESS_KEY)"; \
+	echo "  secret key: $$secret  (DEV_SECRET_KEY, or the one kept in $(DEV_SECRET_FILE))"; \
+	echo "  CORS allows $(DEV_UI_ORIGIN); start the UI with: cd web && pnpm install && pnpm dev"; \
+	echo "  then add the server http://$(DEV_ADDRESS) with the keys above."; \
+	GOS3_ROOT_ACCESS_KEY='$(DEV_ACCESS_KEY)' GOS3_ROOT_SECRET_KEY="$$secret" \
+		exec $(GO) run ./cmd/gos3 serve --backend memory --address '$(DEV_ADDRESS)' --no-discovery \
+		--cors-origin '$(DEV_UI_ORIGIN)' --log-level debug
 
 clean: ui-clean ## remove build output (binary, UI build) and restore the UI placeholder
 	rm -rf bin web/.output web/.nuxt
 
 docker: ## build the container image (gos3:<git version>, override IMAGE / VERSION) from the Dockerfile
-	docker build -t $(IMAGE):$(VERSION) \
-		--build-arg VERSION=$(VERSION) --build-arg COMMIT=$(COMMIT) --build-arg DATE=$(DATE) .
+	docker build -t '$(IMAGE):$(VERSION)' \
+		--build-arg 'VERSION=$(VERSION)' --build-arg 'COMMIT=$(COMMIT)' --build-arg 'DATE=$(DATE)' .
 
 # --- additional targets (docs, deployment, compatibility) ---------------------
 
@@ -100,7 +115,7 @@ UI_IMAGE ?= gos3-ui
 .PHONY: docker-ui compat e2e-web demo demo-down
 
 docker-ui: ## build the standalone web UI image (gos3-ui:<git version>, override UI_IMAGE / VERSION)
-	docker build -f deploy/docker/web.Dockerfile -t $(UI_IMAGE):$(VERSION) .
+	docker build -f deploy/docker/web.Dockerfile -t '$(UI_IMAGE):$(VERSION)' .
 
 compat: ## run the boto3 / AWS CLI compatibility suite (test/compat/run.sh)
 	test/compat/run.sh
@@ -110,8 +125,21 @@ e2e-web: build ## run the Playwright suites (mocked, real server, standalone) ag
 	cd web && GOS3_BIN=$(CURDIR)/$(BIN) E2E_SKIP_UI_BUILD=1 $(PNPM) test:e2e:real
 	cd web && GOS3_BIN=$(CURDIR)/$(BIN) $(PNPM) test:e2e:standalone
 
+# docker-compose.yml has no default root keys: on first use, write a random
+# pair to .env (git- and docker-ignored), which docker compose reads.
 demo: ## start the two-node docker compose demo with the standalone UI (localhost ports 9001, 9002, 3000)
-	GOS3_VERSION=$(VERSION) docker compose --profile ui up -d --build
+	@(umask 077 && touch .env); \
+	if [ -z "$$GOS3_ROOT_ACCESS_KEY" ] && ! grep -qs '^GOS3_ROOT_ACCESS_KEY=' .env; then \
+		echo "GOS3_ROOT_ACCESS_KEY=gos3admin" >> .env; \
+	fi; \
+	if [ -z "$$GOS3_ROOT_SECRET_KEY" ] && ! grep -qs '^GOS3_ROOT_SECRET_KEY=' .env; then \
+		echo "GOS3_ROOT_SECRET_KEY=$$(od -An -tx1 -N16 /dev/urandom | tr -d ' \n')" >> .env; \
+	fi; \
+	echo "Demo root keys (sign in at http://localhost:9001/_gos3/ui/):"; \
+	grep '^GOS3_ROOT_' .env || echo "  from your environment"
+	GOS3_VERSION='$(VERSION)' docker compose --profile ui up -d --build
 
+# `down` needs no keys, but compose refuses to read the file without them.
 demo-down: ## stop the docker compose demo (add -v to the command to delete its volumes)
-	docker compose --profile ui down
+	GOS3_ROOT_ACCESS_KEY="$${GOS3_ROOT_ACCESS_KEY:-unused}" GOS3_ROOT_SECRET_KEY="$${GOS3_ROOT_SECRET_KEY:-unused}" \
+		docker compose --profile ui down

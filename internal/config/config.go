@@ -62,9 +62,23 @@ type ServerConfig struct {
 	// addresses) whose forwarding headers are honoured with
 	// TrustProxyHeaders: requests from other addresses are taken at face
 	// value, and X-Forwarded-For is walked from the right past these
-	// addresses to find the client. Empty: any peer is trusted and the
-	// rightmost X-Forwarded-For entry is the client (a single proxy).
+	// addresses to find the client. Required (non-empty) when
+	// TrustProxyHeaders is set.
 	TrustedProxies []string `yaml:"trusted_proxies"`
+	// AllowedHosts lists extra host names (Host header, without port) that
+	// clients use to reach this server, besides the ones it knows itself:
+	// IP addresses, localhost, the OS host name (and <name>.local), the
+	// hosts of public_url and address, and the virtual-host domains.
+	// "*.example.com" allows every subdomain; "*" alone turns the Host
+	// check off. Empty: requests for unknown hosts are served only when
+	// they are signed. Non-empty: requests for unknown hosts are refused.
+	// See docs/security.md (DNS rebinding).
+	AllowedHosts []string `yaml:"allowed_hosts"`
+	// MaxConnections caps the number of simultaneously open client
+	// connections (0 = no limit, the default). At the cap a new connection
+	// closes the longest-idle keep-alive connection, or is closed itself
+	// when none is idle.
+	MaxConnections int `yaml:"max_connections"`
 }
 
 // StorageConfig selects the backend.
@@ -87,6 +101,12 @@ type AuthConfig struct {
 	RootAccessKey string `yaml:"root_access_key"`
 	RootSecretKey string `yaml:"root_secret_key"`
 	StrictRegion  bool   `yaml:"strict_region"`
+	// InsecureDemoCredentials allows a root secret key that is published
+	// in documentation or demo files (see IsDemoSecret). Without it such a
+	// configuration is rejected: anyone, including any website the
+	// operator visits, can sign requests with a published key. For
+	// throwaway local demos only.
+	InsecureDemoCredentials bool `yaml:"insecure_demo_credentials"`
 }
 
 // UIConfig configures the embedded web UI served at /_gos3/ui/.

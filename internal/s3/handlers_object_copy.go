@@ -3,17 +3,21 @@ package s3
 // CopyObject and DeleteObjects. Owned by the s3-object work item.
 
 import (
+	"bytes"
 	"crypto/md5"
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/xml"
 	"errors"
+	"fmt"
 	"hash"
 	"io"
 	"log/slog"
 	"maps"
 	"net/http"
+	"strconv"
 	"strings"
+	"time"
 
 	"github.com/seanmmitchell/gos3/internal/s3err"
 	"github.com/seanmmitchell/gos3/internal/storage"
@@ -154,6 +158,10 @@ func (s *Server) handleCopyObject(w http.ResponseWriter, r *http.Request, rc *re
 		meta.CacheControl = info.CacheControl
 		meta.Expires = info.Expires
 		meta.UserMeta = maps.Clone(info.UserMeta)
+		// The source's metadata may predate the current limits.
+		if err := validateStoredMeta(meta); err != nil {
+			return err
+		}
 	}
 	if tagDir == directiveCopy {
 		meta.Tags = maps.Clone(info.Tags)
@@ -346,17 +354,25 @@ type deleteError struct {
 // bounds the bytes read and parsed, not the memory kept.
 const maxDeleteObjectsBody = maxDeleteObjects*6450 + 4096
 
+// maxDeleteETagLength bounds an <ETag> of a DeleteObjects entry: far more
+// than any ETag (or list of ETags) a client would compare against.
+const maxDeleteETagLength = 1024
+
 // maxDeleteObjectsElements bounds the XML elements of a DeleteObjects
 // body: an <Object> and its three fields are four elements; six per entry
 // (the 1001st included, which is rejected) leave room for others.
 const maxDeleteObjectsElements = (maxDeleteObjects+1)*6 + 64
 
 // parseDeleteRequest reads a DeleteObjects document from x. It stops with
-// MalformedXML at the 1001st <Object>, before reading the rest of the
-// body, and otherwise accepts what encoding/xml accepted for deleteRequest
-// (unknown elements ignored, the last of repeated fields wins). The body
-// is read to its end, so its Content-MD5 / checksum is verified, before it
-// returns successfully.
+// MalformedXML at the 1001st <Object>, with KeyTooLongError at a <Key>
+// longer than 1024 bytes and with InvalidArgument at a <VersionId> or
+// <ETag> longer than 1024 bytes (no such key or version can exist), before
+// reading the rest of the body, and otherwise accepts what encoding/xml
+// accepted for deleteRequest (unknown elements ignored, the last of
+// repeated fields wins). Rejecting oversized values here keeps a request
+// (possibly anonymous) from having them echoed back in per-key <Error>
+// entries. The body is read to its end, so its Content-MD5 / checksum is
+// verified, before it returns successfully.
 func parseDeleteRequest(x *xmlStream) (deleteRequest, error) {
 	var req deleteRequest
 	if err := x.root("Delete"); err != nil {
@@ -384,17 +400,30 @@ func parseDeleteRequest(x *xmlStream) (deleteRequest, error) {
 				return req, s3err.ErrMalformedXML
 			}
 			var o deleteIdentifier
+			var tooLong error
 			if err := x.fields(func(name, v string) {
 				switch name {
 				case "Key":
 					o.Key = v
+					if len(v) > maxKeyLength && tooLong == nil {
+						tooLong = s3err.ErrKeyTooLong.With("MaxSizeAllowed", strconv.Itoa(maxKeyLength)).With("Size", strconv.Itoa(len(v)))
+					}
 				case "VersionId":
 					o.VersionID = v
+					if len(v) > maxVersionIDLength && tooLong == nil {
+						tooLong = s3err.ErrInvalidArgument.WithMessage("Invalid version id specified").With("ArgumentName", "VersionId")
+					}
 				case "ETag":
 					o.ETag = v
+					if len(v) > maxDeleteETagLength && tooLong == nil {
+						tooLong = s3err.ErrInvalidArgument.WithMessage("Invalid ETag specified").With("ArgumentName", "ETag")
+					}
 				}
 			}); err != nil {
 				return req, err
+			}
+			if tooLong != nil {
+				return req, tooLong
 			}
 			req.Objects = append(req.Objects, o)
 		default:
@@ -406,26 +435,44 @@ func parseDeleteRequest(x *xmlStream) (deleteRequest, error) {
 	return req, x.finish()
 }
 
+// errDeleteObjectsChecksumRequired is returned for a DeleteObjects request
+// without Content-MD5 or an x-amz-checksum-* header (or trailer).
+var errDeleteObjectsChecksumRequired = s3err.ErrInvalidRequest.WithMessage(
+	"Missing required header for this request: Content-MD5 or x-amz-checksum-*")
+
 // handleDeleteObjects implements DeleteObjects: up to 1000 keys, each
 // authorized (s3:DeleteObject / s3:DeleteObjectVersion) and deleted on its
 // own; failures are reported per key in the DeleteResult. Quiet mode
 // omits successful deletions.
 //
+// As on AWS, the body must carry an integrity check (Content-MD5 or an
+// x-amz-checksum-* header or trailer), verified against it. Besides
+// protecting the list of keys to delete, this makes the request one a web
+// page cannot send cross-origin without a CORS preflight: a form can POST
+// an XML body, but not with such a header.
+//
 // The body is read before anything is authorized (the keys to authorize
 // are in it), possibly from an anonymous caller: it is streamed with
 // bounded size and work (parseDeleteRequest) and within the absolute
 // pre-authorization deadline the core set (see Server.limitPreAuthBody).
+// The result is written as the keys are processed (deleteResultWriter), so
+// its memory does not grow with the request either.
 func (s *Server) handleDeleteObjects(w http.ResponseWriter, r *http.Request, rc *reqContext) error {
 	ctx := r.Context()
 	bi, err := s.bucketInfo(ctx, rc)
 	if err != nil {
 		return err
 	}
-	x, err := s.validatedXMLStream(r, rc, maxDeleteObjectsBody, maxDeleteObjectsElements)
+	// validatedXMLStream, keeping the payload reader to ask whether a
+	// digest was verified.
+	if n := rc.contentLength(); n > maxDeleteObjectsBody {
+		return s3err.ErrMaxMessageLengthExceeded
+	}
+	p, err := s.newPayloadReader(r, rc, payloadOptions{MaxSize: maxDeleteObjectsBody + 1})
 	if err != nil {
 		return err
 	}
-	req, err := parseDeleteRequest(x)
+	req, err := parseDeleteRequest(newXMLStream(p, maxDeleteObjectsBody, maxDeleteObjectsElements))
 	if err != nil {
 		return err
 	}
@@ -440,20 +487,115 @@ func (s *Server) handleDeleteObjects(w http.ResponseWriter, r *http.Request, rc 
 			return s3err.ErrMalformedXML
 		}
 	}
-	res := deleteResult{}
+	if !p.verified() {
+		return errDeleteObjectsChecksumRequired
+	}
+	// Reading the body may have taken a while.
+	if err := s.checkCredentialsCurrent(rc); err != nil {
+		return err
+	}
+	rc.addLog(slog.Int("delete_keys", len(req.Objects)))
+	out := newDeleteResultWriter(w, s.bodyIdleTimeout)
 	for _, o := range req.Objects {
 		d, err := s.deleteObjectsEntry(r, rc, bi, o)
 		if err != nil {
 			e := s.toS3Error(ctx, rc, err)
-			res.Errors = append(res.Errors, deleteError{Key: o.Key, VersionID: o.VersionID, Code: e.Code, Message: e.Message})
+			out.add("Error", deleteError{Key: o.Key, VersionID: o.VersionID, Code: e.Code, Message: e.Message})
 			continue
 		}
 		if !req.Quiet {
-			res.Deleted = append(res.Deleted, d)
+			out.add("Deleted", d)
 		}
 	}
-	rc.addLog(slog.Int("delete_keys", len(req.Objects)))
-	return writeXML(w, http.StatusOK, res)
+	return out.finish()
+}
+
+// deleteResultFlushSize is how much of a DeleteResult is buffered before
+// it is sent; a result that fits is sent with a Content-Length at the end.
+const deleteResultFlushSize = 32 << 10
+
+// deleteResultWriter writes a DeleteResult document entry by entry. Up to
+// deleteResultFlushSize bytes are buffered; beyond that the 200 response
+// starts and the buffer is sent whenever it fills, each write with a
+// deadline (the idle timeout of request bodies) so that a client that
+// stops reading cannot hold the request. All per-key outcomes are entries,
+// so nothing can fail the request once the response has started. When the
+// client is gone, the remaining keys are still processed (as when the
+// result is buffered) but nothing more is written.
+type deleteResultWriter struct {
+	w       http.ResponseWriter
+	ctl     *http.ResponseController
+	timeout time.Duration
+	buf     bytes.Buffer
+	enc     *xml.Encoder
+	started bool  // the 200 header has been written
+	err     error // the first write or encoding failure
+}
+
+func newDeleteResultWriter(w http.ResponseWriter, timeout time.Duration) *deleteResultWriter {
+	d := &deleteResultWriter{w: w, ctl: http.NewResponseController(w), timeout: timeout}
+	d.buf.WriteString(xmlHeader)
+	d.buf.WriteString(`<DeleteResult xmlns="` + s3Namespace + `">`)
+	d.enc = xml.NewEncoder(&d.buf)
+	return d
+}
+
+// add appends the element name (Deleted or Error) with the content of v.
+func (d *deleteResultWriter) add(name string, v any) {
+	if d.err != nil {
+		return
+	}
+	if err := d.enc.EncodeElement(v, xml.StartElement{Name: xml.Name{Local: name}}); err != nil {
+		d.err = err
+		return
+	}
+	if err := d.enc.Flush(); err != nil {
+		d.err = err
+		return
+	}
+	if d.buf.Len() >= deleteResultFlushSize {
+		d.send()
+	}
+}
+
+// send writes the buffered bytes, starting the response if needed.
+func (d *deleteResultWriter) send() {
+	if !d.started {
+		h := d.w.Header()
+		h.Set("Content-Type", "application/xml")
+		h.Del("Content-Length")
+		d.w.WriteHeader(http.StatusOK)
+		d.started = true
+	}
+	if d.timeout > 0 {
+		_ = d.ctl.SetWriteDeadline(time.Now().Add(d.timeout))
+	}
+	if _, err := d.w.Write(d.buf.Bytes()); err != nil {
+		d.err = err
+	}
+	d.buf.Reset()
+}
+
+// finish completes the document. Before the response has started it is
+// written whole (or an encoding failure is returned for the core to
+// render); afterwards the rest is sent and the write deadline cleared.
+func (d *deleteResultWriter) finish() error {
+	if !d.started {
+		if d.err != nil {
+			return fmt.Errorf("s3: encode DeleteResult: %w", d.err)
+		}
+		d.buf.WriteString("</DeleteResult>")
+		writeBody(d.w, http.StatusOK, "application/xml", d.buf.Bytes())
+		return nil
+	}
+	if d.err == nil {
+		d.buf.WriteString("</DeleteResult>")
+		d.send()
+	}
+	if d.timeout > 0 {
+		_ = d.ctl.SetWriteDeadline(time.Time{})
+	}
+	return nil
 }
 
 // deleteObjectsEntry deletes one key of a DeleteObjects request.
@@ -468,6 +610,11 @@ func (s *Server) deleteObjectsEntry(r *http.Request, rc *reqContext, bi storage.
 	if o.VersionID != "" {
 		action = "s3:DeleteObjectVersion"
 	}
+	// Every entry is decided on a fresh lookup of its object: an earlier
+	// entry may have deleted (and someone else re-created) the same key,
+	// and a decision made on the object as it was then must not be reused.
+	// deleteObjectVersion then ties the delete to the version evaluated.
+	rc.authzObjects = nil
 	if err := s.authorize(r, rc, action, bi.Name, o.Key, o.VersionID); err != nil {
 		return deletedEntry{}, err
 	}

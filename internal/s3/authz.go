@@ -140,6 +140,11 @@ func (s *Server) authorizeTarget(ctx context.Context, r *http.Request, rc *reqCo
 		rc.authzReason = "root user"
 		return nil
 	}
+	if id.IsAnonymous {
+		if err := s.checkAnonymousRequest(ctx, r, rc); err != nil {
+			return err
+		}
+	}
 	if s.iam == nil {
 		rc.authzReason = "no IAM manager configured"
 		return s3err.ErrAccessDenied
