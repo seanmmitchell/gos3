@@ -21,6 +21,7 @@ import (
 
 	"github.com/seanmmitchell/gos3/internal/clientip"
 	"github.com/seanmmitchell/gos3/internal/discovery"
+	"github.com/seanmmitchell/gos3/internal/storage/compress"
 )
 
 // Defaults that are not obvious from Default().
@@ -36,6 +37,12 @@ const (
 	// DefaultMaxConnections is the default server.max_connections (no
 	// limit: the process's file descriptor limit applies).
 	DefaultMaxConnections = 0
+	// DefaultCompressionLevel is the default compression.level (DEFLATE
+	// level 1: fastest, still about 3x on source code and text).
+	DefaultCompressionLevel = compress.DefaultLevel
+	// DefaultCompressionMinSize is the default compression.min_size: the
+	// smallest object that can save a file system block.
+	DefaultCompressionMinSize = 4096
 	// MinRootSecretLen is the root secret key length below which gos3
 	// warns at startup (a short secret can be brute-forced offline from a
 	// single captured signed request).
@@ -88,6 +95,18 @@ var DefaultExposeHeaders = []string{
 	"x-amz-abort-date", "x-amz-abort-rule-id",
 }
 
+// DefaultSkipContentTypes are the media types stored uncompressed by
+// default (compression.skip_content_types): formats that are compressed
+// already, where DEFLATE would spend CPU for nothing.
+var DefaultSkipContentTypes = []string{
+	"image/jpeg", "image/png", "image/gif", "image/webp", "image/avif", "image/heic", "image/heif", "image/jxl",
+	"video/*", "audio/*", "font/woff", "font/woff2",
+	"application/zip", "application/gzip", "application/x-gzip", "application/zstd", "application/x-bzip2",
+	"application/x-xz", "application/x-7z-compressed", "application/x-rar-compressed", "application/vnd.rar",
+	"application/x-lz4", "application/java-archive", "application/epub+zip",
+	"application/vnd.openxmlformats-officedocument.*", "application/vnd.oasis.opendocument.*",
+}
+
 // Default returns the default configuration. Name defaults to the host name
 // (truncated to MaxNameLen). Storage.Path is DefaultDataPath; note that Load
 // only keeps it for the fs backend: a memory backend whose path is not
@@ -128,6 +147,12 @@ func Default() Config {
 		Logging:   LoggingConfig{Level: "info", Format: "text", AccessLog: true},
 		Lifecycle: LifecycleConfig{Enabled: true, Interval: DefaultLifecycleEvery},
 		Metrics:   MetricsConfig{Enabled: true},
+		Compression: CompressionConfig{
+			Mode:             CompressionOptional,
+			Level:            DefaultCompressionLevel,
+			MinSize:          DefaultCompressionMinSize,
+			SkipContentTypes: slices.Clone(DefaultSkipContentTypes),
+		},
 	}
 }
 
@@ -222,6 +247,7 @@ var yamlSections = map[string]string{
 	"config.LoggingConfig":     "logging",
 	"config.LifecycleConfig":   "lifecycle",
 	"config.MetricsConfig":     "metrics",
+	"config.CompressionConfig": "compression",
 }
 
 // describeUnknownField rewrites an unknown-field message in terms of YAML
@@ -232,7 +258,7 @@ func describeUnknownField(m string) string {
 		return fmt.Sprintf("unknown key %q in section %q", sub[1], sec)
 	}
 	if sub[2] == "config.Config" {
-		return fmt.Sprintf("unknown top-level key %q (expected server, storage, auth, ui, cors, discovery, logging, lifecycle or metrics)", sub[1])
+		return fmt.Sprintf("unknown top-level key %q (expected server, storage, auth, ui, cors, discovery, logging, lifecycle, metrics or compression)", sub[1])
 	}
 	return fmt.Sprintf("unknown key %q", sub[1])
 }
@@ -291,6 +317,14 @@ func (c *Config) Normalize() {
 	c.Discovery.DNSSRV = trimList(c.Discovery.DNSSRV)
 	c.Logging.Level = strings.ToLower(strings.TrimSpace(c.Logging.Level))
 	c.Logging.Format = strings.ToLower(strings.TrimSpace(c.Logging.Format))
+	c.Compression.Mode = strings.ToLower(strings.TrimSpace(c.Compression.Mode))
+	if c.Compression.Mode == "" {
+		c.Compression.Mode = CompressionOptional
+	}
+	if c.Compression.Level == 0 {
+		c.Compression.Level = DefaultCompressionLevel
+	}
+	c.Compression.SkipContentTypes = trimList(c.Compression.SkipContentTypes)
 }
 
 func trimList(in []string) []string {
@@ -385,20 +419,22 @@ func (c Config) Validate() error {
 // Config fields they are derived from (see SettingsFrom). Paths that are the
 // same in both forms (e.g. "logging.level", "discovery.seeds") are absent.
 var settingsYAMLKeys = map[string]string{
-	"name":                      "server.name",
-	"region":                    "server.region",
-	"publicUrl":                 "server.public_url",
-	"domains":                   "server.domains",
-	"cors.allowedOrigins":       "cors.allowed_origins",
-	"cors.allowedHeaders":       "cors.allowed_headers",
-	"cors.exposeHeaders":        "cors.expose_headers",
-	"cors.maxAgeSeconds":        "cors.max_age_seconds",
-	"discovery.beaconGroup":     "discovery.beacon_group",
-	"discovery.beaconInterval":  "discovery.beacon_interval",
-	"discovery.peerTtl":         "discovery.peer_ttl",
-	"discovery.dnsSrv":          "discovery.dns_srv",
-	"discovery.maxScanHosts":    "discovery.max_scan_hosts",
-	"lifecycle.intervalSeconds": "lifecycle.interval",
+	"name":                         "server.name",
+	"region":                       "server.region",
+	"publicUrl":                    "server.public_url",
+	"domains":                      "server.domains",
+	"cors.allowedOrigins":          "cors.allowed_origins",
+	"cors.allowedHeaders":          "cors.allowed_headers",
+	"cors.exposeHeaders":           "cors.expose_headers",
+	"cors.maxAgeSeconds":           "cors.max_age_seconds",
+	"discovery.beaconGroup":        "discovery.beacon_group",
+	"discovery.beaconInterval":     "discovery.beacon_interval",
+	"discovery.peerTtl":            "discovery.peer_ttl",
+	"discovery.dnsSrv":             "discovery.dns_srv",
+	"discovery.maxScanHosts":       "discovery.max_scan_hosts",
+	"lifecycle.intervalSeconds":    "lifecycle.interval",
+	"compression.minSize":          "compression.min_size",
+	"compression.skipContentTypes": "compression.skip_content_types",
 }
 
 // yamlField translates a FieldError path ("cors.allowedOrigins[2]") to the
@@ -516,6 +552,18 @@ func SettingsFrom(c Config) Settings {
 	if region == "" {
 		region = DefaultRegion
 	}
+	comp := CompressionSettings{
+		Mode:             c.Compression.Mode,
+		Level:            c.Compression.Level,
+		MinSize:          c.Compression.MinSize,
+		SkipContentTypes: c.Compression.SkipContentTypes,
+	}
+	if comp.Mode == "" {
+		comp.Mode = CompressionOptional
+	}
+	if comp.Level == 0 {
+		comp.Level = DefaultCompressionLevel
+	}
 	s := Settings{
 		Name:          c.Server.Name,
 		Region:        region,
@@ -528,6 +576,7 @@ func SettingsFrom(c Config) Settings {
 		Logging:       c.Logging,
 		Lifecycle:     LifecycleSettings{Enabled: c.Lifecycle.Enabled, IntervalSeconds: int64(interval / time.Second)},
 		MetricsPublic: c.Metrics.Public,
+		Compression:   comp,
 	}
 	return normalizeSettings(cloneSettings(s))
 }
@@ -547,6 +596,7 @@ func normalizeSettings(s Settings) Settings {
 	s.CORS.ExposeHeaders = nn(s.CORS.ExposeHeaders)
 	s.Discovery.Seeds = nn(s.Discovery.Seeds)
 	s.Discovery.DNSSRV = nn(s.Discovery.DNSSRV)
+	s.Compression.SkipContentTypes = nn(s.Compression.SkipContentTypes)
 	return s
 }
 

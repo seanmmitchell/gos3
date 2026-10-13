@@ -7,9 +7,13 @@ import (
 	"sync"
 
 	"github.com/seanmmitchell/gos3/internal/storage"
+	"github.com/seanmmitchell/gos3/internal/storage/compress"
 )
 
-var _ storage.VersionImporter = (*Backend)(nil)
+var (
+	_ storage.VersionImporter     = (*Backend)(nil)
+	_ storage.CompressingImporter = (*Backend)(nil)
+)
 
 // versionWriter is the storage.VersionWriter of the memory backend.
 type versionWriter struct {
@@ -20,11 +24,23 @@ type versionWriter struct {
 	mu   sync.Mutex
 	buf  []byte
 	done bool
+	// zw compresses into buf when the version is stored compressed.
+	zw          *compress.Writer
+	compression string
 }
 
 // NewVersionWriter starts writing an imported version of bucket/key (see
 // storage.VersionImporter).
 func (b *Backend) NewVersionWriter(ctx context.Context, bucketName, key string) (storage.VersionWriter, error) {
+	return b.NewVersionWriterWith(ctx, bucketName, key, storage.WriteOptions{})
+}
+
+// NewVersionWriterWith is NewVersionWriter with write options (see
+// storage.CompressingImporter).
+func (b *Backend) NewVersionWriterWith(ctx context.Context, bucketName, key string, opts storage.WriteOptions) (storage.VersionWriter, error) {
+	if err := checkCompression(opts.Compression); err != nil {
+		return nil, err
+	}
 	if err := validKey(key); err != nil {
 		return nil, err
 	}
@@ -33,7 +49,14 @@ func (b *Backend) NewVersionWriter(ctx context.Context, bucketName, key string) 
 		return nil, err
 	}
 	bk.mu.RUnlock()
-	return &versionWriter{b: b, bk: bk, name: bucketName, key: key}, nil
+	w := &versionWriter{b: b, bk: bk, name: bucketName, key: key}
+	if opts.Compression.Enabled() {
+		w.compression = opts.Compression.Algorithm
+		if w.zw, err = compress.NewWriter((*appendWriter)(&w.buf), opts.Compression.Level); err != nil {
+			return nil, err
+		}
+	}
+	return w, nil
 }
 
 func (w *versionWriter) Write(p []byte) (int, error) {
@@ -41,6 +64,9 @@ func (w *versionWriter) Write(p []byte) (int, error) {
 	defer w.mu.Unlock()
 	if w.done {
 		return 0, errWriterDone
+	}
+	if w.zw != nil {
+		return w.zw.Write(p)
 	}
 	w.buf = append(w.buf, p...)
 	return len(p), nil
@@ -57,14 +83,29 @@ func (w *versionWriter) Commit(ctx context.Context, info storage.ObjectInfo) (st
 		return storage.ObjectInfo{}, errWriterDone
 	}
 	w.done = true
+	var enc stored
+	if w.zw != nil {
+		if err := w.zw.Close(); err != nil {
+			w.buf = nil
+			w.mu.Unlock()
+			return storage.ObjectInfo{}, err
+		}
+		if w.zw.Size() > 0 {
+			enc = stored{compression: w.compression, size: w.zw.Size()}
+		}
+	}
 	data := slices.Clip(w.buf)
 	w.buf = nil
 	w.mu.Unlock()
+	contentSize := int64(len(data))
+	if enc.compression != "" {
+		contentSize = enc.size
+	}
 
 	if !storage.ValidImportedVersionID(info.VersionID) {
 		return storage.ObjectInfo{}, fmt.Errorf("%w: version ID %.80q", storage.ErrInvalidName, info.VersionID)
 	}
-	if info.DeleteMarker && len(data) > 0 {
+	if info.DeleteMarker && contentSize > 0 {
 		return storage.ObjectInfo{}, fmt.Errorf("%w: delete marker %s/%q with data", storage.ErrInvalidName, w.name, w.key)
 	}
 	if err := w.b.relock(ctx, w.bk); err != nil {
@@ -81,6 +122,8 @@ func (w *versionWriter) Commit(ctx context.Context, info storage.ObjectInfo) (st
 		imported:     info.VersionID != storage.NullVersionID,
 		data:         data,
 		lastModified: info.LastModified.UTC(),
+		compression:  enc.compression,
+		size:         enc.size,
 	}
 	if !info.DeleteMarker {
 		v.meta = cloneMeta(info.ObjectMeta)
@@ -106,6 +149,9 @@ func (w *versionWriter) Commit(ctx context.Context, info storage.ObjectInfo) (st
 func (w *versionWriter) Abort() error {
 	w.mu.Lock()
 	defer w.mu.Unlock()
+	if !w.done && w.zw != nil {
+		w.zw.Abandon()
+	}
 	w.done = true
 	w.buf = nil
 	return nil

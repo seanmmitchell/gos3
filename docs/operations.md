@@ -59,8 +59,8 @@ uploads, and
 for latency.
 
 The admin API's `GET /_gos3/admin/v1/stats` (and the UI's server overview) add
-storage totals (objects, bytes, versions, delete markers, pending uploads;
-cached for 30 s), Go runtime numbers and disk usage of the data directory
+storage totals (objects, bytes, bytes stored on disk after compression,
+versions, delete markers, pending uploads; cached for 30 s), Go runtime numbers and disk usage of the data directory
 (fs backend on Linux and macOS).
 
 ## Logs
@@ -97,7 +97,7 @@ gos3 logs to stderr with Go's `log/slog`, as `text` (default) or `json`
 <data>/
 └── .gos3/
     ├── meta.db                  bbolt metadata: buckets, configs, object versions, uploads (fs backend)
-    ├── data/<bucket-id>/<xx>/…  object data files, immutable (fs backend)
+    ├── data/<bucket-id>/<xx>/…  object data files, immutable, possibly compressed (fs backend)
     ├── uploads/<upload-id>/…    multipart parts in progress (fs backend)
     ├── tmp/                     files being written (cleaned at startup)
     ├── orphans/<time>-<id>/     unreferenced files moved aside at startup (fs backend)
@@ -271,6 +271,70 @@ worker off or change the interval at runtime in Settings
 (`lifecycle.enabled`, `lifecycle.intervalSeconds`); the change applies
 immediately. Each action and a summary per pass are logged.
 
+## Compression
+
+gos3 can store object data compressed. Compression is transparent: clients
+read back exactly the bytes they wrote, with the same ETag, checksums,
+`Content-Length` and `Content-Range`, and listings report the original
+sizes. Only the space used on disk (or in memory) changes.
+
+Who decides:
+
+- **The server administrator** sets the policy in Settings
+  (`compression.mode`, see [configuration.md](configuration.md#compression)),
+  through the web UI's server settings or `PUT /_gos3/admin/v1/config`:
+  - `optional` (default): each bucket's own setting decides; buckets are
+    uncompressed until enabled.
+  - `enforced`: every bucket compresses new objects. Buckets cannot opt out.
+  - `disabled`: nothing new is compressed and buckets cannot enable it.
+- **Per bucket**, with `admin:PutBucketCompression` on the bucket: the web
+  UI's bucket settings, or `PUT /_gos3/admin/v1/buckets/<name>/compression`
+  with `{"enabled": true}` (see [admin-api.md](admin-api.md#buckets-management-helpers-regular-bucket-ops-use-the-s3-api)).
+  While the administrator enforces or disables compression, a bucket setting
+  that contradicts it is refused with `409 Conflict`; settings stored before
+  the policy changed stay in place but have no effect until the mode is
+  `optional` again. `DELETE` on the same path returns the bucket to the
+  server default.
+
+What is compressed: new objects written by PutObject, CopyObject (following
+the destination bucket), PostObject and CompleteMultipartUpload, unless
+
+- the object is smaller than `compression.min_size` (4 KiB) and its size is
+  known up front,
+- its `Content-Type` is in `compression.skip_content_types` (by default
+  JPEG, PNG and other compressed images, `video/*`, `audio/*`, archives and
+  zip-based office formats), or
+- it has a compressing `Content-Encoding` (`gzip`, `br`, `zstd`, …): the
+  client compressed it already.
+
+Changing the policy or a bucket's setting applies to the next write; stored
+objects stay as they are and remain readable either way, so compressed and
+uncompressed versions coexist in a bucket. To compress existing objects,
+rewrite them: copy them into a bucket that compresses (CopyObject compresses
+by the destination bucket), or copy each object onto itself. S3 only allows
+a copy onto itself that changes something, typically
+`x-amz-metadata-directive: REPLACE`, which replaces the metadata, so pass the
+metadata you want to keep.
+
+How it is stored: DEFLATE (`compress/flate`, level `compression.level`, 1 by
+default) in independently compressed blocks of 256 KiB with a CRC-32C per
+block, so a range request inflates at most one block per 256 KiB it returns
+instead of everything before it, and damaged data is detected and reported as
+a read error rather than served. Blocks that do not shrink are stored as is;
+data that does not compress (already compressed content that the media type
+did not reveal) is detected and mostly skipped, costing little CPU. The
+admin API's bucket usage and `GET /stats` report both sizes: `bytes` (the
+content) and `storedBytes` (on disk), plus `compressedVersions`; the web UI
+shows the saving next to the bucket size. Multipart uploads keep their parts
+uncompressed until completion, which compresses them while concatenating.
+
+Compression costs CPU on writes and some on reads. As a guide, on source
+code and documentation one core compresses about 280 MB/s at level 1 (to
+32 % of the size), 165 MB/s at level 6 (27 %) and 40 MB/s at level 9 (26 %),
+and reads back about 330 MB/s; each request uses one core. It pays off for text, logs, CSV/JSON, source code,
+uncompressed images and backups of such data; it does nothing for media and
+archives, which the default skip list leaves alone.
+
 ## Graceful shutdown and restarts
 
 SIGTERM or SIGINT stops accepting connections, lets in-flight requests finish
@@ -291,7 +355,11 @@ manager a longer stop timeout than `shutdown_timeout`; the systemd unit uses
 
 The fs metadata database records a format version. A gos3 version that does
 not understand it refuses to start rather than risk the data, so rolling back
-after an upgrade that changed the format means restoring the backup. Runtime
+after an upgrade that changed the format means restoring the backup.
+Compressed objects are recorded in a newer record format: a gos3 version
+without compression support starts, but fails to read those objects (and
+reports their metadata as corrupt), so roll back only after rewriting them
+uncompressed, or restore the backup. Runtime
 settings in `settings.json` and IAM data in `iam.json` are kept across upgrades.
 `gos3 version` (or `GET /_gos3/info`) shows the running version.
 

@@ -729,10 +729,25 @@ func (r *Router) WalkMultipartUploads(ctx context.Context, bucket, prefix string
 // CompleteMultipartUpload completes an upload on the primary and
 // replicates the new version.
 func (r *Router) CompleteMultipartUpload(ctx context.Context, bucket, key, uploadID string, partNumbers []int, meta storage.ObjectMeta, opts storage.CommitOptions) (storage.ObjectInfo, error) {
+	return r.CompleteMultipartUploadWith(ctx, bucket, key, uploadID, partNumbers, meta, opts, storage.WriteOptions{})
+}
+
+// CompleteMultipartUploadWith implements storage.CompressingBackend.
+// Replicas store their copy compressed when the primary did.
+func (r *Router) CompleteMultipartUploadWith(ctx context.Context, bucket, key, uploadID string, partNumbers []int,
+	meta storage.ObjectMeta, opts storage.CommitOptions, wopts storage.WriteOptions) (storage.ObjectInfo, error) {
 	var info storage.ObjectInfo
 	err := r.objectWrite(ctx, bucket, key, nil, func(b storage.Backend) error {
 		var err error
-		info, err = b.CompleteMultipartUpload(ctx, bucket, key, uploadID, partNumbers, meta, opts)
+		if !wopts.Compression.Enabled() {
+			info, err = b.CompleteMultipartUpload(ctx, bucket, key, uploadID, partNumbers, meta, opts)
+			return err
+		}
+		cb, ok := b.(storage.CompressingBackend)
+		if !ok {
+			return fmt.Errorf("the primary backing cannot store data compressed: %w", errors.ErrUnsupported)
+		}
+		info, err = cb.CompleteMultipartUploadWith(ctx, bucket, key, uploadID, partNumbers, meta, opts, wopts)
 		return err
 	})
 	return info, err

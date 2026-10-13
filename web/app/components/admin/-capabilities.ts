@@ -26,7 +26,8 @@ export const NO_CAPS: Readonly<Capabilities> = Object.freeze({
   discovery: false,
   scan: false,
   probe: false,
-  createOwnKeys: false
+  createOwnKeys: false,
+  manageCompression: false
 })
 
 /** True when the connection is gos3 and the identity has `cap`. */
@@ -153,6 +154,29 @@ export function canManageStorage(kind: ConnectionKind | undefined, caps: Capabil
   return hasCapability(kind, caps, 'manageStorage')
 }
 
+/**
+ * Bucket compression settings (admin API GET/PUT/DELETE
+ * /buckets/{name}/compression):
+ * - manage:      admin:PutBucketCompression allowed at service level
+ * - try:         not allowed server-wide. A grant scoped to the bucket
+ *                (arn:gos3:admin:::bucket/<name>) does not show in the
+ *                capabilities, so the controls stay usable and the
+ *                server's 403 is shown, like the other bucket tabs do
+ * - unavailable: generic S3, or a gos3 server without compression support
+ *                (its /whoami has no manageCompression)
+ */
+export type BucketCompressionAccess = 'manage' | 'try' | 'unavailable'
+
+export function bucketCompressionAccess(kind: ConnectionKind | undefined, caps: Capabilities | null | undefined): BucketCompressionAccess {
+  if (kind !== 'gos3' || !caps || caps.manageCompression === undefined) return 'unavailable'
+  return caps.manageCompression ? 'manage' : 'try'
+}
+
+/** Changing bucket compression is known to be allowed (admin:PutBucketCompression). */
+export function canManageCompression(kind: ConnectionKind | undefined, caps: Capabilities | null | undefined): boolean {
+  return bucketCompressionAccess(kind, caps) === 'manage'
+}
+
 /** Bucket usage / owner / public flag come from the gos3 admin API. */
 export function canShowBucketUsage(kind: ConnectionKind | undefined, caps: Capabilities | null | undefined): boolean {
   return kind === 'gos3' && !!caps?.admin
@@ -166,6 +190,7 @@ export type BucketSettingsTab =
   | 'lifecycle'
   | 'tags'
   | 'encryption'
+  | 'compression'
   | 'object-lock'
   | 'access'
   | 'placement'
@@ -178,8 +203,9 @@ export interface BucketTabDef {
 }
 
 /**
- * Bucket settings tabs. Every tab maps to plain S3 bucket sub-resources, so
- * all of them are shown for gos3 and generic S3 alike; per-bucket
+ * Bucket settings tabs. Every tab but "compression" maps to plain S3 bucket
+ * sub-resources, so they are shown for gos3 and generic S3 alike;
+ * "compression" is a gos3 admin API feature (see bucketTabs). Per-bucket
  * permissions are not knowable up front and each tab handles AccessDenied.
  */
 export const BUCKET_TABS: readonly BucketTabDef[] = [
@@ -190,22 +216,34 @@ export const BUCKET_TABS: readonly BucketTabDef[] = [
   { value: 'lifecycle', label: 'Lifecycle', icon: 'i-lucide-timer' },
   { value: 'tags', label: 'Tags', icon: 'i-lucide-tags' },
   { value: 'encryption', label: 'Encryption', icon: 'i-lucide-lock' },
+  { value: 'compression', label: 'Compression', icon: 'i-lucide-file-archive' },
   { value: 'object-lock', label: 'Object lock', icon: 'i-lucide-shield-alert' },
   { value: 'access', label: 'Access', icon: 'i-lucide-key-round' },
   { value: 'danger', label: 'Danger zone', icon: 'i-lucide-triangle-alert' }
 ]
 
+/** Tabs that only some servers offer, with the rule that decides. */
+const TAB_AVAILABLE: Partial<Record<BucketSettingsTab, (kind: ConnectionKind | undefined, caps: Capabilities | null | undefined) => boolean>> = {
+  compression: (kind, caps) => bucketCompressionAccess(kind, caps) !== 'unavailable'
+}
+
+/** The bucket settings tabs a connection offers (BUCKET_TABS minus gos3-only ones it lacks). */
+export function bucketTabs(kind: ConnectionKind | undefined, caps: Capabilities | null | undefined): readonly BucketTabDef[] {
+  return BUCKET_TABS.filter(t => TAB_AVAILABLE[t.value]?.(kind, caps) ?? true)
+}
+
 /** gos3 storage placement (admin:ListBackings), shown before the danger zone. */
 export const PLACEMENT_TAB: Readonly<BucketTabDef> = Object.freeze({ value: 'placement', label: 'Placement', icon: 'i-lucide-hard-drive' })
 
 /**
- * The bucket settings tabs for a connection: BUCKET_TABS, plus Placement
+ * The bucket settings tabs for a connection: bucketTabs, plus Placement
  * for gos3 identities with viewStorage.
  */
 export function bucketSettingsTabs(kind: ConnectionKind | undefined, caps: Capabilities | null | undefined): readonly BucketTabDef[] {
-  if (!canViewStorage(kind, caps)) return BUCKET_TABS
-  const i = BUCKET_TABS.findIndex(t => t.value === 'danger')
-  return [...BUCKET_TABS.slice(0, i), PLACEMENT_TAB, ...BUCKET_TABS.slice(i)]
+  const tabs = bucketTabs(kind, caps)
+  if (!canViewStorage(kind, caps)) return tabs
+  const i = tabs.findIndex(t => t.value === 'danger')
+  return [...tabs.slice(0, i), PLACEMENT_TAB, ...tabs.slice(i)]
 }
 
 /** Normalises a `?tab=` query value to one of `tabs` (default overview). */

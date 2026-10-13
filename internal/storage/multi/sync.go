@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/seanmmitchell/gos3/internal/storage"
+	"github.com/seanmmitchell/gos3/internal/storage/compress"
 )
 
 // errSourceChanged: a key changed on the source while it was being
@@ -136,11 +137,13 @@ func (r *Router) syncKey(ctx context.Context, src, dst *backing, bucket, key str
 // importVersion copies version v of bucket/key from src to dst. It returns
 // the number of bytes copied.
 func (r *Router) importVersion(ctx context.Context, src, dst *backing, bucket, key string, v storage.ObjectInfo) (int64, error) {
-	imp, ok := dst.Backend.(storage.VersionImporter)
-	if !ok {
-		return 0, fmt.Errorf("backing %q cannot receive copies: %w", dst.Name, errors.ErrUnsupported)
+	var opts storage.WriteOptions
+	if v.Compression == storage.CompressionDeflate {
+		// Keep the copy compressed like its source (the level the source
+		// used is not recorded).
+		opts.Compression = storage.Compression{Algorithm: storage.CompressionDeflate, Level: compress.DefaultLevel}
 	}
-	w, err := imp.NewVersionWriter(ctx, bucket, key)
+	w, err := newVersionWriter(ctx, dst, bucket, key, opts)
 	if err != nil {
 		return 0, r.observe(dst, fmt.Errorf("copying %s/%s to backing %q: %w", bucket, key, dst.Name, err))
 	}
@@ -175,6 +178,22 @@ func (r *Router) importVersion(ctx context.Context, src, dst *backing, bucket, k
 		return n, errSourceChanged
 	}
 	return n, nil
+}
+
+// newVersionWriter starts an imported version on b, stored as opts asks
+// when b can compress (else as is). errors.ErrUnsupported when b cannot
+// import versions at all.
+func newVersionWriter(ctx context.Context, b *backing, bucket, key string, opts storage.WriteOptions) (storage.VersionWriter, error) {
+	if opts.Compression.Enabled() {
+		if ci, ok := b.Backend.(storage.CompressingImporter); ok {
+			return ci.NewVersionWriterWith(ctx, bucket, key, opts)
+		}
+	}
+	imp, ok := b.Backend.(storage.VersionImporter)
+	if !ok {
+		return nil, fmt.Errorf("backing %q cannot receive copies: %w", b.Name, errors.ErrUnsupported)
+	}
+	return imp.NewVersionWriter(ctx, bucket, key)
 }
 
 // keyVersions returns the versions of bucket/key, newest first.

@@ -132,6 +132,9 @@ type Server struct {
 	serving  atomic.Bool
 	draining atomic.Bool
 	ready    chan struct{}
+	// limiter is the connection limiter while serving with
+	// server.max_connections (nil otherwise); tests inspect it.
+	limiter atomic.Pointer[connLimiter]
 
 	lifeCtx    context.Context // background work (discovery, lifecycle)
 	lifeCancel context.CancelFunc

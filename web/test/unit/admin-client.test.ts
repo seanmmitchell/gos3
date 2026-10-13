@@ -138,6 +138,27 @@ describe('AdminClient', () => {
     expect(calls[2]!.url).toBe('http://localhost:9000/_gos3/admin/v1/buckets/photos')
   })
 
+  it('gets, sets and resets bucket compression (signed JSON body)', async () => {
+    const doc = { enabled: true, effective: true, serverMode: 'optional', algorithm: 'deflate', level: 1, minSize: 4096 }
+    const { admin, calls } = makeAdmin(c => (c.method === 'DELETE' ? new Response(null, { status: 204 }) : json(doc)))
+    expect(await admin.getBucketCompression('my bucket')).toEqual(doc)
+    expect(calls[0]!).toMatchObject({ method: 'GET', url: 'http://localhost:9000/_gos3/admin/v1/buckets/my%20bucket/compression' })
+    expect(await admin.putBucketCompression('photos', true)).toEqual(doc)
+    expect(calls[1]!).toMatchObject({ method: 'PUT', url: 'http://localhost:9000/_gos3/admin/v1/buckets/photos/compression', body: '{"enabled":true}' })
+    expect(calls[1]!.headers['content-type']).toBe('application/json')
+    expect(calls[1]!.headers['x-amz-content-sha256']).toBe(sha256('{"enabled":true}'))
+    expect(verifySigV4(calls[1]!)).toBe(true)
+    await expect(admin.deleteBucketCompression('photos')).resolves.toBeUndefined()
+    expect(calls[2]!).toMatchObject({ method: 'DELETE', url: 'http://localhost:9000/_gos3/admin/v1/buckets/photos/compression' })
+  })
+
+  it('reports a compression setting that contradicts the server mode as 409 Conflict', async () => {
+    const { admin } = makeAdmin(() => json({ error: { code: 'Conflict', message: 'compression is enforced on this server by its administrator (compression.mode is "enforced")' } }, 409))
+    const err = await admin.putBucketCompression('photos', false).catch((e: unknown) => e)
+    expect(err).toBeInstanceOf(AdminError)
+    expect(err).toMatchObject({ code: 'Conflict', status: 409 })
+  })
+
   it('throws AdminError from the error envelope', async () => {
     const { admin } = makeAdmin(() => json({ error: { code: 'Conflict', message: 'bucket not empty' } }, 409))
     const err = await admin.deleteBucket('b').catch(e => e)

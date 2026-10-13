@@ -6,6 +6,7 @@ import { AdminClient } from '~/utils/admin/client'
 import type { Backing, Capabilities, Placement, PlacementMember } from '~/types/admin'
 import {
   BUCKET_TABS,
+  bucketTabs,
   NO_CAPS,
   bucketSettingsTabs,
   canManageStorage,
@@ -135,11 +136,14 @@ describe('storage capabilities', () => {
   })
 
   it('adds the Placement tab before the danger zone only with viewStorage', () => {
-    expect(bucketSettingsTabs('gos3', NO_CAPS)).toBe(BUCKET_TABS)
-    expect(bucketSettingsTabs('s3', caps({ viewStorage: true }))).toBe(BUCKET_TABS)
-    const tabs = bucketSettingsTabs('gos3', caps({ viewStorage: true })).map(t => t.value)
+    // Without viewStorage: exactly the tabs the connection offers anyway.
+    expect(bucketSettingsTabs('gos3', NO_CAPS)).toEqual(bucketTabs('gos3', NO_CAPS))
+    expect(bucketSettingsTabs('s3', caps({ viewStorage: true }))).toEqual(bucketTabs('s3', caps({ viewStorage: true })))
+    const withStorage = caps({ viewStorage: true })
+    const tabs = bucketSettingsTabs('gos3', withStorage).map(t => t.value)
     expect(tabs.slice(-2)).toEqual(['placement', 'danger'])
-    expect(tabs).toHaveLength(BUCKET_TABS.length + 1)
+    expect(tabs).toHaveLength(bucketTabs('gos3', withStorage).length + 1)
+    expect(BUCKET_TABS.some(t => t.value === 'placement')).toBe(false)
     expect(resolveBucketTab('placement')).toBe('overview')
     expect(resolveBucketTab('placement', bucketSettingsTabs('gos3', caps({ viewStorage: true })))).toBe('placement')
   })

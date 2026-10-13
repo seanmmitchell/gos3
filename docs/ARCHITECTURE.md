@@ -34,6 +34,8 @@ discovery of gos3 servers on the network.
 | `internal/storage/fs/` | filesystem backend (bbolt index + data files) | storage-fs |
 | `internal/storage/multi/` | multi-backing router: bucket placement, replication (active-passive / active-active), online moves, backing health | storage-multi |
 | `internal/storage/storagetest/` | backend conformance suite | storage-conformance |
+| `internal/storage/compress/` | seekable block-compressed data format used by both backends | storage-compression |
+| `internal/compression/` | compression policy: bucket setting document, server mode, per-object decision | storage-compression |
 | `internal/auth/` | SigV4 verification, aws-chunked decoding, POST policy, client signer | auth |
 | `internal/iam/` | users, keys, policies, bucket policy parsing, authorization engine | iam |
 | `internal/s3/` | S3 HTTP layer (see file ownership below) | s3-core + s3-* |
@@ -210,6 +212,9 @@ See the doc comments in `storage.go`. Key points:
   - `UploadWalker.WalkMultipartUploads` walks in-progress uploads in listing
     order (key, Initiated, UploadID) from an `UploadPosition`, without loading
     all of a bucket's uploads.
+  - `CompressingBackend.NewObjectWriterWith` / `CompleteMultipartUploadWith`
+    store a version's data compressed (`WriteOptions.Compression`), see
+    [Compression](#compression).
   `storage.ListObjects`, `ListObjectVersions` and `ListUploads` return
   entries trimmed to the fields a listing reports (`storage.ListingInfo`).
   `uploads.go` builds on them: `storage.ListUploads` (S3
@@ -256,6 +261,10 @@ See the doc comments in `storage.go`. Key points:
 - `memory` keeps everything in maps guarded by RW mutexes. Imported versions
   get a fresh internal stamp (so they sort newest) but keep their foreign
   ID; lookups by such IDs fall back to scanning the key's versions.
+- Compression: see [Compression](#compression). A compressed fs version
+  record uses record format 4 (format 3 plus the algorithm and the stored
+  size); uncompressed records stay format 3, so databases without
+  compressed objects remain readable by older builds.
 - `list.go` turns `WalkObjects`/`WalkVersions` into S3 listings (prefix,
   delimiter grouping, markers, truncation). When a common prefix `p` is found
   it restarts the walk after `p + "\xff"` (UTF-8 never contains 0xFF) so huge
@@ -292,6 +301,10 @@ adopted where they are found at startup.
   failed periodic `ListBuckets` probe. Reads skip unhealthy backings; walks
   fall back only before the first entry was delivered.
 - Multipart uploads live on the primary only (not copied).
+- Compression: the router implements `storage.CompressingBackend` by
+  forwarding to the primary; active-active replicas receive the same write
+  options, and background copies of a compressed version are stored
+  compressed too (`storage.CompressingImporter`, at the default level).
 
 System state lives in `<data>/.gos3/`: `lock` (an exclusive lock held by the
 running server, whatever the backend; a no-op on platforms without
@@ -301,6 +314,40 @@ Settings fields), `server-id`, and `root-credentials.json` (only when root
 keys were generated). With the memory backend this needs `storage.path`;
 without it the server is fully ephemeral. Bucket names cannot start with `.`,
 so no clash.
+
+### Compression
+
+Object data can be stored compressed, transparently: the S3 layer computes
+ETags and checksums over the uncompressed stream as always, and
+`ObjectInfo.Size`, `OpenObject` and seeking are in uncompressed terms;
+`ObjectInfo.Compression` / `StoredSize` (and `PhysicalSize()`) say how a
+version is stored.
+
+- **Policy** (`internal/compression`): the server's `Settings.Compression`
+  (`mode` optional | enforced | disabled, `level`, `minSize`,
+  `skipContentTypes`) and the bucket's setting, a JSON document
+  `{"enabled": bool}` under the bucket config key `compression`
+  (`storage.ConfigCompression`), managed by the admin API. `Effective`
+  combines them; `Decide` refines per object (empty or smaller than
+  `minSize` when the size is known, skipped media type, compressing
+  `Content-Encoding` → uncompressed).
+- **S3 layer** (`internal/s3/compression.go`): `storeObject` (PutObject,
+  CopyObject, PostObject) and CompleteMultipartUpload ask the policy and
+  use the `CompressingBackend` methods; backends without them store
+  everything uncompressed.
+- **Format** (`internal/storage/compress`): 256 KiB blocks, each raw
+  DEFLATE (or stored as is when it does not shrink by 1/32, with a
+  backoff that skips attempts on incompressible data), then an index of
+  12-byte entries (cumulative end offset with a raw flag, CRC-32C of the
+  uncompressed block) and a 24-byte footer (magic `gos3blk1`, block size,
+  block count, uncompressed size). Readers locate any block with one
+  `ReadAt` of the index, verify every block's CRC and keep one decoded
+  block. Empty content is never compressed.
+- **fs**: the compressor sits between the object writer and the temporary
+  file; multipart completion compresses while concatenating the parts
+  (parts themselves are stored uncompressed). The data file's size is the
+  record's `StoredSize`, checked at open like `Size` is for plain files.
+- **memory**: keeps the compressed bytes in the version.
 
 ## Auth & IAM
 

@@ -170,8 +170,9 @@ per-target resources (see
 [admin-api.md](admin-api.md#resources-and-condition-keys)):
 `arn:gos3:admin:::user/<name>` for user and key actions (a key is evaluated
 as its owner), `arn:gos3:admin:::policy/<name>` for policy actions and
-`arn:gos3:admin:::bucket/<name>` for `admin:GetBucket` and
-`admin:ForceDeleteBucket`, with wildcards, and limit which policies may be
+`arn:gos3:admin:::bucket/<name>` for `admin:GetBucket`,
+`admin:ForceDeleteBucket`, `admin:GetBucketCompression` and
+`admin:PutBucketCompression`, with wildcards, and limit which policies may be
 attached with the multi-valued condition key `admin:PolicyName`. For
 example, this help-desk policy manages only `team-*` users, which cannot
 include the help-desk user itself, and may attach only `readonly`:
@@ -278,6 +279,17 @@ such as `C:\ProgramData` with default permissions. Object data outside
 `x-amz-server-side-encryption` headers are accepted and reported for client
 compatibility only. Use full-disk or file system encryption if you need
 encryption at rest. SSE-C is rejected (`NotImplemented`).
+
+Compressed objects (see [operations.md](operations.md#compression)) are
+compressed, not protected: anyone who can read the data files can inflate
+them. The stored size of a compressed object depends on its content, so it
+can leak how well data that an attacker partly controls compresses together
+with a secret in the same object (the idea behind CRIME/BREACH). Stored sizes
+are only reported by the admin API's bucket usage and stats
+(`admin:GetBucket`, `admin:ListBuckets`, `admin:GetStats`), as totals per
+bucket; if your buckets mix untrusted input with secrets in single objects,
+keep compression off for them or do not grant those actions to the parties
+supplying the input.
 
 Only one gos3 process can use a data directory at a time: every backend,
 including the memory backend with a data path, takes an exclusive lock on

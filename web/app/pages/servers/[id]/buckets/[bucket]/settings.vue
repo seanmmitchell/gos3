@@ -6,8 +6,8 @@ import { bucketSettingsTabs, canShowBucketUsage, resolveBucketTab, type BucketSe
 import { modeOption } from '~/components/admin/-storage'
 
 /**
- * Bucket settings with one tab per S3 bucket sub-resource (synced with
- * `?tab=`). Shared state — versioning, object lock and the admin
+ * Bucket settings with one tab per S3 bucket sub-resource, plus gos3-only
+ * ones such as compression (synced with `?tab=`). Shared state — versioning, object lock and the admin
  * BucketSummary — is loaded here and refreshed when a tab changes it.
  */
 const route = useRoute()
@@ -147,6 +147,7 @@ const lockEnabled = computed(() => !!objectLock.value?.enabled)
         <BucketSettingsLifecycleTab v-else-if="tab === 'lifecycle'" :bucket="bucket" :versioning="versioning" @changed="loadSummary" />
         <BucketSettingsTagsTab v-else-if="tab === 'tags'" :bucket="bucket" @changed="loadSummary" />
         <BucketSettingsEncryptionTab v-else-if="tab === 'encryption'" :bucket="bucket" @changed="loadSummary" />
+        <BucketSettingsCompressionTab v-else-if="tab === 'compression'" :bucket="bucket" @changed="loadSummary" />
         <BucketSettingsObjectLockTab v-else-if="tab === 'object-lock'" :bucket="bucket" :versioning="versioning" @changed="refreshShared" />
         <BucketSettingsAccessTab v-else-if="tab === 'access'" :bucket="bucket" @changed="loadSummary" />
         <BucketSettingsPlacementTab v-else-if="tab === 'placement'" :bucket="bucket" @changed="loadSummary" />

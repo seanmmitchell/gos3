@@ -73,6 +73,9 @@ func defaultSettings() config.Settings {
 		Logging:       config.LoggingConfig{Level: "info", Format: "text", AccessLog: true},
 		Lifecycle:     config.LifecycleSettings{Enabled: true, IntervalSeconds: 3600},
 		MetricsPublic: false,
+		Compression: config.CompressionSettings{
+			Mode: config.CompressionOptional, Level: 1, MinSize: 4096, SkipContentTypes: []string{"video/*"},
+		},
 	}
 }
 

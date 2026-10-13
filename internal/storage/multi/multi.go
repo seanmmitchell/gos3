@@ -191,6 +191,7 @@ var (
 	_ storage.ConditionalMetaUpdater = (*Router)(nil)
 	_ storage.ConfigViewer           = (*Router)(nil)
 	_ storage.UploadWalker           = (*Router)(nil)
+	_ storage.CompressingBackend     = (*Router)(nil)
 )
 
 // Open builds a Router over opts.Backings: it loads the state file,

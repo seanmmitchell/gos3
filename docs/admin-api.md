@@ -59,7 +59,7 @@ ARNs, policy variables such as `${aws:username}` included):
 |---|---|
 | `arn:gos3:admin:::user/<name>` | CreateUser (the new user's name), GetUser, UpdateUser, DeleteUser, CreateAccessKey (the target user; choosing the access key ID also needs it at service level), UpdateAccessKey / DeleteAccessKey (the key's owner; an unknown key is evaluated at service level) |
 | `arn:gos3:admin:::policy/<name>` | GetPolicy, PutPolicy, DeletePolicy |
-| `arn:gos3:admin:::bucket/<name>` | GetBucket, ForceDeleteBucket, GetBucketPlacement, UpdateBucketPlacement |
+| `arn:gos3:admin:::bucket/<name>` | GetBucket, ForceDeleteBucket, GetBucketCompression, PutBucketCompression, GetBucketPlacement, UpdateBucketPlacement |
 | service level | every other action (list actions, config, stats, discovery, simulate, self-service) |
 
 The policy resources `*` and `arn:gos3:admin:::*` match every admin
@@ -131,7 +131,8 @@ Non-2xx responses: `{"error": {"code": "<Code>", "message": "<text>"}}`.
     "discovery": false,       // admin:GetDiscovery
     "scan": false,            // admin:ScanNetwork
     "probe": false,           // admin:ProbeNetwork
-    "createOwnKeys": false    // admin:CreateOwnAccessKey explicitly allowed (always false for root)
+    "createOwnKeys": false,   // admin:CreateOwnAccessKey explicitly allowed (always false for root)
+    "manageCompression": false // admin:PutBucketCompression
   },
   "server": Info              // same as GET /_gos3/info
 }
@@ -156,7 +157,9 @@ Non-2xx responses: `{"error": {"code": "<Code>", "message": "<text>"}}`.
 {
   "metrics": metrics.Snapshot,          // see below
   "storage": { "buckets": 3, "objects": 1200, "bytes": 123456789,
+               "storedBytes": 61234567,  // bytes stored for "bytes" (less when compressed)
                "versions": 1300, "versionBytes": 133456789,
+               "storedVersionBytes": 71234567, "compressedVersions": 800,
                "deleteMarkers": 4, "pendingUploads": 1,
                "computedAt": "…" },     // cached up to 30s
   "runtime": { "goroutines": 42, "heapAllocBytes": 1234, "sysBytes": 5678, "gcPauseTotalNs": 1 },
@@ -198,7 +201,10 @@ requests out.
                  "allowScan": true, "maxScanHosts": 1024 },
   "logging": { "level": "info", "format": "text", "accessLog": true },
   "lifecycle": { "enabled": true, "intervalSeconds": 3600 },
-  "metricsPublic": false
+  "metricsPublic": false,
+  "compression": { "mode": "optional",   // optional | enforced | disabled
+                   "level": 1, "minSize": 4096,
+                   "skipContentTypes": ["image/jpeg", "video/*", "…"] }
 }
 ```
 
@@ -216,8 +222,13 @@ without scheme or port; CORS origins `*`, `scheme://host[:port]` or
 `peerTtl` 30 s–7 d; `seeds` http(s) base URLs without a path, or a bare
 `host[:port]` (meaning `http://`), at most 256; `dnsSrv` domain names, at
 most 64; `maxScanHosts` 1–65536; `logging.level` `debug|info|warn|error`;
-`logging.format` `text|json`; `lifecycle.intervalSeconds` 60–31536000; other
-lists at most 256 entries. Changes apply immediately and are persisted to
+`logging.format` `text|json`; `lifecycle.intervalSeconds` 60–31536000;
+`compression.mode` `optional|enforced|disabled`; `compression.level` 1–9;
+`compression.minSize` 0–5 TiB; `compression.skipContentTypes` entries
+`type/subtype`, `type/*` or a prefix ending in `*` (no parameters); other
+lists at most 256 entries. A document without `compression` (from a client
+that predates it) keeps the current compression settings, and fields missing
+from `compression` keep their current values. Changes apply immediately and are persisted to
 `<data>/.gos3/settings.json`, which from then on overrides the YAML file,
 environment and flags for these fields.
 
@@ -247,6 +258,9 @@ environment and flags for these fields.
 |---|---|---|---|
 | GET | `/buckets` | ListBuckets | `{"buckets": BucketSummary[]}`; `?usage=true` includes usage (cached 30s) |
 | GET | `/buckets/{name}` | GetBucket | `BucketSummary` with usage |
+| GET | `/buckets/{name}/compression` | GetBucketCompression | `BucketCompression` |
+| PUT | `/buckets/{name}/compression` | PutBucketCompression | body `{"enabled": bool}` → `BucketCompression`. 409 `Conflict` when it contradicts the server's `compression.mode` (`true` while `disabled`, `false` while `enforced`); 400 for any other body |
+| DELETE | `/buckets/{name}/compression` | PutBucketCompression | removes the bucket's setting (back to the server default) → 204; idempotent |
 | DELETE | `/buckets/{name}?force=true` | ForceDeleteBucket | deletes all versions, delete markers, uploads and configs, then the bucket → 204. Without `force` behaves like S3 DeleteBucket (409 if not empty; in-progress uploads alone do not make a bucket non-empty, they are aborted with it). Object lock is honoured: any version under legal hold or unexpired COMPLIANCE retention → 409 before anything is deleted; unexpired GOVERNANCE retention → 409 unless `bypassGovernanceRetention=true` is added (only with `force`, else 400), which also requires `s3:BypassGovernanceRetention` on each such object (identity policies; 403 otherwise). |
 
 ```jsonc
@@ -256,8 +270,20 @@ environment and flags for these fields.
   "configs": { "policy": true, "cors": false, "lifecycle": true, "tagging": false,
                "encryption": false, "website": false, "objectLock": false, "acl": "private" },
   "public": false,          // bucket policy grants anonymous access or ACL public-*
-  "usage": storage.BucketUsage | null }  // {"objects","bytes","versions","versionBytes","deleteMarkers","pendingUploads"}
+  "compression": { "enabled": false, "effective": false }, // see BucketCompression
+  "usage": storage.BucketUsage | null }  // {"objects","bytes","storedBytes","versions","versionBytes",
+                                         //  "storedVersionBytes","compressedVersions","deleteMarkers","pendingUploads"}
+
+// BucketCompression
+{ "enabled": true,          // the bucket's setting (false when none is stored)
+  "effective": true,        // new objects are stored compressed (subject to minSize and skipContentTypes)
+  "serverMode": "optional", // the administrator's compression.mode: optional (enabled decides), enforced, disabled
+  "algorithm": "deflate", "level": 1, "minSize": 4096 }
 ```
+
+Compression is transparent to S3 clients (same content, ETags, checksums
+and sizes); `storedBytes` and `storedVersionBytes` count what the backend
+stores. See [operations.md](operations.md#compression).
 
 ### Storage backings and bucket placement
 

@@ -97,6 +97,12 @@ export interface Capabilities {
    * explicitly denied: use canCreateOwnKeys(), which then assumes allowed.
    */
   createOwnKeys?: boolean
+  /**
+   * admin:PutBucketCompression allowed at service level (bucket
+   * compression settings). Absent from servers without compression: use
+   * bucketCompressionAccess() (~/components/admin/-capabilities).
+   */
+  manageCompression?: boolean
 }
 
 export type CapabilityName = keyof Capabilities
@@ -171,6 +177,16 @@ export interface StorageStats {
   versionBytes: number
   deleteMarkers: number
   pendingUploads: number
+  /**
+   * Physical bytes stored for current versions (compressed data counts
+   * its compressed size); `bytes` is the logical size. Absent from servers
+   * without compression.
+   */
+  storedBytes?: number
+  /** Physical bytes stored for all versions (see storedBytes). */
+  storedVersionBytes?: number
+  /** Versions whose data is stored compressed. */
+  compressedVersions?: number
   /** Cached up to 30 s. */
   computedAt: Timestamp
 }
@@ -240,6 +256,29 @@ export interface LifecycleSettings {
   intervalSeconds: number
 }
 
+/**
+ * Server-wide compression policy set by the administrator:
+ * - optional: each bucket decides (off unless enabled for the bucket)
+ * - enforced: every bucket compresses new objects; buckets cannot opt out
+ * - disabled: nothing new is compressed and buckets cannot enable it
+ *   (objects already stored compressed stay readable)
+ */
+export type CompressionMode = 'optional' | 'enforced' | 'disabled'
+
+/** config.CompressionSettings */
+export interface CompressionSettings {
+  mode: CompressionMode | string
+  /** DEFLATE level, 1 (fastest, default) to 9 (smallest). */
+  level: number
+  /** Objects smaller than this (when the size is known up front) stay uncompressed. */
+  minSize: number
+  /**
+   * Media types stored uncompressed (already compressed): "type/subtype",
+   * "type/*" or a prefix ending in "*". Case-insensitive.
+   */
+  skipContentTypes: string[] | null
+}
+
 /** config.Settings — GET/PUT /config. PUT takes the full document. */
 export interface Settings {
   name: string
@@ -253,6 +292,8 @@ export interface Settings {
   logging: LoggingSettings
   lifecycle: LifecycleSettings
   metricsPublic: boolean
+  /** Absent from servers without compression support. */
+  compression?: CompressionSettings
 }
 
 // ---------------------------------------------------------------------------
@@ -410,8 +451,32 @@ export interface BucketUsage {
   versionBytes: number
   deleteMarkers: number
   pendingUploads: number
+  /** Physical bytes of current versions (see StorageStats.storedBytes). */
+  storedBytes?: number
+  /** Physical bytes of all versions. */
+  storedVersionBytes?: number
+  /** Versions whose data is stored compressed. */
+  compressedVersions?: number
   /** When the server computed these figures (admin BucketSummary only; cached up to 30 s). */
   computedAt?: Timestamp
+}
+
+/** The "compression" member of a BucketSummary. */
+export interface BucketCompressionSummary {
+  /** The bucket's own setting. */
+  enabled: boolean
+  /** Whether new objects are compressed under the server's policy. */
+  effective: boolean
+}
+
+/** GET/PUT /buckets/{name}/compression */
+export interface BucketCompression extends BucketCompressionSummary {
+  /** The administrator's compression.mode. */
+  serverMode: CompressionMode | string
+  /** e.g. "deflate" */
+  algorithm: string
+  level: number
+  minSize: number
 }
 
 export interface BucketSummary {
@@ -425,6 +490,8 @@ export interface BucketSummary {
   /** Bucket policy grants anonymous access or ACL public-*. */
   public: boolean
   usage: BucketUsage | null
+  /** Absent from servers without compression support. */
+  compression?: BucketCompressionSummary
   /** Where the bucket is stored (servers with storage backings only). */
   placement?: PlacementSummary
 }

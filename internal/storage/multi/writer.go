@@ -3,6 +3,7 @@ package multi
 import (
 	"context"
 	"errors"
+	"fmt"
 	"sync"
 
 	"github.com/seanmmitchell/gos3/internal/storage"
@@ -38,23 +39,39 @@ type teeWriter struct {
 
 // NewObjectWriter starts writing a new version of bucket/key.
 func (r *Router) NewObjectWriter(ctx context.Context, bucket, key string) (storage.ObjectWriter, error) {
+	return r.NewObjectWriterWith(ctx, bucket, key, storage.WriteOptions{})
+}
+
+// NewObjectWriterWith implements storage.CompressingBackend: the primary,
+// and in an active-active bucket every in-sync replica, store the version
+// as opts asks.
+func (r *Router) NewObjectWriterWith(ctx context.Context, bucket, key string, opts storage.WriteOptions) (storage.ObjectWriter, error) {
 	rt, leave, err := r.enterWrite(ctx, bucket)
 	if err != nil {
 		return nil, err
 	}
-	w, err := rt.lead.Backend.NewObjectWriter(ctx, bucket, key)
+	var w storage.ObjectWriter
+	if opts.Compression.Enabled() {
+		cb, ok := rt.lead.Backend.(storage.CompressingBackend)
+		if !ok {
+			leave()
+			return nil, fmt.Errorf("backing %q cannot store data compressed: %w", rt.lead.Name, errors.ErrUnsupported)
+		}
+		w, err = cb.NewObjectWriterWith(ctx, bucket, key, opts)
+	} else {
+		w, err = rt.lead.Backend.NewObjectWriter(ctx, bucket, key)
+	}
 	if err != nil {
 		leave()
 		return nil, r.observe(rt.lead, err)
 	}
 	ow := &objectWriter{r: r, rt: rt, bucket: bucket, key: key, w: w, leave: leave}
 	for _, f := range rt.followers {
-		imp, ok := f.backing.Backend.(storage.VersionImporter)
-		if !ok {
+		vw, err := newVersionWriter(ctx, f.backing, bucket, key, opts)
+		if errors.Is(err, errors.ErrUnsupported) {
 			r.demote(f, key)
 			continue
 		}
-		vw, err := imp.NewVersionWriter(ctx, bucket, key)
 		if err != nil {
 			r.observe(f.backing, err)
 			r.demote(f, key)

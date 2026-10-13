@@ -167,6 +167,11 @@ verified digest (`sha256:…`); deploy that digest (for example `digest:` in
 `deploy/kubernetes/kustomization.yaml`) rather than a tag, which can be
 pushed again.
 
+GitHub stores attestations only for public repositories (private ones need
+GitHub Enterprise Cloud), so the workflows skip the attestation steps while
+the repository is private; builds from that time have none to verify, and
+only `checksums.txt` and the image's BuildKit provenance are available.
+
 ## Build integrity
 
 What keeps code that did not go through `dev` → `main` out of a release:

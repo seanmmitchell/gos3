@@ -206,6 +206,9 @@ func (a *api) routes() []route {
 		{"DELETE", "/buckets/{name}/placement/move", "UpdateBucketPlacement", bucket, a.cancelMove},
 		{"POST", "/buckets/{name}/placement/promote", "UpdateBucketPlacement", bucket, a.promote},
 		{"POST", "/buckets/{name}/placement/resync", "UpdateBucketPlacement", bucket, a.resync},
+		{"GET", "/buckets/{name}/compression", "GetBucketCompression", bucket, a.getBucketCompression},
+		{"PUT", "/buckets/{name}/compression", "PutBucketCompression", bucket, a.putBucketCompression},
+		{"DELETE", "/buckets/{name}/compression", "PutBucketCompression", bucket, a.deleteBucketCompression},
 		// Discovery
 		{"GET", "/discovery", "GetDiscovery", service, a.getDiscovery},
 		{"POST", "/discovery/probe", "ProbeNetwork", service, a.probe},

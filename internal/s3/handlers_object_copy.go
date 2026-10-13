@@ -216,7 +216,7 @@ func (s *Server) handleCopyObject(w http.ResponseWriter, r *http.Request, rc *re
 		hasher := &copyHasher{md5: md5.New(), sum: newChecksumHash(algo), algo: algo}
 		// ctxReader stops the copy when the client goes away.
 		data := io.TeeReader(io.LimitReader(ctxReader{ctx, rd}, info.Size), hasher)
-		out, err := s.storeObject(ctx, bucket, key, data, meta, cond, func(m *storage.ObjectMeta) error {
+		out, err := s.storeObject(ctx, bucket, key, data, info.Size, meta, cond, func(m *storage.ObjectMeta) error {
 			if hasher.n != info.Size {
 				return io.ErrUnexpectedEOF
 			}

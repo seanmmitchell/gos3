@@ -300,7 +300,7 @@ func (s *Server) handlePostObject(w http.ResponseWriter, r *http.Request, rc *re
 	if err != nil {
 		return err
 	}
-	info, err := s.storeObject(ctx, rc.bucket, key, p, meta, storage.CommitOptions{}, func(m *storage.ObjectMeta) error {
+	info, err := s.storeObject(ctx, rc.bucket, key, p, -1, meta, storage.CommitOptions{}, func(m *storage.ObjectMeta) error {
 		if err := auth.CheckPostPolicy(policy, pform, p.Size()); err != nil {
 			return err
 		}

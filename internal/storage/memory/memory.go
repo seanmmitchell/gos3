@@ -117,8 +117,12 @@ type version struct {
 	// from another backend.
 	imported     bool
 	meta         storage.ObjectMeta
-	data         []byte
+	data         []byte // the content, or its compressed form (compression set)
 	lastModified time.Time
+	// compression is the algorithm data is compressed with ("" = none);
+	// size is then the size of the content.
+	compression string
+	size        int64
 }
 
 func (o *object) latest() *version { return o.versions[len(o.versions)-1] }
@@ -176,6 +180,9 @@ func (v *version) info(bucketName, key string, isLatest bool) storage.ObjectInfo
 	}
 	if !v.deleteMarker {
 		oi.ObjectMeta = cloneMeta(v.meta)
+		if v.compression != "" {
+			oi.Size, oi.Compression, oi.StoredSize = v.size, v.compression, int64(len(v.data))
+		}
 	}
 	return oi
 }

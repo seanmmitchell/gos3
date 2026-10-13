@@ -21,7 +21,8 @@ the internet.
 
 - **Dashboard** of all configured servers with status, version and usage.
 - **Buckets**: create and delete; versioning, policy editor with templates,
-  CORS, lifecycle, tags, object lock, default encryption and ACL settings.
+  CORS, lifecycle, tags, object lock, default encryption and ACL settings,
+  and (gos3 only) compression.
 - **Object browser**: folders, drag-and-drop uploads (multipart with parallel
   parts and progress), downloads, delete, rename and copy, metadata and tag
   editors, versions, and presigned share links.
@@ -67,6 +68,20 @@ policies and clears that option.
   with "Bypass governance retention" (Danger zone checkbox, or the follow-up
   confirmation on the bucket list), which sends
   `bypassGovernanceRetention=true` and needs `s3:BypassGovernanceRetention`.
+- **Compression.** The server settings page has a Compression card where
+  the administrator chooses the mode (Optional, Enforced, Disabled), the
+  DEFLATE level, the minimum size and the media types to skip. A bucket's
+  Compression tab (gos3 servers that report the `manageCompression`
+  capability) shows whether new objects are compressed, the bucket's own
+  setting and the server mode; while the administrator enforces or disables
+  compression the switch is locked in the direction the server would refuse
+  (409), and "Reset to server default" removes the bucket's setting. The tab
+  is shown to everyone on such servers, since a grant of
+  `admin:PutBucketCompression` scoped to some buckets does not show in the
+  capabilities; a refused change shows the server's 403. Bucket lists, the
+  bucket overview and the server overview show the stored size and the
+  saving next to the size when compression saves space. See
+  [operations.md](operations.md#compression).
 - **Policy editor and simulator.** Admin actions are evaluated against
   `arn:gos3:admin:::user/<name>`, `arn:gos3:admin:::policy/<name>` and
   `arn:gos3:admin:::bucket/<name>` (see [admin-api.md](admin-api.md));

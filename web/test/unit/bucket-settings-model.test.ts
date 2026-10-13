@@ -13,6 +13,8 @@ import {
 } from '~/components/bucket-settings/-lifecycle'
 import { corsRuleToForm, formToCorsRule, hasErrors, newCorsRule, validateCorsRule } from '~/components/bucket-settings/-cors'
 import { buildPublicAccessBlock, parsePublicAccessBlock } from '~/components/bucket-settings/-public-access-block'
+import { COMPRESSION_MODE_TEXT, compressionConflict, compressionModeText } from '~/components/bucket-settings/-compression'
+import { COMPRESSION_MODES } from '~/components/admin/-settings-form'
 import { buildLifecycle } from '~/utils/s3/builders'
 import { parseLifecycle } from '~/utils/s3/parsers'
 
@@ -154,5 +156,27 @@ describe('public access block XML', () => {
     expect(xml).toContain('<BlockPublicAcls>true</BlockPublicAcls>')
     expect(xml).toContain('<IgnorePublicAcls>false</IgnorePublicAcls>')
     expect(parsePublicAccessBlock(xml)).toEqual(cfg)
+  })
+})
+
+describe('bucket compression vs the server mode', () => {
+  it('flags only the switch direction the server refuses (409)', () => {
+    // enforced: turning it off is refused, turning it on is fine
+    expect(compressionConflict('enforced', true)).toMatch(/enforces compression/)
+    expect(compressionConflict('enforced', false)).toBeUndefined()
+    // disabled: turning it on is refused, turning it off is fine
+    expect(compressionConflict('disabled', false)).toMatch(/disabled compression/)
+    expect(compressionConflict('disabled', true)).toBeUndefined()
+    // optional: the bucket decides
+    expect(compressionConflict('optional', true)).toBeUndefined()
+    expect(compressionConflict('optional', false)).toBeUndefined()
+    expect(compressionConflict('enforced', undefined)).toBeUndefined()
+  })
+
+  it('describes every mode, and unknown modes as they are', () => {
+    for (const m of COMPRESSION_MODES) expect(COMPRESSION_MODE_TEXT[m].label).toBeTruthy()
+    expect(compressionModeText('enforced').label).toBe('Enforced')
+    expect(compressionModeText('adaptive').label).toBe('adaptive')
+    expect(compressionModeText(undefined).label).toBe('Unknown')
   })
 })

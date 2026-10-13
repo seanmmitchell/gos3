@@ -3,12 +3,14 @@ package fs
 import (
 	"context"
 	"fmt"
+	"io"
 	"sync"
 	"time"
 
 	"go.etcd.io/bbolt"
 
 	"github.com/seanmmitchell/gos3/internal/storage"
+	"github.com/seanmmitchell/gos3/internal/storage/compress"
 )
 
 // Imported versions (storage.VersionImporter).
@@ -23,7 +25,10 @@ import (
 // lookup by version ID finds imported versions. Imported null versions use
 // the "null" index like local ones.
 
-var _ storage.VersionImporter = (*Backend)(nil)
+var (
+	_ storage.VersionImporter     = (*Backend)(nil)
+	_ storage.CompressingImporter = (*Backend)(nil)
+)
 
 // importedIdentity is the identity an imported version keeps.
 type importedIdentity struct {
@@ -99,15 +104,29 @@ type versionWriter struct {
 	bucketID string
 	key      string
 
-	mu   sync.Mutex
-	t    *tmpFile
-	done bool
+	mu sync.Mutex
+	t  *tmpFile
+	// cw compresses into t when the version is stored compressed; w is
+	// where written data goes (cw or t).
+	cw          *compress.Writer
+	w           io.Writer
+	compression string
+	done        bool
 }
 
 // NewVersionWriter starts writing an imported version of bucket/key (see
 // storage.VersionImporter). Data is streamed to a temporary file; nothing is
 // visible until Commit.
 func (b *Backend) NewVersionWriter(ctx context.Context, bucket, key string) (storage.VersionWriter, error) {
+	return b.NewVersionWriterWith(ctx, bucket, key, storage.WriteOptions{})
+}
+
+// NewVersionWriterWith is NewVersionWriter with write options (see
+// storage.CompressingImporter).
+func (b *Backend) NewVersionWriterWith(ctx context.Context, bucket, key string, opts storage.WriteOptions) (storage.VersionWriter, error) {
+	if err := checkCompression(opts.Compression); err != nil {
+		return nil, err
+	}
 	if err := validKey(key); err != nil {
 		return nil, err
 	}
@@ -126,7 +145,23 @@ func (b *Backend) NewVersionWriter(ctx context.Context, bucket, key string) (sto
 	if err != nil {
 		return nil, err
 	}
-	return &versionWriter{b: b, bucket: bucket, bucketID: id, key: key, t: b.newTemp()}, nil
+	w := &versionWriter{b: b, bucket: bucket, bucketID: id, key: key, t: b.newTemp(), compression: opts.Compression.Algorithm}
+	if w.cw, err = newCompressor(w.t, opts.Compression); err != nil {
+		return nil, err
+	}
+	w.w = w.t
+	if w.cw != nil {
+		w.w = w.cw
+	}
+	return w, nil
+}
+
+// discard drops the written data.
+func (w *versionWriter) discard() {
+	if w.cw != nil {
+		w.cw.Abandon()
+	}
+	w.t.discard()
 }
 
 func (w *versionWriter) Write(p []byte) (int, error) {
@@ -135,7 +170,7 @@ func (w *versionWriter) Write(p []byte) (int, error) {
 	if w.done {
 		return 0, errWriterDone
 	}
-	return w.t.Write(p)
+	return w.w.Write(p)
 }
 
 // Commit stores the written data as the newest version of the key with the
@@ -148,16 +183,21 @@ func (w *versionWriter) Commit(ctx context.Context, info storage.ObjectInfo) (st
 	}
 	w.done = true
 	if !storage.ValidImportedVersionID(info.VersionID) {
-		w.t.discard()
+		w.discard()
 		return storage.ObjectInfo{}, fmt.Errorf("%w: version ID %.80q", storage.ErrInvalidName, info.VersionID)
 	}
-	if info.DeleteMarker && w.t.size > 0 {
-		w.t.discard()
-		return storage.ObjectInfo{}, fmt.Errorf("%w: delete marker %s/%.64s with data", storage.ErrInvalidName, w.bucket, w.key)
-	}
 	if err := w.b.begin(ctx); err != nil {
+		w.discard()
+		return storage.ObjectInfo{}, err
+	}
+	size, compression, stored, err := sealData(w.t, w.cw, w.compression)
+	if err != nil {
 		w.t.discard()
 		return storage.ObjectInfo{}, err
+	}
+	if info.DeleteMarker && size > 0 {
+		w.t.discard()
+		return storage.ObjectInfo{}, fmt.Errorf("%w: delete marker %s/%.64s with data", storage.ErrInvalidName, w.bucket, w.key)
 	}
 	dataID, path, err := w.b.finishData(w.t, w.bucketID)
 	if err != nil {
@@ -171,12 +211,14 @@ func (w *versionWriter) Commit(ctx context.Context, info storage.ObjectInfo) (st
 		meta = cloneMeta(info.ObjectMeta)
 	}
 	return w.b.commitObject(commitReq{
-		bucket:   w.bucket,
-		bucketID: w.bucketID,
-		key:      w.key,
-		dataID:   dataID,
-		size:     w.t.size,
-		meta:     meta,
+		bucket:      w.bucket,
+		bucketID:    w.bucketID,
+		key:         w.key,
+		dataID:      dataID,
+		size:        size,
+		compression: compression,
+		storedSize:  stored,
+		meta:        meta,
 		imported: &importedIdentity{
 			versionID:    info.VersionID,
 			lastModified: info.LastModified.UTC(),
@@ -192,6 +234,6 @@ func (w *versionWriter) Abort() error {
 		return nil
 	}
 	w.done = true
-	w.t.discard()
+	w.discard()
 	return nil
 }

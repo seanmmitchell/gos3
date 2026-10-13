@@ -31,6 +31,10 @@ Run `gos3 serve`, point the AWS CLI, an SDK, `mc` or rclone at it, and open
   move buckets between them online, and replicate a bucket to other backings
   in active-passive or active-active mode with automatic failover. See
   [docs/operations.md](docs/operations.md#multiple-backings-and-replication).
+- **Compression**: transparent, seekable DEFLATE compression of object data,
+  enabled per bucket, or enforced or disabled server-wide by the
+  administrator. Already-compressed media types are skipped. See
+  [docs/operations.md](docs/operations.md#compression).
 - **Web UI**: embedded in the binary or run standalone to manage many gos3
   and other S3 servers. It has an object browser with uploads, versions,
   metadata and share links, bucket settings, users and policies, server

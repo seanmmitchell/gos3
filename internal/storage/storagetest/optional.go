@@ -24,6 +24,7 @@ func optionalTests() []testCase {
 		{"UpdateObjectMetaIfRace", testUpdateObjectMetaIfRace},
 		{"ViewBucketConfig", testViewBucketConfig},
 		{"VersionImporter", testVersionImporter}, // importer.go
+		{"Compression", testCompression},
 	}
 }
 

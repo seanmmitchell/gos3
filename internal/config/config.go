@@ -24,15 +24,16 @@ import (
 
 // Config is the full static configuration.
 type Config struct {
-	Server    ServerConfig     `yaml:"server"`
-	Storage   StorageConfig    `yaml:"storage"`
-	Auth      AuthConfig       `yaml:"auth"`
-	UI        UIConfig         `yaml:"ui"`
-	CORS      CORSConfig       `yaml:"cors"`
-	Discovery discovery.Config `yaml:"discovery"`
-	Logging   LoggingConfig    `yaml:"logging"`
-	Lifecycle LifecycleConfig  `yaml:"lifecycle"`
-	Metrics   MetricsConfig    `yaml:"metrics"`
+	Server      ServerConfig      `yaml:"server"`
+	Storage     StorageConfig     `yaml:"storage"`
+	Auth        AuthConfig        `yaml:"auth"`
+	UI          UIConfig          `yaml:"ui"`
+	CORS        CORSConfig        `yaml:"cors"`
+	Discovery   discovery.Config  `yaml:"discovery"`
+	Logging     LoggingConfig     `yaml:"logging"`
+	Lifecycle   LifecycleConfig   `yaml:"lifecycle"`
+	Metrics     MetricsConfig     `yaml:"metrics"`
+	Compression CompressionConfig `yaml:"compression"`
 }
 
 // ServerConfig configures the HTTP listener and identity.
@@ -189,20 +190,64 @@ type MetricsConfig struct {
 	Public bool `yaml:"public"`
 }
 
+// Compression modes (CompressionConfig.Mode): the server-wide policy that
+// decides whether new object data is stored compressed.
+const (
+	// CompressionOptional lets each bucket's compression setting decide
+	// (off unless enabled for the bucket). The default.
+	CompressionOptional = "optional"
+	// CompressionEnforced compresses new objects in every bucket; buckets
+	// cannot opt out.
+	CompressionEnforced = "enforced"
+	// CompressionDisabled compresses nothing new and buckets cannot enable
+	// compression. Objects already stored compressed stay readable.
+	CompressionDisabled = "disabled"
+)
+
+// CompressionConfig is the server-wide compression policy set by the
+// server administrator (runtime-editable as Settings.Compression).
+// Compression is transparent to clients: objects read back byte for byte,
+// with the same ETags, checksums and sizes.
+type CompressionConfig struct {
+	// Mode is CompressionOptional (default), CompressionEnforced or
+	// CompressionDisabled.
+	Mode string `yaml:"mode"`
+	// Level is the DEFLATE level, 1 (fastest, the default) to 9 (smallest).
+	Level int `yaml:"level"`
+	// MinSize is the object size in bytes below which objects whose size
+	// is known up front are stored uncompressed (default 4096).
+	MinSize int64 `yaml:"min_size"`
+	// SkipContentTypes lists media types that are stored uncompressed
+	// because they are compressed already: "type/subtype", "type/*" or a
+	// prefix ending in "*" (case-insensitive; parameters are ignored).
+	// Default DefaultSkipContentTypes. Objects with a Content-Encoding
+	// such as gzip are never compressed again.
+	SkipContentTypes []string `yaml:"skip_content_types"`
+}
+
 // Settings is the runtime-editable subset of configuration, exposed via the
 // admin API (GET/PUT /_gos3/admin/v1/config) and persisted to settings.json.
 type Settings struct {
-	Name          string            `json:"name"`
-	Region        string            `json:"region"`
-	PublicURL     string            `json:"publicUrl"`
-	Domains       []string          `json:"domains"`
-	PublicInfo    bool              `json:"publicInfo"`
-	UIRedirect    bool              `json:"uiRedirect"`
-	CORS          CORSConfig        `json:"cors"`
-	Discovery     discovery.Config  `json:"discovery"`
-	Logging       LoggingConfig     `json:"logging"`
-	Lifecycle     LifecycleSettings `json:"lifecycle"`
-	MetricsPublic bool              `json:"metricsPublic"`
+	Name          string              `json:"name"`
+	Region        string              `json:"region"`
+	PublicURL     string              `json:"publicUrl"`
+	Domains       []string            `json:"domains"`
+	PublicInfo    bool                `json:"publicInfo"`
+	UIRedirect    bool                `json:"uiRedirect"`
+	CORS          CORSConfig          `json:"cors"`
+	Discovery     discovery.Config    `json:"discovery"`
+	Logging       LoggingConfig       `json:"logging"`
+	Lifecycle     LifecycleSettings   `json:"lifecycle"`
+	MetricsPublic bool                `json:"metricsPublic"`
+	Compression   CompressionSettings `json:"compression"`
+}
+
+// CompressionSettings is the runtime-editable form of CompressionConfig.
+type CompressionSettings struct {
+	Mode             string   `json:"mode"`
+	Level            int      `json:"level"`
+	MinSize          int64    `json:"minSize"`
+	SkipContentTypes []string `json:"skipContentTypes"`
 }
 
 // LifecycleSettings is the runtime-editable part of LifecycleConfig.
@@ -290,6 +335,7 @@ func cloneSettings(in Settings) Settings {
 	out.CORS = cloneCORS(in.CORS)
 	out.Discovery.Seeds = slices.Clone(in.Discovery.Seeds)
 	out.Discovery.DNSSRV = slices.Clone(in.Discovery.DNSSRV)
+	out.Compression.SkipContentTypes = slices.Clone(in.Compression.SkipContentTypes)
 	return out
 }
 

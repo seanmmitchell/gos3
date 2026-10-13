@@ -76,6 +76,9 @@ import (
 //	                      with U+FFFD; gob stores strings byte-exactly.
 //	recordFormatVersionV1 (3): compact binary encoding, always used for
 //	                      versionRecord (see codec.go); read in bulk by walks.
+//	recordFormatVersionV2 (4): recordFormatVersionV1 plus the compression
+//	                      fields, used only for versions stored compressed
+//	                      (so other records stay readable by older builds).
 //
 // The format byte also allows switching encodings later without migrating
 // existing values.
@@ -153,6 +156,19 @@ type versionRecord struct {
 	LastModified time.Time          `json:"mtime"`
 	DataID       string             `json:"data,omitempty"` // "" for delete markers and empty objects
 	Meta         storage.ObjectMeta `json:"meta"`
+	// Compression is the algorithm the data file is compressed with ("" =
+	// stored as is); StoredSize is then the data file's size, while Size
+	// stays the size of the content.
+	Compression string `json:"cmp,omitempty"`
+	StoredSize  int64  `json:"ssize,omitempty"`
+}
+
+// fileSize returns the expected size of the version's data file.
+func (r *versionRecord) fileSize() int64 {
+	if r.Compression != "" {
+		return r.StoredSize
+	}
+	return r.Size
 }
 
 func (r *versionRecord) info(bucket, key string, latest bool) storage.ObjectInfo {
@@ -167,6 +183,7 @@ func (r *versionRecord) info(bucket, key string, latest bool) storage.ObjectInfo
 	}
 	if !r.DeleteMarker {
 		oi.ObjectMeta = r.Meta
+		oi.Compression, oi.StoredSize = r.Compression, r.StoredSize
 	}
 	return oi
 }
@@ -247,12 +264,12 @@ func decodeRecord(data []byte, v any) error {
 		err = json.Unmarshal(data[1:], v)
 	case recordFormatGob:
 		err = gob.NewDecoder(bytes.NewReader(data[1:])).Decode(v)
-	case recordFormatVersionV1:
+	case recordFormatVersionV1, recordFormatVersionV2:
 		r, ok := v.(*versionRecord)
 		if !ok {
 			return fmt.Errorf("%w: version record format for %T", errCorrupt, v)
 		}
-		err = decodeVersionRecord(data[1:], r)
+		err = decodeVersionRecord(data[1:], r, data[0] == recordFormatVersionV2)
 	default:
 		return fmt.Errorf("%w: unknown record format %d", errCorrupt, data[0])
 	}

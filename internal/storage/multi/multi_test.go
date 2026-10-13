@@ -515,3 +515,51 @@ func TestGateQuiesce(t *testing.T) {
 	}
 	g.leave()
 }
+
+// Copies keep compression: the synchronous active-active copy and the
+// background copy of an active-passive replica both store compressed
+// versions compressed, with the same content.
+func TestReplicasKeepCompression(t *testing.T) {
+	bk := memBackings(3)
+	r := openRouter(t, Options{Backings: bk, NewBucketMode: ModeActiveActive, NewBucketReplicas: []string{"b"}})
+	ctx := context.Background()
+	if err := r.CreateBucket(ctx, "z", storage.CreateBucketOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	waitState(t, r, "z", StateInSync)
+	data := strings.Repeat("compressible text ", 4096)
+	w, err := r.NewObjectWriterWith(ctx, "z", "k", storage.WriteOptions{
+		Compression: storage.Compression{Algorithm: storage.CompressionDeflate, Level: 1},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := w.Write([]byte(data)); err != nil {
+		t.Fatal(err)
+	}
+	info, err := w.Commit(ctx, storage.ObjectMeta{ETag: "e"}, storage.CommitOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Compression == "" {
+		t.Fatal("the primary stored the version uncompressed")
+	}
+	// Synchronous copy (active-active), then a background copy (a new
+	// active-passive replica).
+	if _, err := r.SetReplication(ctx, "z", ModeActivePassive, []string{"b", "c"}); err != nil {
+		t.Fatal(err)
+	}
+	waitState(t, r, "z", StateInSync)
+	for _, b := range bk {
+		got, err := b.Backend.GetObjectInfo(ctx, "z", "k", "")
+		if err != nil {
+			t.Fatalf("%s: %v", b.Name, err)
+		}
+		if got.Compression != storage.CompressionDeflate || got.Size != int64(len(data)) || got.StoredSize >= got.Size {
+			t.Errorf("%s stores %+v", b.Name, got)
+		}
+		if read(t, b.Backend, "z", "k", "") != data {
+			t.Errorf("%s: content differs", b.Name)
+		}
+	}
+}
