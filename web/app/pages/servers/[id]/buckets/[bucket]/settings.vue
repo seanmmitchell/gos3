@@ -6,8 +6,9 @@ import { bucketSettingsTabs, canShowBucketUsage, resolveBucketTab, type BucketSe
 import { modeOption } from '~/components/admin/-storage'
 
 /**
- * Bucket settings with one tab per S3 bucket sub-resource, plus gos3-only
- * ones such as compression (synced with `?tab=`). Shared state — versioning, object lock and the admin
+ * Bucket settings with one section per S3 bucket sub-resource, plus gos3-only
+ * ones such as compression, picked with the chips under the header (synced
+ * with `?tab=`). Shared state — versioning, object lock and the admin
  * BucketSummary — is loaded here and refreshed when a tab changes it.
  */
 const route = useRoute()
@@ -27,7 +28,7 @@ const tab = computed<BucketSettingsTab>({
     void router.replace({ query: { ...route.query, tab: v === 'overview' ? undefined : v } })
   }
 })
-const tabItems = computed(() => tabs.value.map(t => ({ label: t.label, value: t.value, icon: t.icon })))
+const tabLabel = computed(() => tabs.value.find(t => t.value === tab.value)?.label)
 
 // --- shared state ----------------------------------------------------------
 const versioning = ref<VersioningStatus | null>(null)
@@ -116,22 +117,13 @@ const lockEnabled = computed(() => !!objectLock.value?.enabled)
     <CommonErrorAlert v-else-if="stateError" :error="stateError" title="Could not load the bucket" retryable @retry="refreshShared" />
 
     <template v-else>
-      <div class="-mx-1 overflow-x-auto px-1 pb-1">
-        <UTabs
-          v-model="tab"
-          :items="tabItems"
-          :content="false"
-          variant="link"
-          class="min-w-max"
-          aria-label="Bucket settings sections"
-        />
-      </div>
+      <CommonSectionChips v-model="tab" :items="tabs" label="Bucket settings sections" panel-id="bucket-settings-panel" />
 
       <div v-if="stateLoading && versioning === null" class="space-y-3">
         <USkeleton class="h-24 w-full" />
         <USkeleton class="h-40 w-full" />
       </div>
-      <div v-else role="tabpanel" :aria-label="tabItems.find(t => t.value === tab)?.label">
+      <div v-else id="bucket-settings-panel" role="tabpanel" :aria-label="tabLabel">
         <BucketSettingsOverviewTab
           v-if="tab === 'overview'"
           :bucket="bucket"

@@ -10,6 +10,7 @@ import ErrorAlert from '~/components/common/ErrorAlert.vue'
 import JsonEditor from '~/components/common/JsonEditor.vue'
 import KeyValueEditor from '~/components/common/KeyValueEditor.vue'
 import PageHeader from '~/components/common/PageHeader.vue'
+import SectionChips from '~/components/common/SectionChips.vue'
 import StatusDot from '~/components/common/StatusDot.vue'
 import type { KeyValuePair } from '~/types/ui'
 import { S3Error } from '~/utils/s3/errors'
@@ -23,6 +24,47 @@ describe('common components', () => {
     expect(w.find('h1').text()).toBe('Buckets')
     expect(w.text()).toContain('All buckets')
     expect(w.text()).toContain('ACTION')
+  })
+
+  it('SectionChips is a tab list that selects with clicks and arrow keys', async () => {
+    const items = [
+      { value: 'general', label: 'General', icon: 'i-lucide-server' },
+      { value: 'cors', label: 'CORS', issues: 2 },
+      { value: 'logging', label: 'Logging', changed: true }
+    ]
+    const w = await mountSuspended(SectionChips, {
+      props: {
+        'items': items,
+        'modelValue': 'general',
+        'label': 'Settings sections',
+        'panelId': 'panel',
+        'onUpdate:modelValue': (v: string) => w.setProps({ modelValue: v })
+      }
+    })
+    const list = w.find('[role="tablist"]')
+    expect(list.attributes('aria-label')).toBe('Settings sections')
+    const tabs = () => w.findAll('[role="tab"]')
+    expect(tabs().map(t => t.attributes('aria-selected'))).toEqual(['true', 'false', 'false'])
+    expect(tabs().map(t => t.attributes('tabindex'))).toEqual(['0', '-1', '-1'])
+    expect(tabs()[0]!.attributes('aria-controls')).toBe('panel')
+    // Issue counts and unsaved changes are announced with the label.
+    expect(tabs()[1]!.text()).toContain('(2 issues)')
+    expect(tabs()[2]!.text()).toContain('(unsaved changes)')
+    expect(tabs()[0]!.text()).toBe('General')
+
+    await tabs()[1]!.trigger('click')
+    expect(w.emitted('update:modelValue')?.at(-1)).toEqual(['cors'])
+    await list.trigger('keydown', { key: 'ArrowRight' })
+    expect(w.emitted('update:modelValue')?.at(-1)).toEqual(['logging'])
+    await list.trigger('keydown', { key: 'ArrowRight' })
+    expect(w.emitted('update:modelValue')?.at(-1)).toEqual(['general'])
+    await list.trigger('keydown', { key: 'End' })
+    expect(w.emitted('update:modelValue')?.at(-1)).toEqual(['logging'])
+    await list.trigger('keydown', { key: 'Home' })
+    expect(w.emitted('update:modelValue')?.at(-1)).toEqual(['general'])
+    await list.trigger('keydown', { key: 'ArrowLeft' })
+    expect(w.emitted('update:modelValue')?.at(-1)).toEqual(['logging'])
+    expect(tabs()[2]!.attributes('aria-selected')).toBe('true')
   })
 
   it('ConfirmModal only claims irreversibility for destructive actions', async () => {

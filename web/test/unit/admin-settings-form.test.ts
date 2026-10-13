@@ -1,12 +1,15 @@
 import { describe, expect, it } from 'vitest'
 import type { Settings } from '~/types/admin'
 import {
+  dirtySections,
   formatList,
   formToSettings,
   isFormDirty,
   normalizeList,
   parseList,
+  resolveSettingsSection,
   sectionOf,
+  settingsSections,
   settingsToForm,
   validateBeaconGroup,
   validateDomain,
@@ -337,5 +340,44 @@ describe('settings validation', () => {
     expect(sectionOf('name')).toBe('general')
     expect(sectionOf('cors.maxAgeSeconds')).toBe('cors')
     expect(sectionOf('discovery.seeds')).toBe('discovery')
+  })
+})
+
+describe('settings sections', () => {
+  it('offers compression only when the server reported it', () => {
+    expect(settingsSections(settingsToForm(sample())).map(s => s.value)).toEqual(['general', 'cors', 'discovery', 'logging', 'lifecycle'])
+    const withCompression = settingsToForm({ ...sample(), compression: { mode: 'optional', level: 1, minSize: 0, skipContentTypes: [] } })
+    expect(settingsSections(withCompression).map(s => s.value)).toContain('compression')
+    expect(settingsSections(null).map(s => s.value)).not.toContain('compression')
+  })
+
+  it('resolves ?tab= to a known section (default general)', () => {
+    const sections = settingsSections(settingsToForm(sample()))
+    expect(resolveSettingsSection('discovery', sections)).toBe('discovery')
+    expect(resolveSettingsSection(['logging', 'cors'], sections)).toBe('logging')
+    expect(resolveSettingsSection('compression', sections)).toBe('general')
+    expect(resolveSettingsSection(undefined, sections)).toBe('general')
+    expect(resolveSettingsSection('bogus')).toBe('general')
+  })
+
+  it('reports the sections with unsaved changes', () => {
+    const original = settingsToForm(sample())
+    const f = settingsToForm(sample())
+    expect(dirtySections(f, original).size).toBe(0)
+    expect(dirtySections(f, null).size).toBe(0)
+    f.name = 'renamed'
+    f.discovery.beaconIntervalSeconds = 5
+    expect([...dirtySections(f, original)].sort()).toEqual(['discovery', 'general'])
+    // Normalised like the saved document: whitespace and duplicates are no change.
+    const g = settingsToForm(sample())
+    g.cors.allowedOrigins = [' * ', '*']
+    g.region = ' us-east-1 '
+    expect(dirtySections(g, original).size).toBe(0)
+  })
+
+  it('maps every section field path to its section', () => {
+    expect(sectionOf('logging.level')).toBe('logging')
+    expect(sectionOf('lifecycle.intervalSeconds')).toBe('lifecycle')
+    expect(sectionOf('publicUrl')).toBe('general')
   })
 })
