@@ -119,9 +119,11 @@ func invalidChecksumValue(header string) error {
 
 // payloadOptions configures a payloadReader.
 type payloadOptions struct {
-	// MaxSize bounds the payload (EntityTooLarge beyond); <= 0 means the
-	// server's MaxObjectSize.
+	// MaxSize bounds the payload (EntityTooLarge beyond). A zero value uses
+	// the server's MaxObjectSize unless MaxSizeSet is true.
 	MaxSize int64
+	// MaxSizeSet allows a valid policy limit of zero bytes.
+	MaxSizeSet bool
 	// RequireLength makes an unknown payload length an error
 	// (MissingContentLength), as for PutObject and UploadPart.
 	RequireLength bool
@@ -170,7 +172,7 @@ type payloadReader struct {
 //     unknown one with MissingContentLength when RequireLength is set.
 func (s *Server) newPayloadReader(r *http.Request, rc *reqContext, opts payloadOptions) (*payloadReader, error) {
 	max := opts.MaxSize
-	if max <= 0 {
+	if max <= 0 && !opts.MaxSizeSet {
 		max = s.maxObjectSize
 	}
 	p := &payloadReader{
@@ -287,6 +289,11 @@ func (p *payloadReader) Read(b []byte) (int, error) {
 	}
 	if p.done {
 		return 0, io.EOF
+	}
+	// Read at most one byte beyond the limit. A zero-byte POST policy must
+	// not stream and hash an arbitrary body before denial.
+	if len(b) > 0 && p.max-p.n < int64(len(b)) {
+		b = b[:int(p.max-p.n)+1]
 	}
 	n, err := p.r.Read(b)
 	if n > 0 {

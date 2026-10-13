@@ -488,6 +488,27 @@ func (s *Server) defaultRetention(ctx context.Context, bucket string) (string, t
 	return mode, until, nil
 }
 
+// publishObjectRetention uses the bucket's current default and the new
+// version's creation time. The backend calls this under its commit lock with
+// configurations from the same atomic snapshot; it must not read the backend.
+func publishObjectRetention(meta *storage.ObjectMeta, created time.Time, config func(string) []byte, explicit bool) error {
+	if explicit {
+		if !meta.RetainUntil.After(created) {
+			return s3err.ErrInvalidArgument.WithMessage("The retain until date must be in the future!")
+		}
+		return nil
+	}
+	meta.RetentionMode, meta.RetainUntil = "", time.Time{}
+	if raw := config(storage.ConfigObjectLock); raw != nil {
+		d, err := parseLockDefaults(raw)
+		if err != nil {
+			return s3err.ErrInternalError
+		}
+		meta.RetentionMode, meta.RetainUntil = d.retentionAt(created)
+	}
+	return nil
+}
+
 // sseConfigDoc is the stored ServerSideEncryptionConfiguration document.
 type sseConfigDoc struct {
 	XMLName xml.Name `xml:"ServerSideEncryptionConfiguration"`
@@ -591,6 +612,9 @@ func (s *Server) handlePutObject(w http.ResponseWriter, r *http.Request, rc *req
 	opts := headerObjectOpts(h)
 	if err := s.prepareNewObject(ctx, r, rc, bi, rc.key, &meta, opts); err != nil {
 		return err
+	}
+	cond.BeforePublish = func(m, _ *storage.ObjectMeta, created time.Time, config func(string) []byte) error {
+		return publishObjectRetention(m, created, config, opts.retentionSet)
 	}
 	p, err := s.newObjectPayload(r, rc, payloadOptions{RequireLength: true})
 	if err != nil {
