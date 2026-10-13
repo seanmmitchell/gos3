@@ -66,9 +66,27 @@ func (b *Backend) commitObject(req commitReq) (storage.ObjectInfo, error) {
 		if err := checkPreconditions(bb, req.key, req.opts); err != nil {
 			return err
 		}
+		created := time.Now().UTC()
+		if req.opts.BeforePublish != nil {
+			latest, _, err := latestVersion(bb, req.key)
+			if err != nil {
+				return err
+			}
+			var current *storage.ObjectMeta
+			if latest != nil && !latest.DeleteMarker {
+				m := cloneMeta(latest.Meta)
+				current = &m
+			}
+			config := bb.Bucket(subConfig)
+			if err := req.opts.BeforePublish(&req.meta, current, created, func(key string) []byte {
+				return config.Get([]byte(key))
+			}); err != nil {
+				return err
+			}
+		}
 		rec := versionRecord{
 			Size:         req.size,
-			LastModified: time.Now().UTC(),
+			LastModified: created,
 			DataID:       req.dataID,
 			Meta:         req.meta,
 			Compression:  req.compression,

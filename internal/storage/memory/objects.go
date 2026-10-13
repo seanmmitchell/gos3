@@ -203,10 +203,27 @@ func (b *Backend) commitLocked(bk *bucket, key string, data []byte, enc stored, 
 	if err := checkPreconditions(obj, opts); err != nil {
 		return storage.ObjectInfo{}, err
 	}
+	stamp, created := b.nextStamp()
+	if opts.BeforePublish != nil {
+		var current *storage.ObjectMeta
+		if obj != nil && len(obj.versions) > 0 {
+			latest := obj.versions[len(obj.versions)-1]
+			if !latest.deleteMarker {
+				m := cloneMeta(latest.meta)
+				current = &m
+			}
+		}
+		if err := opts.BeforePublish(&meta, current, created, func(key string) []byte {
+			return bk.configs[key]
+		}); err != nil {
+			return storage.ObjectInfo{}, err
+		}
+	}
 	if data == nil {
 		data = []byte{}
 	}
-	v := &version{meta: cloneMeta(meta), data: data, compression: enc.compression, size: enc.size}
+	v := &version{meta: cloneMeta(meta), data: data, stamp: stamp, lastModified: created,
+		compression: enc.compression, size: enc.size}
 	b.addVersionLocked(bk, key, obj, v)
 	return v.info(bk.info.Name, key, true), nil
 }
@@ -215,7 +232,9 @@ func (b *Backend) commitLocked(bk *bucket, key string, data []byte, enc stored, 
 // versioning status (replacing an existing null version when the new one is
 // null) and makes it the latest version of key. obj may be nil.
 func (b *Backend) addVersionLocked(bk *bucket, key string, obj *object, v *version) {
-	v.stamp, v.lastModified = b.nextStamp()
+	if v.lastModified.IsZero() {
+		v.stamp, v.lastModified = b.nextStamp()
+	}
 	if bk.info.Versioning == storage.VersioningEnabled {
 		v.id = newVersionID(v.stamp)
 	} else {
