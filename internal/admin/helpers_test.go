@@ -56,6 +56,9 @@ type testEnv struct {
 }
 
 func defaultSettings() config.Settings {
+	// These fixtures exercise discovery endpoints and scans explicitly.
+	disc := discovery.DefaultConfig()
+	disc.Enabled, disc.AllowScan = true, true
 	return config.Settings{
 		Name:       "gos3-test",
 		Region:     "us-east-1",
@@ -69,7 +72,7 @@ func defaultSettings() config.Settings {
 			ExposeHeaders:  []string{"ETag", "x-amz-request-id"},
 			MaxAgeSeconds:  600,
 		},
-		Discovery:     discovery.DefaultConfig(),
+		Discovery:     disc,
 		Logging:       config.LoggingConfig{Level: "info", Format: "text", AccessLog: true},
 		Lifecycle:     config.LifecycleSettings{Enabled: true, IntervalSeconds: 3600},
 		MetricsPublic: false,

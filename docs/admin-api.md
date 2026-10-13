@@ -1,5 +1,11 @@
 # gos3 admin API (v1)
 
+The API is enabled by default. Set `admin.enabled: false`,
+`GOS3_ADMIN_ENABLED=false`, or `--no-admin` to disable it and the embedded
+UI. Disabled API routes return 404, including signed requests and preflights.
+Enabling it requires a restart. `--no-ui` alone keeps the API available for
+a separately hosted UI.
+
 Base path: `/_gos3/admin/v1` on the S3 listener. JSON in/out
 (`Content-Type: application/json`). Timestamps are RFC3339. Go
 `time.Duration` fields (e.g. discovery `beaconInterval`, `peerTtl`, scan

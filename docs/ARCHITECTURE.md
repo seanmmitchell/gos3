@@ -15,7 +15,7 @@ discovery of gos3 servers on the network.
   object + composite), tagging, bucket policies + IAM users/policies, canned
   ACLs, CORS, lifecycle expiration, object lock (retention/legal hold),
   presigned URLs, browser POST uploads, virtual-hosted-style addressing.
-- **Simple ops**: one binary, `gos3 serve --data ./data`, YAML/env/flags,
+- **Simple ops**: one binary, `gos3 serve --data ./data`, JSON/YAML/env/flags,
   Prometheus metrics, JSON admin API, embedded UI, graceful shutdown.
 - **Discovery**: servers advertise via mDNS + UDP beacon, follow static seeds
   and DNS SRV, and can scan networks; the UI aggregates all of it.
@@ -66,7 +66,7 @@ docs/security.md#dns-rebinding-and-the-host-header):
    domain) → **S3 handler**, always (even if the path starts with `/_gos3/`;
    that is then an object key).
 2. Path starts with `/_gos3/`:
-   - `/_gos3/admin/v1/...` → admin API
+   - `/_gos3/admin/v1/...` → admin API (404 when `admin.enabled` is false)
    - `/_gos3/ui/...` → embedded web UI (SPA, `index.html`/`200.html` fallback)
    - `/_gos3/info` → public `discovery.Info` JSON (CORS `*`; requires auth when `publicInfo` is false)
    - `/_gos3/health` (liveness) and `/_gos3/ready` (backend reachable within 5 s; 503 while shutting down) → `{"status":"ok"}`
@@ -76,6 +76,12 @@ docs/security.md#dns-rebinding-and-the-host-header):
 4. Everything else → **S3 handler**.
 
 `_gos3` can never be a bucket name (underscore is invalid), so there is no clash.
+
+Anonymous path-style `/minio/health/live` and `/minio/health/ready` without
+a query string are also probes; signed and virtual-host requests still go
+to S3. Management can be disabled independently of S3; doing so also disables
+UI and the saved settings overlay. The `noui` build tag excludes embedded
+assets and defaults UI off. Every discovery switch defaults off.
 
 ## S3 layer (`internal/s3`)
 

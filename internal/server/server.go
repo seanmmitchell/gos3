@@ -252,7 +252,7 @@ func New(cfg config.Config, logger *slog.Logger, opts ...Option) (_ *Server, err
 	}); err != nil {
 		return nil, fmt.Errorf("opening IAM: %w", err)
 	}
-	if s.settings, err = config.LoadStore(config.SettingsFrom(cfg), cfg.SettingsPath()); err != nil {
+	if s.settings, err = cfg.LoadSettings(); err != nil {
 		return nil, err
 	}
 	st := s.settings.Get()
@@ -281,20 +281,22 @@ func New(cfg config.Config, logger *slog.Logger, opts ...Option) (_ *Server, err
 		ClientIP:      s.clientIP,
 	})
 	s.disc = discovery.New(st.Discovery, s.Info, logger)
-	s.admin = s.instrumentAdmin(admin.NewHandler(admin.Deps{
-		Backend:     s.backend,
-		Verifier:    s.verifier,
-		IAM:         s.iam,
-		Metrics:     s.metrics,
-		Settings:    s.settings,
-		Discovery:   s.disc,
-		Info:        s.Info,
-		BackendName: s.backendName,
-		DataPath:    s.dataPath,
-		Logger:      logger,
+	if cfg.Admin.Enabled {
+		s.admin = s.instrumentAdmin(admin.NewHandler(admin.Deps{
+			Backend:     s.backend,
+			Verifier:    s.verifier,
+			IAM:         s.iam,
+			Metrics:     s.metrics,
+			Settings:    s.settings,
+			Discovery:   s.disc,
+			Info:        s.Info,
+			BackendName: s.backendName,
+			DataPath:    s.dataPath,
+			Logger:      logger,
 
-		TrustProxyHeaders: s.clientIP,
-	}))
+			TrustProxyHeaders: s.clientIP,
+		}))
+	}
 	s.lifecycle = lifecycle.NewWorker(s.backend, lifecycle.Options{
 		Interval: time.Duration(st.Lifecycle.IntervalSeconds) * time.Second,
 		Logger:   logger.With("component", "lifecycle"),
@@ -305,6 +307,9 @@ func New(cfg config.Config, logger *slog.Logger, opts ...Option) (_ *Server, err
 		fsys := o.uiFS
 		if fsys == nil {
 			fsys = webui.FS()
+		}
+		if fsys == nil {
+			return nil, fmt.Errorf("ui.enabled: this binary was built without UI assets; disable ui.enabled or use a build with the UI")
 		}
 		s.ui = webui.NewHandler(fsys)
 		s.uiBuilt = webui.IsBuilt(fsys)

@@ -30,7 +30,7 @@ func TestSettingFieldsComplete(t *testing.T) {
 // settings.json overrides (previously ignored without any warning).
 func TestPersistedOverrides(t *testing.T) {
 	cfg := Default()
-	cfg.Discovery.Enabled = false                                // explicit (--no-discovery)
+	cfg.Discovery.Enabled = true                                 // explicit opt-in
 	cfg.CORS.AllowedOrigins = []string{"https://ui.example.com"} // explicit (--cors-origin)
 	cfg.Normalize()
 
@@ -44,7 +44,7 @@ func TestPersistedOverrides(t *testing.T) {
 	}
 	want := map[string]SettingOverride{
 		"server.name":          {Key: "server.name", Configured: cfg.Server.Name, Persisted: "renamed in the UI", Explicit: false},
-		"discovery.enabled":    {Key: "discovery.enabled", Configured: "false", Persisted: "true", Explicit: true},
+		"discovery.enabled":    {Key: "discovery.enabled", Configured: "true", Persisted: "false", Explicit: true},
 		"cors.allowed_origins": {Key: "cors.allowed_origins", Configured: `["https://ui.example.com"]`, Persisted: `["*"]`, Explicit: true},
 		"logging.level":        {Key: "logging.level", Configured: "info", Persisted: "debug", Explicit: false},
 	}

@@ -42,7 +42,9 @@ func expectClosed(t *testing.T, conn net.Conn, br *bufio.Reader) {
 // without any deadline, so the response was never sent and the connection
 // and its goroutine were held forever – without any credentials.
 func TestStalledBodyOnSystemEndpoints(t *testing.T) {
-	srv := start(t, testConfig(), WithUIFS(fakeUI()))
+	cfg := testConfig()
+	cfg.UI.Enabled = true
+	srv := start(t, cfg, WithUIFS(fakeUI()))
 	addr := srv.Addr()
 	for _, tc := range []struct {
 		name, method, path string

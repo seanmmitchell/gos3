@@ -124,6 +124,12 @@ func TestFallbackToIndexWithout200(t *testing.T) {
 }
 
 func TestEmbeddedPlaceholder(t *testing.T) {
+	if FS() == nil {
+		if Built() || get(t, Handler(), "GET", "/_gos3/ui/", nil).Code != 404 {
+			t.Fatal("UI is available in a build without embedded assets")
+		}
+		return
+	}
 	// The committed tree holds the placeholder; a developer tree may hold a
 	// real build. Either way the root must answer with HTML.
 	w := get(t, Handler(), "GET", "/_gos3/ui/", nil)

@@ -1,7 +1,7 @@
 // Package config holds gos3 configuration: static configuration loaded from
-// defaults < YAML file < environment (GOS3_*) < CLI flags, plus a runtime
+// defaults < JSON/YAML file < environment (GOS3_*) < CLI flags, plus a runtime
 // Settings overlay that the admin API can change and that is persisted to
-// <data>/.gos3/settings.json (it wins over static config for its fields).
+// <data>/.gos3/settings.json (it wins over static config when admin is enabled).
 //
 // Entry points: Load (CLI flags passed as Overrides) then Config.Validate;
 // ResolveRootCredentials fills in generated root credentials; SettingsFrom
@@ -28,6 +28,7 @@ type Config struct {
 	Storage     StorageConfig     `yaml:"storage"`
 	Auth        AuthConfig        `yaml:"auth"`
 	UI          UIConfig          `yaml:"ui"`
+	Admin       AdminConfig       `yaml:"admin"`
 	CORS        CORSConfig        `yaml:"cors"`
 	Discovery   discovery.Config  `yaml:"discovery"`
 	Logging     LoggingConfig     `yaml:"logging"`
@@ -154,9 +155,14 @@ type AuthConfig struct {
 	InsecureDemoCredentials bool `yaml:"insecure_demo_credentials"`
 }
 
+// AdminConfig controls the management API and persisted runtime settings.
+type AdminConfig struct {
+	Enabled bool `yaml:"enabled"` // default true; false also disables the UI
+}
+
 // UIConfig configures the embedded web UI served at /_gos3/ui/.
 type UIConfig struct {
-	Enabled bool `yaml:"enabled"` // default true
+	Enabled bool `yaml:"enabled"` // default true; false in noui builds
 	// RedirectRoot redirects anonymous browser GET / (Accept: text/html) to the UI.
 	RedirectRoot bool `yaml:"redirect_root"` // default true
 }
