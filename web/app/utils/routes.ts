@@ -54,6 +54,7 @@ export const appRoutes = {
   policies: (id: string) => `/servers/${seg(id)}/policies`,
   policy: (id: string, name: string) => `/servers/${seg(id)}/policies/${seg(name)}`,
   settings: (id: string) => `/servers/${seg(id)}/settings`,
+  storage: (id: string) => `/servers/${seg(id)}/storage`,
   discovery: (id: string) => `/servers/${seg(id)}/discovery`
 }
 

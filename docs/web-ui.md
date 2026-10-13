@@ -32,6 +32,9 @@ the internet.
   [configuration.md](configuration.md#runtime-settings-settingsjson).
 - **Discovery** (gos3 only): peers seen by each connected server, network
   scans, local discovery from the UI host, and one-click "add server".
+- **Storage** (gos3 only): the server's storage backings, and per bucket
+  its placement, replication, moves and promotions (see
+  [Storage backings and placement](#storage-backings-and-placement)).
 
 Pages are shown according to the signed-in identity's permissions (from
 `GET /_gos3/admin/v1/whoami`). For example, Users appears only with
@@ -90,6 +93,36 @@ policies and clears that option.
   (it lists all users; actions on users outside the pattern are refused by
   the server and shown as errors). For an admin action the simulator asks for an admin
   resource instead of a bucket and key (empty = service level).
+
+### Storage backings and placement
+
+On servers with several storage backings (see
+[admin-api.md](admin-api.md#storage-backings-and-bucket-placement)):
+
+- **Storage** (sidebar, needs `admin:ListBackings`, whoami capability
+  `viewStorage`) shows every backing with its kind, path, health (the last
+  error of an unhealthy one), last check, bucket and replica counts and disk
+  usage. It refreshes every 10 seconds.
+- **Bucket settings → Placement** (also `viewStorage`) shows the replication
+  mode and each member (primary, replicas, a move target) with its state
+  (`in sync`, `syncing`, `lagging`, `degraded`, `offline`), pending changes,
+  copy progress, last full sync and last error, and a banner while the
+  bucket moves. The tab polls every 3 seconds while a copy runs, changes are
+  pending or a move is in progress.
+- With `admin:UpdateBucketPlacement` (capability `manageStorage`) the tab
+  changes the mode (single, active-passive, active-active) and the replica
+  backings (removing a replica asks first, because its copy is deleted),
+  moves the bucket (or one replica) to a backing without a copy, cancels a
+  move while it is copying, promotes a replica to primary and resyncs one or
+  all replicas. "Force promote" is offered when the replica is not in sync
+  or the primary is offline; it asks you to type the backing name, because
+  changes not yet copied to the replica are lost. Without the capability the
+  tab is read-only.
+- The bucket list shows the primary backing, the mode with the number of
+  copies (for example `AP ×2`) and `moving`, when the server reports
+  placement and the buckets are not all on one backing.
+- Servers that do not report `viewStorage` (older versions) show neither the
+  page nor the tab.
 
 ### Object browser notes
 

@@ -1,0 +1,763 @@
+package multi
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"io"
+	"slices"
+	"sort"
+	"sync"
+	"time"
+
+	"github.com/seanmmitchell/gos3/internal/storage"
+)
+
+// --- routing ---
+
+// lookup returns the state of bucket.
+func (r *Router) lookup(bucket string) (*bucketState, error) {
+	if r.closed.Load() {
+		return nil, ErrClosed
+	}
+	r.mu.RLock()
+	bs := r.buckets[bucket]
+	r.mu.RUnlock()
+	if bs == nil {
+		return nil, fmt.Errorf("%w: %q", storage.ErrBucketNotFound, bucket)
+	}
+	return bs, nil
+}
+
+// readers returns the backings a read of the bucket may use, best first:
+// the primary, then (active-passive) synced replicas or (active-active)
+// in-sync replicas, healthy backings before unhealthy ones. spread
+// rotates the in-sync members of an active-active bucket, to spread
+// object reads over them.
+func (r *Router) readers(bs *bucketState, spread bool) []*backing {
+	r.mu.RLock()
+	rec := bs.rec
+	cands := []*backing{r.backings[rec.primary()]}
+	for _, m := range rec.Members[1:] {
+		ms := bs.members[m.Backing]
+		switch {
+		case rec.Mode == ModeActiveActive && ms.syncMode:
+		case rec.Mode == ModeActivePassive && m.Synced:
+		default:
+			continue
+		}
+		cands = append(cands, ms.backing)
+	}
+	r.mu.RUnlock()
+	if spread && rec.Mode == ModeActiveActive && len(cands) > 1 {
+		n := int(bs.rr.Add(1) % uint32(len(cands)))
+		cands = append(cands[n:], cands[:n]...)
+	}
+	slices.SortStableFunc(cands, func(a, b *backing) int {
+		ha, hb := a.healthy.Load(), b.healthy.Load()
+		switch {
+		case ha == hb:
+			return 0
+		case ha:
+			return -1
+		}
+		return 1
+	})
+	return cands
+}
+
+// readFrom calls fn with the bucket's readers in order until one answers
+// with something other than a backing failure.
+// cb, when not nil, tells errors of the caller's callback apart.
+func (r *Router) readFrom(bs *bucketState, spread bool, cb *cbTracker, fn func(b *backing) error) error {
+	var first error
+	for _, b := range r.readers(bs, spread) {
+		err := fn(b)
+		if !isBackingError(err) || cb.isCaller(err) {
+			return err
+		}
+		r.observe(b, err)
+		if first == nil {
+			first = err
+		}
+	}
+	return first
+}
+
+// route says where a write to a bucket goes.
+type route struct {
+	bs   *bucketState
+	lead *backing
+	// followers receive the write synchronously (in-sync active-active
+	// replicas).
+	followers []*memberState
+	// async are the other members (and the move target): the changed key
+	// is copied to them in the background.
+	async []*memberState
+}
+
+// writeRoute computes the route of a write to bs.
+func (r *Router) writeRoute(bs *bucketState) *route {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	rec := bs.rec
+	rt := &route{bs: bs, lead: r.backings[rec.primary()]}
+	for _, m := range rec.Members[1:] {
+		ms := bs.members[m.Backing]
+		if rec.Mode == ModeActiveActive && ms.syncMode {
+			rt.followers = append(rt.followers, ms)
+		} else {
+			rt.async = append(rt.async, ms)
+		}
+	}
+	if rec.Move != nil {
+		rt.async = append(rt.async, bs.members[rec.Move.To])
+	}
+	return rt
+}
+
+// enterWrite looks the bucket up, passes its gate and computes the route.
+// The caller must call leave.
+func (r *Router) enterWrite(ctx context.Context, bucket string) (rt *route, leave func(), err error) {
+	bs, err := r.lookup(bucket)
+	if err != nil {
+		return nil, nil, err
+	}
+	if err := bs.gate.enter(ctx); err != nil {
+		return nil, nil, err
+	}
+	return r.writeRoute(bs), bs.gate.leave, nil
+}
+
+// inSyncMode reports whether ms receives synchronous writes.
+func (r *Router) inSyncMode(ms *memberState) bool {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return ms.syncMode
+}
+
+// demote takes an active-active replica out of synchronous writes after
+// a failed write; key (when not "") is copied to it in the background.
+func (r *Router) demote(ms *memberState, key string) {
+	r.mu.Lock()
+	ms.syncMode = false
+	r.mu.Unlock()
+	if key != "" {
+		r.markDirty(ms, key)
+	} else {
+		r.markFull(ms)
+	}
+}
+
+// replicate propagates a change of key, made on rt.lead, to the other
+// members: synchronously to the followers (the caller holds the key's
+// lock), in the background to the others.
+func (r *Router) replicate(ctx context.Context, rt *route, key string) {
+	for _, f := range rt.followers {
+		if err := r.syncKey(ctx, rt.lead, f.backing, rt.bs.name, key, nil); err != nil {
+			r.demote(f, key)
+			continue
+		}
+		if !r.inSyncMode(f) {
+			r.markDirty(f, key)
+		}
+	}
+	for _, a := range rt.async {
+		r.markDirty(a, key)
+	}
+}
+
+// objectWrite runs op, a change of bucket/key, on the bucket's primary and
+// replicates it. caller reports whether an error came from the caller's
+// callback rather than from the backing.
+func (r *Router) objectWrite(ctx context.Context, bucket, key string, cb *cbTracker, op func(b storage.Backend) error) error {
+	rt, leave, err := r.enterWrite(ctx, bucket)
+	if err != nil {
+		return err
+	}
+	defer leave()
+	if len(rt.followers) > 0 {
+		unlock := r.keys.lock(bucket, key)
+		defer unlock()
+	}
+	if err := op(rt.lead.Backend); err != nil {
+		if !cb.isCaller(err) {
+			r.observe(rt.lead, err)
+		}
+		return err
+	}
+	r.replicate(ctx, rt, key)
+	return nil
+}
+
+// bucketWrite applies op (a bucket-level change) to the primary, then to
+// every other copy. A copy that fails gets a full comparison later.
+func (r *Router) bucketWrite(ctx context.Context, bucket string, op func(b storage.Backend) error) error {
+	rt, leave, err := r.enterWrite(ctx, bucket)
+	if err != nil {
+		return err
+	}
+	defer leave()
+	if err := op(rt.lead.Backend); err != nil {
+		return r.observe(rt.lead, err)
+	}
+	for _, ms := range append(slices.Clone(rt.followers), rt.async...) {
+		if err := op(ms.backing.Backend); err != nil {
+			r.observe(ms.backing, err)
+			if r.inSyncMode(ms) {
+				r.demote(ms, "")
+			} else {
+				r.markFull(ms)
+			}
+		}
+	}
+	return nil
+}
+
+// cbTracker remembers the last error a caller's callback returned, to
+// tell it apart from backing failures.
+type cbTracker struct {
+	mu  sync.Mutex
+	err error
+}
+
+func (t *cbTracker) note(err error) error {
+	if err != nil && t != nil {
+		t.mu.Lock()
+		t.err = err
+		t.mu.Unlock()
+	}
+	return err
+}
+
+func (t *cbTracker) isCaller(err error) bool {
+	if t == nil || err == nil {
+		return false
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return t.err != nil && errors.Is(err, t.err)
+}
+
+// --- buckets ---
+
+// ListBuckets returns every bucket, as its first reachable copy describes
+// it.
+func (r *Router) ListBuckets(ctx context.Context) ([]storage.BucketInfo, error) {
+	if r.closed.Load() {
+		return nil, ErrClosed
+	}
+	r.mu.RLock()
+	states := make([]*bucketState, 0, len(r.buckets))
+	for _, bs := range r.buckets {
+		states = append(states, bs)
+	}
+	r.mu.RUnlock()
+	sort.Slice(states, func(i, j int) bool { return states[i].name < states[j].name })
+
+	lists := map[*backing]map[string]storage.BucketInfo{}
+	errs := map[*backing]error{}
+	list := func(b *backing) (map[string]storage.BucketInfo, error) {
+		if m, ok := lists[b]; ok {
+			return m, nil
+		}
+		if err, ok := errs[b]; ok {
+			return nil, err
+		}
+		infos, err := b.Backend.ListBuckets(ctx)
+		if err != nil {
+			errs[b] = r.observe(b, err)
+			return nil, err
+		}
+		m := make(map[string]storage.BucketInfo, len(infos))
+		for _, in := range infos {
+			m[in.Name] = in
+		}
+		lists[b] = m
+		return m, nil
+	}
+	out := make([]storage.BucketInfo, 0, len(states))
+	for _, bs := range states {
+		var lastErr error
+		found := false
+		for _, b := range r.readers(bs, false) {
+			m, err := list(b)
+			if err != nil {
+				lastErr = err
+				continue
+			}
+			if in, ok := m[bs.name]; ok {
+				out = append(out, in)
+				found = true
+				break
+			}
+		}
+		if !found && lastErr != nil {
+			return nil, lastErr
+		}
+	}
+	return out, nil
+}
+
+// CreateBucket creates the bucket on the default backing.
+func (r *Router) CreateBucket(ctx context.Context, name string, opts storage.CreateBucketOptions) error {
+	if r.closed.Load() {
+		return ErrClosed
+	}
+	for {
+		r.adminMu.Lock()
+		r.mu.RLock()
+		exists := r.buckets[name] != nil
+		pj := r.purges[purgeRecord{Bucket: name, Backing: r.def.Name}]
+		r.mu.RUnlock()
+		if exists {
+			r.adminMu.Unlock()
+			return fmt.Errorf("%w: %q", storage.ErrBucketExists, name)
+		}
+		if pj == nil {
+			break
+		}
+		// A copy of a deleted bucket with this name is still being
+		// removed from the default backing: wait for it.
+		r.adminMu.Unlock()
+		if err := r.waitPurge(ctx, pj.rec); err != nil {
+			return err
+		}
+	}
+	defer r.adminMu.Unlock()
+	if err := r.def.Backend.CreateBucket(ctx, name, opts); err != nil {
+		return r.observe(r.def, err)
+	}
+	rec := &placementRecord{
+		Mode:    r.opts.NewBucketMode,
+		Members: []memberRecord{{Backing: r.def.Name, Synced: true}},
+	}
+	for _, rep := range r.opts.NewBucketReplicas {
+		r.mu.RLock()
+		pending := r.purges[purgeRecord{Bucket: name, Backing: rep}] != nil
+		r.mu.RUnlock()
+		if pending || !r.backings[rep].healthy.Load() {
+			// Added later with SetReplication; mostly a stale copy.
+			r.log.Warn("new bucket created without one of its default replicas", "bucket", name, "backing", rep,
+				"copy_being_deleted", pending)
+			continue
+		}
+		rec.Members = append(rec.Members, memberRecord{Backing: rep})
+	}
+	if len(rec.Members) == 1 {
+		rec.Mode = ModeSingle
+	}
+	bs := r.newBucketState(name, rec)
+	r.mu.Lock()
+	r.buckets[name] = bs
+	r.mu.Unlock()
+	for _, ms := range bs.members {
+		if ms.backing != r.def {
+			r.kick(ms)
+		}
+	}
+	// A failed save is repaired at the next start: buckets without a
+	// placement are adopted where they are.
+	r.saveLogged("creating a bucket")
+	return nil
+}
+
+// purgePollInterval is how often waitPurge checks a purge.
+const purgePollInterval = 200 * time.Millisecond
+
+// waitPurge waits until the purge p finished.
+func (r *Router) waitPurge(ctx context.Context, p purgeRecord) error {
+	for {
+		r.mu.RLock()
+		pending := r.purges[p] != nil
+		r.mu.RUnlock()
+		if !pending {
+			return nil
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-r.ctx.Done():
+			return ErrClosed
+		case <-time.After(purgePollInterval):
+		}
+	}
+}
+
+// GetBucket describes the bucket.
+func (r *Router) GetBucket(ctx context.Context, name string) (storage.BucketInfo, error) {
+	bs, err := r.lookup(name)
+	if err != nil {
+		return storage.BucketInfo{}, err
+	}
+	var info storage.BucketInfo
+	err = r.readFrom(bs, false, nil, func(b *backing) error {
+		var err error
+		info, err = b.Backend.GetBucket(ctx, name)
+		return err
+	})
+	return info, err
+}
+
+// DeleteBucket deletes the (empty) bucket from its primary; the other
+// copies are deleted in the background.
+func (r *Router) DeleteBucket(ctx context.Context, name string) error {
+	if r.closed.Load() {
+		return ErrClosed
+	}
+	r.adminMu.Lock()
+	defer r.adminMu.Unlock()
+	bs, err := r.lookup(name)
+	if err != nil {
+		return err
+	}
+	r.mu.RLock()
+	prim := r.backings[bs.rec.primary()]
+	r.mu.RUnlock()
+	if err := prim.Backend.DeleteBucket(ctx, name); err != nil {
+		return r.observe(prim, err)
+	}
+	var cancel []*memberState
+	r.mu.Lock()
+	bs.removed = true
+	delete(r.buckets, name)
+	for bname, ms := range bs.members {
+		cancel = append(cancel, ms)
+		if bname != prim.Name {
+			r.addPurgeLocked(name, bname)
+		}
+	}
+	r.mu.Unlock()
+	for _, ms := range cancel {
+		r.cancelMember(ms)
+	}
+	r.saveLogged("deleting a bucket")
+	r.mu.RLock()
+	for bname := range bs.members {
+		r.startPurge(r.purges[purgeRecord{Bucket: name, Backing: bname}])
+	}
+	r.mu.RUnlock()
+	return nil
+}
+
+// SetBucketVersioning changes the versioning state on every copy.
+func (r *Router) SetBucketVersioning(ctx context.Context, name string, status storage.VersioningStatus) error {
+	return r.bucketWrite(ctx, name, func(b storage.Backend) error { return b.SetBucketVersioning(ctx, name, status) })
+}
+
+// SetBucketObjectLock enables object lock on every copy.
+func (r *Router) SetBucketObjectLock(ctx context.Context, name string, enabled bool) error {
+	return r.bucketWrite(ctx, name, func(b storage.Backend) error { return b.SetBucketObjectLock(ctx, name, enabled) })
+}
+
+// GetBucketConfig returns a configuration document.
+func (r *Router) GetBucketConfig(ctx context.Context, bucket, key string) ([]byte, error) {
+	bs, err := r.lookup(bucket)
+	if err != nil {
+		return nil, err
+	}
+	var data []byte
+	err = r.readFrom(bs, false, nil, func(b *backing) error {
+		var err error
+		data, err = b.Backend.GetBucketConfig(ctx, bucket, key)
+		return err
+	})
+	return data, err
+}
+
+// ViewBucketConfig implements storage.ConfigViewer.
+func (r *Router) ViewBucketConfig(ctx context.Context, bucket, key string, fn func(data []byte) error) error {
+	bs, err := r.lookup(bucket)
+	if err != nil {
+		return err
+	}
+	cb := &cbTracker{}
+	return r.readFrom(bs, false, cb, func(b *backing) error {
+		var err error
+		if cv, ok := b.Backend.(storage.ConfigViewer); ok {
+			err = cv.ViewBucketConfig(ctx, bucket, key, func(data []byte) error { return cb.note(fn(data)) })
+		} else {
+			var data []byte
+			if data, err = b.Backend.GetBucketConfig(ctx, bucket, key); err == nil {
+				err = cb.note(fn(data))
+			}
+		}
+		return err
+	})
+}
+
+// PutBucketConfig stores a configuration document on every copy.
+func (r *Router) PutBucketConfig(ctx context.Context, bucket, key string, data []byte) error {
+	return r.bucketWrite(ctx, bucket, func(b storage.Backend) error { return b.PutBucketConfig(ctx, bucket, key, data) })
+}
+
+// DeleteBucketConfig removes a configuration document from every copy.
+func (r *Router) DeleteBucketConfig(ctx context.Context, bucket, key string) error {
+	return r.bucketWrite(ctx, bucket, func(b storage.Backend) error { return b.DeleteBucketConfig(ctx, bucket, key) })
+}
+
+// --- objects ---
+
+// GetObjectInfo returns a version's metadata.
+func (r *Router) GetObjectInfo(ctx context.Context, bucket, key, versionID string) (storage.ObjectInfo, error) {
+	bs, err := r.lookup(bucket)
+	if err != nil {
+		return storage.ObjectInfo{}, err
+	}
+	var info storage.ObjectInfo
+	err = r.readFrom(bs, true, nil, func(b *backing) error {
+		var err error
+		info, err = b.Backend.GetObjectInfo(ctx, bucket, key, versionID)
+		return err
+	})
+	return info, err
+}
+
+// OpenObject opens a version for reading.
+func (r *Router) OpenObject(ctx context.Context, bucket, key, versionID string) (storage.ObjectInfo, io.ReadSeekCloser, error) {
+	bs, err := r.lookup(bucket)
+	if err != nil {
+		return storage.ObjectInfo{}, nil, err
+	}
+	var (
+		info storage.ObjectInfo
+		rc   io.ReadSeekCloser
+	)
+	err = r.readFrom(bs, true, nil, func(b *backing) error {
+		var err error
+		info, rc, err = b.Backend.OpenObject(ctx, bucket, key, versionID)
+		return err
+	})
+	return info, rc, err
+}
+
+// UpdateObjectMeta changes a version's metadata on every copy.
+func (r *Router) UpdateObjectMeta(ctx context.Context, bucket, key, versionID string, fn func(*storage.ObjectMeta) error) (storage.ObjectInfo, error) {
+	var info storage.ObjectInfo
+	cb := &cbTracker{}
+	err := r.objectWrite(ctx, bucket, key, cb, func(b storage.Backend) error {
+		var err error
+		info, err = b.UpdateObjectMeta(ctx, bucket, key, versionID, func(m *storage.ObjectMeta) error { return cb.note(fn(m)) })
+		return err
+	})
+	return info, err
+}
+
+// UpdateObjectMetaIf implements storage.ConditionalMetaUpdater.
+func (r *Router) UpdateObjectMetaIf(ctx context.Context, bucket, key, versionID string, check func(storage.ObjectInfo) error, fn func(*storage.ObjectMeta) error) (storage.ObjectInfo, error) {
+	var info storage.ObjectInfo
+	cb := &cbTracker{}
+	err := r.objectWrite(ctx, bucket, key, cb, func(b storage.Backend) error {
+		cu, ok := b.(storage.ConditionalMetaUpdater)
+		if !ok {
+			return fmt.Errorf("conditional metadata updates: %w", errors.ErrUnsupported)
+		}
+		var err error
+		info, err = cu.UpdateObjectMetaIf(ctx, bucket, key, versionID,
+			func(oi storage.ObjectInfo) error { return cb.note(check(oi)) },
+			func(m *storage.ObjectMeta) error { return cb.note(fn(m)) })
+		return err
+	})
+	return info, err
+}
+
+// DeleteObject deletes per S3 semantics on the primary and replicates.
+func (r *Router) DeleteObject(ctx context.Context, bucket, key, versionID string) (storage.DeleteResult, error) {
+	var res storage.DeleteResult
+	err := r.objectWrite(ctx, bucket, key, nil, func(b storage.Backend) error {
+		var err error
+		res, err = b.DeleteObject(ctx, bucket, key, versionID)
+		return err
+	})
+	return res, err
+}
+
+// DeleteObjectIf implements storage.ConditionalDeleter.
+func (r *Router) DeleteObjectIf(ctx context.Context, bucket, key, versionID string, check func(storage.ObjectInfo) error) (storage.DeleteResult, error) {
+	var res storage.DeleteResult
+	cb := &cbTracker{}
+	err := r.objectWrite(ctx, bucket, key, cb, func(b storage.Backend) error {
+		cd, ok := b.(storage.ConditionalDeleter)
+		if !ok {
+			return fmt.Errorf("conditional deletes: %w", errors.ErrUnsupported)
+		}
+		var err error
+		res, err = cd.DeleteObjectIf(ctx, bucket, key, versionID, func(oi storage.ObjectInfo) error { return cb.note(check(oi)) })
+		return err
+	})
+	return res, err
+}
+
+// DeleteObjectChecked implements storage.CheckedDeleter.
+func (r *Router) DeleteObjectChecked(ctx context.Context, bucket, key, versionID string, check func(storage.ObjectInfo, bool) error) (storage.DeleteResult, error) {
+	var res storage.DeleteResult
+	cb := &cbTracker{}
+	err := r.objectWrite(ctx, bucket, key, cb, func(b storage.Backend) error {
+		cd, ok := b.(storage.CheckedDeleter)
+		if !ok {
+			return fmt.Errorf("checked deletes: %w", errors.ErrUnsupported)
+		}
+		var err error
+		res, err = cd.DeleteObjectChecked(ctx, bucket, key, versionID,
+			func(oi storage.ObjectInfo, found bool) error { return cb.note(check(oi, found)) })
+		return err
+	})
+	return res, err
+}
+
+// walk runs a walk on the bucket's readers. It falls back to the next
+// reader on a backing failure only when nothing was delivered yet.
+func (r *Router) walk(bs *bucketState, fn func(storage.ObjectInfo) error, run func(b storage.Backend, fn func(storage.ObjectInfo) error) error) error {
+	cands := r.readers(bs, false)
+	cb := &cbTracker{}
+	for i, b := range cands {
+		delivered := false
+		err := run(b.Backend, func(oi storage.ObjectInfo) error {
+			delivered = true
+			return cb.note(fn(oi))
+		})
+		if !isBackingError(err) || cb.isCaller(err) {
+			return err
+		}
+		r.observe(b, err)
+		if delivered || i == len(cands)-1 {
+			return err
+		}
+	}
+	return nil
+}
+
+// WalkObjects walks the latest versions.
+func (r *Router) WalkObjects(ctx context.Context, bucket, prefix, after string, fn func(storage.ObjectInfo) error) error {
+	bs, err := r.lookup(bucket)
+	if err != nil {
+		return err
+	}
+	return r.walk(bs, fn, func(b storage.Backend, fn func(storage.ObjectInfo) error) error {
+		return b.WalkObjects(ctx, bucket, prefix, after, fn)
+	})
+}
+
+// WalkVersions walks every version and delete marker.
+func (r *Router) WalkVersions(ctx context.Context, bucket, prefix, keyMarker, versionIDMarker string, fn func(storage.ObjectInfo) error) error {
+	bs, err := r.lookup(bucket)
+	if err != nil {
+		return err
+	}
+	return r.walk(bs, fn, func(b storage.Backend, fn func(storage.ObjectInfo) error) error {
+		return b.WalkVersions(ctx, bucket, prefix, keyMarker, versionIDMarker, fn)
+	})
+}
+
+// --- multipart uploads (primary only) ---
+
+// primary returns the primary backing of bucket.
+func (r *Router) primary(bucket string) (*backing, error) {
+	bs, err := r.lookup(bucket)
+	if err != nil {
+		return nil, err
+	}
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return r.backings[bs.rec.primary()], nil
+}
+
+// CreateMultipartUpload starts an upload on the primary.
+func (r *Router) CreateMultipartUpload(ctx context.Context, bucket, key string, meta storage.ObjectMeta, initiator string) (storage.UploadInfo, error) {
+	b, err := r.primary(bucket)
+	if err != nil {
+		return storage.UploadInfo{}, err
+	}
+	u, err := b.Backend.CreateMultipartUpload(ctx, bucket, key, meta, initiator)
+	return u, r.observe(b, err)
+}
+
+// GetMultipartUpload describes an upload.
+func (r *Router) GetMultipartUpload(ctx context.Context, bucket, key, uploadID string) (storage.UploadInfo, error) {
+	b, err := r.primary(bucket)
+	if err != nil {
+		return storage.UploadInfo{}, err
+	}
+	u, err := b.Backend.GetMultipartUpload(ctx, bucket, key, uploadID)
+	return u, r.observe(b, err)
+}
+
+// NewPartWriter starts writing a part.
+func (r *Router) NewPartWriter(ctx context.Context, bucket, key, uploadID string, partNumber int) (storage.PartWriter, error) {
+	b, err := r.primary(bucket)
+	if err != nil {
+		return nil, err
+	}
+	w, err := b.Backend.NewPartWriter(ctx, bucket, key, uploadID, partNumber)
+	return w, r.observe(b, err)
+}
+
+// ListParts lists an upload's parts.
+func (r *Router) ListParts(ctx context.Context, bucket, key, uploadID string) ([]storage.PartInfo, error) {
+	b, err := r.primary(bucket)
+	if err != nil {
+		return nil, err
+	}
+	ps, err := b.Backend.ListParts(ctx, bucket, key, uploadID)
+	return ps, r.observe(b, err)
+}
+
+// ListMultipartUploads lists the bucket's uploads.
+func (r *Router) ListMultipartUploads(ctx context.Context, bucket string) ([]storage.UploadInfo, error) {
+	b, err := r.primary(bucket)
+	if err != nil {
+		return nil, err
+	}
+	us, err := b.Backend.ListMultipartUploads(ctx, bucket)
+	return us, r.observe(b, err)
+}
+
+// WalkMultipartUploads implements storage.UploadWalker.
+func (r *Router) WalkMultipartUploads(ctx context.Context, bucket, prefix string, after storage.UploadPosition, fn func(storage.UploadInfo) error) error {
+	b, err := r.primary(bucket)
+	if err != nil {
+		return err
+	}
+	cb := &cbTracker{}
+	err = storage.WalkMultipartUploads(ctx, b.Backend, bucket, prefix, after, func(u storage.UploadInfo) error { return cb.note(fn(u)) })
+	if !cb.isCaller(err) {
+		r.observe(b, err)
+	}
+	return err
+}
+
+// CompleteMultipartUpload completes an upload on the primary and
+// replicates the new version.
+func (r *Router) CompleteMultipartUpload(ctx context.Context, bucket, key, uploadID string, partNumbers []int, meta storage.ObjectMeta, opts storage.CommitOptions) (storage.ObjectInfo, error) {
+	return r.CompleteMultipartUploadWith(ctx, bucket, key, uploadID, partNumbers, meta, opts, storage.WriteOptions{})
+}
+
+// CompleteMultipartUploadWith implements storage.CompressingBackend.
+// Replicas store their copy compressed when the primary did.
+func (r *Router) CompleteMultipartUploadWith(ctx context.Context, bucket, key, uploadID string, partNumbers []int,
+	meta storage.ObjectMeta, opts storage.CommitOptions, wopts storage.WriteOptions) (storage.ObjectInfo, error) {
+	var info storage.ObjectInfo
+	err := r.objectWrite(ctx, bucket, key, nil, func(b storage.Backend) error {
+		var err error
+		if !wopts.Compression.Enabled() {
+			info, err = b.CompleteMultipartUpload(ctx, bucket, key, uploadID, partNumbers, meta, opts)
+			return err
+		}
+		cb, ok := b.(storage.CompressingBackend)
+		if !ok {
+			return fmt.Errorf("the primary backing cannot store data compressed: %w", errors.ErrUnsupported)
+		}
+		info, err = cb.CompleteMultipartUploadWith(ctx, bucket, key, uploadID, partNumbers, meta, opts, wopts)
+		return err
+	})
+	return info, err
+}
+
+// AbortMultipartUpload aborts an upload.
+func (r *Router) AbortMultipartUpload(ctx context.Context, bucket, key, uploadID string) error {
+	b, err := r.primary(bucket)
+	if err != nil {
+		return err
+	}
+	return r.observe(b, b.Backend.AbortMultipartUpload(ctx, bucket, key, uploadID))
+}

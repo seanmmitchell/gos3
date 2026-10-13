@@ -117,13 +117,13 @@ func TestAuthorization(t *testing.T) {
 		r := e.do(&diag, "GET", Prefix+"/whoami", nil)
 		var w whoAmI
 		r.json(t, &w)
-		want := capabilities{Admin: true, ViewInfo: true, ViewStats: true, Discovery: true}
+		want := capabilities{Admin: true, ViewInfo: true, ViewStats: true, Discovery: true, ViewStorage: true}
 		if w.Capabilities != want {
 			t.Errorf("capabilities = %+v, want %+v", w.Capabilities, want)
 		}
 	})
 	t.Run("admin policy and root", func(t *testing.T) {
-		all := capabilities{true, true, true, true, true, true, true, true, true, true, true, true, true}
+		all := capabilities{true, true, true, true, true, true, true, true, true, true, true, true, true, true, true}
 		for _, c := range []auth.Credentials{adm, rootCreds} {
 			r := e.do(&c, "GET", Prefix+"/whoami", nil)
 			var w whoAmI

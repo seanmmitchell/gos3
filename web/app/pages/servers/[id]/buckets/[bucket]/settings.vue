@@ -2,7 +2,8 @@
 import type { BucketSummary } from '~/types/admin'
 import type { ObjectLockConfiguration, VersioningStatus } from '~/types/s3'
 import { S3Error } from '~/utils/s3/errors'
-import { bucketTabs, canShowBucketUsage, resolveBucketTab, type BucketSettingsTab } from '~/components/admin/-capabilities'
+import { bucketSettingsTabs, canShowBucketUsage, resolveBucketTab, type BucketSettingsTab } from '~/components/admin/-capabilities'
+import { modeOption } from '~/components/admin/-storage'
 
 /**
  * Bucket settings with one tab per S3 bucket sub-resource, plus gos3-only
@@ -18,7 +19,8 @@ const { capabilities } = useWhoAmI()
 
 useHead({ title: () => `${bucket.value} · Settings` })
 
-const tabs = computed(() => bucketTabs(connection.value?.kind, capabilities.value))
+// Placement is only offered for gos3 identities with viewStorage.
+const tabs = computed(() => bucketSettingsTabs(connection.value?.kind, capabilities.value))
 const tab = computed<BucketSettingsTab>({
   get: () => resolveBucketTab(route.query.tab, tabs.value),
   set: (v) => {
@@ -82,6 +84,12 @@ function refreshShared() {
 watch([id, bucket], refreshShared, { immediate: true })
 watch(showUsage, () => void loadSummary())
 
+const replication = computed(() => {
+  const p = summary.value?.placement
+  if (!p || p.mode === 'single') return null
+  return `${modeOption(p.mode)?.label ?? p.mode} ×${(p.replicas?.length ?? 0) + 1}`
+})
+
 const notFound = computed(() => stateError.value instanceof S3Error && stateError.value.code === 'NoSuchBucket')
 const lockEnabled = computed(() => !!objectLock.value?.enabled)
 </script>
@@ -94,6 +102,8 @@ const lockEnabled = computed(() => !!objectLock.value?.enabled)
         <UBadge v-else-if="versioning === 'Suspended'" label="Versioning suspended" color="warning" variant="subtle" size="sm" />
         <UBadge v-if="lockEnabled" label="Object lock" color="primary" variant="subtle" size="sm" icon="i-lucide-shield-check" />
         <UBadge v-if="summary?.public" label="Public" color="warning" variant="subtle" size="sm" icon="i-lucide-globe" />
+        <UBadge v-if="replication" :label="replication" color="primary" variant="subtle" size="sm" icon="i-lucide-copy" />
+        <UBadge v-if="summary?.placement?.moving" label="Moving" color="warning" variant="subtle" size="sm" icon="i-lucide-arrow-right-left" />
       </template>
       <template #actions>
         <UButton color="neutral" variant="outline" icon="i-lucide-folder-open" label="Browse" :to="appRoutes.bucket(id, bucket)" />
@@ -140,6 +150,7 @@ const lockEnabled = computed(() => !!objectLock.value?.enabled)
         <BucketSettingsCompressionTab v-else-if="tab === 'compression'" :bucket="bucket" @changed="loadSummary" />
         <BucketSettingsObjectLockTab v-else-if="tab === 'object-lock'" :bucket="bucket" :versioning="versioning" @changed="refreshShared" />
         <BucketSettingsAccessTab v-else-if="tab === 'access'" :bucket="bucket" @changed="loadSummary" />
+        <BucketSettingsPlacementTab v-else-if="tab === 'placement'" :bucket="bucket" @changed="loadSummary" />
         <BucketSettingsDangerZoneTab v-else-if="tab === 'danger'" :bucket="bucket" />
       </div>
     </template>

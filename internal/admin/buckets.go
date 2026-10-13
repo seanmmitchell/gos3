@@ -16,6 +16,7 @@ import (
 	"github.com/seanmmitchell/gos3/internal/compression"
 	"github.com/seanmmitchell/gos3/internal/iam"
 	"github.com/seanmmitchell/gos3/internal/storage"
+	"github.com/seanmmitchell/gos3/internal/storage/multi"
 )
 
 // aclPrivate is the default canned ACL.
@@ -35,6 +36,9 @@ type bucketSummary struct {
 	// objects are compressed under the server's policy.
 	Compression bucketCompressionSummary `json:"compression"`
 	Usage       *bucketUsageJSON         `json:"usage"`
+	// Placement is where the bucket is stored (nil without the
+	// multi-backing router).
+	Placement *multi.PlacementSummary `json:"placement,omitempty"`
 }
 
 // bucketConfigs flags which configuration documents a bucket has.
@@ -47,16 +51,6 @@ type bucketConfigs struct {
 	Website    bool   `json:"website"`
 	ObjectLock bool   `json:"objectLock"`
 	ACL        string `json:"acl"`
-}
-
-// allConfigKeys are every bucket configuration document key (deleted by a
-// forced bucket delete).
-var allConfigKeys = []string{
-	storage.ConfigPolicy, storage.ConfigCORS, storage.ConfigLifecycle, storage.ConfigTagging,
-	storage.ConfigEncryption, storage.ConfigObjectLock, storage.ConfigACL, storage.ConfigWebsite,
-	storage.ConfigOwnership, storage.ConfigNotification, storage.ConfigLogging,
-	storage.ConfigPublicAccessBlock, storage.ConfigReplication, storage.ConfigAccelerate,
-	storage.ConfigRequestPayment, storage.ConfigCompression,
 }
 
 // listUsageConcurrency bounds parallel usage computations for GET /buckets.
@@ -124,6 +118,11 @@ func (a *api) summarize(rc *reqCtx, info storage.BucketInfo, withUsage bool) (*b
 	}
 	if s.Owner == "" {
 		s.Owner = auth.RootUser
+	}
+	if r, ok := a.d.Backend.(*multi.Router); ok {
+		if p, err := r.Summary(info.Name); err == nil {
+			s.Placement = &p
+		}
 	}
 	has := func(key string) (bool, error) {
 		_, err := a.d.Backend.GetBucketConfig(rc.ctx, info.Name, key)
@@ -396,7 +395,7 @@ func (a *api) emptyBucket(ctx context.Context, name string, guard *lockGuard) er
 			return fmt.Errorf("aborting upload %q of %q: %w", u.UploadID, u.Key, err)
 		}
 	}
-	for _, key := range allConfigKeys {
+	for _, key := range storage.AllConfigKeys {
 		if err := b.DeleteBucketConfig(ctx, name, key); err != nil && !errors.Is(err, storage.ErrConfigNotFound) {
 			return fmt.Errorf("deleting %s configuration: %w", key, err)
 		}

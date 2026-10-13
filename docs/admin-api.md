@@ -26,7 +26,8 @@ Base path: `/_gos3/admin/v1` on the S3 listener. JSON in/out
   checked with `iam.Manager.Authorize` against the endpoint's resource (see
   [Resources and condition keys](#resources-and-condition-keys)). Root is
   always allowed; the built-in `admin` policy allows all; `diagnostics`
-  allows `ServerInfo`, `GetStats`, `GetDiscovery` (not `ProbeNetwork` or
+  allows `ServerInfo`, `GetStats`, `GetDiscovery`, `ListBackings`,
+  `GetBucketPlacement` (not `ProbeNetwork` or
   `ScanNetwork`).
 - Endpoints marked *any* only require a valid (non-anonymous) identity.
   `DELETE /whoami/keys/{accessKey}` is refused with 403 `AccessDenied` only
@@ -58,7 +59,7 @@ ARNs, policy variables such as `${aws:username}` included):
 |---|---|
 | `arn:gos3:admin:::user/<name>` | CreateUser (the new user's name), GetUser, UpdateUser, DeleteUser, CreateAccessKey (the target user; choosing the access key ID also needs it at service level), UpdateAccessKey / DeleteAccessKey (the key's owner; an unknown key is evaluated at service level) |
 | `arn:gos3:admin:::policy/<name>` | GetPolicy, PutPolicy, DeletePolicy |
-| `arn:gos3:admin:::bucket/<name>` | GetBucket, ForceDeleteBucket, GetBucketCompression, PutBucketCompression |
+| `arn:gos3:admin:::bucket/<name>` | GetBucket, ForceDeleteBucket, GetBucketCompression, PutBucketCompression, GetBucketPlacement, UpdateBucketPlacement |
 | service level | every other action (list actions, config, stats, discovery, simulate, self-service) |
 
 The policy resources `*` and `arn:gos3:admin:::*` match every admin
@@ -125,6 +126,8 @@ Non-2xx responses: `{"error": {"code": "<Code>", "message": "<text>"}}`.
     "listUsers": false,       // admin:ListUsers (true for delegated user managers too)
     "managePolicies": false,  // admin:PutPolicy
     "manageBuckets": false,   // admin:ForceDeleteBucket
+    "viewStorage": false,     // admin:ListBackings
+    "manageStorage": false,   // admin:UpdateBucketPlacement
     "discovery": false,       // admin:GetDiscovery
     "scan": false,            // admin:ScanNetwork
     "probe": false,           // admin:ProbeNetwork
@@ -281,6 +284,69 @@ environment and flags for these fields.
 Compression is transparent to S3 clients (same content, ETags, checksums
 and sizes); `storedBytes` and `storedVersionBytes` count what the backend
 stores. See [operations.md](operations.md#compression).
+
+### Storage backings and bucket placement
+
+A server can store buckets on several **backings** (storage backends such as
+an fs directory per disk; see
+[configuration.md](configuration.md#storage-backings)). Every bucket has a
+**placement**: the backing that holds its primary copy and, optionally,
+replicas on other backings. See [operations.md](operations.md#multiple-backings-and-replication)
+for the semantics.
+
+| Method | Path | Action | Response |
+|---|---|---|---|
+| GET | `/backings` | ListBackings | `{"defaultBacking": "default", "autoFailover": false, "backings": Backing[]}` |
+| GET | `/buckets/{name}/placement` | GetBucketPlacement | `Placement` |
+| PUT | `/buckets/{name}/placement` | UpdateBucketPlacement | body `{"mode": "single" \| "active-passive" \| "active-active", "replicas": ["fast", …]}` → `Placement`. Sets the replication mode and the replica backings (the primary stays). `single` needs an empty `replicas`, the other modes at least one. New replicas start a full copy (`state` `syncing`); removed replicas lose their copy (deleted in the background). 400 `InvalidRequest` for an unknown backing, the primary listed as a replica, or a duplicate; 409 `Conflict` while a move is in progress or while the bucket's copy on a backing being added is still being deleted |
+| POST | `/buckets/{name}/placement/move` | UpdateBucketPlacement | body `{"to": "archive", "from"?: "<backing>"}` → 202 `Placement`. Moves the copy on `from` (default: the primary) to `to`, online: `to` is filled in the background while the bucket stays readable and writable, then a short cutover (writes to the bucket wait, at most 60 s, for in-flight writes to finish) makes `to` take `from`'s place and `from`'s copy is deleted. In-progress multipart uploads are not moved: after a move of the primary they fail with `NoSuchUpload`. 400 for an unknown backing or a `from` that is not a member; 409 when a move is already in progress or `to` already holds a copy |
+| DELETE | `/buckets/{name}/placement/move` | UpdateBucketPlacement | cancels the move in progress → `Placement` (the partial copy on `to` is deleted); 409 when there is none or its cutover already started |
+| POST | `/buckets/{name}/placement/promote` | UpdateBucketPlacement | body `{"backing": "fast", "force"?: false}` → `Placement`. Makes a replica the primary (the old primary becomes a replica). Without `force` the replica must have finished its initial copy, and pending changes are copied to it during a cutover (as for a move) before the switch, so nothing is lost. `force: true` switches immediately, e.g. when the primary's backing is down: changes not yet copied to the replica are lost (the old primary is re-copied from the new one). 400 when `backing` is not a replica; 409 when it has not finished its initial copy (without `force`) or a move is in progress |
+| POST | `/buckets/{name}/placement/resync` | UpdateBucketPlacement | body `{"backing"?: "fast"}` (default: every replica) → 202 `Placement`. Compares the replica(s) with the primary and copies every difference (versions, metadata, bucket configuration) |
+
+`UpdateBucketPlacement` and `GetBucketPlacement` are evaluated against
+`arn:gos3:admin:::bucket/<name>`, `ListBackings` at service level. The
+built-in `diagnostics` policy allows `ListBackings` and `GetBucketPlacement`.
+404 `NotFound` for an unknown bucket.
+
+```jsonc
+// Backing
+{ "name": "fast",              // "default" is the backing configured by storage.backend / storage.path
+  "kind": "fs" | "memory",
+  "path": "/mnt/nvme/gos3",    // "" for memory
+  "default": false,            // new buckets are created here
+  "healthy": true,             // last health check or operation succeeded
+  "lastError": "",             // last error that marked it unhealthy ("" when healthy)
+  "checkedAt": "…",            // last health check (RFC3339; omitted before the first)
+  "buckets": 3,                // buckets whose primary copy is here
+  "replicas": 1,               // replica copies (and move targets) of other buckets here
+  "disk": { "path": "/mnt/nvme/gos3", "totalBytes": 1, "freeBytes": 1, "usedBytes": 1 } | null } // fs only
+
+// Placement
+{ "bucket": "photos",
+  "mode": "single" | "active-passive" | "active-active",
+  "primary": "default",
+  "members": [                 // primary first, then replicas, then a move target
+    { "backing": "default",
+      "role": "primary" | "replica" | "move-target",
+      "state": "in-sync" | "syncing" | "lagging" | "degraded" | "offline",
+      "healthy": true,         // the backing's health
+      "pending": 0,            // changed keys not yet copied to this member
+      "progress": { "keys": 120, "versions": 130, "bytes": 1048576 } | null, // running full copy
+      "lastSyncAt": "…",       // last completed full copy (omitted when none)
+      "lastError": "" } ],
+  "move": { "from": "default", "to": "archive", "startedAt": "…",
+            "phase": "copying" | "cutover" } | null }
+```
+
+Member states: `in-sync` (an active-active replica receiving every write
+synchronously, a replica with no pending changes, or the primary); `syncing`
+(initial or requested full copy running); `lagging` (changes are pending,
+copied in the background); `degraded` (copying failed; retried with
+back-off, see `lastError`); `offline` (the backing is unhealthy).
+
+`BucketSummary` (`GET /buckets`, `GET /buckets/{name}`) also has
+`"placement": {"mode": "single", "primary": "default", "replicas": [], "moving": false}`.
 
 ### Discovery
 | Method | Path | Action | Response |

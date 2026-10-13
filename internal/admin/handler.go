@@ -198,6 +198,14 @@ func (a *api) routes() []route {
 		{"GET", "/buckets", "ListBuckets", service, a.listBuckets},
 		{"GET", "/buckets/{name}", "GetBucket", bucket, a.getBucket},
 		{"DELETE", "/buckets/{name}", "ForceDeleteBucket", bucket, a.deleteBucket},
+		// Storage backings and bucket placement
+		{"GET", "/backings", "ListBackings", service, a.listBackings},
+		{"GET", "/buckets/{name}/placement", "GetBucketPlacement", bucket, a.getPlacement},
+		{"PUT", "/buckets/{name}/placement", "UpdateBucketPlacement", bucket, a.putPlacement},
+		{"POST", "/buckets/{name}/placement/move", "UpdateBucketPlacement", bucket, a.startMove},
+		{"DELETE", "/buckets/{name}/placement/move", "UpdateBucketPlacement", bucket, a.cancelMove},
+		{"POST", "/buckets/{name}/placement/promote", "UpdateBucketPlacement", bucket, a.promote},
+		{"POST", "/buckets/{name}/placement/resync", "UpdateBucketPlacement", bucket, a.resync},
 		{"GET", "/buckets/{name}/compression", "GetBucketCompression", bucket, a.getBucketCompression},
 		{"PUT", "/buckets/{name}/compression", "PutBucketCompression", bucket, a.putBucketCompression},
 		{"DELETE", "/buckets/{name}/compression", "PutBucketCompression", bucket, a.deleteBucketCompression},
@@ -475,6 +483,10 @@ func (a *api) toAPIError(err error) *apiError {
 	}
 	msg := strings.TrimPrefix(err.Error(), "iam: ")
 	msg = strings.TrimPrefix(msg, "storage: ")
+	msg = strings.TrimPrefix(msg, "multi: ")
+	if pe := placementError(err, msg); pe != nil {
+		return pe
+	}
 	switch {
 	// iam (order matters: some errors wrap others)
 	case errors.Is(err, iam.ErrUserNotFound), errors.Is(err, iam.ErrKeyNotFound), errors.Is(err, iam.ErrPolicyNotFound):

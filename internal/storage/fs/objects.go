@@ -40,6 +40,10 @@ type commitReq struct {
 	// pre runs first inside the transaction (multipart: verify and remove
 	// the upload). Its error aborts the commit.
 	pre func(tx *bbolt.Tx, bb *bbolt.Bucket) error
+	// imported, when set, stores the version under the identity it has on
+	// another backend (import.go) instead of assigning a new one; opts is
+	// then ignored.
+	imported *importedIdentity
 }
 
 // commitObject publishes a new version in one write transaction, evaluating
@@ -63,36 +67,44 @@ func (b *Backend) commitObject(req commitReq) (storage.ObjectInfo, error) {
 				return err
 			}
 		}
-		if err := checkPreconditions(bb, req.key, req.opts); err != nil {
-			return err
-		}
-		created := time.Now().UTC()
-		if req.opts.BeforePublish != nil {
-			latest, _, err := latestVersion(bb, req.key)
-			if err != nil {
-				return err
-			}
-			var current *storage.ObjectMeta
-			if latest != nil && !latest.DeleteMarker {
-				m := cloneMeta(latest.Meta)
-				current = &m
-			}
-			config := bb.Bucket(subConfig)
-			if err := req.opts.BeforePublish(&req.meta, current, created, func(key string) []byte {
-				return config.Get([]byte(key))
-			}); err != nil {
-				return err
-			}
-		}
 		rec := versionRecord{
-			Size:         req.size,
-			LastModified: created,
-			DataID:       req.dataID,
-			Meta:         req.meta,
-			Compression:  req.compression,
-			StoredSize:   req.storedSize,
+			Size:        req.size,
+			DataID:      req.dataID,
+			Meta:        req.meta,
+			Compression: req.compression,
+			StoredSize:  req.storedSize,
 		}
-		unlink, err = addVersion(br, bb, req.key, &rec)
+		if req.imported != nil {
+			rec.VersionID = req.imported.versionID
+			rec.LastModified = req.imported.lastModified
+			rec.DeleteMarker = req.imported.deleteMarker
+			unlink, err = importVersion(bb, req.key, &rec)
+		} else {
+			if err := checkPreconditions(bb, req.key, req.opts); err != nil {
+				return err
+			}
+			created := time.Now().UTC()
+			if req.opts.BeforePublish != nil {
+				latest, _, err := latestVersion(bb, req.key)
+				if err != nil {
+					return err
+				}
+				var current *storage.ObjectMeta
+				if latest != nil && !latest.DeleteMarker {
+					m := cloneMeta(latest.Meta)
+					current = &m
+				}
+				config := bb.Bucket(subConfig)
+				if err := req.opts.BeforePublish(&req.meta, current, created, func(key string) []byte {
+					return config.Get([]byte(key))
+				}); err != nil {
+					return err
+				}
+				rec.Meta = req.meta
+			}
+			rec.LastModified = created
+			unlink, err = addVersion(br, bb, req.key, &rec)
+		}
 		if err != nil {
 			return err
 		}

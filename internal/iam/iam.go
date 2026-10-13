@@ -38,7 +38,7 @@ const (
 	PolicyReadWrite   = "readwrite"   // s3:* on all buckets/objects
 	PolicyReadOnly    = "readonly"    // s3:Get*, s3:List*, s3:HeadBucket-equivalents
 	PolicyWriteOnly   = "writeonly"   // s3:PutObject, multipart upload actions, s3:ListBucketMultipartUploads
-	PolicyDiagnostics = "diagnostics" // admin:ServerInfo, admin:GetStats, admin:GetDiscovery
+	PolicyDiagnostics = "diagnostics" // admin:ServerInfo, admin:GetStats, admin:GetDiscovery, admin:ListBackings, admin:GetBucketPlacement
 )
 
 // Key status values.

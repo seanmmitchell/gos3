@@ -21,6 +21,8 @@ export const NO_CAPS: Readonly<Capabilities> = Object.freeze({
   listUsers: false,
   managePolicies: false,
   manageBuckets: false,
+  viewStorage: false,
+  manageStorage: false,
   discovery: false,
   scan: false,
   probe: false,
@@ -139,6 +141,20 @@ export function canForceDeleteBucket(kind: ConnectionKind | undefined, caps: Cap
 }
 
 /**
+ * The server Storage page and the bucket Placement tab need
+ * admin:ListBackings. Servers without storage backings do not report
+ * `viewStorage`, so a missing field means false.
+ */
+export function canViewStorage(kind: ConnectionKind | undefined, caps: Capabilities | null | undefined): boolean {
+  return hasCapability(kind, caps, 'viewStorage')
+}
+
+/** Changing replication, moving, promoting and resyncing need admin:UpdateBucketPlacement. */
+export function canManageStorage(kind: ConnectionKind | undefined, caps: Capabilities | null | undefined): boolean {
+  return hasCapability(kind, caps, 'manageStorage')
+}
+
+/**
  * Bucket compression settings (admin API GET/PUT/DELETE
  * /buckets/{name}/compression):
  * - manage:      admin:PutBucketCompression allowed at service level
@@ -177,6 +193,7 @@ export type BucketSettingsTab =
   | 'compression'
   | 'object-lock'
   | 'access'
+  | 'placement'
   | 'danger'
 
 export interface BucketTabDef {
@@ -213,6 +230,20 @@ const TAB_AVAILABLE: Partial<Record<BucketSettingsTab, (kind: ConnectionKind | u
 /** The bucket settings tabs a connection offers (BUCKET_TABS minus gos3-only ones it lacks). */
 export function bucketTabs(kind: ConnectionKind | undefined, caps: Capabilities | null | undefined): readonly BucketTabDef[] {
   return BUCKET_TABS.filter(t => TAB_AVAILABLE[t.value]?.(kind, caps) ?? true)
+}
+
+/** gos3 storage placement (admin:ListBackings), shown before the danger zone. */
+export const PLACEMENT_TAB: Readonly<BucketTabDef> = Object.freeze({ value: 'placement', label: 'Placement', icon: 'i-lucide-hard-drive' })
+
+/**
+ * The bucket settings tabs for a connection: bucketTabs, plus Placement
+ * for gos3 identities with viewStorage.
+ */
+export function bucketSettingsTabs(kind: ConnectionKind | undefined, caps: Capabilities | null | undefined): readonly BucketTabDef[] {
+  const tabs = bucketTabs(kind, caps)
+  if (!canViewStorage(kind, caps)) return tabs
+  const i = tabs.findIndex(t => t.value === 'danger')
+  return [...tabs.slice(0, i), PLACEMENT_TAB, ...tabs.slice(i)]
 }
 
 /** Normalises a `?tab=` query value to one of `tabs` (default overview). */

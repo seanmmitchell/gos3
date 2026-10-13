@@ -71,6 +71,16 @@ export interface Capabilities {
   managePolicies: boolean
   /** admin:ForceDeleteBucket */
   manageBuckets: boolean
+  /**
+   * admin:ListBackings (server Storage page, bucket Placement tab). Absent
+   * from servers without storage backings: treated as false.
+   */
+  viewStorage?: boolean
+  /**
+   * admin:UpdateBucketPlacement (change replication, move, promote, resync).
+   * Absent from servers without storage backings: treated as false.
+   */
+  manageStorage?: boolean
   /** admin:GetDiscovery */
   discovery: boolean
   /** admin:ScanNetwork */
@@ -482,6 +492,125 @@ export interface BucketSummary {
   usage: BucketUsage | null
   /** Absent from servers without compression support. */
   compression?: BucketCompressionSummary
+  /** Where the bucket is stored (servers with storage backings only). */
+  placement?: PlacementSummary
+}
+
+// ---------------------------------------------------------------------------
+// Storage backings & bucket placement
+// ---------------------------------------------------------------------------
+
+/** "fs" | "memory" */
+export type BackingKind = 'fs' | 'memory'
+
+/** A storage backend of the server (GET /backings). */
+export interface Backing {
+  /** "default" is the backing configured by storage.backend / storage.path. */
+  name: string
+  kind: BackingKind | string
+  /** "" for memory. */
+  path: string
+  /** New buckets are created here. */
+  default: boolean
+  /** The last health check or operation succeeded. */
+  healthy: boolean
+  /** Last error that marked it unhealthy ("" when healthy). */
+  lastError: string
+  /** Last health check (omitted before the first). */
+  checkedAt?: Timestamp
+  /** Buckets whose primary copy is here. */
+  buckets: number
+  /** Replica copies (and move targets) of other buckets here. */
+  replicas: number
+  /** fs only, else null. */
+  disk: DiskStats | null
+}
+
+/** GET /backings */
+export interface BackingList {
+  defaultBacking: string
+  autoFailover: boolean
+  backings: Backing[] | null
+}
+
+export type ReplicationMode = 'single' | 'active-passive' | 'active-active'
+
+export type PlacementRole = 'primary' | 'replica' | 'move-target'
+
+/**
+ * - in-sync:  receives every write synchronously, has no pending changes, or is the primary
+ * - syncing:  initial or requested full copy running
+ * - lagging:  changes are pending, copied in the background
+ * - degraded: copying failed; retried with back-off (see lastError)
+ * - offline:  the backing is unhealthy
+ */
+export type MemberState = 'in-sync' | 'syncing' | 'lagging' | 'degraded' | 'offline'
+
+/** Progress of a running full copy. */
+export interface CopyProgress {
+  keys: number
+  versions: number
+  bytes: number
+}
+
+export interface PlacementMember {
+  backing: string
+  role: PlacementRole
+  state: MemberState
+  /** The backing's health. */
+  healthy: boolean
+  /** Changed keys not yet copied to this member. */
+  pending: number
+  /** Running full copy, else null. */
+  progress: CopyProgress | null
+  /** Last completed full copy (omitted when none). */
+  lastSyncAt?: Timestamp
+  lastError: string
+}
+
+export type MovePhase = 'copying' | 'cutover'
+
+export interface PlacementMove {
+  from: string
+  to: string
+  startedAt: Timestamp
+  phase: MovePhase
+}
+
+/** GET /buckets/{name}/placement */
+export interface Placement {
+  bucket: string
+  mode: ReplicationMode
+  primary: string
+  /** Primary first, then replicas, then a move target. */
+  members: PlacementMember[] | null
+  move: PlacementMove | null
+}
+
+/** PUT /buckets/{name}/placement body. `single` needs an empty `replicas`. */
+export interface UpdatePlacementRequest {
+  mode: ReplicationMode
+  replicas: string[]
+}
+
+/** POST /buckets/{name}/placement/move body (`from` defaults to the primary). */
+export interface MoveBucketRequest {
+  to: string
+  from?: string
+}
+
+/** POST /buckets/{name}/placement/promote body. */
+export interface PromoteReplicaRequest {
+  backing: string
+  force?: boolean
+}
+
+/** Placement as summarised in BucketSummary. */
+export interface PlacementSummary {
+  mode: ReplicationMode
+  primary: string
+  replicas: string[] | null
+  moving: boolean
 }
 
 // ---------------------------------------------------------------------------
