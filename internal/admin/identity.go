@@ -30,6 +30,8 @@ type capabilities struct {
 	ListUsers      bool `json:"listUsers"`      // admin:ListUsers (also granted to delegated user managers)
 	ManagePolicies bool `json:"managePolicies"` // admin:PutPolicy
 	ManageBuckets  bool `json:"manageBuckets"`  // admin:ForceDeleteBucket
+	ViewStorage    bool `json:"viewStorage"`    // admin:ListBackings
+	ManageStorage  bool `json:"manageStorage"`  // admin:UpdateBucketPlacement
 	Discovery      bool `json:"discovery"`      // admin:GetDiscovery
 	Scan           bool `json:"scan"`           // admin:ScanNetwork
 	Probe          bool `json:"probe"`          // admin:ProbeNetwork
@@ -44,6 +46,7 @@ var adminActions = []string{
 	"CreateAccessKey", "UpdateAccessKey", "DeleteAccessKey",
 	"ListPolicies", "GetPolicy", "PutPolicy", "DeletePolicy", "SimulatePolicy",
 	"ListBuckets", "GetBucket", "ForceDeleteBucket",
+	"ListBackings", "GetBucketPlacement", "UpdateBucketPlacement",
 	"GetDiscovery", "ScanNetwork", "ProbeNetwork",
 }
 
@@ -81,6 +84,8 @@ func (a *api) whoami(rc *reqCtx) (int, any, error) {
 			ListUsers:      allowed["ListUsers"],
 			ManagePolicies: allowed["PutPolicy"],
 			ManageBuckets:  allowed["ForceDeleteBucket"],
+			ViewStorage:    allowed["ListBackings"],
+			ManageStorage:  allowed["UpdateBucketPlacement"],
 			Discovery:      allowed["GetDiscovery"],
 			Scan:           allowed["ScanNetwork"],
 			Probe:          allowed["ProbeNetwork"],

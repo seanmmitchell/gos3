@@ -48,6 +48,7 @@ import (
 	"github.com/seanmmitchell/gos3/internal/storage"
 	fsbackend "github.com/seanmmitchell/gos3/internal/storage/fs"
 	"github.com/seanmmitchell/gos3/internal/storage/memory"
+	"github.com/seanmmitchell/gos3/internal/storage/multi"
 	"github.com/seanmmitchell/gos3/internal/version"
 	"github.com/seanmmitchell/gos3/internal/webui"
 )
@@ -101,7 +102,8 @@ type Server struct {
 	logControl *LogControl
 	version    string
 
-	backend     storage.Backend
+	backend     storage.Backend // the multi-backing router over backings
+	backings    []multi.Backing // opened backings (owned by backend once it is set)
 	backendName string
 	dataPath    string // absolute data directory ("" when ephemeral)
 	systemDir   string
@@ -228,6 +230,9 @@ func New(cfg config.Config, logger *slog.Logger, opts ...Option) (_ *Server, err
 			return nil, err
 		}
 	}
+	if err := s.openRouter(); err != nil {
+		return nil, err
+	}
 	if s.serverID, err = loadServerID(s.systemDir, logger); err != nil {
 		return nil, err
 	}
@@ -309,11 +314,14 @@ func New(cfg config.Config, logger *slog.Logger, opts ...Option) (_ *Server, err
 	return s, nil
 }
 
-// openBackend opens the configured storage backend.
+// openBackend opens the configured storage backings: the default one
+// (storage.backend, storage.path) and storage.backings. openRouter then
+// puts the router in front of them.
 func (s *Server) openBackend() error {
 	switch s.cfg.Storage.Backend {
 	case config.BackendMemory:
-		s.backend, s.backendName = memory.New(), config.BackendMemory
+		s.backings = append(s.backings, multi.Backing{Name: config.DefaultBackingName, Kind: config.BackendMemory, Backend: memory.New()})
+		s.backendName = config.BackendMemory
 		if s.cfg.Storage.Path != "" {
 			abs, err := filepath.Abs(s.cfg.Storage.Path)
 			if err != nil {
@@ -329,8 +337,58 @@ func (s *Server) openBackend() error {
 		if err != nil {
 			return fmt.Errorf("opening storage: %w", err)
 		}
-		s.backend, s.backendName, s.dataPath = b, config.BackendFS, b.Root()
+		s.backings = append(s.backings, multi.Backing{Name: config.DefaultBackingName, Kind: config.BackendFS, Path: b.Root(), Backend: b})
+		s.backendName, s.dataPath = config.BackendFS, b.Root()
 	}
+	for _, bc := range s.cfg.Storage.Backings {
+		if bc.Backend == config.BackendMemory {
+			s.backings = append(s.backings, multi.Backing{Name: bc.Name, Kind: config.BackendMemory, Backend: memory.New()})
+			continue
+		}
+		b, err := fsbackend.Open(bc.Path, fsbackend.Options{
+			FsyncData: s.cfg.Storage.FsyncData,
+			Logger:    s.log.With("component", "storage", "backing", bc.Name),
+		})
+		if err != nil {
+			return fmt.Errorf("opening storage backing %q: %w", bc.Name, err)
+		}
+		s.backings = append(s.backings, multi.Backing{Name: bc.Name, Kind: config.BackendFS, Path: b.Root(), Backend: b})
+	}
+	return nil
+}
+
+// PlacementsFileName is the file in the system directory holding the
+// bucket placements (which backings hold which buckets).
+const PlacementsFileName = "placements.json"
+
+// openRouter puts the multi-backing router in front of the backings.
+func (s *Server) openRouter() error {
+	st := s.cfg.Storage
+	state := ""
+	if s.systemDir != "" {
+		state = filepath.Join(s.systemDir, PlacementsFileName)
+	} else if len(st.Backings) > 0 {
+		s.log.Warn("bucket placements are not persisted without a data directory (memory backend without storage.path): " +
+			"after a restart buckets are found where they are, but replication settings are lost")
+	}
+	mode := multi.Mode(st.Replication.DefaultMode)
+	r, err := multi.Open(s.lifeCtx, multi.Options{
+		Backings:          s.backings,
+		Default:           st.DefaultBacking,
+		NewBucketMode:     mode,
+		NewBucketReplicas: st.Replication.DefaultReplicas,
+		StatePath:         state,
+		Workers:           st.Replication.Workers,
+		HealthInterval:    st.Replication.HealthInterval,
+		AutoFailover:      st.Replication.AutoFailover,
+		CutoverTimeout:    st.Replication.CutoverTimeout,
+		Logger:            s.log.With("component", "placement"),
+	})
+	s.backings = nil // closed by the router, also when Open fails
+	if err != nil {
+		return fmt.Errorf("opening storage: %w", err)
+	}
+	s.backend = r
 	return nil
 }
 
@@ -455,6 +513,11 @@ func (s *Server) Close() error {
 		if s.backend != nil {
 			if err := s.backend.Close(); err != nil {
 				errs = append(errs, fmt.Errorf("closing storage: %w", err))
+			}
+		}
+		for _, b := range s.backings { // opened, but the router never took them
+			if err := b.Backend.Close(); err != nil {
+				errs = append(errs, fmt.Errorf("closing storage backing %q: %w", b.Name, err))
 			}
 		}
 		if s.iam != nil {

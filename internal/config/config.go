@@ -88,8 +88,52 @@ type StorageConfig struct {
 	// (<path>/.gos3/{iam.json,settings.json,server-id}). Empty with the memory
 	// backend means fully ephemeral.
 	Path string `yaml:"path"` // default "./data" for fs, "" (ephemeral) for memory
-	// FsyncData controls fsync of object data files on commit (default true).
+	// FsyncData controls fsync of object data files on commit (default true),
+	// for every fs backing.
 	FsyncData bool `yaml:"fsync_data"`
+	// Backings are additional named storage backings (e.g. one directory
+	// per disk). The backing configured by Backend and Path above is named
+	// DefaultBackingName. Every bucket lives on one backing and may be
+	// replicated to, or moved to, others (see internal/storage/multi).
+	Backings []BackingConfig `yaml:"backings"`
+	// DefaultBacking names the backing new buckets are created on
+	// ("" = DefaultBackingName).
+	DefaultBacking string `yaml:"default_backing"`
+	// Replication configures bucket replication between backings.
+	Replication ReplicationConfig `yaml:"replication"`
+}
+
+// BackingConfig is one additional storage backing.
+type BackingConfig struct {
+	// Name identifies the backing in placements and the admin API:
+	// 1-32 characters of [a-z0-9_-], starting with a letter or digit, not
+	// DefaultBackingName.
+	Name    string `yaml:"name"`
+	Backend string `yaml:"backend"` // "fs" (default) or "memory"
+	// Path is the data directory of an fs backing (required for fs; must
+	// differ from every other backing's path and from storage.path).
+	Path string `yaml:"path"`
+}
+
+// ReplicationConfig configures bucket replication between backings.
+type ReplicationConfig struct {
+	// DefaultMode is the replication mode of new buckets: "single"
+	// (default; "active-passive" when DefaultReplicas is set),
+	// "active-passive" or "active-active".
+	DefaultMode string `yaml:"default_mode"`
+	// DefaultReplicas are the backings new buckets are replicated to.
+	DefaultReplicas []string `yaml:"default_replicas"`
+	// AutoFailover promotes a synced replica of an active-passive bucket
+	// when the primary's backing fails (changes not yet copied are lost).
+	// Active-active buckets always fail over. Default false.
+	AutoFailover bool `yaml:"auto_failover"`
+	// Workers is the number of buckets copied concurrently (default 2).
+	Workers int `yaml:"workers"`
+	// HealthInterval is how often every backing is checked (default 10s).
+	HealthInterval time.Duration `yaml:"health_interval"`
+	// CutoverTimeout bounds how long a move's or promotion's cutover waits
+	// for writes in flight on the bucket (default 60s).
+	CutoverTimeout time.Duration `yaml:"cutover_timeout"`
 }
 
 // AuthConfig holds root credentials and signature options.

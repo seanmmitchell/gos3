@@ -27,6 +27,10 @@ Run `gos3 serve`, point the AWS CLI, an SDK, `mc` or rclone at it, and open
   of current and noncurrent versions, delete markers and stale multipart uploads.
 - **Checksums**: CRC32, CRC32C, CRC64NVME, SHA-1 and SHA-256, as headers or
   trailers, full-object or composite for multipart uploads, plus MD5/ETag.
+- **Multiple backings**: spread buckets over several disks or directories,
+  move buckets between them online, and replicate a bucket to other backings
+  in active-passive or active-active mode with automatic failover. See
+  [docs/operations.md](docs/operations.md#multiple-backings-and-replication).
 - **Web UI**: embedded in the binary or run standalone to manage many gos3
   and other S3 servers. It has an object browser with uploads, versions,
   metadata and share links, bucket settings, users and policies, server
@@ -395,9 +399,10 @@ archives and image. Branch rules, versioning and the release steps are in
 
 ## Limitations
 
-- **Single node.** No replication, erasure coding or clustering. Discovery
-  finds servers but does not combine them. Use backups (see
-  [docs/operations.md](docs/operations.md#backups)) for durability.
+- **Single node.** Buckets can be replicated between the backings (disks)
+  of one server, but not between servers; there is no erasure coding or
+  clustering. Discovery finds servers but does not combine them. Use backups
+  (see [docs/operations.md](docs/operations.md#backups)) for durability.
 - One account: IAM users share the bucket namespace, and there is no STS and
   no session tokens.
 - Not implemented: SigV2, SigV4A, SSE-C, ACL grants beyond canned ACLs,

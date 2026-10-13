@@ -105,6 +105,7 @@ gos3 logs to stderr with Go's `log/slog`, as `text` (default) or `json`
     ├── iam.json                 IAM users, keys, policies        (secret)
     ├── root-credentials.json    generated root keys, if any      (secret)
     ├── settings.json            runtime settings, after the first change
+    ├── placements.json          which backings hold which buckets
     └── server-id                this server's discovery ID
 ```
 
@@ -133,6 +134,72 @@ The fs backend refuses to start when `meta.db` is missing or empty while
 `data/` or `uploads/` still contain object or part files: starting would
 discard the index of every stored object. Restore `meta.db` from a backup, or
 move `data/` and `uploads/` aside to start with an empty store.
+
+## Multiple backings and replication
+
+A server can store buckets on several backings (see
+[configuration.md](configuration.md#storage-backings)), typically one fs
+directory per disk. Each backing directory has its own `.gos3/` with its own
+`meta.db`, data files and lock; the system state (`iam.json`,
+`settings.json`, `placements.json`, ...) stays in the default backing's data
+directory. Every bucket has a **placement**, managed in the web UI (bucket
+settings, Placement tab, and the server's Storage page) or the admin API
+([admin-api.md](admin-api.md#storage-backings-and-bucket-placement)):
+
+| Mode | Writes | Reads | When the primary's backing fails |
+|---|---|---|---|
+| `single` | primary | primary | the bucket is unavailable |
+| `active-passive` | primary; changed keys are copied to the replicas in the background (usually within milliseconds) | primary | reads fall back to a synced replica at once; writes fail until a replica is promoted (by hand, or automatically with `storage.replication.auto_failover`); changes not yet copied are lost on promotion |
+| `active-active` | primary and every in-sync replica before the request is acknowledged | spread over the in-sync members | an in-sync replica is promoted automatically; nothing acknowledged is lost |
+
+Copies are exact: version IDs, `LastModified` times, metadata, tags, ACLs,
+object lock settings, bucket configuration (policy, CORS, lifecycle, ...) and
+versioning state are the same on every member, so clients notice nothing
+when the primary changes.
+
+**Adding a replica** (or switching a bucket to a replicated mode) starts a
+full copy in the background; the member shows `syncing` with a progress
+count, then `in-sync`. An active-active replica receives synchronous writes
+only once it is in sync. A replica whose backing fails, or that misses a
+write, drops to background copying (`lagging`, `degraded` or `offline`) and
+returns to synchronous writes by itself once it caught up. Removing a replica
+deletes its copy in the background.
+
+**Moving a bucket** (`POST /buckets/{name}/placement/move`, or Move in the UI)
+copies it to the target backing while it stays readable and writable, then
+performs a short cutover: new writes to the bucket wait while the writes in
+flight finish (at most `storage.replication.cutover_timeout`) and the last
+changes are copied; then the target takes the source's place and the source
+copy is deleted. A move can be canceled until the cutover starts. If the
+writes in flight do not finish in time, the cutover is retried later.
+
+**Promoting a replica** makes it the primary. A normal promotion copies the
+pending changes during a cutover first, so nothing is lost; a forced one
+(`"force": true`, for a failed primary) switches at once.
+
+Things to know:
+
+- In-progress multipart uploads live on the primary only. After the primary
+  changes (move, promotion, failover) they fail with `NoSuchUpload` and must
+  be restarted.
+- Changes waiting to be copied are kept in memory. After a restart every
+  replica is compared with its primary in full, in the background (cost:
+  reading the metadata of every object on both sides); active-active replicas
+  serve reads and receive synchronous writes again when that finishes.
+- Backing health: a backing is marked unhealthy when an operation on it fails
+  with an I/O error, or when it does not list its buckets within 5 s at the
+  periodic check (`storage.replication.health_interval`); it is healthy again
+  after the next successful check. `GET /_gos3/admin/v1/backings` and the
+  Storage page show the state and the last error.
+- Removing a backing from the configuration: replicas on it are forgotten (a
+  replica is promoted where it was the primary). gos3 refuses to start when a
+  bucket's only copy was on it; configure the backing again, or remove the
+  bucket from `placements.json` to forget it. A bucket found on a backing
+  without an entry in `placements.json` is adopted where it is (that is how
+  existing data directories keep working); a copy of a bucket that is placed
+  elsewhere is ignored with a warning and never deleted automatically.
+- Backups: with several backings, back up every backing directory together
+  with the default data directory (one snapshot per file system).
 
 ## Backups
 

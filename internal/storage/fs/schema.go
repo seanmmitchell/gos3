@@ -54,6 +54,16 @@ import (
 //	         uploads in listing order (key, initiation time, upload ID).
 //	         Created and checked against "upl" at Open, so databases
 //	         written before it existed are indexed on first use.
+//	"imp"    importedKey(key, version ID) -> 8-byte inverted sequence of the
+//	         version: the positions of versions stored with a version ID
+//	         taken from another backend (storage.VersionImporter, see
+//	         import.go), which unlike generated IDs does not embed the
+//	         sequence. Every non-null imported version has an entry; null
+//	         imports use "null". Created by the first import into the
+//	         bucket (so it is optional: absent means no imported versions,
+//	         and databases written before it existed need no migration);
+//	         versionPosition consults it before parsing an ID and
+//	         removeVersion deletes the entry of a removed version.
 //
 // Record values are encoded as one format byte followed by the encoded
 // record struct:
@@ -89,7 +99,11 @@ var (
 	subParts    = []byte("parts")
 	// subUploadOrder is the listing-order index of uploads (uploadindex.go).
 	subUploadOrder = []byte("upk")
+	// subImported indexes imported version IDs (import.go). It is created
+	// lazily by the first import, so it is not in perBucketSubs.
+	subImported = []byte("imp")
 
+	// perBucketSubs are the nested buckets created with every bucket.
 	perBucketSubs = [][]byte{subVersions, subCurrent, subNull, subData, subConfig, subUploads, subParts, subUploadOrder}
 
 	keyFormat = []byte("format")
@@ -545,8 +559,16 @@ func latestVersion(bb *bbolt.Bucket, key string) (*versionRecord, []byte, error)
 	return &rec, bytes.Clone(k), nil
 }
 
+// importedKey returns the "imp" key of the imported version versionID of
+// key. Version IDs never contain a 0x00 byte, so the escaped, terminated key
+// prefix keeps entries of different keys apart.
+func importedKey(key, versionID string) []byte {
+	return append(keyVersionsPrefix(key), versionID...)
+}
+
 // versionPosition resolves a version ID of key to its "ver" key without
-// checking that the version exists. "null" is resolved via the null index.
+// checking that the version exists. "null" is resolved via the null index,
+// imported IDs via the "imp" index, other IDs by the sequence they embed.
 func versionPosition(bb *bbolt.Bucket, key, versionID string) ([]byte, bool) {
 	if versionID == storage.NullVersionID {
 		inv := bb.Bucket(subNull).Get([]byte(key))
@@ -554,6 +576,11 @@ func versionPosition(bb *bbolt.Bucket, key, versionID string) ([]byte, bool) {
 			return nil, false
 		}
 		return versionKey(key, binary.BigEndian.Uint64(inv)), true
+	}
+	if imp := bb.Bucket(subImported); imp != nil {
+		if inv := imp.Get(importedKey(key, versionID)); len(inv) == 8 {
+			return versionKey(key, binary.BigEndian.Uint64(inv)), true
+		}
 	}
 	inv, ok := parseVersionID(versionID)
 	if !ok {
@@ -623,8 +650,8 @@ func refreshCurrent(bb *bbolt.Bucket, key string) error {
 }
 
 // removeVersion deletes the version stored at vk (with record rec) of key,
-// maintaining the null and data indexes. It returns the data ID to unlink
-// after commit ("" if none). The caller refreshes "cur".
+// maintaining the null, imported-ID and data indexes. It returns the data ID
+// to unlink after commit ("" if none). The caller refreshes "cur".
 func removeVersion(bb *bbolt.Bucket, key string, vk []byte, rec *versionRecord) (string, error) {
 	if err := bb.Bucket(subVersions).Delete(vk); err != nil {
 		return "", err
@@ -632,6 +659,15 @@ func removeVersion(bb *bbolt.Bucket, key string, vk []byte, rec *versionRecord) 
 	if rec.VersionID == storage.NullVersionID {
 		if err := bb.Bucket(subNull).Delete([]byte(key)); err != nil {
 			return "", err
+		}
+	} else if imp := bb.Bucket(subImported); imp != nil {
+		// Only the entry that points at this version (generated IDs have
+		// none).
+		ik := importedKey(key, rec.VersionID)
+		if inv := imp.Get(ik); len(inv) == 8 && bytes.HasSuffix(vk, inv) {
+			if err := imp.Delete(ik); err != nil {
+				return "", err
+			}
 		}
 	}
 	if rec.DataID != "" {

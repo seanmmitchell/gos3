@@ -32,6 +32,7 @@ discovery of gos3 servers on the network.
 | `internal/storage/` | Backend contract + generic list helpers (`list.go`) | contract / storage-memory |
 | `internal/storage/memory/` | in-memory backend | storage-memory |
 | `internal/storage/fs/` | filesystem backend (bbolt index + data files) | storage-fs |
+| `internal/storage/multi/` | multi-backing router: bucket placement, replication (active-passive / active-active), online moves, backing health | storage-multi |
 | `internal/storage/storagetest/` | backend conformance suite | storage-conformance |
 | `internal/auth/` | SigV4 verification, aws-chunked decoding, POST policy, client signer | auth |
 | `internal/iam/` | users, keys, policies, bucket policy parsing, authorization engine | iam |
@@ -222,7 +223,12 @@ See the doc comments in `storage.go`. Key points:
   checked against the upload records, at `Open`, so existing data
   directories are indexed on first start with no schema version change.
   Paged upload listings, the lifecycle abort pass and usage counts seek it
-  instead of decoding every upload) +
+  instead of decoding every upload; and a per-bucket `imp` index, imported
+  version ID -> version position, for versions stored through
+  `storage.VersionImporter` with an ID from another backend, which does not
+  embed the position the way generated IDs do. It is created by a bucket's
+  first import, so existing databases need no migration and the schema
+  version is unchanged) +
   `<root>/.gos3/data/<bucket-id>/<2-hex>/<random-id>` data
   files (written to `<root>/.gos3/tmp/` then renamed; fsync configurable) +
   multipart parts under `<root>/.gos3/uploads/<upload-id>/<part>`. Data files
@@ -247,15 +253,49 @@ See the doc comments in `storage.go`. Key points:
   never on a later entry of the same key, even if the key changes during the
   walk (both backends). The lifecycle worker skips a key whose walk reports
   more than one latest version until the next pass.
-- `memory` keeps everything in maps guarded by RW mutexes.
+- `memory` keeps everything in maps guarded by RW mutexes. Imported versions
+  get a fresh internal stamp (so they sort newest) but keep their foreign
+  ID; lookups by such IDs fall back to scanning the key's versions.
 - `list.go` turns `WalkObjects`/`WalkVersions` into S3 listings (prefix,
   delimiter grouping, markers, truncation). When a common prefix `p` is found
   it restarts the walk after `p + "\xff"` (UTF-8 never contains 0xFF) so huge
   "directories" are skipped in O(log n) per prefix.
 
+### Multiple backings (`internal/storage/multi`)
+
+The server's backend is always a `multi.Router` over one or more named
+backings (`default` = `storage.backend`/`storage.path`, plus
+`storage.backings`). It implements `storage.Backend` and every optional
+extension by routing each bucket to its placement: a primary backing and
+optional replicas, in mode `single`, `active-passive` (changed keys copied
+in the background, read fallback, promotion by hand or with
+`auto_failover`) or `active-active` (writes teed to every in-sync replica
+before they are acknowledged, reads spread, automatic failover). Placements
+are persisted in `<data>/.gos3/placements.json`; buckets without one are
+adopted where they are found at startup.
+
+- Copies use the optional `storage.VersionImporter` extension, which stores
+  a version under the ID, `LastModified` and position it has on the source.
+  A key is copied by comparing both version lists (`syncKey`): versions
+  missing on the source are deleted, the common oldest-first prefix is kept
+  (metadata updated where it differs) and the rest is replaced. Copying is
+  therefore idempotent, and every repair is just another comparison: changed
+  keys are queued per replica (in memory; a full comparison runs after a
+  restart, after a write to a replica fails and when a queue overflows).
+- A per-bucket gate counts writes in flight; cutovers (end of a move,
+  graceful promotion, an active-active replica switching to synchronous
+  writes, failover) close it, wait for in-flight writes, copy the last
+  queued keys and switch. Per-key locks keep an active-active replica's
+  versions in the primary's order.
+- A backing is unhealthy after an I/O error (any error that is not a
+  storage sentinel, a context error or the caller's callback error) or a
+  failed periodic `ListBuckets` probe. Reads skip unhealthy backings; walks
+  fall back only before the first entry was delivered.
+- Multipart uploads live on the primary only (not copied).
+
 System state lives in `<data>/.gos3/`: `lock` (an exclusive lock held by the
 running server, whatever the backend; a no-op on platforms without
-`flock`/Windows sharing), `iam.json`, `settings.json` (written on
+`flock`/Windows sharing), `iam.json`, `placements.json` (bucket placements), `settings.json` (written on
 the first runtime settings update, then it wins over file/env/flags for the
 Settings fields), `server-id`, and `root-credentials.json` (only when root
 keys were generated). With the memory backend this needs `storage.path`;

@@ -3,11 +3,15 @@ import type { DiskStats } from '~/types/admin'
 import { diskUsedPercent } from './-metrics'
 
 /** Disk usage bar for the data directory (fs backend). */
-const props = defineProps<{ disk: DiskStats }>()
+const props = withDefaults(defineProps<{
+  disk: DiskStats
+  /** Accessible name of the meter (unique when several are shown). */
+  label?: string
+}>(), { label: 'Disk usage' })
 
 const pct = computed(() => diskUsedPercent(props.disk.usedBytes, props.disk.totalBytes))
 const barClass = computed(() => (pct.value >= 90 ? 'bg-error' : pct.value >= 75 ? 'bg-warning' : 'bg-primary'))
-const label = computed(() => `${formatBytes(props.disk.usedBytes)} of ${formatBytes(props.disk.totalBytes)} used (${pct.value.toFixed(1)}%)`)
+const valueText = computed(() => `${formatBytes(props.disk.usedBytes)} of ${formatBytes(props.disk.totalBytes)} used (${pct.value.toFixed(1)}%)`)
 </script>
 
 <template>
@@ -24,13 +28,13 @@ const label = computed(() => `${formatBytes(props.disk.usedBytes)} of ${formatBy
       :aria-valuenow="Math.round(pct)"
       aria-valuemin="0"
       aria-valuemax="100"
-      :aria-valuetext="label"
-      aria-label="Disk usage"
+      :aria-valuetext="valueText"
+      :aria-label="label"
     >
       <div class="h-full rounded-full transition-[width]" :class="barClass" :style="{ width: `${pct}%` }" />
     </div>
     <p class="text-xs text-muted tabular-nums">
-      {{ label }}
+      {{ valueText }}
     </p>
   </div>
 </template>

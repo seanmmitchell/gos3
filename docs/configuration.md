@@ -75,7 +75,44 @@ changed while running.
 |---|---|---|---|---|
 | `storage.backend` | `GOS3_STORAGE_BACKEND` | `--backend` | `fs` | `fs` (files under `path`) or `memory` (everything is lost on exit). |
 | `storage.path` | `GOS3_DATA` | `--data` | `./data` for `fs`, empty for `memory` | Data directory. With `fs` it holds the objects and the metadata database. With either backend it holds the system state in `<path>/.gos3/` (see [operations.md](operations.md#the-data-directory)). With `memory` and no path the server is fully ephemeral, including generated root credentials and IAM users. |
-| `storage.fsync_data` | `GOS3_FSYNC` | `--fsync` | `true` | fsync object data before acknowledging a write. `--fsync=false` is faster but can lose recent writes on power loss. |
+| `storage.fsync_data` | `GOS3_FSYNC` | `--fsync` | `true` | fsync object data before acknowledging a write (every fs backing). `--fsync=false` is faster but can lose recent writes on power loss. |
+| `storage.backings` | `GOS3_STORAGE_BACKINGS` | | none | Additional storage backings, see [below](#storage-backings). Env syntax: comma-separated `name=/path` (fs), `name=fs:/path` or `name=memory`. |
+| `storage.default_backing` | `GOS3_DEFAULT_BACKING` | | `default` | Backing new buckets are created on. |
+| `storage.replication.default_mode` | `GOS3_REPLICATION_MODE` | | `single` | Replication of new buckets: `single`, `active-passive` or `active-active` (`active-passive` when only `default_replicas` is set). |
+| `storage.replication.default_replicas` | `GOS3_REPLICATION_REPLICAS` | | none | Backings new buckets are replicated to (comma-separated in env). Must not include the default backing. |
+| `storage.replication.auto_failover` | `GOS3_AUTO_FAILOVER` | | `false` | Promote a synced replica of an **active-passive** bucket when its primary backing fails. Changes not yet copied to the replica are lost. Active-active buckets always fail over. |
+| `storage.replication.workers` | `GOS3_REPLICATION_WORKERS` | | `2` | Bucket copies (to replicas and move targets) running concurrently, 1-64. |
+| `storage.replication.health_interval` | `GOS3_HEALTH_INTERVAL` | | `10s` | How often every backing is checked (1s-1h). |
+| `storage.replication.cutover_timeout` | `GOS3_CUTOVER_TIMEOUT` | | `60s` | How long the cutover of a move or promotion waits for writes in flight on the bucket (1s-1h); new writes to the bucket wait meanwhile. |
+
+#### Storage backings
+
+A server can spread its buckets over several **backings**, for example one
+fs directory per disk. The backing configured by `storage.backend` and
+`storage.path` is named `default` and also holds the system state; each entry
+of `storage.backings` adds one more:
+
+```yaml
+storage:
+  path: /var/lib/gos3              # the "default" backing + system state
+  backings:
+    - name: nvme                   # 1-32 of [a-z0-9_-]
+      path: /mnt/nvme/gos3         # backend: fs (default) needs its own directory
+    - name: archive
+      path: /mnt/hdd/gos3
+    - name: scratch
+      backend: memory              # lost on restart
+  default_backing: nvme            # new buckets go here
+  replication:
+    default_mode: active-passive   # new buckets get a replica...
+    default_replicas: [archive]    # ...on archive
+```
+
+Every bucket has a primary backing and optionally replicas; buckets can be
+moved between backings online. Placements are changed with the admin API or
+the web UI and saved in `<data>/.gos3/placements.json`. Existing buckets stay
+where they are when backings are added. See
+[operations.md](operations.md#multiple-backings-and-replication).
 
 ### `auth`
 

@@ -1,9 +1,10 @@
 <script setup lang="ts">
 import type { DropdownMenuItem, TableColumn } from '@nuxt/ui'
-import type { BucketUsage } from '~/types/admin'
+import type { BucketUsage, PlacementSummary } from '~/types/admin'
 import { S3Error } from '~/utils/s3/errors'
 import { AdminError } from '~/utils/admin/client'
 import { usageAgeNote } from '~/components/browser/-bucket-usage'
+import { placementChips, placementWorthShowing } from '~/components/admin/-storage'
 import { BYPASS_GOVERNANCE_HELP, FORCE_DELETE_LOCKED_TITLE, forceDeleteBlock } from '~/components/bucket-settings/-force-delete'
 
 /**
@@ -30,6 +31,8 @@ interface BucketRow {
   objectLock?: boolean
   public?: boolean
   usage?: BucketUsage | null
+  /** Storage backing / replication (gos3 with storage backings). */
+  placement?: PlacementSummary
 }
 
 interface Listing {
@@ -56,7 +59,8 @@ async function load(): Promise<Listing> {
           versioning: b.versioning,
           objectLock: b.objectLock,
           public: b.public,
-          usage: b.usage
+          usage: b.usage,
+          placement: b.placement
         }))
       }
     } catch (e) {
@@ -109,12 +113,15 @@ function sortLabel(by: SortKey, label: string): string {
 }
 
 const showUsage = computed(() => data.value?.source === 'admin')
+// Placement chips only when they tell something (not "default" on every row).
+const showPlacement = computed(() => showUsage.value && placementWorthShowing((data.value?.rows ?? []).map(r => r.placement)))
 const showRegion = computed(() => (data.value?.rows ?? []).some(r => !!r.region))
 
 const columns = computed<TableColumn<BucketRow>[]>(() => {
   const cols: TableColumn<BucketRow>[] = [{ id: 'name', header: 'Name' }]
   if (showUsage.value) {
     cols.push({ id: 'versioning', header: 'Versioning' })
+    if (showPlacement.value) cols.push({ id: 'placement', header: 'Storage' })
     cols.push({ id: 'objects', header: 'Objects', meta: { class: { th: 'text-right', td: 'text-right' } } })
     cols.push({ id: 'bytes', header: 'Size', meta: { class: { th: 'text-right', td: 'text-right' } } })
   }
@@ -404,6 +411,13 @@ const isAccessDenied = computed(() => {
           <UBadge v-if="row.original.versioning === 'Enabled'" color="success" variant="subtle" size="sm" label="Enabled" />
           <UBadge v-else-if="row.original.versioning === 'Suspended'" color="warning" variant="subtle" size="sm" label="Suspended" />
           <span v-else class="text-sm text-muted">Off</span>
+        </template>
+        <template #placement-cell="{ row }">
+          <div class="flex flex-wrap items-center gap-1" data-testid="placement-chips">
+            <UTooltip v-for="chip in placementChips(row.original.placement)" :key="chip.label" :text="chip.title">
+              <UBadge :label="chip.label" :color="chip.color" :icon="chip.icon" variant="subtle" size="sm" />
+            </UTooltip>
+          </div>
         </template>
         <template #objects-cell="{ row }">
           <span class="tabular-nums">{{ row.original.usage ? formatNumber(row.original.usage.objects) : '—' }}</span>

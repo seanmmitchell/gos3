@@ -45,6 +45,22 @@ const (
 	BackendFS     = "fs"
 	BackendMemory = "memory"
 
+	// DefaultBackingName names the backing configured by storage.backend
+	// and storage.path.
+	DefaultBackingName = "default"
+	// Replication defaults and limits (storage.replication).
+	DefaultReplicationWorkers = 2
+	MaxReplicationWorkers     = 64
+	DefaultHealthInterval     = 10 * time.Second
+	DefaultCutoverTimeout     = 60 * time.Second
+	// MaxBackings bounds storage.backings.
+	MaxBackings = 64
+
+	// Replication modes (storage.replication.default_mode).
+	ReplicationSingle        = "single"
+	ReplicationActivePassive = "active-passive"
+	ReplicationActiveActive  = "active-active"
+
 	// SystemDirName is the directory under the data path holding system
 	// state (iam.json, settings.json, server-id, root-credentials.json and
 	// the fs backend's metadata).
@@ -95,6 +111,11 @@ func Default() Config {
 			Backend:   BackendFS,
 			Path:      DefaultDataPath,
 			FsyncData: true,
+			Replication: ReplicationConfig{
+				Workers:        DefaultReplicationWorkers,
+				HealthInterval: DefaultHealthInterval,
+				CutoverTimeout: DefaultCutoverTimeout,
+			},
 		},
 		UI: UIConfig{Enabled: true, RedirectRoot: true},
 		CORS: CORSConfig{
@@ -190,15 +211,17 @@ var unknownFieldRe = regexp.MustCompile(`field (\S+) not found in type (\S+)`)
 
 // yamlSections maps the Go types of Config sections to their YAML keys.
 var yamlSections = map[string]string{
-	"config.ServerConfig":    "server",
-	"config.StorageConfig":   "storage",
-	"config.AuthConfig":      "auth",
-	"config.UIConfig":        "ui",
-	"config.CORSConfig":      "cors",
-	"discovery.Config":       "discovery",
-	"config.LoggingConfig":   "logging",
-	"config.LifecycleConfig": "lifecycle",
-	"config.MetricsConfig":   "metrics",
+	"config.ServerConfig":      "server",
+	"config.StorageConfig":     "storage",
+	"config.BackingConfig":     "storage.backings",
+	"config.ReplicationConfig": "storage.replication",
+	"config.AuthConfig":        "auth",
+	"config.UIConfig":          "ui",
+	"config.CORSConfig":        "cors",
+	"discovery.Config":         "discovery",
+	"config.LoggingConfig":     "logging",
+	"config.LifecycleConfig":   "lifecycle",
+	"config.MetricsConfig":     "metrics",
 }
 
 // describeUnknownField rewrites an unknown-field message in terms of YAML
@@ -224,6 +247,27 @@ func (c *Config) Normalize() {
 	}
 	if c.Storage.Backend == BackendFS && c.Storage.Path == "" {
 		c.Storage.Path = DefaultDataPath
+	}
+	for i := range c.Storage.Backings {
+		b := &c.Storage.Backings[i]
+		b.Name = strings.TrimSpace(b.Name)
+		b.Backend = strings.ToLower(strings.TrimSpace(b.Backend))
+		if b.Backend == "" {
+			b.Backend = BackendFS
+		}
+	}
+	c.Storage.DefaultBacking = strings.TrimSpace(c.Storage.DefaultBacking)
+	rp := &c.Storage.Replication
+	rp.DefaultMode = strings.ToLower(strings.TrimSpace(rp.DefaultMode))
+	rp.DefaultReplicas = trimList(rp.DefaultReplicas)
+	if rp.Workers == 0 {
+		rp.Workers = DefaultReplicationWorkers
+	}
+	if rp.HealthInterval == 0 {
+		rp.HealthInterval = DefaultHealthInterval
+	}
+	if rp.CutoverTimeout == 0 {
+		rp.CutoverTimeout = DefaultCutoverTimeout
 	}
 	if c.Server.Region == "" {
 		c.Server.Region = DefaultRegion
@@ -309,6 +353,9 @@ func (c Config) Validate() error {
 	case BackendMemory:
 	default:
 		return fmt.Errorf("storage.backend: %q is invalid (expected fs or memory)", c.Storage.Backend)
+	}
+	if err := c.validateBackings(); err != nil {
+		return err
 	}
 	if err := validateRootCredentials(c.Auth.RootAccessKey, c.Auth.RootSecretKey); err != nil {
 		return err
