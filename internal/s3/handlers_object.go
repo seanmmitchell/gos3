@@ -440,6 +440,30 @@ type lockDefaults struct {
 	days, years int
 }
 
+func parseLockDefaults(raw []byte) (*lockDefaults, error) {
+	var doc objectLockConfigDoc
+	if err := xml.Unmarshal(raw, &doc); err != nil {
+		return nil, err
+	}
+	d := &lockDefaults{}
+	if doc.Rule != nil && doc.Rule.DefaultRetention != nil {
+		dr := doc.Rule.DefaultRetention
+		mode := strings.ToUpper(strings.TrimSpace(dr.Mode))
+		if (mode == "GOVERNANCE" || mode == "COMPLIANCE") && dr.Days >= 0 && dr.Years >= 0 &&
+			dr.Days <= maxRetentionYears*366 && dr.Years <= maxRetentionYears && dr.Days+dr.Years > 0 {
+			d.mode, d.days, d.years = mode, dr.Days, dr.Years
+		}
+	}
+	return d, nil
+}
+
+func (d *lockDefaults) retentionAt(created time.Time) (string, time.Time) {
+	if d.mode == "" {
+		return "", time.Time{}
+	}
+	return d.mode, created.UTC().AddDate(d.years, 0, d.days)
+}
+
 // maxRetentionYears bounds default retention periods (as S3: 100 years).
 const maxRetentionYears = 100
 
@@ -452,32 +476,15 @@ func (s *Server) defaultRetention(ctx context.Context, bucket string) (string, t
 		return "", time.Time{}, err
 	}
 	v, err := s.configs.get(bucket, cacheKindObjectLockDefaults, raw, func(b []byte) (any, error) {
-		var doc objectLockConfigDoc
-		if err := xml.Unmarshal(b, &doc); err != nil {
-			return nil, err
-		}
-		d := &lockDefaults{}
-		if doc.Rule != nil && doc.Rule.DefaultRetention != nil {
-			dr := doc.Rule.DefaultRetention
-			mode := strings.ToUpper(strings.TrimSpace(dr.Mode))
-			if (mode == "GOVERNANCE" || mode == "COMPLIANCE") && dr.Days >= 0 && dr.Years >= 0 &&
-				dr.Days <= maxRetentionYears*366 && dr.Years <= maxRetentionYears && dr.Days+dr.Years > 0 {
-				d.mode, d.days, d.years = mode, dr.Days, dr.Years
-			}
-		}
-		return d, nil
+		return parseLockDefaults(b)
 	})
 	if err != nil {
 		s.log.LogAttrs(ctx, slog.LevelWarn, "s3: ignoring invalid stored object lock configuration",
 			slog.String("bucket", bucket), slog.String("error", err.Error()))
 		return "", time.Time{}, nil
 	}
-	d := v.(*lockDefaults)
-	if d.mode == "" {
-		return "", time.Time{}, nil
-	}
-	until := s.now().UTC().AddDate(d.years, 0, d.days)
-	return d.mode, until, nil
+	mode, until := v.(*lockDefaults).retentionAt(s.now())
+	return mode, until, nil
 }
 
 // sseConfigDoc is the stored ServerSideEncryptionConfiguration document.

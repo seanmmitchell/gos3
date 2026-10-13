@@ -119,6 +119,11 @@ type ObjectMeta struct {
 	RetainUntil     time.Time // zero = none
 	LegalHold       bool
 	WebsiteRedirect string // x-amz-website-redirect-location
+	// MultipartRetentionSource is set only on an in-progress upload. "default"
+	// means its retention must be calculated when the version is published;
+	// "explicit" means the caller supplied the retention headers. It is
+	// cleared before the completed object's metadata is stored.
+	MultipartRetentionSource string
 }
 
 // ObjectInfo describes one object version (or delete marker).
@@ -148,6 +153,12 @@ type CommitOptions struct {
 	// part was replaced after the caller validated it. The check is atomic
 	// with the commit.
 	PartETags []string
+	// BeforePublish runs after any data copy, under the backend's atomic
+	// bucket commit lock/transaction, with the current object's metadata (nil
+	// if absent or a delete marker), the new version's actual creation time,
+	// and current bucket configurations. It may update meta or refuse the
+	// commit. The callback must not call the same backend.
+	BeforePublish func(meta, current *ObjectMeta, created time.Time, config func(key string) []byte) error
 }
 
 // ObjectWriter streams the data of a new object version. Nothing becomes
