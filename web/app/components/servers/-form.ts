@@ -3,7 +3,7 @@
 // Plain TS (no auto-imports) so it is unit-testable.
 import type { Peer } from '~/types/admin'
 import type { Connection, ConnectionInput, ConnectionKind } from '~/types/connection'
-import { DEFAULT_REGION } from '~/utils/connections'
+import { DEFAULT_REGION, hasCredentials, sameEndpoint } from '~/utils/connections'
 import { normalizeEndpoint } from '~/utils/s3/url'
 
 /** Kind selector: 'auto' = detect by probing /_gos3/info. */
@@ -202,11 +202,16 @@ export function isMixedContent(endpoint: string, pageProtocol: string | undefine
   }
 }
 
-/** Best base URL of a discovered peer for the browser: advertised S3 endpoint, else first address. */
-export function peerEndpoint(p: Pick<Peer, 'endpoints' | 'addresses'>): string | undefined {
-  const candidates = [p.endpoints?.s3, ...(p.endpoints?.all ?? []), ...(p.addresses ?? [])]
-  for (const c of candidates) {
-    if (!c) continue
+/**
+ * Base URL of a discovered peer for "Add as server": the first address the
+ * peer was observed and verified at (`addresses`). The peer's self-declared
+ * `endpoints` come from its own /_gos3/info document, which any host can
+ * fill in (discovery is unauthenticated, docs/discovery.md "Peer identity"),
+ * so they are never prefilled; see peerAdvertisedEndpoint.
+ */
+export function peerEndpoint(p: Pick<Peer, 'addresses'>): string | undefined {
+  for (const c of Array.isArray(p.addresses) ? p.addresses : []) {
+    if (!c || typeof c !== 'string') continue
     try {
       return normalizeEndpoint(c)
     } catch {
@@ -216,27 +221,149 @@ export function peerEndpoint(p: Pick<Peer, 'endpoints' | 'addresses'>): string |
   return undefined
 }
 
-/** Connection prefill for "Add as server" from a discovered peer. */
-export function prefillFromPeer(p: Pick<Peer, 'id' | 'name' | 'region' | 'endpoints' | 'addresses'>, creds?: Pick<Connection, 'accessKeyId' | 'secretAccessKey'>): ConnectionInput | undefined {
+/**
+ * The S3 endpoint a peer advertises about itself when it differs from
+ * `chosen` (the prefilled, observed address), else undefined. Shown as an
+ * unverified hint only.
+ */
+export function peerAdvertisedEndpoint(p: Pick<Peer, 'endpoints'>, chosen: string | undefined): string | undefined {
+  const all: unknown[] = Array.isArray(p.endpoints?.all) ? p.endpoints.all : []
+  for (const c of [p.endpoints?.s3, ...all]) {
+    if (!c || typeof c !== 'string') continue
+    try {
+      const ep = normalizeEndpoint(c)
+      return chosen && sameEndpoint(ep, chosen) ? undefined : ep
+    } catch {
+      // try next
+    }
+  }
+  return undefined
+}
+
+/**
+ * Connection prefill for "Add as server" from a discovered peer (endpoint
+ * from peerEndpoint). It never carries credentials: reusing another
+ * connection's keys is a separate, explicit choice in the form.
+ */
+export function prefillFromPeer(p: Pick<Peer, 'id' | 'name' | 'region' | 'addresses'>): ConnectionInput | undefined {
   const endpoint = peerEndpoint(p)
   if (!endpoint) return undefined
   return {
-    name: p.name || undefined,
+    name: typeof p.name === 'string' && p.name ? p.name : undefined,
     endpoint,
-    region: p.region || undefined,
+    region: typeof p.region === 'string' && p.region && !validateRegion(p.region) ? p.region : undefined,
     kind: 'gos3',
     forcePathStyle: true,
     serverId: p.id,
-    source: 'discovered',
-    accessKeyId: creds?.accessKeyId,
-    secretAccessKey: creds?.secretAccessKey
+    source: 'discovered'
   }
 }
 
-/** Internal redirect target from ?redirect=, rejecting external / protocol-relative URLs. */
+/** Lowercased host[:port] of an endpoint, or undefined when it is not a valid URL. */
+export function endpointHost(endpoint: string): string | undefined {
+  try {
+    return new URL(normalizeEndpoint(endpoint)).host.toLowerCase()
+  } catch {
+    return undefined
+  }
+}
+
+/**
+ * Host that would receive requests signed with `from`'s credentials when they
+ * are reused for `endpoint`, or undefined when that is `from`'s own host
+ * (or the endpoint is not valid yet). Discovered servers are not
+ * authenticated, so the form names this host and asks before signing for it.
+ */
+export function credentialReuseHost(endpoint: string, from: Pick<Connection, 'endpoint'>): string | undefined {
+  const host = endpointHost(endpoint)
+  if (!host || host === endpointHost(from.endpoint)) return undefined
+  return host
+}
+
+/**
+ * The stored connection that /connect may put credentials on after they were
+ * verified against `input.endpoint`: one with the same endpoint (the one
+ * with the same server ID first) that has no credentials or the same access
+ * key. Server IDs are not authenticated (a peer, import file or rogue
+ * /_gos3/info can claim any ID), so a connection that only shares the ID but
+ * points elsewhere is never reused: the verified credentials would otherwise
+ * be signed for that other host.
+ */
+export function reusableConnection(
+  list: readonly Connection[],
+  input: Pick<ConnectionInput, 'endpoint' | 'serverId' | 'accessKeyId'>
+): Connection | undefined {
+  const same = list.filter(c => sameEndpoint(c.endpoint, input.endpoint))
+  const candidates = [...same.filter(c => !!input.serverId && c.serverId === input.serverId), ...same]
+  return candidates.find(c => c.accessKeyId === (input.accessKeyId ?? '') || !hasCredentials(c))
+}
+
+/** Lowercased origin (scheme://host[:port], default ports dropped) of an endpoint, or undefined. */
+export function endpointOrigin(endpoint: string): string | undefined {
+  try {
+    return new URL(normalizeEndpoint(endpoint)).origin.toLowerCase()
+  } catch {
+    return undefined
+  }
+}
+
+/**
+ * Warning for a /connect form prefilled from link parameters (?endpoint=):
+ * `origin` is the prefilled endpoint's scheme://host[:port]. `unknown` is
+ * true when that origin is neither this page's nor a configured
+ * connection's: the user must confirm before keys are signed for it.
+ * `downgrade` is true when it is plain http for a host this page or a
+ * configured connection reaches over https (also `unknown`). Undefined
+ * when the endpoint is not a valid URL.
+ */
+export function linkPrefillCheck(
+  endpoint: string,
+  pageOrigin: string | undefined,
+  known: readonly Pick<Connection, 'endpoint'>[]
+): { origin: string, unknown: boolean, downgrade: boolean } | undefined {
+  const origin = endpointOrigin(endpoint)
+  if (!origin) return undefined
+  const origins = [pageOrigin && pageOrigin !== 'null' ? pageOrigin.toLowerCase() : undefined, ...known.map(c => endpointOrigin(c.endpoint))]
+    .filter((o): o is string => !!o)
+  const hostname = (o: string) => new URL(o).hostname
+  const downgrade = origin.startsWith('http:') && origins.some(o => o.startsWith('https:') && hostname(o) === hostname(origin))
+  const unknown = downgrade || !origins.includes(origin)
+  return { origin, unknown, downgrade }
+}
+
+/**
+ * Internal redirect target from ?redirect=, or undefined. Rejects external /
+ * protocol-relative URLs, the connect page itself, and paths with '.' / '..'
+ * segments, encoded slashes or backslashes, or control characters, in any
+ * level of percent-encoding: vue-router decodes route params, so
+ * '/servers/x/buckets/%2E%2E/…' would open a bucket named '..' and the S3
+ * request URL would resolve to another path.
+ */
 export function safeRedirect(v: unknown): string | undefined {
   const s = Array.isArray(v) ? v[0] : v
-  if (typeof s !== 'string' || !s.startsWith('/') || s.startsWith('//') || s.startsWith('/\\')) return undefined
+  if (typeof s !== 'string' || !s.startsWith('/') || s.startsWith('//')) return undefined
   if (s.startsWith('/connect')) return undefined
+  // Backslashes ('\' counts as '/' in http URLs) and control characters.
+  // eslint-disable-next-line no-control-regex
+  if (/[\\\x00-\x1f\x7f]/.test(s)) return undefined
+  const path = s.split(/[?#]/, 1)[0]!
+  for (const raw of path.split('/')) {
+    // The raw segment, what the router decodes it to, and one more level
+    // ('%252E%252E' → '%2E%2E' → '..').
+    let seg = raw
+    for (let level = 0; level < 3; level++) {
+      // eslint-disable-next-line no-control-regex
+      if (seg === '.' || seg === '..' || /[\\\x00-\x1f\x7f]/.test(seg)) return undefined
+      if (level === 1 && seg.includes('/')) return undefined // an encoded slash
+      let next: string
+      try {
+        next = decodeURIComponent(seg)
+      } catch {
+        break // a literal '%' (e.g. in an object key)
+      }
+      if (next === seg) break
+      seg = next
+    }
+  }
   return s
 }

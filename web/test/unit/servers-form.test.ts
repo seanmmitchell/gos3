@@ -4,6 +4,7 @@ import type { Connection } from '~/types/connection'
 import {
   connectionColor,
   copyName,
+  credentialReuseHost,
   duplicateInput,
   emptyServerForm,
   formFromConnection,
@@ -11,9 +12,12 @@ import {
   formToInput,
   isDefinitionLocked,
   isMixedContent,
+  linkPrefillCheck,
+  peerAdvertisedEndpoint,
   peerEndpoint,
   prefillFromPeer,
   resolveKind,
+  reusableConnection,
   safeRedirect,
   validateEndpoint,
   validateRegion,
@@ -119,11 +123,26 @@ describe('misc helpers', () => {
     expect(isMixedContent('http://x', 'http:')).toBe(false)
   })
 
-  it('prefills from discovered peers', () => {
-    const peer = { id: 'p1', name: 'other', region: 'eu', endpoints: { s3: '', admin: '', all: ['http://10.0.0.9:9000/'] }, addresses: ['http://10.0.0.8:9000'] }
-    expect(peerEndpoint(peer)).toBe('http://10.0.0.9:9000')
-    expect(prefillFromPeer(peer, CONN)).toMatchObject({ endpoint: 'http://10.0.0.9:9000', name: 'other', region: 'eu', serverId: 'p1', kind: 'gos3', source: 'discovered', accessKeyId: 'AK', secretAccessKey: 'SK' })
-    expect(prefillFromPeer({ ...peer, endpoints: { s3: '', admin: '' }, addresses: [] })).toBeUndefined()
+  it('prefills from discovered peers with the observed address, never the self-declared endpoint', () => {
+    const peer = { id: 'p1', name: 'other', region: 'eu', endpoints: { s3: 'http://lookalike.example', admin: '', all: ['http://10.0.0.9:9000/'] }, addresses: ['http://10.0.0.8:9000/'] }
+    expect(peerEndpoint(peer)).toBe('http://10.0.0.8:9000')
+    const prefill = prefillFromPeer(peer)!
+    expect(prefill).toEqual({ endpoint: 'http://10.0.0.8:9000', name: 'other', region: 'eu', serverId: 'p1', kind: 'gos3', forcePathStyle: true, source: 'discovered' })
+    // No credentials ride along with a discovery prefill.
+    expect(prefill.accessKeyId).toBeUndefined()
+    expect(prefill.secretAccessKey).toBeUndefined()
+    // The advertised endpoint is only a hint, and only when it differs.
+    expect(peerAdvertisedEndpoint(peer, prefill.endpoint)).toBe('http://lookalike.example')
+    expect(peerAdvertisedEndpoint({ endpoints: { s3: 'http://10.0.0.8:9000/', admin: '' } }, prefill.endpoint)).toBeUndefined()
+    // Advertised endpoints alone are not usable.
+    expect(prefillFromPeer({ ...peer, addresses: [] })).toBeUndefined()
+    // A region that could not be signed with (or put into a config file) is dropped.
+    expect(prefillFromPeer({ ...peer, region: 'eu\n[default]' })?.region).toBeUndefined()
+    // Malformed documents: non-array lists are ignored.
+    const odd = { ...peer, endpoints: { s3: '', admin: '', all: 'http://x:9000' as unknown as string[] }, addresses: 'http://10.0.0.8:9000' as unknown as string[] }
+    expect(peerEndpoint(odd)).toBeUndefined()
+    expect(peerAdvertisedEndpoint(odd, undefined)).toBeUndefined()
+    expect(prefillFromPeer(odd)).toBeUndefined()
   })
 
   it('accepts only internal redirects', () => {
@@ -134,6 +153,71 @@ describe('misc helpers', () => {
     expect(safeRedirect('https://evil.com')).toBeUndefined()
     expect(safeRedirect('/connect?server=x')).toBeUndefined()
     expect(safeRedirect(undefined)).toBeUndefined()
+  })
+
+  it('rejects redirects with dot segments, encoded slashes or control characters', () => {
+    // The audit's link: router.replace decodes %2E%2E to a bucket named '..'.
+    expect(safeRedirect('/servers/this-server/buckets/%2E%2E/objects/?key=_gos3/admin/v1/users/alice')).toBeUndefined()
+    expect(safeRedirect('/servers/x/buckets/%252e%252e/objects/')).toBeUndefined()
+    expect(safeRedirect('/servers/x/buckets/../../evil')).toBeUndefined()
+    expect(safeRedirect('/servers/x/buckets/./b')).toBeUndefined()
+    expect(safeRedirect('/servers/x/buckets/a%2Fb')).toBeUndefined()
+    expect(safeRedirect('/servers/x/buckets/a%5C..')).toBeUndefined()
+    expect(safeRedirect('/servers\\x')).toBeUndefined()
+    expect(safeRedirect('/servers/x\nSet-Cookie')).toBeUndefined()
+    // Ordinary in-app routes still pass, including encoded names and dots in names.
+    expect(safeRedirect('/servers/x/buckets/my.bucket/objects/a%20b/100%25.txt')).toBe('/servers/x/buckets/my.bucket/objects/a%20b/100%25.txt')
+    expect(safeRedirect('/servers/x/buckets/b/objects/?key=a%2F..%2Fb')).toBe('/servers/x/buckets/b/objects/?key=a%2F..%2Fb')
+    expect(safeRedirect('/servers/x/buckets/b?prefix=..%2F')).toBe('/servers/x/buckets/b?prefix=..%2F')
+  })
+})
+
+describe('credential routing', () => {
+  const conn = (over: Partial<Connection>): Connection => ({ ...CONN, accessKeyId: '', secretAccessKey: '', ...over })
+
+  it('never puts verified credentials on a connection that only shares the server ID (web-auth-1)', () => {
+    // An attacker entry (import file / spoofed peer) claims prod's server ID.
+    const evil = conn({ id: 'evil', endpoint: 'http://evil:9000', serverId: 'prod-id' })
+    // The user typed and verified prod's endpoint, whose /_gos3/info reports prod-id.
+    expect(reusableConnection([evil], { endpoint: 'https://prod:9000', serverId: 'prod-id', accessKeyId: 'ROOTKEY' })).toBeUndefined()
+    // Same with the same access key on the attacker entry.
+    expect(reusableConnection([conn({ ...evil, accessKeyId: 'ROOTKEY' })], { endpoint: 'https://prod:9000', serverId: 'prod-id', accessKeyId: 'ROOTKEY' })).toBeUndefined()
+  })
+
+  it('reuses a connection for the verified endpoint (same server ID first)', () => {
+    const a = conn({ id: 'a', endpoint: 'https://prod:9000', serverId: 'other' })
+    const b = conn({ id: 'b', endpoint: 'https://PROD:9000/', serverId: 'prod-id' })
+    expect(reusableConnection([a, b], { endpoint: 'https://prod:9000', serverId: 'prod-id', accessKeyId: 'K' })?.id).toBe('b')
+    expect(reusableConnection([a], { endpoint: 'https://prod:9000', serverId: 'prod-id', accessKeyId: 'K' })?.id).toBe('a')
+    // A connection with another identity's keys is left alone (a new one is added).
+    expect(reusableConnection([conn({ ...a, accessKeyId: 'OTHER', secretAccessKey: 'S' })], { endpoint: 'https://prod:9000', accessKeyId: 'K' })).toBeUndefined()
+    expect(reusableConnection([conn({ ...a, accessKeyId: 'K', secretAccessKey: 'OLD' })], { endpoint: 'https://prod:9000', accessKeyId: 'K' })?.id).toBe('a')
+  })
+
+  it('flags link-prefilled endpoints that are neither this site nor a configured server', () => {
+    const known = [conn({ endpoint: 'http://nas:9000' }), conn({ endpoint: 'https://s3.example.com' })]
+    expect(linkPrefillCheck('https://gos3-corp.attacker.tld', 'https://gos3.corp', known)).toEqual({ origin: 'https://gos3-corp.attacker.tld', unknown: true, downgrade: false })
+    expect(linkPrefillCheck('https://GOS3.corp/', 'https://gos3.corp', known)).toEqual({ origin: 'https://gos3.corp', unknown: false, downgrade: false })
+    expect(linkPrefillCheck('nas:9000', 'http://ui.local', known)).toEqual({ origin: 'http://nas:9000', unknown: false, downgrade: false })
+    expect(linkPrefillCheck('https://s3.example.com:443/', 'http://ui.local', known)).toMatchObject({ unknown: false })
+    // Scheme and port count, not just the host name.
+    expect(linkPrefillCheck('http://nas:9001', 'http://ui.local', known)).toMatchObject({ unknown: true, downgrade: false })
+    expect(linkPrefillCheck('https://nas:9000', 'http://ui.local', known)).toMatchObject({ unknown: true, downgrade: false })
+    expect(linkPrefillCheck('not a url', 'http://ui.local', known)).toBeUndefined()
+  })
+
+  it('treats an https-to-http downgrade of a known host as unknown', () => {
+    const known = [conn({ endpoint: 'https://s3.example.com' })]
+    expect(linkPrefillCheck('http://s3.example.com', 'http://ui.local', known)).toEqual({ origin: 'http://s3.example.com', unknown: true, downgrade: true })
+    // Also against the page itself (embedded UI on https).
+    expect(linkPrefillCheck('http://gos3.corp:9000', 'https://gos3.corp', [])).toMatchObject({ unknown: true, downgrade: true })
+  })
+
+  it('names the host that would receive reused credentials', () => {
+    const from = conn({ endpoint: 'http://10.0.0.5:9000', accessKeyId: 'AK', secretAccessKey: 'SK' })
+    expect(credentialReuseHost('http://10.0.0.66:9000', from)).toBe('10.0.0.66:9000')
+    expect(credentialReuseHost('http://10.0.0.5:9000/', from)).toBeUndefined()
+    expect(credentialReuseHost('', from)).toBeUndefined()
   })
 })
 

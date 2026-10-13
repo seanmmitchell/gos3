@@ -1,11 +1,15 @@
 <script setup lang="ts">
 import { S3Error } from '~/utils/s3/errors'
 import { canForceDeleteBucket } from '~/components/admin/-capabilities'
+import { BYPASS_GOVERNANCE_HELP, FORCE_DELETE_LOCKED_TITLE, forceDeleteBlock, type ForceDeleteBlock } from './-force-delete'
 
 /**
  * Delete the bucket (S3 DeleteBucket, must be empty) or, for gos3 admins
  * with admin:ForceDeleteBucket, force-delete it with every version,
- * delete marker, pending upload and configuration.
+ * delete marker, pending upload and configuration. Object lock is honoured:
+ * the server refuses (409) while versions are under legal hold or COMPLIANCE
+ * retention, and under GOVERNANCE retention unless "Bypass governance
+ * retention" is ticked; the refusal is shown in the card.
  */
 const props = defineProps<{ bucket: string }>()
 
@@ -49,12 +53,23 @@ async function onDelete() {
   }
 }
 
-const force = useAsyncAction(() => requireAdmin().deleteBucket(props.bucket, { force: true }), { errorTitle: 'Could not force-delete bucket', rethrow: true })
+const bypassGovernance = ref(false)
+const lockBlock = ref<ForceDeleteBlock | undefined>()
+
+const force = useAsyncAction(async () => {
+  lockBlock.value = undefined
+  try {
+    await requireAdmin().deleteBucket(props.bucket, { force: true, bypassGovernanceRetention: bypassGovernance.value })
+  } catch (e) {
+    lockBlock.value = forceDeleteBlock(e)
+    throw e
+  }
+}, { errorTitle: 'Could not force-delete bucket', rethrow: true })
 
 async function onForceDelete() {
   const ok = await confirm({
     title: `Force delete ${props.bucket}?`,
-    description: 'Every object, every version, all delete markers, pending multipart uploads and all bucket configuration will be permanently deleted.',
+    description: `Every object, every version, all delete markers, pending multipart uploads and all bucket configuration will be permanently deleted${bypassGovernance.value ? ', including versions under GOVERNANCE retention' : ''}.`,
     confirmLabel: 'Delete everything',
     requireText: props.bucket,
     icon: 'i-lucide-bomb'
@@ -99,6 +114,17 @@ async function onForceDelete() {
           <p class="text-sm text-muted">
             Removes all versions, delete markers, uploads and configuration, then the bucket (admin:ForceDeleteBucket).
           </p>
+          <UCheckbox v-model="bypassGovernance" class="mt-2" label="Bypass governance retention" :description="BYPASS_GOVERNANCE_HELP" data-testid="bypass-governance" />
+          <UAlert
+            v-if="lockBlock"
+            class="mt-2"
+            color="warning"
+            variant="subtle"
+            icon="i-lucide-lock"
+            :title="FORCE_DELETE_LOCKED_TITLE"
+            :description="lockBlock.governance && !bypassGovernance ? `${lockBlock.message} Tick “Bypass governance retention” to delete them.` : lockBlock.message"
+            data-testid="force-delete-locked"
+          />
         </div>
         <UButton color="error" icon="i-lucide-bomb" label="Force delete" :loading="force.loading.value" @click="onForceDelete" />
       </div>

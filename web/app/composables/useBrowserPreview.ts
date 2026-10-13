@@ -10,6 +10,8 @@ export type PreviewKind = 'image' | 'video' | 'audio' | 'markdown' | 'json' | 't
 export const PREVIEW_MEDIA_MAX_BYTES = 50 * 1024 * 1024
 /** Bytes fetched (range GET) for text previews. */
 export const PREVIEW_TEXT_MAX_BYTES = 256 * 1024
+/** Deepest block quote nesting renderMarkdown renders as <blockquote>. */
+export const MARKDOWN_MAX_QUOTE_DEPTH = 16
 
 const IMAGE_EXT = new Set(['png', 'jpg', 'jpeg', 'gif', 'webp', 'avif', 'bmp', 'ico', 'svg'])
 const VIDEO_EXT = new Set(['mp4', 'webm', 'ogv', 'mov', 'm4v'])
@@ -86,7 +88,11 @@ function inline(escaped: string): string {
     codes.push(`<code>${c}</code>`)
     return `\u0000${codes.length - 1}\u0000`
   })
-  s = s.replace(/!?\[([^\]]*)\]\(([^)\s]+)(?:\s+&quot;[^&]*&quot;)?\)/g, (_m, label: string, url: string) => {
+  // The label cannot cross '[' and the URL holds at most one '(…)' group
+  // ('…/Foo_(bar)'): a failed match then stops at the next bracket, which
+  // keeps this linear in the input (with '[^\]]*' a run of '[' without ']'
+  // took quadratic time).
+  s = s.replace(/!?\[([^[\]]*)\]\(([^()\s]+(?:\([^()\s]*\))?)(?:\s+&quot;[^&]*&quot;)?\)/g, (_m, label: string, url: string) => {
     // url is escaped; unescape &amp; for the check, re-escape on output.
     const href = safeHref(url.replace(/&amp;/g, '&'))
     if (!href) return label
@@ -105,9 +111,11 @@ function inline(escaped: string): string {
 /**
  * Renders a practical Markdown subset (headings, paragraphs, emphasis, code
  * spans and fenced blocks, block quotes, lists, horizontal rules, links) to
- * safe HTML.
+ * safe HTML. Block quotes nest at most MARKDOWN_MAX_QUOTE_DEPTH levels;
+ * deeper quote markers are kept as text (a line of thousands of '>' would
+ * otherwise recurse once per marker and overflow the stack).
  */
-export function renderMarkdown(src: string): string {
+export function renderMarkdown(src: string, depth = 0): string {
   const lines = src.replace(/\r\n?/g, '\n').split('\n')
   const out: string[] = []
   let para: string[] = []
@@ -123,7 +131,7 @@ export function renderMarkdown(src: string): string {
     list = null
   }
   const flushQuote = () => {
-    if (quote.length) out.push(`<blockquote>${renderMarkdown(quote.join('\n'))}</blockquote>`)
+    if (quote.length) out.push(`<blockquote>${renderMarkdown(quote.join('\n'), depth + 1)}</blockquote>`)
     quote = []
   }
   const flushAll = () => {
@@ -144,7 +152,7 @@ export function renderMarkdown(src: string): string {
       out.push(`<pre${lang}><code>${previewEscapeHtml(body.join('\n'))}</code></pre>`)
       continue
     }
-    if (/^\s*>/.test(line)) {
+    if (depth < MARKDOWN_MAX_QUOTE_DEPTH && /^\s*>/.test(line)) {
       flushPara()
       flushList()
       quote.push(line.replace(/^\s*>\s?/, ''))

@@ -131,6 +131,11 @@ describe('AdminClient', () => {
     const { admin, calls } = makeAdmin(() => new Response(null, { status: 204 }))
     await admin.deleteBucket('photos', { force: true })
     expect(calls[0]!).toMatchObject({ method: 'DELETE', url: 'http://localhost:9000/_gos3/admin/v1/buckets/photos?force=true' })
+    await admin.deleteBucket('photos', { force: true, bypassGovernanceRetention: true })
+    expect(calls[1]!.url).toBe('http://localhost:9000/_gos3/admin/v1/buckets/photos?force=true&bypassGovernanceRetention=true')
+    // The bypass is only meaningful (and only accepted) with force.
+    await admin.deleteBucket('photos', { bypassGovernanceRetention: true })
+    expect(calls[2]!.url).toBe('http://localhost:9000/_gos3/admin/v1/buckets/photos')
   })
 
   it('throws AdminError from the error envelope', async () => {
@@ -196,5 +201,31 @@ describe('fetchInfo / probeServer', () => {
     const bad = await probeServer('http://a', { fetch: () => Promise.reject(new TypeError('x')) })
     expect(bad.ok).toBe(false)
     expect(bad.error?.code).toBe('NetworkError')
+  })
+})
+
+describe('admin paths with dot segments (gap-2)', () => {
+  it('are refused before anything is signed or sent', async () => {
+    const fetch = vi.fn(() => Promise.resolve(new Response('{}', { status: 200 })))
+    const admin = new AdminClient({ endpoint: 'http://localhost:9000', accessKeyId: 'AK', secretAccessKey: 'SK' }, { fetch })
+    expect(() => admin.url('/users/..')).toThrow(AdminError)
+    await expect(admin.deleteUser('..')).rejects.toMatchObject({ code: 'InvalidArgument', status: 0 })
+    await expect(admin.getUser('.')).rejects.toMatchObject({ code: 'InvalidArgument' })
+    expect(fetch).not.toHaveBeenCalled()
+    // Names that merely contain dots are fine.
+    expect(admin.url('/users/a..b')).toBe('http://localhost:9000/_gos3/admin/v1/users/a..b')
+  })
+})
+
+describe('force delete refused by object lock', () => {
+  it('tells GOVERNANCE-only refusals (bypassable) from legal hold / COMPLIANCE ones', async () => {
+    const { forceDeleteBlock } = await import('~/components/bucket-settings/-force-delete')
+    const gov = new AdminError('Conflict', 'bucket "b" has 2 object(s) under GOVERNANCE retention (e.g. "a"); nothing was deleted (add bypassGovernanceRetention=true, which requires s3:BypassGovernanceRetention, to delete them)', 409)
+    expect(forceDeleteBlock(gov)).toEqual({ governance: true, message: gov.message })
+    const held = new AdminError('Conflict', 'bucket "b" has 1 object version(s) under legal hold or COMPLIANCE retention (e.g. "a"); object lock forbids deleting them, nothing was deleted', 409)
+    expect(forceDeleteBlock(held)).toEqual({ governance: false, message: held.message })
+    expect(forceDeleteBlock(new AdminError('Conflict', 'bucket not empty', 409))).toBeUndefined()
+    expect(forceDeleteBlock(new AdminError('AccessDenied', 'GOVERNANCE', 403))).toBeUndefined()
+    expect(forceDeleteBlock(new Error('x'))).toBeUndefined()
   })
 })

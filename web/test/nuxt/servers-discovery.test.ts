@@ -152,10 +152,19 @@ describe('discovery components', () => {
     await w.find('button[aria-label="Add backup as a server"]').trigger('click')
     expect(onAdd).toHaveBeenCalledWith(PEER)
 
+    // Same server ID at another address: flagged, not linked as that server.
     const store = useConnectionsStore()
     store.add({ id: 'bk', name: 'Backup box', endpoint: 'http://other:9000', serverId: PEER.id })
     await nextTick()
-    expect(w.text()).toContain('Open Backup box')
+    expect(w.text()).not.toContain('Open Backup box')
+    expect(w.find('[data-testid="id-claim-badge"]').text()).toContain('ID of Backup box')
+    expect(w.find('button[aria-label="Add backup as a server"]').exists()).toBe(true)
+
+    // A connection at the address it was observed at: configured.
+    store.add({ id: 'bk2', name: 'Backup NAS', endpoint: 'http://10.9.9.2:9000' })
+    await nextTick()
+    expect(w.text()).toContain('Open Backup NAS')
+    expect(w.find('[data-testid="id-claim-badge"]').exists()).toBe(false)
   })
 
   it('ScanForm validates and emits a ScanRequest', async () => {

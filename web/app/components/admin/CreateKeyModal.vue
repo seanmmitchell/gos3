@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import type { CreateAccessKeyRequest } from '~/types/admin'
-import { validateAccessKeyId, validateSecretKey } from './-credentials'
+import { CUSTOM_KEY_PERMISSION_HINT, validateAccessKeyId, validateSecretKey } from './-credentials'
 
 /**
  * Asks for the description (and, for admins, an optional caller-supplied key
@@ -55,10 +55,10 @@ function submit() {
         <template v-if="allowCustom">
           <USwitch v-model="custom" label="Specify the key pair" description="Leave off to generate a random key pair (recommended)." />
           <template v-if="custom">
-            <UFormField label="Access key ID" name="accessKey" required :error="submitted && errors.accessKey">
+            <UFormField label="Access key ID" name="accessKey" required :help="CUSTOM_KEY_PERMISSION_HINT" :error="submitted && errors.accessKey">
               <UInput v-model="accessKey" class="w-full font-mono" autocomplete="off" spellcheck="false" />
             </UFormField>
-            <UFormField label="Secret access key" name="secretKey" required :error="submitted && errors.secretKey">
+            <UFormField label="Secret access key" name="secretKey" required help="16–128 printable ASCII characters, no spaces." :error="submitted && errors.secretKey">
               <UInput v-model="secretKey" type="password" class="w-full font-mono" autocomplete="new-password" />
             </UFormField>
           </template>

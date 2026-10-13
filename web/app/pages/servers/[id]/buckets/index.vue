@@ -4,6 +4,7 @@ import type { BucketUsage } from '~/types/admin'
 import { S3Error } from '~/utils/s3/errors'
 import { AdminError } from '~/utils/admin/client'
 import { usageAgeNote } from '~/components/browser/-bucket-usage'
+import { BYPASS_GOVERNANCE_HELP, FORCE_DELETE_LOCKED_TITLE, forceDeleteBlock } from '~/components/bucket-settings/-force-delete'
 
 /**
  * Bucket list. gos3 identities with admin rights get the admin listing
@@ -149,8 +150,8 @@ function isNotEmpty(e: unknown): boolean {
 
 const deleting = ref<string | null>(null)
 
-async function forceDelete(name: string) {
-  const ok = await confirm({
+async function forceDelete(name: string, bypassGovernanceRetention = false) {
+  const ok = bypassGovernanceRetention || await confirm({
     title: `Force delete bucket ${name}?`,
     description: 'Every object, version, delete marker, pending upload and configuration in this bucket is deleted permanently, then the bucket itself. This cannot be undone.',
     confirmLabel: 'Delete everything',
@@ -160,11 +161,25 @@ async function forceDelete(name: string) {
   if (!ok) return
   deleting.value = name
   try {
-    await requireAdmin().deleteBucket(name, { force: true })
+    await requireAdmin().deleteBucket(name, { force: true, bypassGovernanceRetention })
     toast.add({ title: `Bucket ${name} and all its contents deleted`, color: 'success', icon: 'i-lucide-circle-check' })
     await refresh()
   } catch (e) {
-    toast.add({ title: 'Could not delete bucket', description: errorMessage(e), color: 'error', icon: 'i-lucide-circle-alert' })
+    const block = forceDeleteBlock(e)
+    if (block?.governance && !bypassGovernanceRetention) {
+      // Only GOVERNANCE retention is in the way: offer to bypass it.
+      deleting.value = null
+      const again = await confirm({
+        title: 'Bypass governance retention?',
+        description: `${block.message} ${BYPASS_GOVERNANCE_HELP}`,
+        confirmLabel: 'Delete with bypass',
+        requireText: name,
+        icon: 'i-lucide-lock-open'
+      })
+      if (again) await forceDelete(name, true)
+      return
+    }
+    toast.add({ title: block ? FORCE_DELETE_LOCKED_TITLE : 'Could not delete bucket', description: errorMessage(e), color: 'error', icon: block ? 'i-lucide-lock' : 'i-lucide-circle-alert' })
   } finally {
     deleting.value = null
   }

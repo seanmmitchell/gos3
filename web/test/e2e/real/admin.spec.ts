@@ -131,6 +131,11 @@ test.describe('discovery', () => {
       await modal.getByRole('textbox', { name: 'Access key ID' }).fill('e2eroot')
       await modal.getByRole('textbox', { name: 'Secret access key' }).fill('e2eroot-secret-key')
     }
+    // Either way the form holds the primary's keys for a peer on another port,
+    // so saving needs the explicit trust confirmation.
+    const trust = modal.getByRole('checkbox', { name: /^I trust .+ keys$/ })
+    await expect(trust).toBeVisible()
+    await trust.check()
     await modal.getByRole('button', { name: 'Add server' }).click()
     await expect(modal).toBeHidden()
     await expect(peerRow.getByRole('link', { name: new RegExp(`Open ${peer.name}`) }).or(peerRow.getByRole('button', { name: new RegExp(`Open ${peer.name}`) }))).toBeVisible()

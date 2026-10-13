@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { prettyJson, previewKind, renderMarkdown } from '~/composables/useBrowserPreview'
+import { MARKDOWN_MAX_QUOTE_DEPTH, PREVIEW_TEXT_MAX_BYTES, prettyJson, previewKind, renderMarkdown } from '~/composables/useBrowserPreview'
 
 describe('previewKind', () => {
   it('uses the content type, then the extension', () => {
@@ -68,5 +68,45 @@ describe('renderMarkdown link filter (review fix)', () => {
   it('keeps ordinary links', () => {
     expect(renderMarkdown('[a](https://example.com/x?y=1&z=2) [b](docs/readme.md) [c](mailto:me@example.com)'))
       .toBe('<p><a href="https://example.com/x?y=1&amp;z=2" target="_blank" rel="noopener noreferrer nofollow">a</a> <a href="docs/readme.md" target="_blank" rel="noopener noreferrer nofollow">b</a> <a href="mailto:me@example.com" target="_blank" rel="noopener noreferrer nofollow">c</a></p>')
+  })
+})
+
+describe('renderMarkdown on hostile input (web-content-2)', () => {
+  const n = PREVIEW_TEXT_MAX_BYTES
+  // Each of these took quadratic time or overflowed the stack before the fix
+  // ('['.repeat(256 KiB) took about 30 s). Linear rendering is well under a second.
+  const inputs: Record<string, string> = {
+    'brackets': '['.repeat(n),
+    'brackets with text': '[a'.repeat(n / 2),
+    'empty links without a closing paren': '[](x'.repeat(n / 4),
+    'link prefix': '[](' + 'a'.repeat(n),
+    'image prefixes': '![x]('.repeat(n / 5),
+    'titles': '[a](b "'.repeat(n / 7),
+    'emphasis': '*a'.repeat(n / 2),
+    'underscores': '_a'.repeat(n / 2),
+    'heading spaces': '# ' + ' '.repeat(n) + 'x',
+    'rule-like line': '- '.repeat(n / 2) + 'x',
+    'list items': '- [\n'.repeat(n / 4)
+  }
+  for (const [name, src] of Object.entries(inputs)) {
+    it(`renders ${name} in linear time`, () => {
+      const t0 = performance.now()
+      const html = renderMarkdown(src)
+      expect(performance.now() - t0, name).toBeLessThan(1500)
+      expect(html).not.toContain('<script')
+    })
+  }
+
+  it('caps block quote nesting instead of recursing per marker', () => {
+    expect(() => renderMarkdown('>'.repeat(50000) + ' deep')).not.toThrow()
+    const html = renderMarkdown('>'.repeat(40) + ' deep')
+    expect(html.match(/<blockquote>/g)).toHaveLength(MARKDOWN_MAX_QUOTE_DEPTH)
+    expect(html).toContain('&gt; deep') // the rest stays text
+    expect(renderMarkdown('> a\n>> b')).toBe('<blockquote><p>a</p>\n<blockquote><p>b</p></blockquote></blockquote>')
+  })
+
+  it('still renders links with one level of parentheses', () => {
+    expect(renderMarkdown('[w](https://en.wikipedia.org/wiki/Foo_(bar))')).toContain('href="https://en.wikipedia.org/wiki/Foo_(bar)"')
+    expect(renderMarkdown('[a](b "t")')).toContain('href="b"')
   })
 })

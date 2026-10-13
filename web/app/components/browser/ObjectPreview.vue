@@ -28,7 +28,15 @@ const rendered = ref<'rendered' | 'source'>('rendered')
 const tooLarge = computed(() => ['image', 'video', 'audio'].includes(kind.value) && props.size > PREVIEW_MEDIA_MAX_BYTES && !force.value)
 
 const json = computed(() => (kind.value === 'json' && !truncated.value ? prettyJson(text.value) : { text: text.value, valid: false }))
-const markdownHtml = computed(() => (kind.value === 'markdown' ? renderMarkdown(text.value) : ''))
+// null when rendering failed: the source is shown instead of a broken preview.
+const markdownHtml = computed<string | null>(() => {
+  if (kind.value !== 'markdown') return ''
+  try {
+    return renderMarkdown(text.value)
+  } catch {
+    return null
+  }
+})
 
 let seq = 0
 async function load() {
@@ -117,6 +125,9 @@ watch(() => [props.bucket, props.objectKey, props.versionId, force.value], () =>
             <template v-else-if="kind === 'json' && !json.valid">
               Not valid JSON; showing the raw text.
             </template>
+            <template v-else-if="kind === 'markdown' && rendered === 'rendered' && markdownHtml === null">
+              This Markdown could not be rendered; showing the raw text.
+            </template>
           </p>
           <UTabs
             v-if="kind === 'markdown'"
@@ -130,9 +141,9 @@ watch(() => [props.bucket, props.objectKey, props.versionId, force.value], () =>
         <!-- renderMarkdown escapes all input and only emits a fixed tag set. -->
         <!-- eslint-disable vue/no-v-html -->
         <article
-          v-if="kind === 'markdown' && rendered === 'rendered'"
+          v-if="kind === 'markdown' && rendered === 'rendered' && markdownHtml !== null"
           class="browser-markdown max-h-[60vh] overflow-auto rounded-lg border border-default p-4 text-sm"
-          v-html="markdownHtml"
+          v-html="markdownHtml ?? ''"
         />
         <!-- eslint-enable vue/no-v-html -->
         <pre
