@@ -264,8 +264,12 @@ The data directory (default `./data`, `/data` in the container) holds:
 | `.gos3/root-credentials.json` | generated root keys | **secret** (0600) |
 | `.gos3/iam.json` | IAM users, access **and secret** keys, policies | **secret** (0600) |
 | `.gos3/settings.json` | runtime settings | private (0600) |
+| `.gos3/backings.json` | backings configured in the web UI (names, backends, paths; no restic credentials) | private (0600) |
 | `.gos3/meta.db` | bucket and object metadata, bucket policies and configurations (fs backend) | private (0600) |
 | `.gos3/data/`, `.gos3/uploads/` | object and part data | your data (files 0600) |
+| `.gos3/keys/` | bucket encryption keys and restic repository passwords (fs backend) | **secret** (0600) |
+| `.gos3/restic-backing.json` | restic S3 storage settings, including credentials (fs backend) | **secret** (0600) |
+| `.gos3/restic/`, `.gos3/restic-cache/` | restic repositories and cache (fs backend) | encrypted by restic |
 | `.gos3/server-id` | random server ID | public |
 
 Keep the directory owned by the gos3 user with mode 0700, and treat backups as

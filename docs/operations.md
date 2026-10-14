@@ -101,13 +101,27 @@ gos3 logs to stderr with Go's `log/slog`, as `text` (default) or `json`
     ├── uploads/<upload-id>/…    multipart parts in progress (fs backend)
     ├── tmp/                     files being written (cleaned at startup)
     ├── orphans/<time>-<id>/     unreferenced files moved aside at startup (fs backend)
+    ├── keys/                    per-bucket encryption keys and restic recovery records (fs backend) (secret)
+    │   ├── <bucket-id>              a bucket's encryption master key
+    │   └── <bucket-id>.restic.json  its restic repository location and password
+    ├── restic/<bucket-id>/      local restic repositories (fs backend)
+    ├── restic-cache/            restic's local repository cache (fs backend)
+    ├── restic-backing.json      restic S3 storage settings and credentials (fs backend) (secret)
     ├── lock                     held by the running server
     ├── iam.json                 IAM users, keys, policies        (secret)
     ├── root-credentials.json    generated root keys, if any      (secret)
     ├── settings.json            runtime settings, after the first change
     ├── placements.json          which backings hold which buckets
+    ├── backings.json            backings configured in the web UI, after the first change
     └── server-id                this server's discovery ID
 ```
+
+Encrypted objects cannot be read without `keys/`, so back it up together
+with `meta.db` and the data (see
+[encryption.md](encryption.md#keys-and-recovery)). Keys, restic recovery
+records and local restic repositories stay after their bucket is deleted.
+Each additional fs backing has its own `keys/`, `restic/`, `restic-cache/`
+and `restic-backing.json`.
 
 With the memory backend and a data path, only the system files (`iam.json`,
 `settings.json`, `server-id`, `root-credentials.json`) are kept; objects live in
@@ -229,6 +243,11 @@ a snapshot like a power loss: committed objects are intact (with
 next start. Do
 not copy a live directory with `cp` or `rsync` without a snapshot: `meta.db`
 can end up inconsistent with the data files.
+
+The copy includes the encryption keys (`.gos3/keys/`), so protect it like
+the keys themselves. Restic repositories on a backing's S3 storage are
+outside the data directory: back them up at that S3 service, at the same
+time as the data directory (see [encryption.md](encryption.md#keys-and-recovery)).
 
 Restore by stopping gos3, replacing the directory contents (keep the owner and
 mode 0700) and starting it again. The restored server keeps its server ID,
@@ -364,10 +383,23 @@ manager a longer stop timeout than `shutdown_timeout`; the systemd unit uses
 The fs metadata database records a format version. A gos3 version that does
 not understand it refuses to start rather than risk the data, so rolling back
 after an upgrade that changed the format means restoring the backup.
-Compressed objects are recorded in a newer record format: a gos3 version
-without compression support starts, but fails to read those objects (and
-reports their metadata as corrupt), so roll back only after rewriting them
-uncompressed, or restore the backup. Runtime
+
+Some object versions are also recorded in a newer record format than older
+gos3 versions understand. Such a version starts, but reports their metadata
+as corrupt (`unknown record format`), and listings, lifecycle passes and
+usage counts that reach one of them fail for the whole bucket:
+
+- Compressed versions use record format 4. Roll back to a gos3 version
+  without compression support only after rewriting them uncompressed.
+- Encrypted versions (SSE-S3 `AES256`, native or restic) use record format
+  5. Roll back to a gos3 version without object encryption only after
+  removing every encrypted version, current and noncurrent: disable the
+  bucket's default encryption, copy each object onto itself with
+  `x-amz-metadata-directive: REPLACE` (repeating its metadata) and without
+  `x-amz-server-side-encryption`, then permanently delete the encrypted
+  versions (Object Lock retention can prevent that until it expires).
+
+Otherwise restore the backup. Runtime
 settings in `settings.json` and IAM data in `iam.json` are kept across upgrades.
 `gos3 version` (or `GET /_gos3/info`) shows the running version.
 

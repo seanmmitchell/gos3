@@ -65,7 +65,13 @@ See [configuration.md](configuration.md) for all settings and
 The default image (`Dockerfile`, target `embedded`) builds the web UI with pnpm, a
 static Go binary with the UI embedded (cross-compiled for the target
 architecture), and a `gcr.io/distroless/static-debian12:nonroot` runtime. That
-runtime has no shell, runs as uid/gid 65532, and is about 25 MB.
+runtime has no shell, runs as uid/gid 65532, and is about 25 MB plus the
+bundled [restic](encryption.md#backing-storage-for-restic) executable (about
+30 MB) at `/usr/local/bin/restic`, which buckets with the restic encryption
+provider use. It is the official restic release for the target
+architecture, pinned to one version and verified against the SHA-256 sums
+published with that release while the image is built; its license is in
+`/usr/share/doc/gos3/THIRD_PARTY_NOTICES`.
 
 The `headless` target builds with `-tags noui` and skips the Node/pnpm stage
 entirely. Both targets use the same runtime and support both architectures.
@@ -136,6 +142,10 @@ Notes:
 - The image is built for `linux/amd64` and `linux/arm64`:
   `docker buildx build --platform linux/amd64,linux/arm64 -t <registry>/gos3 --push .`.
 - Build arguments: `VERSION`, `COMMIT` and `DATE` (shown by `gos3 version`).
+- restic is updated by hand: change `RESTIC_VERSION` and the per-architecture
+  SHA-256 sums in the `Dockerfile` (from the release's signed `SHA256SUMS`),
+  the same pins in `.github/actions/setup-restic/action.yml` (CI) and the
+  license URL in `internal/tools/notices`, then run `make notices`.
 - The base images (`node:22-bookworm-slim`, `golang:1.26-bookworm`,
   `gcr.io/distroless/static-debian12:nonroot`) and the Dockerfile frontend
   are pinned by digest, and the GitHub Actions in `.github/workflows` by
@@ -233,6 +243,10 @@ journalctl -u gos3 -f
   ```
 - `systemctl stop gos3` sends SIGTERM: in-flight requests get
   `server.shutdown_timeout` (30 s) to finish.
+- Buckets with the restic encryption provider need
+  [restic](encryption.md#backing-storage-for-restic) on the service's
+  `PATH`: install the release executable as `/usr/local/bin/restic`
+  (mode 0755). It runs as the service user with the same sandbox.
 
 ## Kubernetes
 

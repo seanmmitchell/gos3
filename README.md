@@ -42,7 +42,7 @@ Run `gos3 serve`, point the AWS CLI, an SDK, `mc` or rclone at it, and open
 - **Discovery**: servers announce themselves through mDNS and a UDP multicast
   beacon, and find each other through static seeds, DNS SRV records and
   on-demand network scans. The UI merges what every server sees.
-- **Simple to run**: one static binary or a ~25 MB distroless image. JSON, YAML,
+- **Simple to run**: one static binary or a distroless image. JSON, YAML,
   environment variables or flags, runtime settings without restarts,
   Prometheus metrics, health and readiness endpoints, and graceful shutdown.
 
@@ -88,8 +88,9 @@ build provenance:
 `gh attestation verify oci://ghcr.io/seanmmitchell/gos3:X.Y.Z --repo seanmmitchell/gos3 --source-ref refs/heads/main`.
 
 To build the image yourself, run `docker build -t gos3 .` or `make docker`.
-The image runs as a non-root user (uid 65532), keeps its data in `/data`, and
-has a health check.
+The image runs as a non-root user (uid 65532), keeps its data in `/data`, has
+a health check, and includes the restic executable that restic-encrypted
+buckets use.
 
 ### Docker Compose: two nodes with discovery
 
@@ -360,8 +361,9 @@ specified in [docs/discovery.md](docs/discovery.md).
   anyone who can reach it.
 - **Object encryption**: SSE-S3 encrypts new object data using server-managed
   keys. Per-bucket restic repositories provide encrypted archival on local
-  storage or remote S3. Existing objects require rewriting to encrypt them;
-  back up the protected keys and metadata. See [encryption](docs/encryption.md).
+  storage or remote S3 (restic is bundled in the container images; install
+  it next to a release binary). Existing objects require rewriting to
+  encrypt them; back up the protected keys and metadata. See [encryption](docs/encryption.md).
 
 More in [docs/security.md](docs/security.md).
 
@@ -426,7 +428,9 @@ docs/                documentation
 
 CI (`.github/workflows/ci.yml`) runs gofmt, vet, govulncheck, the Go unit and
 e2e tests with `-race`, the web typecheck, tests and builds, the Playwright suites, the
-compatibility suite, and the Docker builds.
+compatibility suite, and the Docker builds. The Go tests run on Linux, macOS and
+Windows with a pinned restic installed (`.github/actions/setup-restic`), so the
+restic repository tests run instead of skipping.
 
 Pull requests target `dev`, the default branch; `main` only receives release
 merges from `dev`. Every push to `dev` publishes `ghcr.io/seanmmitchell/gos3:dev`,

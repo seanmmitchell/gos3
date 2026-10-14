@@ -44,15 +44,11 @@ jobs:
         run: go vet ./...
       - name: govulncheck
         run: go run golang.org/x/vuln/cmd/govulncheck@v1.8.0 ./...
+      # The real local and remote-S3 restic repository tests skip without
+      # restic; install the pinned release the container images bundle.
+      - uses: ./.github/actions/setup-restic
       - name: Unit tests (race)
-        # Run the real local and remote-S3 repository tests, which skip when
-        # restic is absent. Pin and verify the upstream release executable.
-        run: |
-          curl -fsSL --retry 3 -o "$RUNNER_TEMP/restic.bz2" https://github.com/restic/restic/releases/download/v0.19.1/restic_0.19.1_linux_amd64.bz2
-          echo "f415415624dcc452f2a02b8c33641791a8c6d6d3b65bbb3543fcf9a25151585c  $RUNNER_TEMP/restic.bz2" | sha256sum -c -
-          bzip2 -dc "$RUNNER_TEMP/restic.bz2" > "$RUNNER_TEMP/restic"
-          chmod +x "$RUNNER_TEMP/restic"
-          PATH="$RUNNER_TEMP:$PATH" go test -race -count=1 ./cmd/... ./internal/...
+        run: go test -race -count=1 ./cmd/... ./internal/...
       - name: Headless build and mode tests
         run: |
           go build -tags noui ./cmd/gos3
@@ -79,6 +75,9 @@ jobs:
         with:
           go-version-file: go.mod
           cache: true
+      # Run the restic repository tests here too (process handling, paths
+      # and file locking differ).
+      - uses: ./.github/actions/setup-restic
       - name: Unit tests
         run: go test -count=1 ./cmd/... ./internal/...
       - name: End-to-end tests
@@ -248,6 +247,8 @@ jobs:
           curl -fsS http://127.0.0.1:9000/_gos3/ready
           curl -fsS http://127.0.0.1:9000/_gos3/info | grep -q '"ui"'
           curl -fsS http://127.0.0.1:9000/_gos3/ui/ | grep -qi '<html'
+          # The bundled restic (Dockerfile, restic stage) runs in the image.
+          docker exec gos3 /usr/local/bin/restic version
           docker rm -f gos3
       - name: Build headless gos3 image
         uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
@@ -270,6 +271,7 @@ jobs:
           curl -fsS http://127.0.0.1:9000/minio/health/live
           test "$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:9000/_gos3/ui/)" = 404
           test "$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:9000/_gos3/admin/v1/config)" = 404
+          docker exec gos3-headless /usr/local/bin/restic version
           docker rm -f gos3-headless
       - name: Build standalone UI image
         uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0

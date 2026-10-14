@@ -1,0 +1,41 @@
+# Installs the restic release executable that the gos3 container images
+# bundle (Dockerfile, restic stage), so the real local and remote-S3
+# repository tests run instead of skipping. The download is pinned to one
+# version and verified against the SHA-256 sums in that release's SHA256SUMS
+# (signed by the restic maintainers). To update restic, change the version
+# and every sum here and in the Dockerfile together, plus the license URL in
+# internal/tools/notices.
+name: Set up restic
+description: Put the pinned, checksum-verified restic executable on PATH.
+runs:
+  using: composite
+  steps:
+    - name: Install restic
+      shell: bash
+      run: |
+        set -euo pipefail
+        version=0.19.1
+        case "$RUNNER_OS/$RUNNER_ARCH" in
+          Linux/X64)   asset=restic_${version}_linux_amd64.bz2;   sum=f415415624dcc452f2a02b8c33641791a8c6d6d3b65bbb3543fcf9a25151585c ;;
+          Linux/ARM64) asset=restic_${version}_linux_arm64.bz2;   sum=a5f64aaab53d51e311fa3829124c5b703f2d14cf187d8640b6be3b2b49376465 ;;
+          macOS/X64)   asset=restic_${version}_darwin_amd64.bz2;  sum=c38d579622cf602f665234c5a8c315030b6cf70656028fe6dc29a786b60e5f35 ;;
+          macOS/ARM64) asset=restic_${version}_darwin_arm64.bz2;  sum=7be0a144ccc377880f294204aa271d76e4b79554b42a751151d425ce6ebac143 ;;
+          Windows/X64) asset=restic_${version}_windows_amd64.zip; sum=da948ad707ed690426473aaba2046cd61f8f90f6f0e7dab6be0d5796531de67d ;;
+          *) echo "::error::no pinned restic executable for $RUNNER_OS/$RUNNER_ARCH"; exit 1 ;;
+        esac
+        dir="$RUNNER_TEMP/restic-bin"
+        mkdir -p "$dir"
+        download="$RUNNER_TEMP/$asset"
+        curl -fsSL --retry 3 -o "$download" "https://github.com/restic/restic/releases/download/v$version/$asset"
+        if command -v sha256sum >/dev/null; then
+          echo "$sum  $download" | sha256sum -c -
+        else
+          echo "$sum  $download" | shasum -a 256 -c -
+        fi
+        case "$asset" in
+          *.zip) unzip -p "$download" "restic_${version}_windows_amd64.exe" > "$dir/restic.exe" ;;
+          *)     bzip2 -dc "$download" > "$dir/restic"; chmod +x "$dir/restic" ;;
+        esac
+        rm -f "$download"
+        echo "$dir" >> "$GITHUB_PATH"
+        PATH="$dir:$PATH" restic version
