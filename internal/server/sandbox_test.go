@@ -11,7 +11,9 @@ import (
 // is delivered with "Content-Security-Policy: sandbox" and nosniff, so it
 // cannot read the console's stored connections and credentials.
 func TestObjectsSandboxedOnUIOrigin(t *testing.T) {
-	srv := start(t, testConfig(), WithUIFS(fakeUI()))
+	cfg := testConfig()
+	cfg.UI.Enabled = true
+	srv := start(t, cfg, WithUIFS(fakeUI()))
 	if r := do(t, "PUT", srv.url+"/pages", nil, &rootCreds, nil); r.status != 200 {
 		t.Fatalf("create bucket: %d %s", r.status, r.body)
 	}

@@ -120,13 +120,14 @@ use `git describe`.
 3. The workflow ([`release.yml`](../.github/workflows/release.yml)):
    - tags `main`'s head with the next version (with the deploy key, see
      above);
-   - runs the Go and web tests, builds the embedded UI and the archives for
+   - runs the Go and web tests, builds embedded-UI and headless archives for
      Linux, macOS and Windows (amd64 and arm64) through
      [`build.yml`](../.github/workflows/build.yml), without any cache (see
      [build integrity](#build-integrity));
    - pushes `ghcr.io/seanmmitchell/gos3` tagged `X.Y.Z`, `X.Y`, `X` (from
      1.0.0 on) and `latest`, with BuildKit provenance, an SBOM and a signed
-     build provenance attestation;
+     build provenance attestation; publishes the headless image under the
+     same tags with `-headless` appended, including `latest-headless`;
    - attests the archives' build provenance, then creates the GitHub release
      as a draft with the archives, `checksums.txt` and notes generated from
      the merged pull requests, grouped by label
@@ -184,7 +185,8 @@ What keeps code that did not go through `dev` → `main` out of a release:
   `build.yml` therefore takes `use-cache`; release.yml sets it to `false`,
   which turns off the `setup-go` caches and the BuildKit `gha` cache
   (`no-cache`), and `setup-node`'s cache is off in every build job. Dev
-  builds still use caches (scope `gos3-dev`), so a dev build is not proof of
+  builds still use caches (separate `gos3-dev-embedded` and
+  `gos3-dev-headless` image scopes), so a dev build is not proof of
   what the release will contain; the release rebuilds from the tag. The
   `binaries` job also runs `go mod verify` against `go.sum`.
 - **Tests apart from the shipped UI.** The embedded UI is built in a job
@@ -212,3 +214,14 @@ the same tests and builds as a release (but with caches), published as
 `ghcr.io/seanmmitchell/gos3:dev` and `:dev-<commit>` with an attestation
 for `--source-ref refs/heads/dev`, and with the archives kept
 as artifacts of the run for 30 days. Nothing appears on the Releases page.
+
+Both release and dev builds produce headless archives for every OS and
+architecture, named `gos3_<version>_<os>_<arch>-headless.tar.gz` (`.zip` on
+Windows), in `bin-<os>-<arch>-headless` workflow artifacts. They compile with
+`-tags noui` and never download the built UI. The image workflow selects
+Docker's `headless` target, which has no Node/pnpm build dependency, and
+publishes `:dev-headless` and `:dev-<commit>-headless` alongside the ordinary
+dev tags. Headless release archives receive the same checksums and
+attestations as embedded archives; both image variants receive provenance
+and SBOMs. Their management API remains enabled by default; use `--no-admin`
+for S3-only operation.

@@ -141,6 +141,9 @@ func TestCSPCoversNuxtBuild(t *testing.T) {
 // or a real UI build in a developer tree / release build. It fails when a
 // rebuilt UI gains inline script the computed policy does not cover.
 func TestCSPCoversEmbeddedBuild(t *testing.T) {
+	if FS() == nil {
+		t.Skip("noui build contains no embedded scripts")
+	}
 	assertCSPCoversFS(t, FS())
 }
 

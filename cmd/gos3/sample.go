@@ -10,7 +10,7 @@ const sampleConfig = `# gos3 configuration file.
 # command line flags. "gos3 config env" lists the variables, "gos3 config
 # print" shows the effective configuration. Settings marked (runtime) can also
 # be changed while running through the admin API / web UI; those changes are
-# stored in <data>/.gos3/settings.json and win over this file.
+# stored in <data>/.gos3/settings.json and win over this file when admin is enabled.
 
 server:
   # Listen address, [host]:port.
@@ -81,9 +81,14 @@ auth:
   # opened in a browser on this machine: throwaway local demos only.
   insecure_demo_credentials: false
 
+admin:
+  # Enable the management API and saved UI settings. False also disables UI.
+  enabled: true
+
 ui:
   # Serve the embedded web UI at /_gos3/ui/.
-  enabled: true
+  # Defaults to true, or false in builds with the noui tag.
+  # enabled: true
   # Redirect browsers opening / to the UI (runtime: uiRedirect).
   redirect_root: true
 
@@ -101,11 +106,11 @@ cors:
 discovery:
   # Find other gos3 servers and let them (and the UI) find this one
   # (runtime). See docs/discovery.md.
-  enabled: true
+  enabled: false
   # Announce this server (mDNS + beacon).
-  advertise: true
-  mdns: true
-  beacon: true
+  advertise: false
+  mdns: false
+  beacon: false
   beacon_group: 239.255.73.83:7373
   beacon_interval: 10s
   # Base URLs of known servers, e.g. ["http://nas:9000"].
@@ -114,7 +119,7 @@ discovery:
   dns_srv: []
   peer_ttl: 60s
   # Allow network scans through the admin API (admin:ScanNetwork).
-  allow_scan: true
+  allow_scan: false
   max_scan_hosts: 1024
 
 logging:

@@ -136,7 +136,8 @@ func Default() Config {
 				CutoverTimeout: DefaultCutoverTimeout,
 			},
 		},
-		UI: UIConfig{Enabled: true, RedirectRoot: true},
+		UI:    UIConfig{Enabled: defaultUIEnabled, RedirectRoot: true},
+		Admin: AdminConfig{Enabled: true},
 		CORS: CORSConfig{
 			AllowedOrigins: []string{"*"},
 			AllowedHeaders: []string{"*"},
@@ -164,9 +165,9 @@ type Override struct {
 	Value string
 }
 
-// Load returns the configuration from defaults < YAML file < environment
-// (GOS3_*) < overrides (CLI flags). path is the YAML file ("" =
-// $GOS3_CONFIG, and no file when that is unset too). Unknown YAML fields are
+// Load returns the configuration from defaults < JSON/YAML file < environment
+// (GOS3_*, with MinIO aliases) < overrides (CLI flags). path is the config file ("" =
+// $GOS3_CONFIG, and no file when that is unset too). Unknown fields are
 // rejected. The result is normalized (see Normalize) but not validated:
 // call Validate before using it.
 //
@@ -188,7 +189,7 @@ func load(path string, lookup func(string) (string, bool), overrides []Override)
 		if err != nil {
 			return Config{}, fmt.Errorf("config: %w", err)
 		}
-		if err := decodeYAML(data, &cfg); err != nil {
+		if err := decodeFile(path, data, &cfg); err != nil {
 			return Config{}, fmt.Errorf("config: %s: %w", path, err)
 		}
 	}
@@ -236,6 +237,7 @@ var unknownFieldRe = regexp.MustCompile(`field (\S+) not found in type (\S+)`)
 
 // yamlSections maps the Go types of Config sections to their YAML keys.
 var yamlSections = map[string]string{
+	"config.AdminConfig":       "admin",
 	"config.ServerConfig":      "server",
 	"config.StorageConfig":     "storage",
 	"config.BackingConfig":     "storage.backings",
@@ -258,7 +260,7 @@ func describeUnknownField(m string) string {
 		return fmt.Sprintf("unknown key %q in section %q", sub[1], sec)
 	}
 	if sub[2] == "config.Config" {
-		return fmt.Sprintf("unknown top-level key %q (expected server, storage, auth, ui, cors, discovery, logging, lifecycle, metrics or compression)", sub[1])
+		return fmt.Sprintf("unknown top-level key %q (expected server, storage, auth, ui, admin, cors, discovery, logging, lifecycle, metrics or compression)", sub[1])
 	}
 	return fmt.Sprintf("unknown key %q", sub[1])
 }
@@ -267,6 +269,9 @@ func describeUnknownField(m string) string {
 // address, region and maximum object size when empty or zero), lower-cases
 // enumerations and trims list entries, dropping empty ones.
 func (c *Config) Normalize() {
+	if !c.Admin.Enabled {
+		c.UI.Enabled = false
+	}
 	c.Storage.Backend = strings.ToLower(strings.TrimSpace(c.Storage.Backend))
 	if c.Storage.Backend == "" {
 		c.Storage.Backend = BackendFS

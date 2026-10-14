@@ -226,7 +226,7 @@ func TestConfigValidate(t *testing.T) {
 		func(c *Config) { c.MaxScanHosts = MaxScanHostsLimit },
 	}
 	for i, f := range ok {
-		c := DefaultConfig()
+		c := enabledConfig()
 		f(&c)
 		if err := c.Validate(); err != nil {
 			t.Errorf("ok case %d: %v", i, err)
@@ -250,7 +250,7 @@ func TestConfigValidate(t *testing.T) {
 		func(c *Config) { c.DNSSRV = make([]string, MaxDNSSRV+1) },
 	}
 	for i, f := range bad {
-		c := DefaultConfig()
+		c := enabledConfig()
 		f(&c)
 		if err := c.Validate(); !errors.Is(err, ErrInvalidConfig) {
 			t.Errorf("bad case %d: err = %v", i, err)

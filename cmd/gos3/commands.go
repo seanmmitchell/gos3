@@ -10,6 +10,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"path/filepath"
 	"strings"
 	"text/tabwriter"
 	"time"
@@ -41,6 +42,7 @@ func cmdConfig(args []string, stdout, stderr io.Writer) error {
 	switch sub {
 	case "print":
 		fs := newFlagSet("config print", "gos3 config print [serve flags]", stderr)
+		asJSON := fs.Bool("json", false, "print effective configuration as JSON (secrets redacted)")
 		cf := addConfigFlags(fs)
 		if err := parseFlags(fs, args); err != nil {
 			return err
@@ -53,7 +55,7 @@ func cmdConfig(args []string, stdout, stderr io.Writer) error {
 		// admin API (<data>/.gos3/settings.json) over the static layers.
 		layers := "defaults < file < GOS3_* env < flags"
 		var overridden []config.SettingOverride
-		if path := cfg.SettingsPath(); path != "" && cfg.Validate() == nil {
+		if path := cfg.SettingsPath(); cfg.Admin.Enabled && path != "" && cfg.Validate() == nil {
 			if _, statErr := os.Stat(path); statErr == nil {
 				if store, err := config.LoadStore(config.SettingsFrom(cfg), path); err != nil {
 					fmt.Fprintf(stderr, "warning: %v; printing the configuration without it\n", err)
@@ -63,6 +65,17 @@ func cmdConfig(args []string, stdout, stderr io.Writer) error {
 					layers += " < " + path
 				}
 			}
+		}
+		if *asJSON {
+			data, err := cfg.Redacted().JSON()
+			if err != nil {
+				return err
+			}
+			if err := cfg.Validate(); err != nil {
+				return fmt.Errorf("the configuration is invalid: %w", err)
+			}
+			_, err = stdout.Write(data)
+			return err
 		}
 		data, err := cfg.Redacted().YAML()
 		if err != nil {
@@ -89,11 +102,20 @@ func cmdConfig(args []string, stdout, stderr io.Writer) error {
 		fs := newFlagSet("config init", "gos3 config init [-o FILE] [--force]", stderr)
 		out := fs.String("o", "", "write to FILE instead of standard output")
 		force := fs.Bool("force", false, "overwrite an existing file")
+		asJSON := fs.Bool("json", false, "write JSON (also selected by a .json output filename)")
 		if err := parseFlags(fs, args); err != nil {
 			return err
 		}
+		sample := sampleConfig
+		if *asJSON || strings.EqualFold(filepath.Ext(*out), ".json") {
+			data, err := config.Default().JSON()
+			if err != nil {
+				return err
+			}
+			sample = string(data)
+		}
 		if *out == "" {
-			_, err := io.WriteString(stdout, sampleConfig)
+			_, err := io.WriteString(stdout, sample)
 			return err
 		}
 		flags := os.O_WRONLY | os.O_CREATE | os.O_EXCL
@@ -107,7 +129,7 @@ func cmdConfig(args []string, stdout, stderr io.Writer) error {
 			}
 			return err
 		}
-		if _, err := io.WriteString(f, sampleConfig); err != nil {
+		if _, err := io.WriteString(f, sample); err != nil {
 			_ = f.Close()
 			return err
 		}

@@ -23,6 +23,7 @@ import (
 
 func TestRouting(t *testing.T) {
 	cfg := testConfig()
+	cfg.UI.Enabled = true // tests inject assets, including in noui builds
 	cfg.Server.Domains = []string{"s3.test"}
 	srv := start(t, cfg, WithUIFS(fakeUI()))
 	u := srv.url
@@ -153,7 +154,9 @@ func TestUIDisabled(t *testing.T) {
 }
 
 func TestPlaceholderUINotAdvertised(t *testing.T) {
-	srv := start(t, testConfig(), WithUIFS(fstestPlaceholder()))
+	cfg := testConfig()
+	cfg.UI.Enabled = true
+	srv := start(t, cfg, WithUIFS(fstestPlaceholder()))
 	if !srv.UIEnabled() || srv.UIBuilt() {
 		t.Fatalf("enabled=%v built=%v", srv.UIEnabled(), srv.UIBuilt())
 	}

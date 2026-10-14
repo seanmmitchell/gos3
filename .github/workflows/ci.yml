@@ -46,6 +46,10 @@ jobs:
         run: go run golang.org/x/vuln/cmd/govulncheck@v1.8.0 ./...
       - name: Unit tests (race)
         run: go test -race -count=1 ./cmd/... ./internal/...
+      - name: Headless build and mode tests
+        run: |
+          go build -tags noui ./cmd/gos3
+          go test -race -tags noui ./internal/config ./internal/webui ./internal/server ./cmd/gos3
       - name: End-to-end tests (race)
         run: go test -race -count=1 ./test/e2e/...
 
@@ -238,6 +242,28 @@ jobs:
           curl -fsS http://127.0.0.1:9000/_gos3/info | grep -q '"ui"'
           curl -fsS http://127.0.0.1:9000/_gos3/ui/ | grep -qi '<html'
           docker rm -f gos3
+      - name: Build headless gos3 image
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          target: headless
+          load: true
+          tags: gos3:headless-ci
+          cache-from: type=gha,scope=gos3
+      - name: Smoke test headless S3-only image
+        run: |
+          docker run -d --name gos3-headless -p 9000:9000 \
+            -e MINIO_ROOT_USER=ciroot -e MINIO_ROOT_PASSWORD=ciroot-secret \
+            gos3:headless-ci server /data --address :9000 --no-admin
+          for i in $(seq 1 30); do
+            curl -fsS http://127.0.0.1:9000/minio/health/ready && break
+            sleep 2
+          done
+          curl -fsS http://127.0.0.1:9000/minio/health/ready
+          curl -fsS http://127.0.0.1:9000/minio/health/live
+          test "$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:9000/_gos3/ui/)" = 404
+          test "$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:9000/_gos3/admin/v1/config)" = 404
+          docker rm -f gos3-headless
       - name: Build standalone UI image
         uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
