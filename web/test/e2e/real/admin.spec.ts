@@ -86,7 +86,9 @@ test.describe('server settings', () => {
     await group.fill('10.0.0.1:7373')
     await page.getByRole('button', { name: /^Save/ }).click()
     await expect(page.getByText(/must be a multicast address/)).toBeVisible()
-    await expect(page.getByRole('tab', { name: /^Discovery/ })).toContainText('1 issue')
+    // The chip counts the section's invalid fields: here the beacon group, and
+    // the peer TTL too when it is now under twice the (clamped) interval.
+    await expect(page.getByRole('tab', { name: /^Discovery/ })).toContainText(/\(\d+ issues?/)
     expect(JSON.stringify(await api.admin('GET', '/config'))).toBe(before)
   })
 })
