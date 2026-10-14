@@ -48,7 +48,7 @@ RUN --mount=type=cache,id=gos3-pnpm,target=/pnpm/store \
 # ---------------------------------------------------------------------------
 # Go binary with the UI embedded (internal/webui/dist)
 # ---------------------------------------------------------------------------
-FROM --platform=$BUILDPLATFORM golang:1.26-bookworm@sha256:d9c68c2c51161e12fd77e4c6320687c9cd86e1af1e3ad6e6cd63ff970641453c AS go-base
+FROM --platform=$BUILDPLATFORM golang:1.27-bookworm@sha256:5cf287a799e6b94384bad13d16b14904c531f51ba65792237e122ce42b392f61 AS go-base
 ARG TARGETOS
 ARG TARGETARCH
 ARG VERSION=dev
@@ -111,7 +111,7 @@ RUN --mount=type=cache,target=/go/pkg/mod \
 # (whose tests check that it names this version). The golang image is reused
 # for curl and to decompress the .bz2 with Go's compress/bzip2.
 # ---------------------------------------------------------------------------
-FROM --platform=$BUILDPLATFORM golang:1.26-bookworm@sha256:d9c68c2c51161e12fd77e4c6320687c9cd86e1af1e3ad6e6cd63ff970641453c AS restic
+FROM --platform=$BUILDPLATFORM golang:1.27-bookworm@sha256:5cf287a799e6b94384bad13d16b14904c531f51ba65792237e122ce42b392f61 AS restic
 ARG TARGETOS
 ARG TARGETARCH
 ARG RESTIC_VERSION=0.19.1
