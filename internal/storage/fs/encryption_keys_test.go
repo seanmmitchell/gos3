@@ -2,6 +2,7 @@ package fs
 
 import (
 	"bytes"
+	"encoding/json"
 	"errors"
 	"io"
 	"os"
@@ -263,7 +264,13 @@ func TestOpenTightensKeyPermissions(t *testing.T) {
 	}
 	keys := filepath.Join(dir, ".gos3", "keys")
 	recovery := filepath.Join(keys, id+".restic.json")
-	if err := os.WriteFile(recovery, []byte("{}"), 0o644); err != nil {
+	// A realistic local recovery record: Open checks that recorded
+	// repositories match the backing's restic location.
+	rec, err := json.Marshal(resticRepository{Initialized: true, Repository: filepath.Join(dir, ".gos3", "restic", id), Password: "x"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(recovery, rec, 0o644); err != nil {
 		t.Fatal(err)
 	}
 	loose := map[string]os.FileMode{keys: 0o755, filepath.Join(keys, id): 0o644, recovery: 0o644}
