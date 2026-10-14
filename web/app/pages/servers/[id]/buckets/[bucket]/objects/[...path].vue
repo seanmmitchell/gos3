@@ -77,19 +77,8 @@ const versioned = computed(() => versioning.value === 'Enabled' || versioning.va
 // ---------------------------------------------------------------------------
 
 const showVersions = ref(false)
-const search = ref('')
-const searchMode = ref<'filter' | 'prefix'>('filter')
-const serverQuery = ref('')
-let searchTimer: ReturnType<typeof setTimeout> | undefined
-watch([search, searchMode], () => {
-  clearTimeout(searchTimer)
-  if (searchMode.value !== 'prefix') {
-    serverQuery.value = ''
-    return
-  }
-  searchTimer = setTimeout(() => (serverQuery.value = search.value), 350)
-})
-const listPrefix = computed(() => prefix.value + serverQuery.value)
+// Search text is cleared when another folder is opened (useBrowserSearch).
+const { search, mode: searchMode, serverQuery, listPrefix } = useBrowserSearch(prefix)
 
 const entries = shallowRef<BrowserEntry[]>([])
 const listing = reactive({
@@ -184,7 +173,6 @@ watch([s3, bucket, listPrefix, showVersions], () => {
 
 onBeforeUnmount(() => {
   listAbort?.abort()
-  clearTimeout(searchTimer)
 })
 
 // Sorting + client-side filter.

@@ -569,6 +569,21 @@ func TestIsVirtualHost(t *testing.T) {
 	if isVirtualHost("bucket.s3.local", nil) {
 		t.Error("match without domains")
 	}
+	// A configured domain is path-style even when it is also a subdomain
+	// of another configured domain (the admin API and UI stay reachable).
+	nested := []string{"example.com", "s3.example.com"}
+	for host, want := range map[string]bool{
+		"s3.example.com":       false,
+		"S3.Example.COM.:9000": false,
+		"example.com":          false,
+		"b.s3.example.com":     true,
+		"b.example.com":        true,
+		"admin.s3.example.com": true,
+	} {
+		if got := isVirtualHost(host, nested); got != want {
+			t.Errorf("nested domains: isVirtualHost(%q) = %v, want %v", host, got, want)
+		}
+	}
 }
 
 func TestLoggerSwitchesFormat(t *testing.T) {

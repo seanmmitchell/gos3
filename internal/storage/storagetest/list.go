@@ -178,7 +178,11 @@ func modelListObjects(keys []string, prefix, delimiter, after string) []listEntr
 }
 
 // modelListVersions returns the complete ListObjectVersions result for all
-// versions (keys ascending, newest first) with S3 marker semantics.
+// versions (keys ascending, newest first) with S3 marker semantics. A
+// vidMarker that is not a version of keyMarker includes every version of
+// keyMarker, which is what the contract requires of a "null" marker whose
+// null version was deleted; deleted generated IDs, which backends may
+// resolve by position, are covered by testWalkVersionsDeletedMarker instead.
 func modelListVersions(all []vref, prefix, delimiter, keyMarker, vidMarker string) []listEntry {
 	skip := ""
 	if cp, ok := refCommonPrefix(keyMarker, prefix, delimiter); ok && cp == keyMarker {

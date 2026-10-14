@@ -276,10 +276,12 @@ func (s *Service) Peers() []Peer {
 // ctx the probe times out after 5 s. Probing this server itself returns its
 // peer view without adding it to the table, and so does probing a URL that
 // claims the ID of a verified peer still answering at its known addresses
-// (the claim is recorded as a conflict). Errors wrap ErrInvalidURL,
-// ErrNotGos3, ErrBlockedAddress (a cloud metadata, unspecified, multicast or
-// broadcast address, checked after DNS resolution) or the transport error;
-// ProbeErrorText turns them into a fixed category.
+// (the claim is recorded as a conflict) or whose known addresses could not
+// all be re-checked before ctx ended (nothing is recorded). Errors wrap
+// ErrInvalidURL, ErrNotGos3, ErrBlockedAddress (a cloud metadata,
+// unspecified, multicast or broadcast address, checked after DNS
+// resolution) or the transport error; ProbeErrorText turns them into a
+// fixed category.
 func (s *Service) Probe(ctx context.Context, baseURL string) (Peer, error) {
 	if ctx == nil {
 		ctx = context.Background()

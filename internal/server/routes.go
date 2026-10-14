@@ -336,12 +336,15 @@ func (s *Server) remoteIP(r *http.Request) string {
 
 // isVirtualHost reports whether host is "<bucket>.<domain>" for one of the
 // configured virtual-host domains (the same rule as the S3 handler: port
-// and trailing dot ignored, case-insensitive, IPv6 literals never match).
+// and trailing dot ignored, case-insensitive, IPv6 literals never match,
+// and a host that is itself a configured domain is never a virtual host,
+// even when it is a subdomain of another configured domain).
 func isVirtualHost(host string, domains []string) bool {
 	if len(domains) == 0 || host == "" {
 		return false
 	}
 	h := normalizeHost(host)
+	match := false
 	for _, d := range domains {
 		d = strings.TrimSpace(d)
 		if i := strings.Index(d, "://"); i >= 0 {
@@ -349,11 +352,17 @@ func isVirtualHost(host string, domains []string) bool {
 		}
 		d, _, _ = strings.Cut(d, "/")
 		d = normalizeHost(strings.TrimPrefix(d, "."))
-		if d != "" && len(h) > len(d)+1 && strings.HasSuffix(h, d) && h[len(h)-len(d)-1] == '.' {
-			return true
+		if d == "" {
+			continue
+		}
+		if h == d {
+			return false
+		}
+		if len(h) > len(d)+1 && strings.HasSuffix(h, d) && h[len(h)-len(d)-1] == '.' {
+			match = true
 		}
 	}
-	return false
+	return match
 }
 
 // normalizeHost lowercases host and strips a port and a trailing dot.

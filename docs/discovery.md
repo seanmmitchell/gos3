@@ -43,7 +43,9 @@ The server ID is random (16 hex chars), persisted in `<data>/.gos3/server-id`
   port and scheme at the interface IPs), never `server.public_url`, which
   may point at another host and port.
 - TXT records: `id=<id>`, `name=<name>`, `v=<version>`, `api=v1`,
-  `region=<region>`, `scheme=http|https`, `info=/_gos3/info`.
+  `region=<region>`, `scheme=http|https`, `info=/_gos3/info`. Values are
+  sent as their raw UTF-8 bytes (RFC 6763 §6.5), without any escaping, and
+  read back the same way: `name=Seán` arrives as `Seán`.
 - Records have a TTL of 120 s; at most 16 addresses are advertised.
 
 ### Responder
@@ -275,6 +277,9 @@ verified record of an ID is kept while the peer still answers:
   and a warning is logged. A claim whose document is identical to the
   verified one (the same server reached at another address) is ignored.
   The admin API probe and scans still report what the new address serves.
+  If the re-probes are cut short before they are decided (the admin API
+  probe's deadline ends while a known address is still being re-probed),
+  nothing is recorded: neither a conflict nor a move.
 - Only when no known address answers with the ID any more does the peer
   move: the new document replaces the record and the new address becomes
   its only address.

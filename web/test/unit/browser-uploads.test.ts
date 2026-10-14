@@ -1,7 +1,11 @@
-import { describe, expect, it } from 'vitest'
-import { UploadQueue, uploadEta } from '~/composables/useUploads'
+import { createPinia, setActivePinia } from 'pinia'
+import { beforeEach, describe, expect, it, vi } from 'vitest'
+import { bindUploadsToConnections, UPLOAD_CREDENTIALS_CLEARED, UPLOAD_NOT_CONNECTED, UploadQueue, uploadEta } from '~/composables/useUploads'
 import type { Uploader } from '~/composables/useUploads'
+import { useConnectionsStore } from '~/stores/connections'
 import type { PutObjectOptions, UploadLargeOptions } from '~/types/s3'
+import { clearClientCache, getS3Client } from '~/utils/clients'
+import { S3Client } from '~/utils/s3/client'
 import { S3Error } from '~/utils/s3/errors'
 
 interface Call {
@@ -181,5 +185,138 @@ describe('UploadQueue', () => {
     expect(uploadEta(500, 100)).toBe('5s')
     expect(uploadEta(100 * 125, 100)).toBe('2m 5s')
     expect(uploadEta(100 * 3700, 100)).toBe('1h 1m')
+  })
+})
+
+describe('UploadQueue credentials', () => {
+  it('forgetConnection stops running and queued uploads of that connection only', async () => {
+    const f = fakeClient()
+    const other = fakeClient()
+    const q = new UploadQueue({ concurrency: 1, multipartThreshold: 1 })
+    const settled: string[] = []
+    q.onSettled(i => settled.push(`${i.key}:${i.status}`))
+    const [a, b] = q.enqueue({ client: f.client, connectionId: 'c', bucket: 'b', files: [{ file: file('a', 5), key: 'a' }, { file: file('b', 5), key: 'b' }] })
+    const [o] = q.enqueue({ client: other.client, connectionId: 'other', bucket: 'b', files: [{ file: file('o', 5), key: 'o' }] })
+    await tick()
+    expect(a!.status).toBe('uploading')
+
+    q.forgetConnection('c')
+    // The running multipart upload is aborted (the client aborts it server-side).
+    expect(f.calls[0]!.opts.signal!.aborted).toBe(true)
+    expect([a!.status, b!.status]).toEqual(['error', 'error'])
+    expect(a!.error).toBe(UPLOAD_CREDENTIALS_CLEARED)
+    expect(b!.error).toBe(UPLOAD_CREDENTIALS_CLEARED)
+    await tick()
+    // The queued upload never started; the other connection's one did.
+    expect(f.calls).toHaveLength(1)
+    expect(o!.status).toBe('uploading')
+    expect(settled).toEqual(['a:error', 'b:error'])
+
+    // Without a resolver the forgotten client is not reused by a retry.
+    q.retry(a!.id)
+    await tick()
+    expect(a!.status).toBe('error')
+    expect(a!.error).toBe(UPLOAD_NOT_CONNECTED)
+    expect(f.calls).toHaveLength(1)
+    other.calls[0]!.resolve()
+    await tick()
+  })
+
+  it('retries with the client the resolver returns at retry time', async () => {
+    const old = fakeClient()
+    const current = fakeClient()
+    let resolved: Uploader | undefined = current.client
+    const q = new UploadQueue({ resolveClient: () => resolved })
+    const [it] = q.enqueue({ client: old.client, connectionId: 'c', bucket: 'b', files: [{ file: file('a', 5), key: 'a' }] })
+    await tick()
+    old.calls[0]!.reject(new S3Error({ code: 'InvalidAccessKeyId', message: 'bad key', status: 403 }))
+    await tick()
+    expect(it!.status).toBe('error')
+
+    q.retry(it!.id)
+    await tick()
+    expect(old.calls).toHaveLength(1)
+    expect(current.calls).toHaveLength(1)
+    current.calls[0]!.reject(new Error('boom'))
+    await tick()
+
+    // Signed out in the meantime: the retry fails with a clear error.
+    resolved = undefined
+    q.retry(it!.id)
+    await tick()
+    expect(it!.status).toBe('error')
+    expect(it!.error).toBe(UPLOAD_NOT_CONNECTED)
+    expect(current.calls).toHaveLength(1)
+  })
+})
+
+describe('bindUploadsToConnections', () => {
+  beforeEach(() => {
+    localStorage.clear()
+    sessionStorage.clear()
+    clearClientCache()
+    setActivePinia(createPinia())
+  })
+
+  it('stops a connection\'s uploads when its credentials are cleared and retries with the new key', async () => {
+    const store = useConnectionsStore()
+    const conn = store.add({ endpoint: 'http://localhost:9000', accessKeyId: 'AK', secretAccessKey: 'old-secret' })
+    const f = fakeClient()
+    const q = new UploadQueue()
+    bindUploadsToConnections(q, store)
+    const [it] = q.enqueue({ client: f.client, connectionId: conn.id, bucket: 'b', files: [{ file: file('a', 5), key: 'a' }] })
+    await tick()
+    expect(it!.status).toBe('uploading')
+
+    store.clearCredentials(conn.id)
+    expect(f.calls[0]!.opts.signal!.aborted).toBe(true)
+    expect(it!.status).toBe('error')
+    expect(it!.error).toBe(UPLOAD_CREDENTIALS_CLEARED)
+
+    // Retry while signed out: refused, nothing is sent.
+    q.retry(it!.id)
+    await tick()
+    expect(it!.error).toBe(UPLOAD_NOT_CONNECTED)
+    expect(f.calls).toHaveLength(1)
+
+    // Signed in with a new key: the retry signs with it.
+    store.setCredentials(conn.id, { accessKeyId: 'AK2', secretAccessKey: 'new-secret' })
+    const used: S3Client[] = []
+    vi.spyOn(S3Client.prototype, 'putObject').mockImplementation(function (this: S3Client) {
+      used.push(this)
+      return Promise.resolve({ etag: 'e' })
+    })
+    q.retry(it!.id)
+    await tick()
+    expect(it!.status).toBe('done')
+    expect(f.calls).toHaveLength(1)
+    expect(used).toEqual([getS3Client(store.byId(conn.id)!)])
+    expect(used[0]!.accessKeyId).toBe('AK2')
+  })
+
+  it('stops the uploads of a removed connection', async () => {
+    const store = useConnectionsStore()
+    const conn = store.add({ endpoint: 'http://localhost:9000', accessKeyId: 'AK', secretAccessKey: 'SK' })
+    const keep = store.add({ endpoint: 'http://other:9000', accessKeyId: 'AK', secretAccessKey: 'SK' })
+    const f = fakeClient()
+    const q = new UploadQueue({ concurrency: 1 })
+    const off = bindUploadsToConnections(q, store)
+    const [a, b] = q.enqueue({ client: f.client, connectionId: conn.id, bucket: 'b', files: [{ file: file('a', 1), key: 'a' }, { file: file('b', 1), key: 'b' }] })
+    const [k] = q.enqueue({ client: f.client, connectionId: keep.id, bucket: 'b', files: [{ file: file('k', 1), key: 'k' }] })
+    await tick()
+
+    store.remove(conn.id)
+    // The freed slot goes to the other connection's upload, not to "b".
+    expect([a!.status, b!.status, k!.status]).toEqual(['error', 'error', 'uploading'])
+    expect(f.calls[0]!.opts.signal!.aborted).toBe(true)
+    await tick()
+    expect(f.calls.map(c => c.key)).toEqual(['a', 'k'])
+
+    // Unbound: store changes no longer reach the queue.
+    off()
+    store.clearCredentials(keep.id)
+    expect(k!.status).toBe('uploading')
+    f.calls[1]!.resolve()
+    await tick()
   })
 })

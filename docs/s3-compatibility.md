@@ -78,7 +78,7 @@ gets `400 InvalidArgument`, whether it is signed or not.
 | DeleteObject | ✅ | Versioning semantics (delete markers), `x-amz-bypass-governance-retention`, `If-Match`. The `If-Match` and object lock checks are atomic with the delete. |
 | DeleteObjects | ✅ | Up to 1000 keys (`MalformedXML` beyond, as AWS), `Quiet` mode, per-key `ETag` condition, object lock checks. As on AWS, `Content-MD5` or an `x-amz-checksum-*` header (or trailer) is required (`InvalidRequest` without; the AWS SDKs, CLI, minio-go and the web UI send one). A `Key`, `VersionId` or `ETag` over 1024 bytes fails the whole request (`KeyTooLongError` / `InvalidArgument`). Large results are streamed (no `Content-Length`); `Deleted` and `Error` entries come in request order. The body may be at most about 6.2 MiB and must arrive within 60 s (see [Limits](#limits)). |
 | CopyObject | ✅ | Versioned sources, `x-amz-copy-source-if-*`, `x-amz-metadata-directive` / `x-amz-tagging-directive` (COPY / REPLACE), checksum recomputation. Like UploadPartCopy and CompleteMultipartUpload, a copy that takes longer than about 5 s sends `200` early with whitespace keep-alives and may then report an `<Error>` inside the 200 body, as AWS does; the copy stops when the client disconnects. An ACL or `REPLACE` tags need `s3:PutObjectAcl` / `s3:PutObjectTagging`; copying the tags of a tagged source (`COPY`, the default) needs tagging permissions too (see [Authorization](#authorization)). |
-| GetObjectAttributes | ✅ | ETag, Checksum, ObjectParts (paged), StorageClass, ObjectSize. |
+| GetObjectAttributes | ✅ | ETag, Checksum, ObjectParts (paged), StorageClass, ObjectSize. As on AWS, the caller needs both `s3:GetObjectAttributes` and `s3:GetObject` (`s3:GetObjectVersionAttributes` and `s3:GetObjectVersion` with `versionId`); the object's ACL can stand in for the read action only. |
 | Get/Put/DeleteObjectTagging | ✅ | Up to 10 tags; version-aware. PutObjectTagging evaluates `s3:RequestObjectTag/<key>` and `s3:RequestObjectTagKeys` from the XML body. |
 | Get/PutObjectAcl | 🟡 | Canned ACLs only (see bucket `?acl`). |
 | Get/PutObjectRetention | ✅ | GOVERNANCE (with bypass) and COMPLIANCE (can only be extended). |
@@ -125,6 +125,18 @@ ListObjectsV2, ListParts and GetObjectAttributes.
   `${aws:username}` variables, and condition operators `String*`, `Numeric*`,
   `Date*`, `Bool`, `IpAddress`/`NotIpAddress`, `Null`, `ArnLike`, `…IfExists`,
   `ForAnyValue:` / `ForAllValues:`.
+  Condition key names are case-insensitive, except for the tag key of
+  tag-qualified keys (`s3:ExistingObjectTag/<key>`,
+  `s3:RequestObjectTag/<key>`, `aws:RequestTag/<key>`, ...): only the part
+  before the `/` is, so `s3:existingobjecttag/Public` tests the tag `Public`
+  and never the tag `public`. As on AWS, a policy variable with no value
+  (such as `${aws:username}` for an anonymous caller) and no
+  `${key, 'default'}` is effectively null: positive operators
+  (`StringEquals`, `StringLike`, `ArnLike`, ...) do not match it, but negated
+  ones (`StringNotEquals`, `StringNotLike`, `ArnNotLike`, ...) do. An `Allow`
+  for `"Principal": "*"` with `StringNotEquals` against `${aws:username}`
+  therefore applies to anonymous callers; add a `Null` condition
+  (`"aws:username": "false"`) to exclude them.
 - **Bucket policies** are evaluated together with identity policies, and an
   explicit Deny wins (except for root). Supported condition keys include
   `aws:SourceIp`, `aws:SecureTransport`, `aws:username`, `aws:userid`,
@@ -287,7 +299,7 @@ ListObjectsV2, ListParts and GetObjectAttributes.
 | Item | Limit |
 |---|---|
 | Bucket name | 3–63 characters, lowercase letters, digits, `-` and `.`; starts and ends with a letter or digit; not an IP address; no `..`, no `xn--` prefix, no `-s3alias` / `--ol-s3` suffix |
-| Object key | 1–1024 bytes of UTF-8 |
+| Object key | 1–1024 bytes of UTF-8. Keys that objects are created at (PutObject, CopyObject, multipart uploads, POST uploads) must consist of XML 1.0 characters: no C0 control characters other than tab, LF and CR, and no U+FFFE / U+FFFF (`InvalidArgument`) |
 | User metadata | 2 KiB |
 | All metadata returned as headers (content headers, website redirect, user metadata) | 8 KiB (`MetadataTooLarge`) |
 | Object tags / bucket tags | 10 / 50 |
@@ -312,10 +324,14 @@ ListObjectsV2, ListParts and GetObjectAttributes.
   `x-amz-version-id` and `x-amz-expiration` are sent as HTTP trailers because
   the status line has already gone out. SDKs then do not report them.
 - Object keys containing characters that are invalid in XML 1.0 (C0 control
-  characters other than tab, LF and CR) appear as U+FFFD in XML responses:
-  listings without `encoding-type=url`, DeleteObjects results and the `Key`
-  element of errors. Use `encoding-type=url` for such keys (the web UI always
-  does for ListObjectsV2, ListObjectVersions and ListMultipartUploads).
+  characters other than tab, LF and CR, U+FFFE and U+FFFF) are refused when
+  an object would be created at them (`InvalidArgument`; AWS accepts them),
+  because XML responses would report them as U+FFFD. Objects stored under
+  such keys by older gos3 versions can still be read and deleted by key
+  (GET, HEAD, DeleteObject); list them with `encoding-type=url` (the web UI
+  always does for ListObjectsV2, ListObjectVersions and
+  ListMultipartUploads), since listings without it, DeleteObjects results and
+  the `Key` element of errors still show U+FFFD.
 - Request bodies that send no data for 60 s fail with `400 RequestTimeout`.
   The bodies gos3 must read before it can authorize the request
   (DeleteObjects, PutObjectTagging, PutObjectRetention, PutObjectLegalHold,

@@ -278,6 +278,14 @@ type Backend interface {
 	//   - versionIDMarker == "": start strictly after all versions of keyMarker.
 	//   - otherwise: start with the version immediately following
 	//     versionIDMarker (older than it) within keyMarker.
+	// A versionIDMarker whose version was deleted (e.g. between pages) must
+	// not make the walk skip the remaining versions of keyMarker: an ID that
+	// encodes its position (as generated IDs may) resumes at that position;
+	// NullVersionID carries none, so a "null" marker of a key without a null
+	// version starts with the newest remaining version of keyMarker.
+	// Re-delivering a version the caller has already seen is acceptable;
+	// silently skipping one is not. Other IDs that are not versions of
+	// keyMarker start after all of its versions.
 	// A walk is not a snapshot when keys change concurrently, but IsLatest
 	// is only ever set on the first entry delivered for a key (and only if
 	// it was the newest version when read), never on a later entry of the

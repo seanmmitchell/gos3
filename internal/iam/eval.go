@@ -80,7 +80,7 @@ type evalCtx struct {
 	bucket   string
 	resource string // resource ARN; "" for service-level requests
 	raw      map[string][]string
-	lower    map[string][]string // lazily built, lower-cased keys + derived keys
+	lower    map[string][]string // lazily built, keys by condKeyIndex + derived keys
 	now      time.Time
 
 	// principalKey is the access key ID that bare principal entries may
@@ -117,8 +117,23 @@ func hasPrefixFold(s, prefix string) bool {
 	return len(s) >= len(prefix) && strings.EqualFold(s[:len(prefix)], prefix)
 }
 
+// condKeyIndex returns the form condition keys are compared in. Key names
+// are case-insensitive, but in a tag-qualified key ("<prefix>/<tag-key>",
+// such as s3:ExistingObjectTag/<key>, s3:RequestObjectTag/<key>,
+// aws:RequestTag/<key> or aws:ResourceTag/<key>) only the part before the
+// first '/' is: the tag key after it is matched exactly, because tag keys
+// are case-sensitive (Public and public are different tags).
+func condKeyIndex(key string) string {
+	name, tag, ok := strings.Cut(key, "/")
+	if !ok {
+		return strings.ToLower(key)
+	}
+	return strings.ToLower(name) + "/" + tag
+}
+
 // lookup returns the values of a condition key (exact match first, then
-// case-insensitive). present is false when the key is missing or empty.
+// with the key name compared case-insensitively; see condKeyIndex).
+// present is false when the key is missing or empty.
 func (c *evalCtx) lookup(key string) ([]string, bool) {
 	if v, ok := c.raw[key]; ok && len(v) > 0 {
 		return v, true
@@ -126,19 +141,21 @@ func (c *evalCtx) lookup(key string) ([]string, bool) {
 	if c.lower == nil {
 		c.buildLower()
 	}
-	v := c.lower[strings.ToLower(key)]
+	v := c.lower[condKeyIndex(key)]
 	return v, len(v) > 0
 }
 
-// buildLower indexes the request context case-insensitively and adds the
-// keys gos3 can derive itself when the caller did not supply them.
+// buildLower indexes the request context by condKeyIndex and adds the keys
+// gos3 can derive itself when the caller did not supply them. Keys that
+// differ only in the case of their tag key stay separate, so the values of
+// the tags Env and env are never merged.
 func (c *evalCtx) buildLower() {
 	c.lower = make(map[string][]string, len(c.raw)+5)
 	for k, v := range c.raw {
 		if len(v) == 0 {
 			continue
 		}
-		lk := strings.ToLower(k)
+		lk := condKeyIndex(k)
 		c.lower[lk] = append(c.lower[lk], v...)
 	}
 	setDefault := func(k string, v ...string) {

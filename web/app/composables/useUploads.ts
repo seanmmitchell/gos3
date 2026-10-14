@@ -8,8 +8,15 @@
 //
 // The queue itself (UploadQueue) is framework-light (Vue reactivity only) and
 // takes any client with putObject/uploadLarge, so it is unit-testable.
+// useUploads() binds the shared queue to the connections store
+// (bindUploadsToConnections): a retry signs with the connection's current
+// credentials, and signing out of / removing a server stops its uploads and
+// drops the clients holding its secret key.
 import { computed, markRaw, reactive, shallowReactive } from 'vue'
 import type { CompleteMultipartUploadResult, PutObjectOptions, PutObjectResult, UploadLargeOptions } from '~/types/s3'
+import { useConnectionsStore } from '~/stores/connections'
+import { getS3Client } from '~/utils/clients'
+import { hasCredentials } from '~/utils/connections'
 import { isAbortedError, errorMessage } from '~/utils/errors'
 import { guessContentType } from './useBrowserPaths'
 
@@ -65,17 +72,34 @@ export interface EnqueueRequest {
   files: EnqueueFile[]
 }
 
+/**
+ * Returns the client for a connection's current credentials, or undefined
+ * when the connection is gone or signed out.
+ */
+export type ClientResolver = (connectionId: string) => Uploader | undefined
+
 export interface UploadQueueOptions {
   concurrency?: number
   multipartThreshold?: number
   /** Clock (tests). */
   now?: () => number
+  /** See UploadQueue.setClientResolver. */
+  resolveClient?: ClientResolver
 }
+
+/** Error of a retry whose server has no credentials (any more). */
+export const UPLOAD_NOT_CONNECTED = 'This server is not connected: sign in again to retry the upload.'
+/** Error of uploads stopped because their server was signed out or removed. */
+export const UPLOAD_CREDENTIALS_CLEARED = 'Upload stopped: the credentials for this server were cleared.'
 
 type Listener = (item: UploadItem) => void
 
 interface Runtime {
-  client: Uploader
+  /**
+   * Client of the current/last attempt; dropped by forgetConnection so the
+   * queue does not keep a forgotten secret key alive.
+   */
+  client?: Uploader
   /** Controller of the current attempt (identifies it: see start()). */
   controller?: AbortController
   lastSampleAt?: number
@@ -90,6 +114,7 @@ export class UploadQueue {
   private readonly now: () => number
   private readonly runtime = new Map<number, Runtime>()
   private readonly listeners = new Set<Listener>()
+  private resolveClient?: ClientResolver
   private nextId = 1
 
   /** Aggregate numbers for the panel header. */
@@ -123,6 +148,17 @@ export class UploadQueue {
     this.concurrency = Math.max(1, opts.concurrency ?? UPLOAD_CONCURRENCY)
     this.multipartThreshold = opts.multipartThreshold ?? UPLOAD_MULTIPART_THRESHOLD
     this.now = opts.now ?? (() => Date.now())
+    this.resolveClient = opts.resolveClient
+  }
+
+  /**
+   * Sets how retry() finds a client. With a resolver a retry uses the
+   * connection's current client (its credentials may have changed since the
+   * file was queued) and fails when there is none; without one it reuses the
+   * client the file was queued with.
+   */
+  setClientResolver(fn: ClientResolver | undefined): void {
+    this.resolveClient = fn
   }
 
   /** Adds files to the queue and starts uploading (up to `concurrency` at once). */
@@ -180,6 +216,20 @@ export class UploadQueue {
   retry(id: number): void {
     const item = this.get(id)
     if (!item || (item.status !== 'error' && item.status !== 'canceled')) return
+    const rt = this.runtime.get(id)
+    if (!rt) return
+    const client = this.resolveClient ? this.resolveClient(item.connectionId) : rt.client
+    if (!client) {
+      rt.client = undefined
+      item.status = 'error'
+      item.error = UPLOAD_NOT_CONNECTED
+      item.cause = undefined
+      item.speed = 0
+      item.finishedAt = this.now()
+      this.emit(item)
+      return
+    }
+    rt.client = markRaw(client)
     item.status = 'queued'
     item.loaded = 0
     item.speed = 0
@@ -193,6 +243,39 @@ export class UploadQueue {
   /** Retries all failed uploads. */
   retryFailed(): void {
     for (const it of this.items) if (it.status === 'error') this.retry(it.id)
+  }
+
+  /**
+   * Stops a connection's uploads after its credentials were cleared or it was
+   * removed: running ones are aborted (an in-progress multipart upload is
+   * aborted server-side, best-effort) and queued ones will not start; both
+   * are marked failed, so they can be retried after signing in again. The
+   * clients (which hold the secret key) of all its items are dropped.
+   */
+  forgetConnection(connectionId: string): void {
+    for (const item of this.items) {
+      if (item.connectionId !== connectionId) continue
+      const rt = this.runtime.get(item.id)
+      if (rt) rt.client = undefined
+      if (item.status !== 'queued' && item.status !== 'uploading') continue
+      // Detach the running attempt: its late settlement is ignored (see
+      // start()); the item is settled here.
+      const controller = rt?.controller
+      if (rt) rt.controller = undefined
+      controller?.abort()
+      item.status = 'error'
+      item.error = UPLOAD_CREDENTIALS_CLEARED
+      item.cause = undefined
+      item.speed = 0
+      item.finishedAt = this.now()
+      this.emit(item)
+    }
+    this.pump()
+  }
+
+  /** IDs of the connections that have items in the queue. */
+  connectionIds(): Set<string> {
+    return new Set(this.items.map(i => i.connectionId))
   }
 
   /** Removes one finished/failed/canceled item from the list. */
@@ -248,6 +331,15 @@ export class UploadQueue {
   private async start(item: UploadItem): Promise<void> {
     const rt = this.runtime.get(item.id)
     if (!rt) return
+    const client = rt.client
+    if (!client) {
+      // Not reachable through the public API (queued items have a client).
+      item.status = 'error'
+      item.error = UPLOAD_NOT_CONNECTED
+      item.finishedAt = this.now()
+      this.emit(item)
+      return
+    }
     const controller = new AbortController()
     rt.controller = controller
     rt.lastSampleAt = this.now()
@@ -278,8 +370,8 @@ export class UploadQueue {
 
     try {
       const res = item.multipart
-        ? await rt.client.uploadLarge(item.bucket, item.key, item.file, opts)
-        : await rt.client.putObject(item.bucket, item.key, item.file, opts)
+        ? await client.uploadLarge(item.bucket, item.key, item.file, opts)
+        : await client.putObject(item.bucket, item.key, item.file, opts)
       if (controller.signal.aborted || !current()) return
       const t = this.now()
       item.status = 'done'
@@ -313,11 +405,45 @@ export class UploadQueue {
   }
 }
 
+type ConnectionsStore = ReturnType<typeof useConnectionsStore>
+
+/** Store actions after which a connection may have lost its credentials. */
+const CREDENTIAL_ACTIONS = new Set(['clearCredentials', 'remove', 'update', 'setCredentials', 'syncFromStorage', 'importJson', 'resetState'])
+
+/**
+ * Binds a queue to the connections store: retries resolve the connection's
+ * current S3 client, and after a store action that can drop credentials
+ * (sign-out, removal, a change merged from another tab …) the uploads of
+ * every connection left without credentials are stopped (forgetConnection).
+ * Returns a function that undoes the binding.
+ */
+export function bindUploadsToConnections(queue: UploadQueue, store: ConnectionsStore): () => void {
+  queue.setClientResolver((id) => {
+    const c = store.byId(id)
+    return c && hasCredentials(c) ? getS3Client(c) : undefined
+  })
+  const off = store.$onAction(({ name, after }) => {
+    if (!CREDENTIAL_ACTIONS.has(name)) return
+    after(() => {
+      for (const id of queue.connectionIds()) {
+        if (!hasCredentials(store.byId(id))) queue.forgetConnection(id)
+      }
+    })
+  }, true) // detached: the queue outlives the component that created it
+  return () => {
+    off()
+    queue.setClientResolver(undefined)
+  }
+}
+
 let shared: UploadQueue | undefined
 
-/** The app-wide upload queue. */
+/** The app-wide upload queue (bound to the connections store). */
 export function useUploads(): UploadQueue {
-  shared ??= new UploadQueue()
+  if (!shared) {
+    shared = new UploadQueue()
+    bindUploadsToConnections(shared, useConnectionsStore())
+  }
   return shared
 }
 

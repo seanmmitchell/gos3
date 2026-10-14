@@ -1,11 +1,15 @@
 package s3
 
 import (
+	"context"
 	"encoding/xml"
+	"net/http"
 	"net/url"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/seanmmitchell/gos3/internal/storage"
 )
 
 func TestValidBucketName(t *testing.T) {
@@ -40,6 +44,83 @@ func TestValidateObjectKey(t *testing.T) {
 	}
 	if err := validateObjectKey(strings.Repeat("日", 341)); err != nil { // 1023 bytes
 		t.Fatal(err)
+	}
+}
+
+func TestValidateNewObjectKey(t *testing.T) {
+	for _, k := range []string{"a\x01b", "\x00", "x\x1f", "a￾", "a￿", "a\x7f\x01"} {
+		if codeOf(validateNewObjectKey(k)) != "InvalidArgument" {
+			t.Errorf("%q accepted", k)
+		}
+		if err := validateObjectKey(k); err != nil { // still readable and deletable
+			t.Errorf("validateObjectKey(%q) = %v", k, err)
+		}
+	}
+	for _, k := range []string{"a\tb\nc\rd", "日本", "\U0001F600", "�", "x\x7f\u0085", "퟿\U0010FFFF"} {
+		if err := validateNewObjectKey(k); err != nil {
+			t.Errorf("%q rejected: %v", k, err)
+		}
+	}
+	if codeOf(validateNewObjectKey(strings.Repeat("k", 1025))) != "KeyTooLongError" || codeOf(validateNewObjectKey("a\xffb")) != "InvalidArgument" {
+		t.Error("validateObjectKey rules not applied")
+	}
+}
+
+// TestObjectKeyXMLCharacters checks that keys which XML 1.0 cannot carry
+// (they would be listed as U+FFFD) are refused by every operation that
+// creates an object, that tab, newline and carriage return round-trip
+// through a listing without encoding-type, and that an object stored
+// under such a key before the rule existed can still be read and deleted.
+func TestObjectKeyXMLCharacters(t *testing.T) {
+	e := newTestEnv(t)
+	e.createBucket("b")
+	e.putObject("b", "src", []byte("x"), storage.ObjectMeta{})
+	const badKey = "bad\x01key"
+	bad := "/b/" + url.PathEscape(badKey)
+	for _, tc := range []struct {
+		name, method, path string
+		hdr                http.Header
+	}{
+		{"PutObject", "PUT", bad, nil},
+		{"CopyObject", "PUT", bad, http.Header{"X-Amz-Copy-Source": {"/b/src"}}},
+		{"CreateMultipartUpload", "POST", bad + "?uploads", nil},
+		{"CompleteMultipartUpload", "POST", bad + "?uploadId=x", nil},
+	} {
+		if resp := e.signed(tc.method, tc.path, []byte("x"), tc.hdr); resp.StatusCode != 400 || resp.code() != "InvalidArgument" {
+			t.Errorf("%s: %d %s", tc.name, resp.StatusCode, resp.Data)
+		}
+	}
+	if _, err := e.backend.GetObjectInfo(context.Background(), "b", badKey, ""); err == nil {
+		t.Fatal("object stored under a key XML cannot represent")
+	}
+
+	// Tab, newline and carriage return are XML characters: they are
+	// written as character references and parse back unchanged.
+	ws := "dir/a\tb\nc\rd"
+	if resp := e.signed("PUT", "/b/"+url.PathEscape(ws), []byte("x"), nil); resp.StatusCode != 200 {
+		t.Fatalf("PUT %q: %d %s", ws, resp.StatusCode, resp.Data)
+	}
+	resp := e.signed("GET", "/b?list-type=2&prefix=dir/", nil, nil)
+	var list struct {
+		Contents []struct{ Key string }
+	}
+	if err := xml.Unmarshal(resp.Data, &list); err != nil || len(list.Contents) != 1 || list.Contents[0].Key != ws {
+		t.Fatalf("listing: %v %+v\n%s", err, list, resp.Data)
+	}
+	if resp := e.signed("GET", "/b/"+url.PathEscape(list.Contents[0].Key), nil, nil); resp.StatusCode != 200 {
+		t.Fatalf("GET listed key: %d %s", resp.StatusCode, resp.Data)
+	}
+
+	// A pre-existing object under such a key stays readable and removable.
+	e.putObject("b", badKey, []byte("old"), storage.ObjectMeta{})
+	if resp := e.signed("HEAD", bad, nil, nil); resp.StatusCode != 200 {
+		t.Fatalf("HEAD existing: %d", resp.StatusCode)
+	}
+	if resp := e.signed("DELETE", bad, nil, nil); resp.StatusCode != 204 {
+		t.Fatalf("DELETE existing: %d %s", resp.StatusCode, resp.Data)
+	}
+	if _, err := e.backend.GetObjectInfo(context.Background(), "b", badKey, ""); err == nil {
+		t.Fatal("object not deleted")
 	}
 }
 
