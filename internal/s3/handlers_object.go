@@ -294,11 +294,11 @@ func (s *Server) prepareNewObject(ctx context.Context, r *http.Request, rc *reqC
 		}
 	}
 	if meta.SSE == "" {
-		sse, kmsKey, err := s.defaultEncryption(ctx, bi.Name)
+		sse, err := s.defaultEncryption(ctx, bi.Name)
 		if err != nil {
 			return err
 		}
-		meta.SSE, meta.SSEKMSKeyID = sse, kmsKey
+		meta.SSE = sse
 	}
 	return s.prepareEncryption(ctx, bi.Name, meta, r.UserAgent())
 }
@@ -514,51 +514,52 @@ type sseConfigDoc struct {
 	XMLName xml.Name `xml:"ServerSideEncryptionConfiguration"`
 	Rules   []struct {
 		Default *struct {
-			SSEAlgorithm   string `xml:"SSEAlgorithm"`
-			KMSMasterKeyID string `xml:"KMSMasterKeyID"`
+			SSEAlgorithm string `xml:"SSEAlgorithm"`
 		} `xml:"ApplyServerSideEncryptionByDefault"`
 	} `xml:"Rule"`
 }
 
-// sseDefaults is the parsed default encryption of a bucket.
-type sseDefaults struct{ algorithm, kmsKeyID string }
-
 // defaultEncryption returns the bucket's default server-side encryption
-// (from storage.ConfigEncryption) to record on new objects, or "" when no
-// default encryption is configured.
-func (s *Server) defaultEncryption(ctx context.Context, bucket string) (string, string, error) {
+// (from storage.ConfigEncryption) to record on new objects: "AES256", or ""
+// when no default encryption is configured.
+//
+// Builds before real encryption accepted and stored AWS KMS defaults. KMS
+// is not implemented, but refusing every write to such a bucket after an
+// upgrade would be an outage, so a stored KMS default applies SSE-S3
+// (AES256) instead. A warning is logged once per bucket and stored
+// document (the parse is cached); GetBucketEncryption still returns the
+// stored document, so administrators see it and can save it again.
+func (s *Server) defaultEncryption(ctx context.Context, bucket string) (string, error) {
 	raw, err := s.bucketConfig(ctx, bucket, storage.ConfigEncryption)
 	if err != nil || raw == nil {
-		return "", "", err
+		return "", err
 	}
 	v, err := s.configs.get(bucket, cacheKindSSEDefaults, raw, func(b []byte) (any, error) {
 		var doc sseConfigDoc
 		if err := xml.Unmarshal(b, &doc); err != nil {
 			return nil, err
 		}
-		d := &sseDefaults{}
 		for _, rule := range doc.Rules {
 			if rule.Default == nil {
 				continue
 			}
-			switch algo := strings.TrimSpace(rule.Default.SSEAlgorithm); algo {
-			case "AES256", "aws:kms", "aws:kms:dsse":
-				d.algorithm = algo
-				if algo != "AES256" {
-					d.kmsKeyID = strings.TrimSpace(rule.Default.KMSMasterKeyID)
-				}
-				return d, nil
+			switch algo := strings.TrimSpace(rule.Default.SSEAlgorithm); {
+			case algo == "AES256":
+				return "AES256", nil
+			case isKMS(algo):
+				s.log.LogAttrs(ctx, slog.LevelWarn, "s3: bucket default encryption uses AWS KMS, which is not implemented; new objects use SSE-S3 (AES256). Save the bucket's default encryption again to replace the setting.",
+					slog.String("bucket", bucket), slog.String("algorithm", algo))
+				return "AES256", nil
 			}
 		}
-		return d, nil
+		return "", nil
 	})
 	if err != nil {
 		s.log.LogAttrs(ctx, slog.LevelWarn, "s3: ignoring invalid stored encryption configuration",
 			slog.String("bucket", bucket), slog.String("error", err.Error()))
-		return "", "", nil
+		return "", nil
 	}
-	d := v.(*sseDefaults)
-	return d.algorithm, d.kmsKeyID, nil
+	return v.(string), nil
 }
 
 // setChecksumHeaders sets x-amz-checksum-<algo> for every checksum plus
@@ -577,14 +578,24 @@ func setChecksumHeaders(h http.Header, sums map[string]string, typ string) {
 	}
 }
 
-// setSSEHeaders reports the server-side encryption of an object.
+// setSSEHeaders reports the server-side encryption of an object. Objects
+// whose SSE an older build recorded without encrypting them (Encryption
+// "") do not report it.
 func setSSEHeaders(h http.Header, meta storage.ObjectMeta) {
 	if meta.SSE == "" || meta.Encryption == "" {
 		return
 	}
 	h.Set("X-Amz-Server-Side-Encryption", meta.SSE)
-	if strings.HasPrefix(meta.SSE, "aws:kms") && meta.SSEKMSKeyID != "" {
-		h.Set("X-Amz-Server-Side-Encryption-Aws-Kms-Key-Id", meta.SSEKMSKeyID)
+}
+
+// setUploadSSEHeaders reports the server-side encryption of the object a
+// multipart upload with metadata meta creates (UploadPart, UploadPartCopy,
+// CompleteMultipartUpload). Completion encrypts every upload that requested
+// SSE, including uploads created by older builds that recorded SSE (even
+// AWS KMS) without Encryption, so those report AES256 too.
+func setUploadSSEHeaders(h http.Header, meta storage.ObjectMeta) {
+	if meta.SSE != "" {
+		h.Set("X-Amz-Server-Side-Encryption", "AES256")
 	}
 }
 

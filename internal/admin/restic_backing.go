@@ -2,11 +2,8 @@ package admin
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
-	"io"
 	"net/http"
-	"strings"
 	"time"
 
 	"github.com/seanmmitchell/gos3/internal/storage"
@@ -53,34 +50,33 @@ func (a *api) getBackingRestic(rc *reqCtx) (int, any, error) {
 	return http.StatusOK, describeResticBacking(s, locked), nil
 }
 
+// putBackingRestic sets the restic storage of a filesystem backing: local
+// repositories, or S3 storage whose blank credentials keep the saved ones.
+// The settings are validated (syntax, not this server itself, repository
+// access) before they replace the old ones. Changes are serialized per
+// backing.
 func (a *api) putBackingRestic(rc *reqCtx) (int, any, error) {
-	a.encryptionMu.Lock()
-	defer a.encryptionMu.Unlock()
+	name := rc.r.PathValue("name")
 	r, err := a.router()
 	if err != nil {
 		return 0, nil, err
 	}
-	b, err := r.ResticBacking(rc.r.PathValue("name"))
+	b, err := r.ResticBacking(name)
 	if err != nil {
 		return 0, nil, notFound("restic storage is available only on filesystem backings")
-	}
-	old, _, err := b.ResticBackingSettings(rc.ctx)
-	if err != nil {
-		return 0, nil, err
-	}
-	raw, err := rc.readBody()
-	if err != nil {
-		return 0, nil, err
 	}
 	var in struct {
 		Mode string `json:"mode"`
 		storage.ResticS3
 		ClearSessionToken bool `json:"clearSessionToken"`
 	}
-	dec := json.NewDecoder(strings.NewReader(string(raw)))
-	dec.DisallowUnknownFields()
-	if err := dec.Decode(&in); err != nil || dec.Decode(new(any)) != io.EOF {
-		return 0, nil, badRequest("invalid restic backing settings")
+	if err := rc.decodeBody(&in, false); err != nil {
+		return 0, nil, err
+	}
+	defer a.configLocks.lock("backing/" + name)()
+	old, _, err := b.ResticBackingSettings(rc.ctx)
+	if err != nil {
+		return 0, nil, err
 	}
 	var cfg *storage.ResticS3
 	switch in.Mode {
@@ -112,8 +108,13 @@ func (a *api) putBackingRestic(rc *reqCtx) (int, any, error) {
 	}
 	ctx, cancel := context.WithTimeout(rc.ctx, time.Minute)
 	defer cancel()
+	if cfg != nil {
+		if err := a.checkNotSelf(ctx, cfg.Endpoint); err != nil {
+			return 0, nil, err
+		}
+	}
 	if err := b.ConfigureResticBacking(ctx, cfg); err != nil {
-		a.log.Error("admin: restic backing configuration failed", "backing", rc.r.PathValue("name"), "err", err)
+		a.log.Error("admin: restic backing configuration failed", "backing", name, "err", err)
 		if errors.Is(err, ctx.Err()) {
 			return 0, nil, badRequest("restic backing validation timed out")
 		}

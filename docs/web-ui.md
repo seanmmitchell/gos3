@@ -72,11 +72,22 @@ policies and clears that option.
   with "Bypass governance retention" (Danger zone checkbox, or the follow-up
   confirmation on the bucket list), which sends
   `bypassGovernanceRetention=true` and needs `s3:BypassGovernanceRetention`.
-- **Encryption.** Bucket settings offers native AES256 or restic on gos3.
-  Restic inherits each assigned backing’s repository settings. Configure local
-  or S3 storage and credentials from the server Storage page. Repository
-  passwords are server-managed. This encrypts new writes; older
-  objects are unchanged. See [encryption.md](encryption.md).
+- **Encryption.** The bucket's Encryption tab has two independently saved
+  cards. *Default encryption* (S3 API, every server) chooses whether uploads
+  without encryption headers are encrypted: None or SSE-S3, plus SSE-KMS with a
+  key ID and bucket key on generic S3. On gos3 an AWS KMS default stored by an
+  older version is flagged; gos3 applies it as SSE-S3, and the card pre-selects
+  SSE-S3 so saving replaces it. *SSE-S3 implementation* (gos3 admin API,
+  `admin:GetBucketEncryption` / `admin:PutBucketEncryption`) chooses native
+  AES-256-GCM or restic for default encryption and for uploads requesting
+  AES256; Restic is disabled when the server reports it unavailable for the
+  bucket (restic not installed, or a copy on a memory backing). Users without
+  those admin permissions, and servers without the endpoint, see a note there
+  while default encryption keeps working. Restic inherits each assigned
+  backing’s repository settings: configure local or S3 storage and credentials
+  from the server Storage page. Repository passwords are server-managed. This
+  encrypts new writes; older objects are unchanged. See
+  [encryption.md](encryption.md).
 - **Compression.** The server settings page has a Compression section where
   the administrator chooses the mode (Optional, Enforced, Disabled), the
   DEFLATE level, the minimum size and the media types to skip. A bucket's
