@@ -169,6 +169,9 @@ func New(cfg config.Config, logger *slog.Logger, opts ...Option) (_ *Server, err
 		o.version = version.Short()
 	}
 	cfg.Normalize()
+	if err := cfg.LoadBackings(); err != nil {
+		return nil, fmt.Errorf("loading backing configuration: %w", err)
+	}
 	if err := cfg.Validate(); err != nil {
 		return nil, fmt.Errorf("invalid configuration: %w", err)
 	}
@@ -399,6 +402,21 @@ func (s *Server) openRouter() error {
 		return fmt.Errorf("opening storage: %w", err)
 	}
 	s.backend = r
+	if s.cfg.Admin.Enabled {
+		r.EnableBackingManagement(s.cfg.Storage, s.cfg.BackingsPath(), func(bc config.BackingDefinition) (multi.Backing, error) {
+			b := multi.Backing{Name: bc.Name, Kind: bc.Backend, Path: bc.Path}
+			if bc.Backend == config.BackendMemory {
+				b.Backend = memory.New()
+			} else {
+				var err error
+				b.Backend, err = fsbackend.Open(bc.Path, fsbackend.Options{FsyncData: s.cfg.Storage.FsyncData, Logger: s.log})
+				if err != nil {
+					return multi.Backing{}, err
+				}
+			}
+			return b, nil
+		})
+	}
 	return nil
 }
 

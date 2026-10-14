@@ -268,7 +268,18 @@ type condValue struct {
 }
 
 // expandPolicyValues substitutes policy variables in condition values.
-// Values whose variables cannot be resolved are dropped (they match nothing).
+// Values whose variables cannot be resolved (and have no ${key, 'default'})
+// are dropped: as on AWS such a value is effectively null, so it equals or
+// is like no request value. Positive operators therefore do not match it,
+// while negated operators (StringNotEquals, StringNotLike, ArnNotLike, ...)
+// do, because the request value is not equal to or like null. This is
+// AWS's documented behaviour ("Policy variables with no value",
+// https://docs.aws.amazon.com/IAM/latest/UserGuide/reference_policies_variables.html#policy-vars-no-value):
+// it makes a Deny with StringNotEquals against ${aws:PrincipalTag/x} deny
+// callers without the tag, but also makes an Allow with a negated operator
+// against such a variable grant callers for whom it is unresolved (an
+// anonymous caller has no aws:username). Write such Allow statements with
+// a positive operator, or guard them with a Null condition on the variable.
 func (c *evalCtx) expandPolicyValues(kind opKind, vals []string) []condValue {
 	pattern := kind == opStringLike || kind == opArnLike
 	out := make([]condValue, 0, len(vals))

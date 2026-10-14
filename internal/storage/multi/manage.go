@@ -92,11 +92,12 @@ func (r *Router) Backings() []BackingStatus {
 		}
 	}
 	r.mu.RUnlock()
-	out := make([]BackingStatus, 0, len(r.order))
-	for _, b := range r.order {
+	topology := r.topology.Load()
+	out := make([]BackingStatus, 0, len(topology.order))
+	for _, b := range topology.order {
 		b.mu.Lock()
 		st := BackingStatus{
-			Name: b.Name, Kind: b.Kind, Path: b.Path, Default: b == r.def,
+			Name: b.Name, Kind: b.Kind, Path: b.Path, Default: b == topology.def,
 			Healthy: b.healthy.Load(), LastError: b.lastErr, CheckedAt: b.checkedAt,
 			Buckets: primaries[b.Name], Replicas: replicas[b.Name],
 		}
@@ -198,7 +199,7 @@ func (r *Router) memberStatus(rec *placementRecord, ms *memberState, role string
 
 // backingByName validates a backing name from a request.
 func (r *Router) backingByName(name string) (*backing, error) {
-	b := r.backings[name]
+	b := r.topology.Load().backings[name]
 	if b == nil {
 		return nil, fmt.Errorf("%w %q", ErrUnknownBacking, name)
 	}
@@ -209,6 +210,8 @@ func (r *Router) backingByName(name string) (*backing, error) {
 // (the primary stays). New replicas start with a full copy; removed ones
 // have their copy deleted in the background.
 func (r *Router) SetReplication(ctx context.Context, bucket string, mode Mode, replicas []string) (PlacementStatus, error) {
+	r.adminMu.Lock()
+	defer r.adminMu.Unlock()
 	if !mode.Valid() {
 		return PlacementStatus{}, fmt.Errorf("%w: unknown mode %q (expected single, active-passive or active-active)", ErrInvalidPlacement, mode)
 	}
@@ -226,8 +229,6 @@ func (r *Router) SetReplication(ctx context.Context, bucket string, mode Mode, r
 			return PlacementStatus{}, fmt.Errorf("%w: replica %q is listed twice", ErrInvalidPlacement, name)
 		}
 	}
-	r.adminMu.Lock()
-	defer r.adminMu.Unlock()
 	bs, err := r.lookup(bucket)
 	if err != nil {
 		return PlacementStatus{}, err
@@ -310,11 +311,11 @@ func (r *Router) SetReplication(ctx context.Context, bucket string, mode Mode, r
 // the backing to. The target is filled in the background; the cutover
 // happens when it has caught up.
 func (r *Router) Move(ctx context.Context, bucket, from, to string) (PlacementStatus, error) {
+	r.adminMu.Lock()
+	defer r.adminMu.Unlock()
 	if _, err := r.backingByName(to); err != nil {
 		return PlacementStatus{}, err
 	}
-	r.adminMu.Lock()
-	defer r.adminMu.Unlock()
 	bs, err := r.lookup(bucket)
 	if err != nil {
 		return PlacementStatus{}, err
@@ -398,11 +399,11 @@ func (r *Router) CancelMove(ctx context.Context, bucket string) (PlacementStatus
 // changes are copied during a cutover first, so nothing is lost. force
 // switches at once: changes not yet copied to the replica are lost.
 func (r *Router) Promote(ctx context.Context, bucket, backingName string, force bool) (PlacementStatus, error) {
+	r.adminMu.Lock()
+	defer r.adminMu.Unlock()
 	if _, err := r.backingByName(backingName); err != nil {
 		return PlacementStatus{}, err
 	}
-	r.adminMu.Lock()
-	defer r.adminMu.Unlock()
 	bs, err := r.lookup(bucket)
 	if err != nil {
 		return PlacementStatus{}, err
@@ -411,7 +412,7 @@ func (r *Router) Promote(ctx context.Context, bucket, backingName string, force 
 	rec := bs.rec
 	i := rec.member(backingName)
 	ms := bs.members[backingName]
-	prim := r.backings[rec.primary()]
+	prim := bs.members[rec.primary()].backing
 	r.mu.RUnlock()
 	switch {
 	case i < 0:
@@ -462,6 +463,8 @@ func (r *Router) Promote(ctx context.Context, bucket, backingName string, force 
 // Resync schedules a full comparison of the replica on backingName (every
 // replica and the move target when "") with the primary.
 func (r *Router) Resync(ctx context.Context, bucket, backingName string) (PlacementStatus, error) {
+	r.adminMu.Lock()
+	defer r.adminMu.Unlock()
 	bs, err := r.lookup(bucket)
 	if err != nil {
 		return PlacementStatus{}, err

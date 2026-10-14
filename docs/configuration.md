@@ -167,6 +167,21 @@ assigned backings. These settings can be managed on the server Storage page;
 persisted backing settings override startup values. See
 [encryption.md](encryption.md#backing-storage-for-restic) for examples and recovery.
 
+Backings can also be configured live in **Storage → Configure backings** in
+the web UI. Administrators can add filesystem or memory backings, edit or
+remove empty backings, and select the default for new buckets. Changes apply
+immediately and are saved in `<storage.path>/.gos3/backings.json`, which
+overrides `storage.backings` and `storage.default_backing` on subsequent
+starts while management is enabled. Without a storage path, changes last
+only until restart. The system backing named `default` and the replication
+defaults remain startup configuration.
+
+New backings added live must contain no existing buckets. Backings holding
+buckets, replicas, move targets, or pending cleanup cannot be edited or
+removed; move their buckets and remove replicas first. Changing the default
+does not move existing buckets. The selected default must not be one of the
+configured default replicas.
+
 A server can spread its buckets over several **backings**, for example one
 fs directory per disk. The backing configured by `storage.backend` and
 `storage.path` is named `default` and also holds the system state; each entry

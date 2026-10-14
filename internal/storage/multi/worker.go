@@ -61,7 +61,7 @@ type Progress struct {
 }
 
 func (r *Router) newMemberState(bs *bucketState, backingName string) *memberState {
-	return &memberState{bucket: bs, backing: r.backings[backingName], dirty: map[string]struct{}{}}
+	return &memberState{bucket: bs, backing: r.topology.Load().backings[backingName], dirty: map[string]struct{}{}}
 }
 
 // markDirty records that key changed and must be copied to the member.
@@ -510,7 +510,7 @@ func (r *Router) failover(bs *bucketState, down string) {
 	}
 	r.mu.Lock()
 	rec := bs.rec
-	if bs.removed || rec.primary() != down || r.backings[down].healthy.Load() {
+	if bs.removed || rec.primary() != down || r.topology.Load().backings[down].healthy.Load() {
 		r.mu.Unlock()
 		return
 	}
