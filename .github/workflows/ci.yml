@@ -45,7 +45,14 @@ jobs:
       - name: govulncheck
         run: go run golang.org/x/vuln/cmd/govulncheck@v1.8.0 ./...
       - name: Unit tests (race)
-        run: go test -race -count=1 ./cmd/... ./internal/...
+        # Run the real local and remote-S3 repository tests, which skip when
+        # restic is absent. Pin and verify the upstream release executable.
+        run: |
+          curl -fsSL --retry 3 -o "$RUNNER_TEMP/restic.bz2" https://github.com/restic/restic/releases/download/v0.19.1/restic_0.19.1_linux_amd64.bz2
+          echo "f415415624dcc452f2a02b8c33641791a8c6d6d3b65bbb3543fcf9a25151585c  $RUNNER_TEMP/restic.bz2" | sha256sum -c -
+          bzip2 -dc "$RUNNER_TEMP/restic.bz2" > "$RUNNER_TEMP/restic"
+          chmod +x "$RUNNER_TEMP/restic"
+          PATH="$RUNNER_TEMP:$PATH" go test -race -count=1 ./cmd/... ./internal/...
       - name: Headless build and mode tests
         run: |
           go build -tags noui ./cmd/gos3

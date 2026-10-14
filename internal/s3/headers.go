@@ -32,8 +32,8 @@ const userMetaPrefix = "x-amz-meta-"
 //     InvalidTag);
 //   - x-amz-acl is validated as an object canned ACL, private => ""; grant
 //     headers (x-amz-grant-*) => NotImplemented;
-//   - x-amz-server-side-encryption AES256 / aws:kms / aws:kms:dsse and the
-//     KMS key ID are recorded; SSE-C headers => NotImplemented;
+//   - x-amz-server-side-encryption AES256 requests object encryption;
+//     AWS KMS and SSE-C headers => NotImplemented;
 //   - x-amz-object-lock-mode / -retain-until-date (both or neither, date in
 //     the future) / -legal-hold (ON|OFF) => InvalidArgument when invalid;
 //     whether the bucket has object lock is checked by requireObjectLock;
@@ -192,7 +192,9 @@ func sseFromHeaders(h http.Header) (sse, kmsKeyID string, err error) {
 	}
 	sse = trimHeaderSpace(h.Get("X-Amz-Server-Side-Encryption"))
 	switch sse {
-	case "", "AES256", "aws:kms", "aws:kms:dsse":
+	case "", "AES256":
+	case "aws:kms", "aws:kms:dsse":
+		return "", "", s3err.ErrNotImplemented.WithMessage("AWS KMS encryption is not implemented. Use SSE-S3 (AES256).")
 	default:
 		return "", "", s3err.ErrInvalidArgument.WithMessage("The encryption method specified is not supported").
 			With("ArgumentName", "x-amz-server-side-encryption").With("ArgumentValue", sse)
@@ -323,10 +325,7 @@ func writeObjectHeaders(w http.ResponseWriter, info storage.ObjectInfo, versione
 	if info.StorageClass != "" && info.StorageClass != "STANDARD" {
 		h.Set("X-Amz-Storage-Class", info.StorageClass)
 	}
-	set("X-Amz-Server-Side-Encryption", info.SSE)
-	if strings.HasPrefix(info.SSE, "aws:kms") {
-		set("X-Amz-Server-Side-Encryption-Aws-Kms-Key-Id", info.SSEKMSKeyID)
-	}
+	setSSEHeaders(h, info.ObjectMeta)
 	if info.RetentionMode != "" && !info.RetainUntil.IsZero() {
 		h.Set("X-Amz-Object-Lock-Mode", info.RetentionMode)
 		h.Set("X-Amz-Object-Lock-Retain-Until-Date", formatXMLTime(info.RetainUntil))

@@ -22,7 +22,7 @@ the internet.
 - **Dashboard** of all configured servers with status, version and usage.
 - **Buckets**: create and delete; versioning, policy editor with templates,
   CORS, lifecycle, tags, object lock, default encryption and ACL settings,
-  and (gos3 only) compression.
+  and (gos3 only) compression and restic encryption providers.
 - **Object browser**: folders, drag-and-drop uploads (multipart with parallel
   parts and progress), downloads, delete, rename and copy, metadata and tag
   editors, versions, and presigned share links.
@@ -72,6 +72,10 @@ policies and clears that option.
   with "Bypass governance retention" (Danger zone checkbox, or the follow-up
   confirmation on the bucket list), which sends
   `bypassGovernanceRetention=true` and needs `s3:BypassGovernanceRetention`.
+- **Encryption.** Bucket settings offers native AES256 or restic on gos3.
+  Restic supports a local repository or a dedicated remote S3 prefix, with
+  server-managed passwords and credentials. This encrypts new writes; older
+  objects are unchanged. See [encryption.md](encryption.md).
 - **Compression.** The server settings page has a Compression section where
   the administrator chooses the mode (Optional, Enforced, Disabled), the
   DEFLATE level, the minimum size and the media types to skip. A bucket's

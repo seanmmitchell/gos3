@@ -204,6 +204,7 @@ func (c Compression) Enabled() bool { return c.Algorithm != "" }
 // WriteOptions are backend-level options for writing an object version.
 type WriteOptions struct {
 	Compression Compression
+	Encryption  string // EncryptionAES256, EncryptionRestic, or "" for none
 }
 
 // CompressingBackend stores object data compressed on request.
@@ -219,6 +220,9 @@ type WriteOptions struct {
 // a version uncompressed although compression was requested (e.g. an
 // empty object); it reports that in ObjectInfo.Compression. It returns an
 // error for an algorithm or level it does not support.
+// Encryption uses the same write-options methods: an unsupported encryption
+// provider must fail, never fall back to plaintext. ObjectMeta.Encryption in
+// the committed result describes the actual data encoding.
 type CompressingBackend interface {
 	NewObjectWriterWith(ctx context.Context, bucket, key string, opts WriteOptions) (ObjectWriter, error)
 	CompleteMultipartUploadWith(ctx context.Context, bucket, key, uploadID string, partNumbers []int,

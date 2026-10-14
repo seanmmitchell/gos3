@@ -114,7 +114,10 @@ type ObjectMeta struct {
 	// PartChecksums holds per-part checksums for multipart objects (same order
 	// as PartSizes) for GetObjectAttributes / GetObject?partNumber.
 	PartChecksums []map[string]string
-	// Server-side encryption as reported back to clients (gos3 records it).
+	// Encryption records the actual storage implementation. Empty on legacy
+	// objects whose SSE fields were only recorded, without encryption.
+	Encryption string
+	// Server-side encryption requested by the client.
 	SSE         string // "AES256", "aws:kms" or ""
 	SSEKMSKeyID string
 	// Object Lock
@@ -149,9 +152,21 @@ type ObjectInfo struct {
 	StoredSize int64
 }
 
-// PhysicalSize is the number of bytes stored for the object's data: Size,
-// or StoredSize for compressed data.
+// PhysicalSize is the number of locally stored data bytes, including native
+// encryption overhead. Restic counts its local reference, not repository packs.
 func (o ObjectInfo) PhysicalSize() int64 {
+	if o.Encryption == EncryptionRestic {
+		// Local snapshot reference only. Repository packs are shared between
+		// objects/snapshots and cannot be attributed to individual versions.
+		return 64
+	}
+	if o.Encryption == EncryptionAES256 {
+		n := o.Size
+		if o.Compression != "" {
+			n = o.StoredSize
+		}
+		return EncryptedSize(n)
+	}
 	if o.Compression != "" {
 		return o.StoredSize
 	}

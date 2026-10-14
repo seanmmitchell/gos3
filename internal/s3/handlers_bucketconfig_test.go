@@ -648,6 +648,10 @@ func TestBucketEncryptionSDK(t *testing.T) {
 				ApplyServerSideEncryptionByDefault: &types.ServerSideEncryptionByDefault{SSEAlgorithm: tc.algo, KMSMasterKeyID: aws.String(tc.key)},
 				BucketKeyEnabled:                   tc.bkey,
 			}}}}); err != nil {
+			if tc.algo != types.ServerSideEncryptionAes256 {
+				bcSDKErr(t, err, "NotImplemented")
+				continue
+			}
 			t.Fatalf("%s: %v", tc.algo, err)
 		}
 		out, err := c.GetBucketEncryption(bcCtx, &awss3.GetBucketEncryptionInput{Bucket: aws.String("cfg")})
@@ -688,7 +692,7 @@ func TestBucketEncryptionValidation(t *testing.T) {
 		code   string
 	}{
 		{"aes", doc(rule("AES256", "")), 200, ""},
-		{"kms no key", doc(rule("aws:kms", "")), 200, ""},
+		{"kms no key", doc(rule("aws:kms", "")), 501, "NotImplemented"},
 		{"aes with key", doc(rule("AES256", "k")), 400, "InvalidArgument"},
 		{"bad algo", doc(rule("DES", "")), 400, "MalformedXML"},
 		{"no rules", doc(""), 400, "MalformedXML"},

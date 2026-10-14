@@ -1,0 +1,82 @@
+package multi
+
+import (
+	"context"
+	"errors"
+	"strings"
+	"testing"
+
+	"github.com/seanmmitchell/gos3/internal/storage"
+)
+
+func TestReplicasKeepEncryption(t *testing.T) {
+	bk := []Backing{fsBacking(t, "a", t.TempDir()), fsBacking(t, "b", t.TempDir()), fsBacking(t, "c", t.TempDir())}
+	r := openRouter(t, Options{Backings: bk, NewBucketMode: ModeActiveActive, NewBucketReplicas: []string{"b"}})
+	ctx := context.Background()
+	if err := r.CreateBucket(ctx, "encrypted", storage.CreateBucketOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	waitState(t, r, "encrypted", StateInSync)
+	data := strings.Repeat("replicate encrypted content", 5000)
+	w, err := r.NewObjectWriterWith(ctx, "encrypted", "k", storage.WriteOptions{Encryption: storage.EncryptionAES256})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, _ = w.Write([]byte(data))
+	_, err = w.Commit(ctx, storage.ObjectMeta{SSE: "AES256", Encryption: storage.EncryptionAES256}, storage.CommitOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = r.SetReplication(ctx, "encrypted", ModeActivePassive, []string{"b", "c"}); err != nil {
+		t.Fatal(err)
+	}
+	waitState(t, r, "encrypted", StateInSync)
+	for _, backing := range bk {
+		info, err := backing.Backend.GetObjectInfo(ctx, "encrypted", "k", "")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if info.Encryption != storage.EncryptionAES256 || info.PhysicalSize() <= info.Size {
+			t.Fatalf("%s lost encryption: %+v", backing.Name, info)
+		}
+		if got := read(t, backing.Backend, "encrypted", "k", ""); got != data {
+			t.Fatalf("%s content mismatch", backing.Name)
+		}
+	}
+}
+
+func TestReplicationEncryptionChangedBeforeRead(t *testing.T) {
+	bk := memBackings(2)
+	r := openRouter(t, Options{Backings: bk})
+	ctx := context.Background()
+	for _, b := range bk {
+		if err := b.Backend.CreateBucket(ctx, "source", storage.CreateBucketOptions{}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	w, err := bk[0].Backend.NewObjectWriter(ctx, "source", "k")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, _ = w.Write([]byte("public"))
+	old, err := w.Commit(ctx, storage.ObjectMeta{}, storage.CommitOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	w, err = bk[0].Backend.(storage.CompressingBackend).NewObjectWriterWith(ctx, "source", "k", storage.WriteOptions{Encryption: storage.EncryptionAES256})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, _ = w.Write([]byte("private"))
+	if _, err = w.Commit(ctx, storage.ObjectMeta{SSE: "AES256"}, storage.CommitOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	// A listing saw plaintext, but opening that null version now sees a new
+	// encrypted object. Abort before sending any bytes to the plaintext writer.
+	if _, err = r.importVersion(ctx, r.backings["a"], r.backings["b"], "source", "k", old); !errors.Is(err, errSourceChanged) {
+		t.Fatalf("expected retry after encryption changed: %v", err)
+	}
+	if _, err = bk[1].Backend.GetObjectInfo(ctx, "source", "k", ""); !errors.Is(err, storage.ErrObjectNotFound) {
+		t.Fatalf("published inconsistent copy: %v", err)
+	}
+}

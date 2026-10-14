@@ -700,3 +700,24 @@ export interface HealthStatus {
   status: 'ok' | 'unavailable' | string
   error?: string
 }
+
+/** Per-bucket implementation of SSE-S3. Secrets are write-only. */
+export interface BucketEncryptionProvider {
+  provider: 'AES256' | 'restic'
+  repository: string
+  region: string
+  credentialsConfigured: boolean
+  passwordConfigured: boolean
+  /** Present after a PUT, indicating whether preparation succeeded. */
+  ready?: boolean
+  error?: string
+}
+export interface BucketEncryptionProviderInput {
+  provider: 'AES256' | 'restic'
+  repository?: string
+  region?: string
+  accessKey?: string
+  secretKey?: string
+  sessionToken?: string
+  password?: string
+}

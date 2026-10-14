@@ -12,6 +12,7 @@ import (
 	"path"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/seanmmitchell/gos3/internal/auth"
@@ -124,11 +125,12 @@ func pathTarget(arn func(string) string, param string) target {
 
 // api is the admin API handler.
 type api struct {
-	d       Deps
-	log     *slog.Logger
-	mux     *http.ServeMux
-	started time.Time
-	now     func() time.Time
+	encryptionMu sync.Mutex
+	d            Deps
+	log          *slog.Logger
+	mux          *http.ServeMux
+	started      time.Time
+	now          func() time.Time
 
 	usage  *ttlCache[storage.BucketUsage] // per bucket
 	totals *ttlCache[storageTotals]       // key ""
@@ -206,6 +208,8 @@ func (a *api) routes() []route {
 		{"DELETE", "/buckets/{name}/placement/move", "UpdateBucketPlacement", bucket, a.cancelMove},
 		{"POST", "/buckets/{name}/placement/promote", "UpdateBucketPlacement", bucket, a.promote},
 		{"POST", "/buckets/{name}/placement/resync", "UpdateBucketPlacement", bucket, a.resync},
+		{"GET", "/buckets/{name}/encryption-provider", "GetBucketEncryption", bucket, a.getBucketEncryption},
+		{"PUT", "/buckets/{name}/encryption-provider", "PutBucketEncryption", bucket, a.putBucketEncryption},
 		{"GET", "/buckets/{name}/compression", "GetBucketCompression", bucket, a.getBucketCompression},
 		{"PUT", "/buckets/{name}/compression", "PutBucketCompression", bucket, a.putBucketCompression},
 		{"DELETE", "/buckets/{name}/compression", "PutBucketCompression", bucket, a.deleteBucketCompression},

@@ -27,8 +27,7 @@ func TestObjectMetaFromHeaders(t *testing.T) {
 	h.Set("X-Amz-Storage-Class", "STANDARD_IA")
 	h.Set("X-Amz-Tagging", "k1=v1&k%202=v%202")
 	h.Set("X-Amz-Acl", "public-read")
-	h.Set("X-Amz-Server-Side-Encryption", "aws:kms")
-	h.Set("X-Amz-Server-Side-Encryption-Aws-Kms-Key-Id", "key-1")
+	h.Set("X-Amz-Server-Side-Encryption", "AES256")
 	h.Set("X-Amz-Object-Lock-Mode", "GOVERNANCE")
 	h.Set("X-Amz-Object-Lock-Retain-Until-Date", "2030-01-02T03:04:05.000Z")
 	h.Set("X-Amz-Object-Lock-Legal-Hold", "ON")
@@ -40,7 +39,7 @@ func TestObjectMetaFromHeaders(t *testing.T) {
 	if m.ContentType != "text/plain" || m.ContentEncoding != "gzip" || m.ContentDisposition == "" || m.ContentLanguage != "en" ||
 		m.CacheControl != "no-cache" || m.Expires == "" || m.UserMeta["color"] != "blue" || m.UserMeta["multi"] != "a,b" ||
 		m.StorageClass != "STANDARD_IA" || m.Tags["k1"] != "v1" || m.Tags["k 2"] != "v 2" || m.ACL != "public-read" ||
-		m.SSE != "aws:kms" || m.SSEKMSKeyID != "key-1" || m.RetentionMode != "GOVERNANCE" ||
+		m.SSE != "AES256" || m.SSEKMSKeyID != "" || m.RetentionMode != "GOVERNANCE" ||
 		!m.RetainUntil.Equal(time.Date(2030, 1, 2, 3, 4, 5, 0, time.UTC)) || !m.LegalHold || m.WebsiteRedirect != "/other" {
 		t.Fatalf("%+v", m)
 	}
@@ -101,7 +100,7 @@ func TestWriteObjectHeaders(t *testing.T) {
 	info := storage.ObjectInfo{
 		ObjectMeta: storage.ObjectMeta{
 			ETag: "abc-2", UserMeta: map[string]string{"a": "1"}, Tags: map[string]string{"t": "v"},
-			StorageClass: "GLACIER", SSE: "aws:kms", SSEKMSKeyID: "kid", RetentionMode: "COMPLIANCE",
+			StorageClass: "GLACIER", SSE: "AES256", Encryption: storage.EncryptionAES256, RetentionMode: "COMPLIANCE",
 			RetainUntil: time.Date(2030, 1, 1, 0, 0, 0, 0, time.UTC), LegalHold: true, PartSizes: []int64{5, 5},
 			Checksums: map[string]string{ChecksumCRC32: "AAAAAA=="}, ChecksumType: ChecksumTypeComposite,
 			WebsiteRedirect: "/x", CacheControl: "max-age=1",
@@ -114,8 +113,8 @@ func TestWriteObjectHeaders(t *testing.T) {
 	for k, want := range map[string]string{
 		"Content-Length": "10", "ETag": `"abc-2"`, "Last-Modified": "Sat, 03 Feb 2024 04:05:06 GMT",
 		"Content-Type": "binary/octet-stream", "X-Amz-Version-Id": "v1",
-		"X-Amz-Tagging-Count": "1", "X-Amz-Storage-Class": "GLACIER", "X-Amz-Server-Side-Encryption": "aws:kms",
-		"X-Amz-Server-Side-Encryption-Aws-Kms-Key-Id": "kid", "X-Amz-Object-Lock-Mode": "COMPLIANCE",
+		"X-Amz-Tagging-Count": "1", "X-Amz-Storage-Class": "GLACIER", "X-Amz-Server-Side-Encryption": "AES256",
+		"X-Amz-Object-Lock-Mode":              "COMPLIANCE",
 		"X-Amz-Object-Lock-Retain-Until-Date": "2030-01-01T00:00:00.000Z", "X-Amz-Object-Lock-Legal-Hold": "ON",
 		"X-Amz-Mp-Parts-Count": "2", "X-Amz-Website-Redirect-Location": "/x", "X-Amz-Checksum-Crc32": "AAAAAA==",
 		"X-Amz-Checksum-Type": "COMPOSITE", "Accept-Ranges": "bytes", "Cache-Control": "max-age=1",

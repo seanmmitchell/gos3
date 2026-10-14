@@ -279,17 +279,18 @@ the modes above do not apply; instead gos3 gives `.gos3` a protected ACL
 (no inherited entries) that grants access only to the account running gos3,
 SYSTEM and Administrators, inherited by everything inside, and writes the
 secret files with the same ACL. If that fails (for example on a file system
-without ACLs) it logs a warning: then put the data directory somewhere only
-the gos3 account (and administrators) can read, not in a shared location
-such as `C:\ProgramData` with default permissions. Object data outside
-`.gos3` keeps the data directory's ACL. **gos3 does not encrypt objects.** Bucket default encryption and
-`x-amz-server-side-encryption` headers are accepted and reported for client
-compatibility only. Use full-disk or file system encryption if you need
-encryption at rest. SSE-C is rejected (`NotImplemented`).
+without ACLs), the filesystem backend refuses to open: its system directory
+contains encryption keys and repository credentials. Object data outside
+`.gos3` keeps the data directory's ACL. SSE-S3 (`AES256`) encrypts new object
+data using native AES-256-GCM or the bucket’s restic provider. Existing legacy
+objects require rewriting; AWS KMS and SSE-C return `NotImplemented`.
+Server-managed keys allow unattended access and must be backed up with
+metadata. They do not protect against a compromised server or a full copy of
+its data and keys. See [encryption.md](encryption.md).
 
 Compressed objects (see [operations.md](operations.md#compression)) are
-compressed, not protected: anyone who can read the data files can inflate
-them. The stored size of a compressed object depends on its content, so it
+not protected by compression alone: without object encryption, anyone who
+can read the data files can inflate them. The stored size of a compressed object depends on its content, so it
 can leak how well data that an attacker partly controls compresses together
 with a secret in the same object (the idea behind CRIME/BREACH). Stored sizes
 are only reported by the admin API's bucket usage and stats

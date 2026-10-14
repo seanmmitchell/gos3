@@ -55,7 +55,7 @@ gets `400 InvalidArgument`, whether it is signed or not.
 | `?cors` | ✅ | Bucket rules override the server-wide `cors` settings. |
 | `?policy`, `?policyStatus` | ✅ | IAM policy language with conditions (see [Authorization](#authorization)). Policies are stored byte for byte. `IsPublic` reflects anonymous access. |
 | `?lifecycle` | 🟡 | Every rule form is validated and stored. Executed by the lifecycle worker: Expiration (Days, Date, ExpiredObjectDeleteMarker), NoncurrentVersionExpiration (NoncurrentDays, NewerNoncurrentVersions) and AbortIncompleteMultipartUpload. Filters: prefix (at most 1024 bytes), tags, object size. **Transitions are stored but never executed** (there are no storage tiers). `x-amz-expiration` and `x-amz-abort-date` headers are reported. |
-| `?encryption` | 🟡 | Configuration stored and reported (AES256, aws:kms, aws:kms:dsse); objects get the matching `x-amz-server-side-encryption` headers. **gos3 does not encrypt data at rest**; use disk encryption. |
+| `?encryption` | 🟡 | AES256 encrypts object data through native AES-256-GCM or the bucket’s restic provider. AWS KMS and SSE-C return 501. Legacy objects are unchanged and do not advertise encryption. See [encryption.md](encryption.md). |
 | `?acl` | 🟡 | Canned ACLs (`private`, `public-read`, `public-read-write`, `authenticated-read`, `log-delivery-write`), as `x-amz-acl` or as an equivalent `AccessControlPolicy`; what each grants is listed under [Authorization](#authorization). Grants to individual users or e-mail addresses and `x-amz-grant-*` headers ❌. |
 | `?object-lock` | ✅ | Default retention (GOVERNANCE / COMPLIANCE, Days or Years). Lock can be enabled at creation or later on a versioned bucket. |
 | `?ownershipControls` | ✅ | `BucketOwnerEnforced` disables ACLs. |

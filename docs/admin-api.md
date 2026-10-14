@@ -65,7 +65,7 @@ ARNs, policy variables such as `${aws:username}` included):
 |---|---|
 | `arn:gos3:admin:::user/<name>` | CreateUser (the new user's name), GetUser, UpdateUser, DeleteUser, CreateAccessKey (the target user; choosing the access key ID also needs it at service level), UpdateAccessKey / DeleteAccessKey (the key's owner; an unknown key is evaluated at service level) |
 | `arn:gos3:admin:::policy/<name>` | GetPolicy, PutPolicy, DeletePolicy |
-| `arn:gos3:admin:::bucket/<name>` | GetBucket, ForceDeleteBucket, GetBucketCompression, PutBucketCompression, GetBucketPlacement, UpdateBucketPlacement |
+| `arn:gos3:admin:::bucket/<name>` | GetBucket, ForceDeleteBucket, GetBucketCompression, PutBucketCompression, GetBucketEncryption, PutBucketEncryption, GetBucketPlacement, UpdateBucketPlacement |
 | service level | every other action (list actions, config, stats, discovery, simulate, self-service) |
 
 The policy resources `*` and `arn:gos3:admin:::*` match every admin
@@ -290,6 +290,42 @@ environment and flags for these fields.
 Compression is transparent to S3 clients (same content, ETags, checksums
 and sizes); `storedBytes` and `storedVersionBytes` count what the backend
 stores. See [operations.md](operations.md#compression).
+
+### Object encryption providers
+
+| Method | Path | Action | Response |
+|---|---|---|---|
+| GET | `/buckets/{name}/encryption-provider` | GetBucketEncryption | `BucketEncryptionProvider` (secrets omitted) |
+| PUT | `/buckets/{name}/encryption-provider` | PutBucketEncryption | Selects and prepares native AES256 or restic; returns `BucketEncryptionProvider` with `ready` and optional `error` |
+
+Both actions use `arn:gos3:admin:::bucket/<name>`. Example PUT:
+
+```json
+{ "provider": "restic",
+  "repository": "s3:https://s3.example.com/backups/photos",
+  "region": "us-east-1",
+  "accessKey": "BACKUP_ACCESS_KEY", "secretKey": "BACKUP_SECRET_KEY" }
+```
+
+The provider is `AES256` (native, also the default) or `restic`. For restic,
+empty `repository` uses local storage; remote S3 requires credentials.
+Optional `sessionToken` and `password` are write-only, as are the access and
+secret keys. An empty password generates one on initial setup; for an existing
+repository supply its password. Blank credentials retain saved values. The
+repository location is fixed after setup. Switching to AES256 preserves
+credentials needed to read existing restic objects.
+
+Responses contain `provider`, `repository`, `region`,
+`credentialsConfigured`, and `passwordConfigured`; they never contain
+credentials. GET reports saved settings, not repository health. PUT checks
+credentials before saving; if repository initialization fails after saving,
+it returns 200 with `ready: false` and `error`, preserving the password for
+retry. A successful PUT has `ready: true`. Validation failures return 400.
+
+Provider selection alone does not enable bucket-default encryption. Use S3
+PutBucketEncryption with AES256 to enable it (also for restic), or an AES256
+upload header. Existing versions retain their actual encoding. See
+[encryption.md](encryption.md) for setup, archive behavior, and recovery.
 
 ### Storage backings and bucket placement
 

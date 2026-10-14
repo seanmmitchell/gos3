@@ -2,6 +2,7 @@ package memory
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"slices"
 	"sync"
@@ -27,6 +28,7 @@ type versionWriter struct {
 	// zw compresses into buf when the version is stored compressed.
 	zw          *compress.Writer
 	compression string
+	encryption  string
 }
 
 // NewVersionWriter starts writing an imported version of bucket/key (see
@@ -38,6 +40,9 @@ func (b *Backend) NewVersionWriter(ctx context.Context, bucketName, key string) 
 // NewVersionWriterWith is NewVersionWriter with write options (see
 // storage.CompressingImporter).
 func (b *Backend) NewVersionWriterWith(ctx context.Context, bucketName, key string, opts storage.WriteOptions) (storage.VersionWriter, error) {
+	if opts.Encryption != "" && opts.Encryption != storage.EncryptionAES256 {
+		return nil, errors.ErrUnsupported
+	}
 	if err := checkCompression(opts.Compression); err != nil {
 		return nil, err
 	}
@@ -49,7 +54,7 @@ func (b *Backend) NewVersionWriterWith(ctx context.Context, bucketName, key stri
 		return nil, err
 	}
 	bk.mu.RUnlock()
-	w := &versionWriter{b: b, bk: bk, name: bucketName, key: key}
+	w := &versionWriter{b: b, bk: bk, name: bucketName, key: key, encryption: opts.Encryption}
 	if opts.Compression.Enabled() {
 		w.compression = opts.Compression.Algorithm
 		if w.zw, err = compress.NewWriter((*appendWriter)(&w.buf), opts.Compression.Level); err != nil {
@@ -127,6 +132,10 @@ func (w *versionWriter) Commit(ctx context.Context, info storage.ObjectInfo) (st
 	}
 	if !info.DeleteMarker {
 		v.meta = cloneMeta(info.ObjectMeta)
+		v.meta.Encryption = w.encryption
+	}
+	if err := encryptVersion(v); err != nil {
+		return storage.ObjectInfo{}, err
 	}
 	v.stamp, _ = w.b.nextStamp()
 

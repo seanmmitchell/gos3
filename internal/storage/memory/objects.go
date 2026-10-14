@@ -44,6 +44,7 @@ type objectWriter struct {
 	// zw compresses into buf when the version is stored compressed.
 	zw          *compress.Writer
 	compression string
+	encryption  string
 }
 
 // The optional storage interface implemented by NewObjectWriterWith and
@@ -59,6 +60,9 @@ func (b *Backend) NewObjectWriter(ctx context.Context, bucketName, key string) (
 // opts.Compression the data is kept in the compress package's format (see
 // storage.CompressingBackend).
 func (b *Backend) NewObjectWriterWith(ctx context.Context, bucketName, key string, opts storage.WriteOptions) (storage.ObjectWriter, error) {
+	if opts.Encryption != "" && opts.Encryption != storage.EncryptionAES256 {
+		return nil, errors.ErrUnsupported
+	}
 	if err := checkCompression(opts.Compression); err != nil {
 		return nil, err
 	}
@@ -70,7 +74,7 @@ func (b *Backend) NewObjectWriterWith(ctx context.Context, bucketName, key strin
 		return nil, err
 	}
 	bk.mu.RUnlock()
-	w := &objectWriter{b: b, bk: bk, key: key}
+	w := &objectWriter{b: b, bk: bk, key: key, encryption: opts.Encryption}
 	if opts.Compression.Enabled() {
 		w.compression = opts.Compression.Algorithm
 		if w.zw, err = compress.NewWriter((*appendWriter)(&w.buf), opts.Compression.Level); err != nil {
@@ -149,6 +153,7 @@ func (w *objectWriter) Commit(ctx context.Context, meta storage.ObjectMeta, opts
 		return storage.ObjectInfo{}, err
 	}
 	defer w.bk.mu.Unlock()
+	meta.Encryption = w.encryption
 	return w.b.commitLocked(w.bk, w.key, data, enc, meta, opts)
 }
 
@@ -224,6 +229,9 @@ func (b *Backend) commitLocked(bk *bucket, key string, data []byte, enc stored, 
 	}
 	v := &version{meta: cloneMeta(meta), data: data, stamp: stamp, lastModified: created,
 		compression: enc.compression, size: enc.size}
+	if err := encryptVersion(v); err != nil {
+		return storage.ObjectInfo{}, err
+	}
 	b.addVersionLocked(bk, key, obj, v)
 	return v.info(bk.info.Name, key, true), nil
 }
@@ -359,14 +367,18 @@ func (b *Backend) OpenObject(ctx context.Context, bucketName, key, versionID str
 	if v.deleteMarker {
 		return info, nil, nil
 	}
+	data, err := decryptedData(v)
+	if err != nil {
+		return storage.ObjectInfo{}, nil, err
+	}
 	if v.compression != "" {
-		z, err := compress.NewReader(bytes.NewReader(v.data), int64(len(v.data)))
+		z, err := compress.NewReader(bytes.NewReader(data), int64(len(data)))
 		if err != nil {
 			return storage.ObjectInfo{}, nil, fmt.Errorf("memory: open %s/%s: %w", bucketName, key, err)
 		}
 		return info, z, nil
 	}
-	return info, newObjectReader(v.data), nil
+	return info, newObjectReader(data), nil
 }
 
 // UpdateObjectMeta atomically mutates the metadata of an existing version.
@@ -416,6 +428,7 @@ func (b *Backend) updateObjectMeta(ctx context.Context, bucketName, key, version
 	if err := fn(&m); err != nil {
 		return storage.ObjectInfo{}, err
 	}
+	m.Encryption = v.meta.Encryption
 	v.meta = cloneMeta(m)
 	return v.info(bk.info.Name, key, i == len(obj.versions)-1), nil
 }

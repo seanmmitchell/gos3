@@ -137,7 +137,7 @@ func (r *Router) syncKey(ctx context.Context, src, dst *backing, bucket, key str
 // importVersion copies version v of bucket/key from src to dst. It returns
 // the number of bytes copied.
 func (r *Router) importVersion(ctx context.Context, src, dst *backing, bucket, key string, v storage.ObjectInfo) (int64, error) {
-	var opts storage.WriteOptions
+	opts := storage.WriteOptions{Encryption: v.Encryption}
 	if v.Compression == storage.CompressionDeflate {
 		// Keep the copy compressed like its source (the level the source
 		// used is not recorded).
@@ -157,6 +157,13 @@ func (r *Router) importVersion(ctx context.Context, src, dst *backing, bucket, k
 				return 0, errSourceChanged
 			}
 			return 0, r.observe(src, fmt.Errorf("reading %s/%s version %s on backing %q: %w", bucket, key, v.VersionID, src.Name, err))
+		}
+		if oi.Encryption != opts.Encryption {
+			if rc != nil {
+				_ = rc.Close()
+			}
+			_ = w.Abort()
+			return 0, errSourceChanged
 		}
 		if rc != nil { // nil: the null version became a delete marker meanwhile
 			n, err = io.Copy(w, rc)
@@ -184,9 +191,12 @@ func (r *Router) importVersion(ctx context.Context, src, dst *backing, bucket, k
 // when b can compress (else as is). errors.ErrUnsupported when b cannot
 // import versions at all.
 func newVersionWriter(ctx context.Context, b *backing, bucket, key string, opts storage.WriteOptions) (storage.VersionWriter, error) {
-	if opts.Compression.Enabled() {
+	if opts.Compression.Enabled() || opts.Encryption != "" {
 		if ci, ok := b.Backend.(storage.CompressingImporter); ok {
 			return ci.NewVersionWriterWith(ctx, bucket, key, opts)
+		}
+		if opts.Encryption != "" {
+			return nil, fmt.Errorf("backing %q cannot receive encrypted copies: %w", b.Name, errors.ErrUnsupported)
 		}
 	}
 	imp, ok := b.Backend.(storage.VersionImporter)
@@ -211,7 +221,7 @@ func keyVersions(ctx context.Context, b storage.Backend, bucket, key string) ([]
 
 // sameVersion reports whether a and b are the same stored version.
 func sameVersion(a, b storage.ObjectInfo) bool {
-	return a.VersionID == b.VersionID && a.DeleteMarker == b.DeleteMarker && a.Size == b.Size &&
+	return a.Encryption == b.Encryption && a.VersionID == b.VersionID && a.DeleteMarker == b.DeleteMarker && a.Size == b.Size &&
 		a.LastModified.Equal(b.LastModified) && a.ETag == b.ETag
 }
 

@@ -17,6 +17,8 @@ import type {
   AdminErrorCode,
   BackingList,
   BucketCompression,
+  BucketEncryptionProvider,
+  BucketEncryptionProviderInput,
   BucketSummary,
   CreateAccessKeyRequest,
   CreateUserRequest,
@@ -538,6 +540,14 @@ export class AdminClient {
   /** Removes the bucket's setting: back to the server default (204, idempotent). */
   deleteBucketCompression(name: string): Promise<void> {
     return this.request('DELETE', `/buckets/${enc(name)}/compression`, { expect: 'none' })
+  }
+
+  getBucketEncryptionProvider(name: string): Promise<BucketEncryptionProvider> {
+    return this.request('GET', `/buckets/${enc(name)}/encryption-provider`)
+  }
+
+  putBucketEncryptionProvider(name: string, body: BucketEncryptionProviderInput): Promise<BucketEncryptionProvider> {
+    return this.request('PUT', `/buckets/${enc(name)}/encryption-provider`, { body })
   }
 
   // Discovery --------------------------------------------------------------
