@@ -701,14 +701,27 @@ export interface HealthStatus {
   error?: string
 }
 
-/** Per-bucket implementation of SSE-S3, with storage inherited from placement. */
+/** Implementations of SSE-S3 a gos3 bucket can use. */
+export type EncryptionProviderName = 'AES256' | 'restic'
+
+/**
+ * GET/PUT /buckets/{name}/encryption-provider: the bucket's implementation
+ * of SSE-S3 (native AES-256-GCM or restic), used for default encryption and
+ * for uploads that request AES256. Restic storage is inherited from the
+ * bucket's placement (backings).
+ */
 export interface BucketEncryptionProvider {
- provider: 'AES256' | 'restic'
- backings?: string[]
- ready?: boolean
- error?: string
+  provider: EncryptionProviderName
+  /**
+   * Providers the bucket can use now (restic needs the restic executable on
+   * the server and filesystem storage for every copy). Absent when the
+   * server cannot tell: then every provider is offered.
+   */
+  available?: EncryptionProviderName[]
+  /** Backings holding the bucket (primary first). */
+  backings?: string[]
 }
-export interface BucketEncryptionProviderInput { provider: 'AES256' | 'restic' }
+export interface BucketEncryptionProviderInput { provider: EncryptionProviderName }
 export interface ResticBacking {
  mode: 'local' | 's3'
  endpoint: string

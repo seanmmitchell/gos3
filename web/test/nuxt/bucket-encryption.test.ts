@@ -12,50 +12,71 @@ const INFO: Info = {
   features: [], startedAt: '2026-10-09T12:00:00Z'
 }
 
-function fakeServer(ready = true) {
+const AES_RULE = '<ServerSideEncryptionConfiguration><Rule><ApplyServerSideEncryptionByDefault><SSEAlgorithm>AES256</SSEAlgorithm></ApplyServerSideEncryptionByDefault></Rule></ServerSideEncryptionConfiguration>'
+const KMS_RULE = '<ServerSideEncryptionConfiguration><Rule><ApplyServerSideEncryptionByDefault><SSEAlgorithm>aws:kms</SSEAlgorithm><KMSMasterKeyID>arn:aws:kms:k</KMSMasterKeyID></ApplyServerSideEncryptionByDefault></Rule></ServerSideEncryptionConfiguration>'
+
+interface FakeOptions {
+  /** Status of every admin encryption-provider request (403 = S3-only user, 404 = older server). */
+  providerStatus?: number
+  /** Providers the server reports available. */
+  available?: string[]
+  /** The stored default encryption document (undefined = none). */
+  rule?: string
+  /** Answer the provider PUT with this error status. */
+  putProviderStatus?: number
+}
+
+function fakeServer(opts: FakeOptions = {}) {
   const writes: { path: string, method: string, body: string }[] = []
-  let encrypted = false
-  let provider = { provider: 'AES256' }
+  let rule = opts.rule
+  let provider = 'AES256'
   const whoami: WhoAmI = { user: 'root', accessKey: 'AK', isRoot: true, policies: [], capabilities: { admin: true } as WhoAmI['capabilities'], server: INFO }
   vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL) => {
     const req = input instanceof Request ? input : new Request(String(input))
     const url = new URL(req.url)
-    const json = (v: unknown) => new Response(JSON.stringify(v), { headers: { 'content-type': 'application/json' } })
+    const json = (v: unknown, status = 200) => new Response(JSON.stringify(v), { status, headers: { 'content-type': 'application/json' } })
     if (url.pathname === '/_gos3/info') return json(INFO)
     if (url.pathname === '/_gos3/admin/v1/whoami') return json(whoami)
     if (req.method !== 'GET') writes.push({ path: url.pathname, method: req.method, body: await req.clone().text() })
     if (url.pathname === '/_gos3/admin/v1/buckets/photos/encryption-provider') {
-      if (req.method === 'GET') return json(provider)
-      const body = await req.json()
-      provider = { provider: body.provider }
-      return json({ ...provider, ready, error: ready ? undefined : 'Provider settings saved, but repository preparation failed.' })
+      if (opts.providerStatus) return json({ error: { code: opts.providerStatus === 403 ? 'AccessDenied' : 'NotFound', message: 'no' } }, opts.providerStatus)
+      if (req.method === 'PUT') {
+        if (opts.putProviderStatus) return json({ error: { code: 'InvalidRequest', message: 'Cannot prepare the restic repository of this bucket; the provider was not changed.' } }, opts.putProviderStatus)
+        provider = (await req.json()).provider
+      }
+      return json({ provider, available: opts.available ?? ['AES256', 'restic'], backings: ['default'] })
     }
     if (url.pathname === '/photos/' && url.searchParams.has('encryption')) {
-      if (req.method === 'PUT') encrypted = true
-      if (req.method === 'DELETE') encrypted = false
-      return new Response(encrypted
-        ? '<ServerSideEncryptionConfiguration><Rule><ApplyServerSideEncryptionByDefault><SSEAlgorithm>AES256</SSEAlgorithm></ApplyServerSideEncryptionByDefault></Rule></ServerSideEncryptionConfiguration>'
-        : '<Error><Code>ServerSideEncryptionConfigurationNotFoundError</Code></Error>',
-      { status: encrypted || req.method === 'DELETE' ? 200 : 404, headers: { 'content-type': 'application/xml' } })
+      if (req.method === 'PUT') rule = await req.clone().text()
+      if (req.method === 'DELETE') rule = undefined
+      if (req.method !== 'GET') return new Response(null, { status: req.method === 'DELETE' ? 204 : 200 })
+      return new Response(rule ?? '<Error><Code>ServerSideEncryptionConfigurationNotFoundError</Code></Error>',
+        { status: rule ? 200 : 404, headers: { 'content-type': 'application/xml' } })
     }
     return new Response('', { status: 404 })
   }))
   return writes
 }
 
-async function mountTab() {
+async function mountTab(kind: 'gos3' | 's3' = 'gos3') {
   const store = useConnectionsStore()
-  const c = store.add({ name: 'nas', endpoint: 'http://10.9.9.2:9000', accessKeyId: 'AK', secretAccessKey: 'SK', kind: 'gos3' })
+  const c = store.add({ name: 'nas', endpoint: 'http://10.9.9.2:9000', accessKeyId: 'AK', secretAccessKey: 'SK', kind })
   store.setActive(c.id)
   await store.refreshStatus(c.id)
   const w = await mountSuspended(EncryptionTab, { props: { bucket: 'photos' } })
-  await vi.waitFor(() => expect(w.find('form').exists(), w.text()).toBe(true))
+  await vi.waitFor(() => expect(w.find('[data-testid="default-encryption"]').exists(), w.text()).toBe(true))
   return w
 }
 
 type TabVm = {
   mode: string
+  provider: string
+  dirty: boolean
+  providerDirty: boolean
+  kmsKeyId: string
+  bucketKey: boolean
   save: { run: () => Promise<unknown> }
+  saveProvider: { run: () => Promise<unknown> }
 }
 
 beforeEach(() => {
@@ -67,44 +88,112 @@ beforeEach(() => {
 afterEach(() => vi.unstubAllGlobals())
 
 describe('EncryptionTab', () => {
-  it('saves only the restic provider and enables standard S3 AES256', async () => {
+  it('saves the default rule and the SSE-S3 implementation separately', async () => {
     const writes = fakeServer()
     const w = await mountTab()
+    await vi.waitFor(() => expect(w.find('[data-testid="encryption-provider"] form').exists(), w.text()).toBe(true))
     expect(w.text()).not.toContain('SSE-KMS (aws:kms)')
     const vm = w.vm as unknown as TabVm
-    vm.mode = 'restic'
-    await vm.save.run()
+
+    vm.provider = 'restic'
     await nextTick()
-    expect(writes.map(r => r.path)).toEqual(['/_gos3/admin/v1/buckets/photos/encryption-provider', '/photos/'])
-    expect(JSON.parse(writes[0]!.body)).toEqual({ provider: 'restic' })
-    expect(writes[1]!.body).toContain('<SSEAlgorithm>AES256</SSEAlgorithm>')
-    expect(vm.mode).toBe('restic')
+    expect(vm.providerDirty).toBe(true)
+    expect(vm.dirty).toBe(false)
+    await vm.saveProvider.run()
+    expect(writes).toEqual([{ method: 'PUT', path: '/_gos3/admin/v1/buckets/photos/encryption-provider', body: '{"provider":"restic"}' }])
+    await nextTick()
     expect(w.text()).toContain('inherited from this bucket’s placement')
     expect(w.find('input[type="password"]').exists()).toBe(false)
-    expect(w.emitted('changed')).toHaveLength(1)
-  })
 
-  it('shows preparation failure and does not enable default SSE', async () => {
-    const writes = fakeServer(false)
-    const w = await mountTab()
-    const vm = w.vm as unknown as TabVm
-    vm.mode = 'restic'
-    await vm.save.run()
-    await nextTick()
-    expect(writes).toHaveLength(1)
-    expect(w.text()).toContain('repository preparation failed')
-    expect(w.emitted('changed')).toBeUndefined()
-  })
-
-  it('disables only the S3 default, preserving provider keys and archive settings', async () => {
-    const writes = fakeServer()
-    const w = await mountTab()
-    const vm = w.vm as unknown as TabVm
+    writes.length = 0
     vm.mode = 'AES256'
     await vm.save.run()
+    expect(writes.map(r => `${r.method} ${r.path}`)).toEqual(['PUT /photos/'])
+    expect(writes[0]!.body).toContain('<SSEAlgorithm>AES256</SSEAlgorithm>')
+
+    // "None" removes only the default rule; the implementation stays visible.
     writes.length = 0
     vm.mode = 'none'
     await vm.save.run()
     expect(writes).toEqual([{ method: 'DELETE', path: '/photos/', body: '' }])
+    await nextTick()
+    expect(vm.provider).toBe('restic')
+    expect(w.find('[data-testid="encryption-provider"]').text()).toContain('Restic')
+    expect(w.emitted('changed')).toHaveLength(3)
+  })
+
+  it('keeps the saved implementation when preparation fails', async () => {
+    const writes = fakeServer({ putProviderStatus: 400 })
+    const w = await mountTab()
+    await vi.waitFor(() => expect(w.find('[data-testid="encryption-provider"] form').exists()).toBe(true))
+    const vm = w.vm as unknown as TabVm
+    vm.provider = 'restic'
+    await vm.saveProvider.run()
+    await nextTick()
+    expect(writes).toHaveLength(1)
+    expect(vm.providerDirty).toBe(true)
+    expect(w.emitted('changed')).toBeUndefined()
+    // The error is reported once (toast), not repeated inline.
+    expect(w.text()).not.toContain('provider was not changed')
+  })
+
+  it('disables restic when the server reports it unavailable', async () => {
+    fakeServer({ available: ['AES256'] })
+    const w = await mountTab()
+    await vi.waitFor(() => expect(w.find('[data-testid="encryption-provider"] form').exists()).toBe(true))
+    expect(w.text()).toContain('restic must be installed on the server')
+    const restic = w.findAll('[data-testid="encryption-provider"] input[type="radio"], [data-testid="encryption-provider"] button[role="radio"]')
+      .find(el => el.attributes('value') === 'restic')
+    expect(restic?.attributes('disabled')).toBeDefined()
+  })
+
+  for (const [status, testid] of [[403, 'provider-denied'], [404, 'provider-unsupported']] as const) {
+    it(`falls back to S3-only mode on admin ${status}`, async () => {
+      const writes = fakeServer({ providerStatus: status })
+      const w = await mountTab()
+      await vi.waitFor(() => expect(w.find(`[data-testid="${testid}"]`).exists(), w.text()).toBe(true))
+      const vm = w.vm as unknown as TabVm
+      vm.mode = 'AES256'
+      await vm.save.run()
+      expect(writes.map(r => `${r.method} ${r.path}`)).toEqual(['PUT /photos/'])
+      expect(w.emitted('changed')).toHaveLength(1)
+    })
+  }
+
+  it('offers to replace a legacy KMS default on gos3 with SSE-S3', async () => {
+    const writes = fakeServer({ rule: KMS_RULE })
+    const w = await mountTab()
+    const vm = w.vm as unknown as TabVm
+    expect(w.find('[data-testid="legacy-kms"]').exists()).toBe(true)
+    expect(vm.mode).toBe('AES256')
+    expect(vm.dirty).toBe(true)
+    await vm.save.run()
+    expect(writes).toHaveLength(1)
+    expect(writes[0]!.body).toContain('<SSEAlgorithm>AES256</SSEAlgorithm>')
+    expect(writes[0]!.body).not.toContain('KMSMasterKeyID')
+    await nextTick()
+    expect(w.find('[data-testid="legacy-kms"]').exists()).toBe(false)
+  })
+
+  it('keeps SSE-KMS for generic S3 and ignores fields of other modes', async () => {
+    const writes = fakeServer({ rule: AES_RULE })
+    const w = await mountTab('s3')
+    expect(w.text()).toContain('SSE-KMS (aws:kms)')
+    expect(w.find('[data-testid="encryption-provider"]').exists()).toBe(false)
+    expect(writes).toHaveLength(0)
+    const vm = w.vm as unknown as TabVm
+    vm.mode = 'aws:kms'
+    await nextTick()
+    expect(w.text()).toContain('Key ID or ARN')
+    expect(w.text()).toContain('Reduce KMS requests')
+    vm.bucketKey = true
+    vm.kmsKeyId = '  '
+    vm.mode = 'AES256'
+    await nextTick()
+    expect(vm.dirty).toBe(false)
+    vm.mode = 'aws:kms'
+    vm.kmsKeyId = ' arn:aws:kms:x '
+    await vm.save.run()
+    expect(writes[0]!.body).toContain('<KMSMasterKeyID>arn:aws:kms:x</KMSMasterKeyID>')
   })
 })
