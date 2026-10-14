@@ -550,8 +550,9 @@ func (c *bucketEncryptionConfig) validate() error {
 		}
 	case "aws:kms", "aws:kms:dsse":
 		if len(d.KMSMasterKeyID) > maxKMSKeyIDLength {
-			return s3err.ErrInvalidArgument.WithMessage("The KMSMasterKeyID is too long.").With("ArgumentName", "KMSMasterKeyID")
+			return s3err.ErrInvalidArgument.WithMessage("KMS key ID is too long.")
 		}
+		return s3err.ErrNotImplemented.WithMessage("AWS KMS encryption is not implemented. Use SSE-S3 (AES256).")
 	default:
 		return s3err.ErrMalformedXML
 	}
@@ -575,9 +576,8 @@ func (s *Server) handleGetBucketEncryption(w http.ResponseWriter, r *http.Reques
 }
 
 // handlePutBucketEncryption implements PutBucketEncryption (see
-// bucketEncryptionConfig.validate). gos3 does not encrypt data; the
-// default algorithm is recorded on new objects and reported back
-// (x-amz-server-side-encryption), as with explicit SSE headers.
+// bucketEncryptionConfig.validate). Verify the selected provider before
+// enabling encryption for new objects; existing versions remain unchanged.
 func (s *Server) handlePutBucketEncryption(w http.ResponseWriter, r *http.Request, rc *reqContext) error {
 	ctx := r.Context()
 	if _, err := s.bucketInfo(ctx, rc); err != nil {
@@ -591,6 +591,9 @@ func (s *Server) handlePutBucketEncryption(w http.ResponseWriter, r *http.Reques
 		return err
 	}
 	c.XMLNS = s3Namespace
+	if err := s.prepareEncryption(ctx, rc.bucket, &storage.ObjectMeta{SSE: "AES256"}); err != nil {
+		return err
+	}
 	if err := s.storeBucketConfig(ctx, rc, storage.ConfigEncryption, c); err != nil {
 		return err
 	}

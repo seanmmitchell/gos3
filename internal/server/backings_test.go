@@ -6,8 +6,38 @@ import (
 	"testing"
 
 	"github.com/seanmmitchell/gos3/internal/config"
+	"github.com/seanmmitchell/gos3/internal/storage"
 	"github.com/seanmmitchell/gos3/internal/storage/multi"
 )
+
+func TestBackingManagementRetainsStartupResticSettings(t *testing.T) {
+	cfg := testConfig()
+	cfg.Storage.Backend = config.BackendFS
+	cfg.Storage.Path = t.TempDir()
+	cfg.Storage.Backings = []config.BackingConfig{{Name: "archive", Backend: config.BackendFS, Path: t.TempDir(),
+		ResticS3: &storage.ResticS3{Endpoint: "https://s3.example.test", Bucket: "archives", AccessKey: "test-access", SecretKey: "test-secret"}}}
+	srv := start(t, cfg)
+	const definitions = "/_gos3/admin/v1/backings/config"
+	var in multi.BackingConfiguration
+	do(t, "GET", srv.url+definitions, nil, &rootCreds, nil).json(t, &in)
+	raw, _ := json.Marshal(in)
+	res := do(t, "PUT", srv.url+definitions, raw, &rootCreds, nil)
+	if res.status != 200 {
+		t.Fatalf("saving backing definitions: %d %s", res.status, res.body)
+	}
+	if err := srv.stop(); err != nil {
+		t.Fatal(err)
+	}
+	srv = start(t, cfg)
+	var settings struct {
+		Mode, Endpoint, Bucket string
+		CredentialsConfigured  bool
+	}
+	do(t, "GET", srv.url+"/_gos3/admin/v1/backings/archive/restic", nil, &rootCreds, nil).json(t, &settings)
+	if settings.Mode != "s3" || settings.Endpoint != "https://s3.example.test" || settings.Bucket != "archives" || !settings.CredentialsConfigured {
+		t.Fatalf("backing overlay discarded startup restic settings: %+v", settings)
+	}
+}
 
 func TestLiveBackingConfigurationSurvivesRestart(t *testing.T) {
 	cfg := testConfig()

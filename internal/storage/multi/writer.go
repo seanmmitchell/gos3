@@ -70,7 +70,7 @@ func (r *Router) NewObjectWriterWith(ctx context.Context, bucket, key string, op
 		return nil, err
 	}
 	var w storage.ObjectWriter
-	if opts.Compression.Enabled() {
+	if opts.Compression.Enabled() || opts.Encryption != "" {
 		cb, ok := rt.lead.Backend.(storage.CompressingBackend)
 		if !ok {
 			leave()

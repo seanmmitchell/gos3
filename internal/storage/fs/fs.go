@@ -77,6 +77,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	iofs "io/fs"
 	"log/slog"
 	"os"
@@ -86,9 +87,11 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/minio/sio"
 	"go.etcd.io/bbolt"
 	berrors "go.etcd.io/bbolt/errors"
 
+	"github.com/seanmmitchell/gos3/internal/config"
 	"github.com/seanmmitchell/gos3/internal/storage"
 )
 
@@ -97,6 +100,7 @@ var ErrClosed = errors.New("fs: backend closed")
 
 // Options configures Open.
 type Options struct {
+	ResticS3 *storage.ResticS3
 	// FsyncData fsyncs every data file (and its directory) before the
 	// metadata referencing it is committed. Slower, but committed objects
 	// survive power loss.
@@ -123,16 +127,21 @@ const (
 
 // Backend is a filesystem storage.Backend. Create it with Open.
 type Backend struct {
-	root      string
-	sysDir    string
-	dataDir   string
-	tmpDir    string
-	uploadDir string
-	orphanDir string
-	retention time.Duration
-	fsync     bool
-	log       *slog.Logger
-	db        *bbolt.DB
+	keyMu          sync.Mutex
+	keys           map[string][]byte
+	resticMu       sync.Mutex
+	resticConfigMu sync.RWMutex
+	resticS3       *storage.ResticS3
+	root           string
+	sysDir         string
+	dataDir        string
+	tmpDir         string
+	uploadDir      string
+	orphanDir      string
+	retention      time.Duration
+	fsync          bool
+	log            *slog.Logger
+	db             *bbolt.DB
 
 	closed atomic.Bool
 	cancel context.CancelFunc
@@ -193,6 +202,9 @@ func Open(root string, opts Options) (*Backend, error) {
 		b.tightenPerm(d)
 	}
 	b.tightenPerm(b.orphanDir)
+	if err := config.RestrictDir(b.sysDir); err != nil {
+		return nil, fmt.Errorf("fs: protect encryption secrets: %w", err)
+	}
 
 	dbPath := filepath.Join(b.sysDir, "meta.db")
 	if err := b.checkMetadataPresent(dbPath); err != nil {
@@ -210,6 +222,10 @@ func Open(root string, opts Options) (*Backend, error) {
 		return nil, fmt.Errorf("fs: open metadata database %s: %w", dbPath, err)
 	}
 	b.db = db
+	if err := b.loadResticBacking(opts.ResticS3); err != nil {
+		_ = db.Close()
+		return nil, err
+	}
 	b.tightenPerm(dbPath)
 	if err := b.initSchema(); err != nil {
 		_ = db.Close()
@@ -499,13 +515,16 @@ func (p *pendingSet) has(path string) bool {
 // is created lazily, when the buffer first overflows or at finish, so empty
 // objects never touch the filesystem.
 type tmpFile struct {
-	dir  string
-	f    *os.File
-	path string // f.Name() once created
-	buf  []byte
-	n    int // buffered bytes
-	size int64
-	err  error // sticky error
+	cryptoID string
+	key      []byte
+	ew       io.WriteCloser
+	dir      string
+	f        *os.File
+	path     string // f.Name() once created
+	buf      []byte
+	n        int // buffered bytes
+	size     int64
+	err      error // sticky error
 }
 
 const writeBufSize = 64 << 10
@@ -523,7 +542,10 @@ func (t *tmpFile) open() error {
 		return t.err
 	}
 	t.f, t.path = f, f.Name()
-	return nil
+	if t.key != nil {
+		t.ew, t.err = sio.EncryptWriter(struct{ io.Writer }{f}, storage.EncryptionConfig(t.key))
+	}
+	return t.err
 }
 
 func (t *tmpFile) Write(p []byte) (int, error) {
@@ -537,7 +559,7 @@ func (t *tmpFile) Write(p []byte) (int, error) {
 			if err := t.open(); err != nil {
 				return written, err
 			}
-			n, err := t.f.Write(p)
+			n, err := t.writeDisk(p)
 			written += n
 			t.size += int64(n)
 			if err != nil {
@@ -571,7 +593,7 @@ func (t *tmpFile) flush() error {
 	if err := t.open(); err != nil {
 		return err
 	}
-	_, err := t.f.Write(t.buf[:t.n])
+	_, err := t.writeDisk(t.buf[:t.n])
 	t.n = 0
 	if err != nil {
 		t.err = fmt.Errorf("fs: write data: %w", err)
@@ -589,6 +611,9 @@ func (t *tmpFile) finish(sync, keepEmpty bool) error {
 	err := t.open()
 	if err == nil {
 		err = t.flush()
+	}
+	if err == nil && t.ew != nil {
+		err = t.ew.Close()
 	}
 	if err == nil && sync {
 		if serr := t.f.Sync(); serr != nil {
@@ -703,3 +728,10 @@ type emptyReader struct{ *bytes.Reader }
 func newEmptyReader() emptyReader { return emptyReader{bytes.NewReader(nil)} }
 
 func (emptyReader) Close() error { return nil }
+
+func (t *tmpFile) writeDisk(p []byte) (int, error) {
+	if t.ew != nil {
+		return t.ew.Write(p)
+	}
+	return t.f.Write(p)
+}

@@ -36,10 +36,24 @@ func BackingsFrom(s StorageConfig) BackingSettings {
 
 // Apply validates against the system backing and configured replication defaults.
 func (s BackingSettings) Apply(base StorageConfig) (StorageConfig, error) {
+	previous := base.Backings
 	base.Backings = nil
 	base.DefaultBacking = s.DefaultBacking
 	for _, b := range s.Backings {
-		base.Backings = append(base.Backings, BackingConfig{Name: b.Name, Backend: b.Backend, Path: b.Path})
+		next := BackingConfig{Name: b.Name, Backend: b.Backend, Path: b.Path}
+		// The live backing form edits identity/placement, not restic secrets.
+		// Retain startup S3 settings when the same filesystem is kept, without
+		// putting credentials into the backing-definition response or overlay.
+		for _, old := range previous {
+			oldPath, _ := filepath.Abs(old.Path)
+			newPath, _ := filepath.Abs(b.Path)
+			if old.Name == b.Name && old.Backend == b.Backend && oldPath == newPath && old.ResticS3 != nil {
+				cfg := *old.ResticS3
+				next.ResticS3 = &cfg
+				break
+			}
+		}
+		base.Backings = append(base.Backings, next)
 	}
 	if err := (Config{Storage: base}).validateBackings(); err != nil {
 		return base, err

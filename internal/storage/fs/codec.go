@@ -7,6 +7,8 @@ import (
 	"math"
 	"slices"
 	"time"
+
+	"github.com/seanmmitchell/gos3/internal/storage"
 )
 
 // recordFormatVersionV1 is the compact binary encoding of versionRecord, the
@@ -49,6 +51,9 @@ const recordFormatVersionV1 byte = 3
 // It is used only for records with Compression set, so databases without
 // compressed objects stay readable by builds that predate it.
 const recordFormatVersionV2 byte = 4
+
+// V3 adds actual encryption, so legacy SSE claims remain distinguishable.
+const recordFormatVersionV3 byte = 5
 
 var errShortRecord = errors.New("truncated record")
 
@@ -208,6 +213,9 @@ func encodeVersionRecord(r *versionRecord) []byte {
 	if r.Compression != "" {
 		format = recordFormatVersionV2
 	}
+	if m.Encryption != "" {
+		format = recordFormatVersionV3
+	}
 	e.b = append(e.b, format)
 	e.str(r.VersionID)
 	var flags byte
@@ -251,9 +259,12 @@ func encodeVersionRecord(r *versionRecord) []byte {
 	e.str(m.RetentionMode)
 	e.time(m.RetainUntil)
 	e.str(m.WebsiteRedirect)
-	if format == recordFormatVersionV2 {
+	if format >= recordFormatVersionV2 {
 		e.str(r.Compression)
 		e.varint(r.StoredSize)
+	}
+	if format == recordFormatVersionV3 {
+		e.str(m.Encryption)
 	}
 	return e.b
 }
@@ -261,7 +272,7 @@ func encodeVersionRecord(r *versionRecord) []byte {
 // decodeVersionRecord parses the payload (after the format byte) of an
 // encodeVersionRecord result; v2 tells whether the format byte was
 // recordFormatVersionV2.
-func decodeVersionRecord(data []byte, r *versionRecord, v2 bool) error {
+func decodeVersionRecord(data []byte, r *versionRecord, v2 bool, encrypted ...bool) error {
 	d := decoder{b: data}
 	m := &r.Meta
 	r.VersionID = d.str()
@@ -305,8 +316,15 @@ func decodeVersionRecord(data []byte, r *versionRecord, v2 bool) error {
 	if v2 {
 		r.Compression = d.str()
 		r.StoredSize = d.varint()
-		if d.err == nil && (r.Compression == "" || r.StoredSize < 0) {
+		if d.err == nil && ((r.Compression == "" && len(encrypted) == 0) || r.StoredSize < 0) {
 			d.fail(errors.New("invalid compression fields"))
+		}
+	}
+	m.Encryption = ""
+	if len(encrypted) > 0 {
+		m.Encryption = d.str()
+		if m.Encryption != storage.EncryptionAES256 && m.Encryption != storage.EncryptionRestic {
+			d.fail(errors.New("invalid encryption provider"))
 		}
 	}
 	if d.err == nil && len(d.b) != 0 {

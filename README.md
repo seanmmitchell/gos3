@@ -358,8 +358,10 @@ specified in [docs/discovery.md](docs/discovery.md).
   The standalone UI's Node server performs
   local discovery only when `GOS3_UI_LOCAL_DISCOVERY=true`, and then for
   anyone who can reach it.
-- **No encryption at rest**: server-side encryption headers are accepted for
-  compatibility only. Use disk encryption.
+- **Object encryption**: SSE-S3 encrypts new object data using server-managed
+  keys. Per-bucket restic repositories provide encrypted archival on local
+  storage or remote S3. Existing objects require rewriting to encrypt them;
+  back up the protected keys and metadata. See [encryption](docs/encryption.md).
 
 More in [docs/security.md](docs/security.md).
 
@@ -445,7 +447,8 @@ archives and image. Branch rules, versioning and the release steps are in
   configurations. Lifecycle transitions, website, notification, logging and
   replication configurations are stored but not acted on. Details are in
   [docs/s3-compatibility.md](docs/s3-compatibility.md).
-- Objects are not encrypted at rest by gos3.
+- AWS KMS encryption is not implemented. Native AES256 and restic encrypt
+  new objects when requested or enabled as the bucket default.
 - TLS certificates are loaded at startup; restart after renewal.
 
 ## License

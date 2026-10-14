@@ -111,6 +111,7 @@ type versionWriter struct {
 	cw          *compress.Writer
 	w           io.Writer
 	compression string
+	encryption  string
 	done        bool
 }
 
@@ -145,7 +146,14 @@ func (b *Backend) NewVersionWriterWith(ctx context.Context, bucket, key string, 
 	if err != nil {
 		return nil, err
 	}
-	w := &versionWriter{b: b, bucket: bucket, bucketID: id, key: key, t: b.newTemp(), compression: opts.Compression.Algorithm}
+	t, err := b.encryptedTemp(id, opts.Encryption)
+	if err != nil {
+		return nil, err
+	}
+	if opts.Encryption == storage.EncryptionRestic {
+		opts.Compression = storage.Compression{}
+	}
+	w := &versionWriter{b: b, bucket: bucket, bucketID: id, key: key, t: t, compression: opts.Compression.Algorithm, encryption: opts.Encryption}
 	if w.cw, err = newCompressor(w.t, opts.Compression); err != nil {
 		return nil, err
 	}
@@ -182,6 +190,7 @@ func (w *versionWriter) Commit(ctx context.Context, info storage.ObjectInfo) (st
 		return storage.ObjectInfo{}, errWriterDone
 	}
 	w.done = true
+	defer w.t.discard()
 	if !storage.ValidImportedVersionID(info.VersionID) {
 		w.discard()
 		return storage.ObjectInfo{}, fmt.Errorf("%w: version ID %.80q", storage.ErrInvalidName, info.VersionID)
@@ -199,7 +208,7 @@ func (w *versionWriter) Commit(ctx context.Context, info storage.ObjectInfo) (st
 		w.t.discard()
 		return storage.ObjectInfo{}, fmt.Errorf("%w: delete marker %s/%.64s with data", storage.ErrInvalidName, w.bucket, w.key)
 	}
-	dataID, path, err := w.b.finishData(w.t, w.bucketID)
+	dataID, path, err := w.b.finishEncryptedData(ctx, w.t, w.bucketID, w.encryption, w.bucket, w.key)
 	if err != nil {
 		return storage.ObjectInfo{}, err
 	}
@@ -209,6 +218,9 @@ func (w *versionWriter) Commit(ctx context.Context, info storage.ObjectInfo) (st
 	var meta storage.ObjectMeta
 	if !info.DeleteMarker {
 		meta = cloneMeta(info.ObjectMeta)
+	}
+	if !info.DeleteMarker {
+		meta.Encryption = w.encryption
 	}
 	return w.b.commitObject(commitReq{
 		bucket:      w.bucket,

@@ -323,6 +323,7 @@ func (b *Backend) CompleteMultipartUploadWith(ctx context.Context, bucketName, k
 			data = append(data, p.data...)
 		}
 	}
+	meta.Encryption = wopts.Encryption
 	info, err := b.commitLocked(bk, key, data, enc, meta, opts)
 	if err != nil {
 		return storage.ObjectInfo{}, err

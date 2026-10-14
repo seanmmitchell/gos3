@@ -62,9 +62,12 @@ func (s *Server) objectCompression(ctx context.Context, bucket string, meta stor
 
 // newObjectWriter starts a new version of bucket/key, compressed as c
 // says when the backend supports it.
-func (s *Server) newObjectWriter(ctx context.Context, bucket, key string, c storage.Compression) (storage.ObjectWriter, error) {
-	if cb, ok := s.backend.(storage.CompressingBackend); ok && c.Enabled() {
-		return cb.NewObjectWriterWith(ctx, bucket, key, storage.WriteOptions{Compression: c})
+func (s *Server) newObjectWriter(ctx context.Context, bucket, key string, c storage.Compression, encryption string) (storage.ObjectWriter, error) {
+	if cb, ok := s.backend.(storage.CompressingBackend); ok && (c.Enabled() || encryption != "") {
+		return cb.NewObjectWriterWith(ctx, bucket, key, storage.WriteOptions{Compression: c, Encryption: encryption})
+	}
+	if encryption != "" {
+		return nil, errors.ErrUnsupported
 	}
 	return s.backend.NewObjectWriter(ctx, bucket, key)
 }
@@ -73,15 +76,21 @@ func (s *Server) newObjectWriter(ctx context.Context, bucket, key string, c stor
 // object as the compression policy says.
 func (s *Server) completeMultipartUpload(ctx context.Context, bucket, key, uploadID string, partNumbers []int,
 	meta storage.ObjectMeta, cond storage.CommitOptions) (storage.ObjectInfo, error) {
+	if err := s.prepareEncryption(ctx, bucket, &meta); err != nil {
+		return storage.ObjectInfo{}, err
+	}
 	var size int64
 	for _, n := range meta.PartSizes {
 		size += n
 	}
 	if cb, ok := s.backend.(storage.CompressingBackend); ok {
-		if c := s.objectCompression(ctx, bucket, meta, size); c.Enabled() {
+		if c := s.objectCompression(ctx, bucket, meta, size); c.Enabled() || meta.Encryption != "" {
 			return cb.CompleteMultipartUploadWith(ctx, bucket, key, uploadID, partNumbers, meta, cond,
-				storage.WriteOptions{Compression: c})
+				storage.WriteOptions{Compression: c, Encryption: meta.Encryption})
 		}
+	}
+	if meta.Encryption != "" {
+		return storage.ObjectInfo{}, errors.ErrUnsupported
 	}
 	return s.backend.CompleteMultipartUpload(ctx, bucket, key, uploadID, partNumbers, meta, cond)
 }

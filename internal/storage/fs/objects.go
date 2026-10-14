@@ -100,6 +100,7 @@ func (b *Backend) commitObject(req commitReq) (storage.ObjectInfo, error) {
 				}); err != nil {
 					return err
 				}
+				req.meta.Encryption = rec.Meta.Encryption
 				rec.Meta = req.meta
 			}
 			rec.LastModified = created
@@ -139,7 +140,10 @@ func (b *Backend) finishData(t *tmpFile, bucketID string) (dataID, path string, 
 		t.remove()
 		return "", "", nil
 	}
-	dataID = randomHex(16)
+	dataID = t.cryptoID
+	if dataID == "" {
+		dataID = randomHex(16)
+	}
 	path = b.dataPath(bucketID, dataID)
 	b.pending.add(path)
 	if err := b.place(t.path, path); err != nil {
@@ -211,6 +215,7 @@ type objectWriter struct {
 	cw          *compress.Writer
 	w           io.Writer
 	compression string
+	encryption  string
 	done        bool
 }
 
@@ -245,7 +250,14 @@ func (b *Backend) NewObjectWriterWith(ctx context.Context, bucket, key string, o
 	if err != nil {
 		return nil, err
 	}
-	w := &objectWriter{b: b, bucket: bucket, bucketID: id, key: key, t: b.newTemp(), compression: opts.Compression.Algorithm}
+	t, err := b.encryptedTemp(id, opts.Encryption)
+	if err != nil {
+		return nil, err
+	}
+	if opts.Encryption == storage.EncryptionRestic {
+		opts.Compression = storage.Compression{}
+	}
+	w := &objectWriter{b: b, bucket: bucket, bucketID: id, key: key, t: t, compression: opts.Compression.Algorithm, encryption: opts.Encryption}
 	if w.cw, err = newCompressor(w.t, opts.Compression); err != nil {
 		return nil, err
 	}
@@ -280,6 +292,7 @@ func (w *objectWriter) Commit(ctx context.Context, meta storage.ObjectMeta, opts
 		return storage.ObjectInfo{}, errWriterDone
 	}
 	w.done = true
+	defer w.t.discard()
 	if err := w.b.begin(ctx); err != nil {
 		w.discard()
 		return storage.ObjectInfo{}, err
@@ -289,13 +302,14 @@ func (w *objectWriter) Commit(ctx context.Context, meta storage.ObjectMeta, opts
 		w.t.discard()
 		return storage.ObjectInfo{}, err
 	}
-	dataID, path, err := w.b.finishData(w.t, w.bucketID)
+	dataID, path, err := w.b.finishEncryptedData(ctx, w.t, w.bucketID, w.encryption, w.bucket, w.key)
 	if err != nil {
 		return storage.ObjectInfo{}, err
 	}
 	if path != "" {
 		defer w.b.pending.done(path)
 	}
+	meta.Encryption = w.encryption
 	return w.b.commitObject(commitReq{
 		bucket:      w.bucket,
 		bucketID:    w.bucketID,
@@ -395,9 +409,46 @@ func (b *Backend) OpenObject(ctx context.Context, bucket, key, versionID string)
 			_ = f.Close()
 			return storage.ObjectInfo{}, nil, fmt.Errorf("fs: stat data of %s/%s: %w", bucket, key, err)
 		}
-		if want := info.PhysicalSize(); st.Size() != want {
+		want := info.PhysicalSize()
+		if info.Encryption == storage.EncryptionRestic {
+			want = 64
+		}
+		if st.Size() != want {
 			_ = f.Close()
 			return storage.ObjectInfo{}, nil, fmt.Errorf("%w: data file of %s/%s has %d bytes, expected %d", errCorrupt, bucket, key, st.Size(), want)
+		}
+		if info.Encryption == storage.EncryptionRestic {
+			rd, err := b.openRestic(ctx, f, bucketID, info.Size)
+			return info, rd, err
+		}
+		if info.Encryption == storage.EncryptionAES256 {
+			key, err := b.bucketKey(bucketID, false)
+			if err != nil {
+				_ = f.Close()
+				return storage.ObjectInfo{}, nil, err
+			}
+			size := info.Size
+			if info.Compression != "" {
+				size = info.StoredSize
+			}
+			key, err = objectDataKey(key, dataID)
+			if err != nil {
+				_ = f.Close()
+				return storage.ObjectInfo{}, nil, err
+			}
+			rd, err := decryptFile(f, key, size, f.Close)
+			if err != nil {
+				_ = f.Close()
+				return storage.ObjectInfo{}, nil, err
+			}
+			if info.Compression == "" {
+				return info, rd, nil
+			}
+			z, err := openCompressed(rd, info)
+			if err != nil {
+				_ = rd.Close()
+			}
+			return info, z, err
 		}
 		if info.Compression == "" {
 			return info, &fileReader{f: f}, nil
@@ -413,7 +464,10 @@ func (b *Backend) OpenObject(ctx context.Context, bucket, key, versionID string)
 
 // openCompressed returns a reader over the content of the compressed data
 // file f of the version info.
-func openCompressed(f *os.File, info storage.ObjectInfo) (io.ReadSeekCloser, error) {
+func openCompressed(f interface {
+	io.ReaderAt
+	io.Closer
+}, info storage.ObjectInfo) (io.ReadSeekCloser, error) {
 	if info.Compression != storage.CompressionDeflate {
 		return nil, fmt.Errorf("%w: unknown compression %q", errCorrupt, info.Compression)
 	}
@@ -432,7 +486,7 @@ func openCompressed(f *os.File, info storage.ObjectInfo) (io.ReadSeekCloser, err
 // a compress.Reader over the data file. Close closes both, idempotently.
 type compressedReader struct {
 	*compress.Reader
-	f      *os.File
+	f      io.Closer
 	closed sync.Once
 	err    error
 }
@@ -538,9 +592,11 @@ func (b *Backend) updateObjectMeta(ctx context.Context, bucket, key, versionID s
 				return storage.ObjectInfo{}, err
 			}
 		}
+		encryption := rec.Meta.Encryption
 		if err := fn(&rec.Meta); err != nil {
 			return storage.ObjectInfo{}, err
 		}
+		rec.Meta.Encryption = encryption
 		rec.Meta = cloneMeta(rec.Meta)
 		newRaw, err := encodeRecord(rec)
 		if err != nil {

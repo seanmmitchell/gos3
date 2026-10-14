@@ -758,7 +758,7 @@ func (r *Router) CompleteMultipartUploadWith(ctx context.Context, bucket, key, u
 	opts = cb.commitOptions(opts)
 	err := r.objectWrite(ctx, bucket, key, cb, func(b storage.Backend) error {
 		var err error
-		if !wopts.Compression.Enabled() {
+		if !wopts.Compression.Enabled() && wopts.Encryption == "" {
 			info, err = b.CompleteMultipartUpload(ctx, bucket, key, uploadID, partNumbers, meta, opts)
 			return err
 		}

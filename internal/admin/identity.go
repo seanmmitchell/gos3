@@ -49,6 +49,7 @@ var adminActions = []string{
 	"CreateAccessKey", "UpdateAccessKey", "DeleteAccessKey",
 	"ListPolicies", "GetPolicy", "PutPolicy", "DeletePolicy", "SimulatePolicy",
 	"ListBuckets", "GetBucket", "ForceDeleteBucket", "GetBucketCompression", "PutBucketCompression",
+	"GetBucketEncryption", "PutBucketEncryption",
 	"ListBackings", "GetBucketPlacement", "UpdateBucketPlacement",
 	"GetDiscovery", "ScanNetwork", "ProbeNetwork",
 }

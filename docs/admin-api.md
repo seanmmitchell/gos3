@@ -65,7 +65,7 @@ ARNs, policy variables such as `${aws:username}` included):
 |---|---|
 | `arn:gos3:admin:::user/<name>` | CreateUser (the new user's name), GetUser, UpdateUser, DeleteUser, CreateAccessKey (the target user; choosing the access key ID also needs it at service level), UpdateAccessKey / DeleteAccessKey (the key's owner; an unknown key is evaluated at service level) |
 | `arn:gos3:admin:::policy/<name>` | GetPolicy, PutPolicy, DeletePolicy |
-| `arn:gos3:admin:::bucket/<name>` | GetBucket, ForceDeleteBucket, GetBucketCompression, PutBucketCompression, GetBucketPlacement, UpdateBucketPlacement |
+| `arn:gos3:admin:::bucket/<name>` | GetBucket, ForceDeleteBucket, GetBucketCompression, PutBucketCompression, GetBucketEncryption, PutBucketEncryption, GetBucketPlacement, UpdateBucketPlacement |
 | service level | every other action (list actions, config, stats, discovery, simulate, self-service) |
 
 The policy resources `*` and `arn:gos3:admin:::*` match every admin
@@ -290,6 +290,41 @@ environment and flags for these fields.
 Compression is transparent to S3 clients (same content, ETags, checksums
 and sizes); `storedBytes` and `storedVersionBytes` count what the backend
 stores. See [operations.md](operations.md#compression).
+
+### Object encryption providers
+
+| Method | Path | Action | Response |
+|---|---|---|---|
+| GET | `/buckets/{name}/encryption-provider` | GetBucketEncryption | `{"provider":"AES256"\|"restic", "backings":["default",…]}` |
+| PUT | `/buckets/{name}/encryption-provider` | PutBucketEncryption | body `{"provider":"AES256"\|"restic"}`; prepares the provider and returns its saved selection with `ready` and optional `error` |
+
+Provider actions use `arn:gos3:admin:::bucket/<name>`. Storage and secret fields
+are rejected: restic derives its repository from each assigned backing. GET lists
+saved settings and assigned backings, not repository health. A failed preparation
+after saving returns 200 with `ready:false` so the configuration can be retried.
+Provider selection alone does not enable S3 bucket-default encryption; use
+PutBucketEncryption with AES256 (also for restic), or an AES256 upload header.
+
+| Method | Path | Action | Response |
+|---|---|---|---|
+| GET | `/backings/{name}/restic` | ListBackings | `ResticBacking`; credentials omitted |
+| PUT | `/backings/{name}/restic` | UpdateConfig | Sets local or S3 restic storage for the backing; validates credentials before saving |
+
+Both backing actions are evaluated at service level. A memory or unknown backing
+returns 404. PUT accepts `{"mode":"local"}` or:
+
+```json
+{ "mode":"s3", "endpoint":"https://s3.example.com", "bucket":"archives",
+  "prefix":"gos3", "region":"us-east-1", "accessKey":"AK", "secretKey":"SK" }
+```
+
+Optional `sessionToken` is write-only; `clearSessionToken:true` clears it.
+Blank credentials retain saved values. Responses contain `mode`, `endpoint`,
+`bucket`, `prefix`, `region`, `credentialsConfigured`,
+`sessionTokenConfigured`, and `locked`, never secrets. Locations are fixed
+once repositories have been prepared, including retained deleted-bucket archives;
+use a placement move to another backing to change storage. Settings persist in
+the backing's protected system directory. See [encryption.md](encryption.md).
 
 ### Storage backings and bucket placement
 

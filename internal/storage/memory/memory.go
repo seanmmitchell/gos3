@@ -40,6 +40,8 @@ import (
 	"strconv"
 	"sync"
 	"time"
+
+	"github.com/minio/sio"
 	"unicode/utf8"
 
 	"github.com/seanmmitchell/gos3/internal/storage"
@@ -117,6 +119,7 @@ type version struct {
 	// from another backend.
 	imported     bool
 	meta         storage.ObjectMeta
+	dataKey      []byte
 	data         []byte // the content, or its compressed form (compression set)
 	lastModified time.Time
 	// compression is the algorithm data is compressed with ("" = none);
@@ -179,9 +182,15 @@ func (v *version) info(bucketName, key string, isLatest bool) storage.ObjectInfo
 		LastModified: v.lastModified,
 	}
 	if !v.deleteMarker {
+		dataSize := int64(len(v.data))
+		if v.meta.Encryption != "" {
+			n, _ := sio.DecryptedSize(uint64(dataSize))
+			dataSize = int64(n)
+			oi.Size = dataSize
+		}
 		oi.ObjectMeta = cloneMeta(v.meta)
 		if v.compression != "" {
-			oi.Size, oi.Compression, oi.StoredSize = v.size, v.compression, int64(len(v.data))
+			oi.Size, oi.Compression, oi.StoredSize = v.size, v.compression, dataSize
 		}
 	}
 	return oi

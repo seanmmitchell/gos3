@@ -713,3 +713,33 @@ export interface HealthStatus {
   status: 'ok' | 'unavailable' | string
   error?: string
 }
+
+/** Per-bucket implementation of SSE-S3, with storage inherited from placement. */
+export interface BucketEncryptionProvider {
+ provider: 'AES256' | 'restic'
+ backings?: string[]
+ ready?: boolean
+ error?: string
+}
+export interface BucketEncryptionProviderInput { provider: 'AES256' | 'restic' }
+export interface ResticBacking {
+ mode: 'local' | 's3'
+ endpoint: string
+ bucket: string
+ prefix: string
+ region: string
+ credentialsConfigured: boolean
+ sessionTokenConfigured: boolean
+ locked: boolean
+}
+export interface ResticBackingInput {
+ mode: 'local' | 's3'
+ endpoint?: string
+ bucket?: string
+ prefix?: string
+ region?: string
+ accessKey?: string
+ secretKey?: string
+ sessionToken?: string
+ clearSessionToken?: boolean
+}

@@ -209,6 +209,8 @@ func (r *uploadRecord) info(bucket, uploadID string) storage.UploadInfo {
 
 // partRecord is the persisted form of an uploaded part.
 type partRecord struct {
+	KeyID        string            `json:"keyID,omitempty"`
+	Encrypted    bool              `json:"encrypted,omitempty"`
 	File         string            `json:"file"` // file name inside the upload directory
 	Size         int64             `json:"size"`
 	LastModified time.Time         `json:"mtime"`
@@ -264,12 +266,16 @@ func decodeRecord(data []byte, v any) error {
 		err = json.Unmarshal(data[1:], v)
 	case recordFormatGob:
 		err = gob.NewDecoder(bytes.NewReader(data[1:])).Decode(v)
-	case recordFormatVersionV1, recordFormatVersionV2:
+	case recordFormatVersionV1, recordFormatVersionV2, recordFormatVersionV3:
 		r, ok := v.(*versionRecord)
 		if !ok {
 			return fmt.Errorf("%w: version record format for %T", errCorrupt, v)
 		}
-		err = decodeVersionRecord(data[1:], r, data[0] == recordFormatVersionV2)
+		if data[0] == recordFormatVersionV3 {
+			err = decodeVersionRecord(data[1:], r, true, true)
+		} else {
+			err = decodeVersionRecord(data[1:], r, data[0] == recordFormatVersionV2)
+		}
 	default:
 		return fmt.Errorf("%w: unknown record format %d", errCorrupt, data[0])
 	}

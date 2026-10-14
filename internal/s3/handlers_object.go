@@ -215,7 +215,7 @@ func (s *Server) commitError(ctx context.Context, err error, bucket, key string,
 // is aborted on any error.
 func (s *Server) storeObject(ctx context.Context, bucket, key string, src io.Reader, size int64, meta storage.ObjectMeta,
 	cond storage.CommitOptions, finish func(*storage.ObjectMeta) error) (storage.ObjectInfo, error) {
-	ow, err := s.newObjectWriter(ctx, bucket, key, s.objectCompression(ctx, bucket, meta, size))
+	ow, err := s.newObjectWriter(ctx, bucket, key, s.objectCompression(ctx, bucket, meta, size), meta.Encryption)
 	if err != nil {
 		return storage.ObjectInfo{}, bucketError(err, bucket)
 	}
@@ -260,7 +260,7 @@ func (s *Server) newObjectPayload(r *http.Request, rc *reqContext, opts payloadO
 //     s3:PutObjectRetention / s3:PutObjectLegalHold permissions
 //     (o.legalHoldSet: a legal hold header or field was given);
 //   - without explicit retention, the bucket's default retention applies;
-//   - without explicit SSE, the bucket's default encryption is recorded;
+//   - without explicit SSE, the bucket's default encryption applies;
 //   - a canned ACL (o.aclSet: given explicitly) requires s3:PutObjectAcl
 //     and must be allowed by the bucket's ownership controls and public
 //     access block;
@@ -300,7 +300,7 @@ func (s *Server) prepareNewObject(ctx context.Context, r *http.Request, rc *reqC
 		}
 		meta.SSE, meta.SSEKMSKeyID = sse, kmsKey
 	}
-	return nil
+	return s.prepareEncryption(ctx, bi.Name, meta, r.UserAgent())
 }
 
 // authorizeNewObject makes the authorization checks of prepareNewObject
@@ -579,7 +579,7 @@ func setChecksumHeaders(h http.Header, sums map[string]string, typ string) {
 
 // setSSEHeaders reports the server-side encryption of an object.
 func setSSEHeaders(h http.Header, meta storage.ObjectMeta) {
-	if meta.SSE == "" {
+	if meta.SSE == "" || meta.Encryption == "" {
 		return
 	}
 	h.Set("X-Amz-Server-Side-Encryption", meta.SSE)
