@@ -125,11 +125,13 @@ ListObjectsV2, ListParts and GetObjectAttributes.
   `${aws:username}` variables, and condition operators `String*`, `Numeric*`,
   `Date*`, `Bool`, `IpAddress`/`NotIpAddress`, `Null`, `ArnLike`, `…IfExists`,
   `ForAnyValue:` / `ForAllValues:`.
-  Condition key names are case-insensitive, except for the tag key of
+  Condition key names are case-insensitive, including the tag key of
   tag-qualified keys (`s3:ExistingObjectTag/<key>`,
-  `s3:RequestObjectTag/<key>`, `aws:RequestTag/<key>`, ...): only the part
-  before the `/` is, so `s3:existingobjecttag/Public` tests the tag `Public`
-  and never the tag `public`. As on AWS, a policy variable with no value
+  `s3:RequestObjectTag/<key>`, `aws:RequestTag/<key>`, ...), so
+  `s3:existingobjecttag/Public` also matches the tag key `public`. Values
+  retain the case sensitivity of the condition operator. Avoid tag keys
+  differing only in case: their values share a condition key. As on AWS,
+  a policy variable with no value
   (such as `${aws:username}` for an anonymous caller) and no
   `${key, 'default'}` is effectively null: positive operators
   (`StringEquals`, `StringLike`, `ArnLike`, ...) do not match it, but negated

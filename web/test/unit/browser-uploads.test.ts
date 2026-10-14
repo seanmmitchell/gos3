@@ -1,8 +1,9 @@
 import { createPinia, setActivePinia } from 'pinia'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
+import { effectScope } from 'vue'
 import { bindUploadsToConnections, UPLOAD_CREDENTIALS_CLEARED, UPLOAD_NOT_CONNECTED, UploadQueue, uploadEta } from '~/composables/useUploads'
 import type { Uploader } from '~/composables/useUploads'
-import { useConnectionsStore } from '~/stores/connections'
+import { LOCAL_STORAGE_KEY, useConnectionsStore } from '~/stores/connections'
 import type { PutObjectOptions, UploadLargeOptions } from '~/types/s3'
 import { clearClientCache, getS3Client } from '~/utils/clients'
 import { S3Client } from '~/utils/s3/client'
@@ -256,6 +257,46 @@ describe('bindUploadsToConnections', () => {
     sessionStorage.clear()
     clearClientCache()
     setActivePinia(createPinia())
+  })
+
+  it.each(['remove', 'sign out'])('stops running and queued uploads when another tab performs %s', async (action) => {
+    let onStorage: EventListener | undefined
+    vi.stubGlobal('addEventListener', (name: string, listener: EventListener) => {
+      if (name === 'storage') onStorage = listener
+    })
+    const store = useConnectionsStore()
+    await store.init({ skipServersJson: true, embedded: false })
+    const conn = store.add({ endpoint: 'http://localhost:9000', accessKeyId: 'AK', secretAccessKey: 'SK', remember: true })
+    const f = fakeClient()
+    const q = new UploadQueue({ concurrency: 1 })
+    const scope = effectScope()
+    const off = scope.run(() => bindUploadsToConnections(q, store))!
+    // The shared queue must remain bound after its original component leaves.
+    scope.stop()
+    const items = q.enqueue({ client: f.client, connectionId: conn.id, bucket: 'b', files: ['a', 'b'].map(key => ({ key, file: file(key, 1) })) })
+    expect(items.map(i => i.status)).toEqual(['uploading', 'queued'])
+    expect(onStorage).toBeDefined()
+
+    // Exercise the actual storage listener, not store.syncFromStorage's
+    // Pinia wrapper: internal calls do not invoke action subscriptions.
+    onStorage!({
+      key: LOCAL_STORAGE_KEY,
+      newValue: JSON.stringify({
+        connections: action === 'remove' ? [] : [{ ...conn, secretAccessKey: '' }],
+        defaultId: null,
+        dismissedPresets: []
+      })
+    } as StorageEvent)
+    expect(store.hasCredentials(store.byId(conn.id))).toBe(false)
+    expect(f.calls[0]!.opts.signal!.aborted).toBe(true)
+    expect(items.map(i => i.status)).toEqual(['error', 'error'])
+    expect(items.every(i => i.error === UPLOAD_CREDENTIALS_CLEARED)).toBe(true)
+    await tick()
+    expect(f.calls).toHaveLength(1)
+    q.retry(items[1]!.id)
+    expect(items[1]!.error).toBe(UPLOAD_NOT_CONNECTED)
+    expect(f.calls).toHaveLength(1)
+    off()
   })
 
   it('stops a connection\'s uploads when its credentials are cleared and retries with the new key', async () => {

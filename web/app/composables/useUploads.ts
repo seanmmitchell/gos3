@@ -407,12 +407,9 @@ export class UploadQueue {
 
 type ConnectionsStore = ReturnType<typeof useConnectionsStore>
 
-/** Store actions after which a connection may have lost its credentials. */
-const CREDENTIAL_ACTIONS = new Set(['clearCredentials', 'remove', 'update', 'setCredentials', 'syncFromStorage', 'importJson', 'resetState'])
-
 /**
  * Binds a queue to the connections store: retries resolve the connection's
- * current S3 client, and after a store action that can drop credentials
+ * current S3 client, and after a state change that can drop credentials
  * (sign-out, removal, a change merged from another tab …) the uploads of
  * every connection left without credentials are stopped (forgetConnection).
  * Returns a function that undoes the binding.
@@ -422,14 +419,14 @@ export function bindUploadsToConnections(queue: UploadQueue, store: ConnectionsS
     const c = store.byId(id)
     return c && hasCredentials(c) ? getS3Client(c) : undefined
   })
-  const off = store.$onAction(({ name, after }) => {
-    if (!CREDENTIAL_ACTIONS.has(name)) return
-    after(() => {
-      for (const id of queue.connectionIds()) {
-        if (!hasCredentials(store.byId(id))) queue.forgetConnection(id)
-      }
-    })
-  }, true) // detached: the queue outlives the component that created it
+  // Storage events call the store's internal syncFromStorage directly,
+  // bypassing Pinia action hooks. Observe state, synchronously, so no upload
+  // can finish and start the next queued item after credentials disappear.
+  const off = store.$subscribe(() => {
+    for (const id of queue.connectionIds()) {
+      if (!hasCredentials(store.byId(id))) queue.forgetConnection(id)
+    }
+  }, { detached: true, flush: 'sync' }) // the queue outlives its component
   return () => {
     off()
     queue.setClientResolver(undefined)

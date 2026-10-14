@@ -221,10 +221,9 @@ func TestParseCondOp(t *testing.T) {
 	}
 }
 
-// Condition key names are case-insensitive, but the tag key of a
-// tag-qualified key is not: Public and public are different tags, and
-// tags whose keys differ only in case are never merged.
-func TestTagConditionKeysCaseSensitive(t *testing.T) {
+// IAM condition key names, including tag-qualified keys, are case-insensitive:
+// https://docs.aws.amazon.com/IAM/latest/UserGuide/reference_policies_elements_condition.html
+func TestTagConditionKeysCaseInsensitive(t *testing.T) {
 	alice := user("alice")
 	envTags := map[string][]string{
 		"s3:ExistingObjectTag/Env": {"prod"},
@@ -239,25 +238,27 @@ func TestTagConditionKeysCaseSensitive(t *testing.T) {
 		want bool
 	}{
 		{"exact tag key", "StringEquals", "s3:ExistingObjectTag/Public", []string{"yes"}, kv("s3:ExistingObjectTag/Public", "yes"), true},
-		{"tag key case differs", "StringEquals", "s3:ExistingObjectTag/Public", []string{"yes"}, kv("s3:ExistingObjectTag/public", "yes"), false},
-		{"tag key case differs negated", "StringNotEquals", "s3:ExistingObjectTag/Public", []string{"no"}, kv("s3:ExistingObjectTag/public", "no"), true},
-		{"tag key case differs null", "Null", "s3:ExistingObjectTag/Public", []string{"true"}, kv("s3:ExistingObjectTag/public", "yes"), true},
+		{"tag key case differs", "StringEquals", "s3:ExistingObjectTag/Public", []string{"yes"}, kv("s3:ExistingObjectTag/public", "yes"), true},
+		{"tag value remains sensitive", "StringEquals", "s3:ExistingObjectTag/Public", []string{"YES"}, kv("s3:ExistingObjectTag/public", "yes"), false},
+		{"tag key case differs negated", "StringNotEquals", "s3:ExistingObjectTag/Public", []string{"no"}, kv("s3:ExistingObjectTag/public", "no"), false},
+		{"tag key case differs null", "Null", "s3:ExistingObjectTag/Public", []string{"true"}, kv("s3:ExistingObjectTag/public", "yes"), false},
 		{"prefix case insensitive", "StringEquals", "S3:existingObjectTag/Public", []string{"yes"}, kv("s3:ExistingObjectTag/Public", "yes"), true},
-		{"prefix case insensitive tag case differs", "StringEquals", "S3:EXISTINGOBJECTTAG/PUBLIC", []string{"yes"}, kv("s3:ExistingObjectTag/Public", "yes"), false},
-		{"request object tag", "StringEquals", "s3:RequestObjectTag/Team", []string{"a"}, kv("s3:RequestObjectTag/team", "a"), false},
+		{"prefix case insensitive tag case differs", "StringEquals", "S3:EXISTINGOBJECTTAG/PUBLIC", []string{"yes"}, kv("s3:ExistingObjectTag/Public", "yes"), true},
+		{"request object tag", "StringEquals", "s3:RequestObjectTag/Team", []string{"a"}, kv("s3:RequestObjectTag/team", "a"), true},
 		{"request object tag prefix", "StringEquals", "s3:requestobjecttag/Team", []string{"a"}, kv("s3:RequestObjectTag/Team", "a"), true},
-		{"aws request tag", "StringEquals", "aws:RequestTag/Team", []string{"a"}, kv("aws:RequestTag/team", "a"), false},
+		{"aws request tag", "StringEquals", "aws:RequestTag/Team", []string{"a"}, kv("aws:RequestTag/team", "a"), true},
 		{"aws resource tag", "StringEquals", "AWS:resourcetag/Team", []string{"a"}, kv("aws:ResourceTag/Team", "a"), true},
-		{"Env only prod", "StringEquals", "s3:ExistingObjectTag/Env", []string{"prod"}, envTags, true},
-		{"Env not dev", "StringEquals", "s3:ExistingObjectTag/Env", []string{"dev"}, envTags, false},
-		{"env only dev", "StringEquals", "s3:ExistingObjectTag/env", []string{"dev"}, envTags, true},
-		{"env not prod", "StringEquals", "s3:ExistingObjectTag/env", []string{"prod"}, envTags, false},
-		{"ENV not prod", "StringEquals", "s3:ExistingObjectTag/ENV", []string{"prod"}, envTags, false},
-		{"ENV not dev", "StringEquals", "s3:ExistingObjectTag/ENV", []string{"dev"}, envTags, false},
-		{"ENV absent", "Null", "s3:ExistingObjectTag/ENV", []string{"true"}, envTags, true},
-		{"Env prefix case not merged", "StringEquals", "S3:ExistingObjectTag/Env", []string{"dev"}, envTags, false},
-		{"Env StringNotEquals dev", "StringNotEquals", "s3:existingobjecttag/Env", []string{"dev"}, envTags, true},
-		{"variable tag key case differs", "StringEquals", "s3:prefix", []string{"${s3:ExistingObjectTag/public}"}, map[string][]string{"s3:prefix": {"yes"}, "s3:ExistingObjectTag/Public": {"yes"}}, false},
+		{"Env prod", "StringEquals", "s3:ExistingObjectTag/Env", []string{"prod"}, envTags, true},
+		{"Env dev", "StringEquals", "s3:ExistingObjectTag/Env", []string{"dev"}, envTags, true},
+		{"env dev", "StringEquals", "s3:ExistingObjectTag/env", []string{"dev"}, envTags, true},
+		{"env prod", "StringEquals", "s3:ExistingObjectTag/env", []string{"prod"}, envTags, true},
+		{"ENV prod", "StringEquals", "s3:ExistingObjectTag/ENV", []string{"prod"}, envTags, true},
+		{"ENV dev", "StringEquals", "s3:ExistingObjectTag/ENV", []string{"dev"}, envTags, true},
+		{"ENV present", "Null", "s3:ExistingObjectTag/ENV", []string{"true"}, envTags, false},
+		{"Env prefix case merged", "StringEquals", "S3:ExistingObjectTag/Env", []string{"dev"}, envTags, true},
+		{"Env StringNotEquals dev", "StringNotEquals", "s3:existingobjecttag/Env", []string{"dev"}, envTags, false},
+		{"Env all values differ", "ForAllValues:StringEquals", "s3:ExistingObjectTag/Env", []string{"prod"}, envTags, false},
+		{"variable tag key case differs", "StringEquals", "s3:prefix", []string{"${s3:ExistingObjectTag/public}"}, map[string][]string{"s3:prefix": {"yes"}, "s3:ExistingObjectTag/Public": {"yes"}}, true},
 		{"variable prefix case insensitive", "StringEquals", "s3:prefix", []string{"${S3:existingobjecttag/Public}"}, map[string][]string{"s3:prefix": {"yes"}, "s3:ExistingObjectTag/Public": {"yes"}}, true},
 	}
 	for _, tt := range tests {
@@ -268,14 +269,28 @@ func TestTagConditionKeysCaseSensitive(t *testing.T) {
 		})
 	}
 
-	// A public-read rule on the tag Public=yes does not open objects
-	// tagged public=yes.
+	// The same condition must match regardless of the stored tag's case.
 	m := newEvalManager(t)
 	bp := mustBucketPolicy(t, "b", `{"Statement":[{"Sid":"Tagged","Effect":"Allow","Principal":"*","Action":"s3:GetObject","Resource":"arn:aws:s3:::b/*","Condition":{"StringEquals":{"s3:ExistingObjectTag/Public":"yes"}}}]}`)
 	runAuthzCases(t, m, []authzCase{
 		{name: "tag Public=yes", id: anon, action: "s3:GetObject", bucket: "b", key: "k", bp: bp, cond: kv("s3:ExistingObjectTag/Public", "yes"), want: true, wantReason: "Sid=Tagged"},
-		{name: "tag public=yes", id: anon, action: "s3:GetObject", bucket: "b", key: "k", bp: bp, cond: kv("s3:ExistingObjectTag/public", "yes"), want: false},
-		{name: "tag PUBLIC=yes", id: anon, action: "s3:GetObject", bucket: "b", key: "k", bp: bp, cond: kv("s3:ExistingObjectTag/PUBLIC", "yes"), want: false},
+		{name: "tag public=yes", id: anon, action: "s3:GetObject", bucket: "b", key: "k", bp: bp, cond: kv("s3:ExistingObjectTag/public", "yes"), want: true, wantReason: "Sid=Tagged"},
+		{name: "tag PUBLIC=yes", id: anon, action: "s3:GetObject", bucket: "b", key: "k", bp: bp, cond: kv("s3:ExistingObjectTag/PUBLIC", "yes"), want: true, wantReason: "Sid=Tagged"},
+	})
+}
+
+func TestMixedCaseTagDeny(t *testing.T) {
+	m := newEvalManager(t)
+	bp := mustBucketPolicy(t, "b", `{"Statement":[
+		{"Effect":"Allow","Principal":"*","Action":"s3:GetObject","Resource":"arn:aws:s3:::b/*"},
+		{"Effect":"Deny","Principal":"*","Action":"s3:GetObject","Resource":"arn:aws:s3:::b/*","Condition":{"StringEquals":{"s3:ExistingObjectTag/Classification":"private"}}}]}`)
+	runAuthzCases(t, m, []authzCase{
+		{name: "lowercase tag still denies", id: anon, action: "s3:GetObject", bucket: "b", key: "k", bp: bp, cond: kv("s3:ExistingObjectTag/classification", "private"), want: false, wantDeny: true},
+		{name: "exact tag cannot hide lowercase denial", id: anon, action: "s3:GetObject", bucket: "b", key: "k", bp: bp, cond: map[string][]string{
+			"s3:ExistingObjectTag/Classification": {"public"},
+			"s3:ExistingObjectTag/classification": {"private"},
+		}, want: false, wantDeny: true},
+		{name: "public value still allows", id: anon, action: "s3:GetObject", bucket: "b", key: "k", bp: bp, cond: kv("s3:ExistingObjectTag/classification", "public"), want: true},
 	})
 }
 
