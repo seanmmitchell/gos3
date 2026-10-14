@@ -159,6 +159,14 @@ changed while running.
 
 #### Storage backings
 
+Filesystem backings may also define `restic_s3` with `endpoint`, `bucket`,
+`prefix`, `region`, `access_key`, `secret_key`, and optional `session_token`.
+For the default backing use `storage.restic_s3`; for others use
+`storage.backings[].restic_s3`. Restic buckets derive repositories from their
+assigned backings. These settings can be managed on the server Storage page;
+persisted backing settings override startup values. See
+[encryption.md](encryption.md#backing-storage-for-restic) for examples and recovery.
+
 A server can spread its buckets over several **backings**, for example one
 fs directory per disk. The backing configured by `storage.backend` and
 `storage.path` is named `default` and also holds the system state; each entry

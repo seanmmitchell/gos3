@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/url"
+	"strings"
 
 	"github.com/minio/sio"
 )
@@ -16,16 +18,50 @@ const (
 	ConfigEncryptionProvider = "encryption-provider"
 )
 
-// Repository credentials are internal bucket state, replicated only between
-// trusted storage backings. Admin responses must never serialize this type.
+// Only provider selection is bucket state. Repository locations and S3
+// credentials belong to the backing and must never replicate with a bucket.
 type EncryptionSettings struct {
-	Provider     string `json:"provider"`
-	Repository   string `json:"repository,omitempty"`
-	AccessKey    string `json:"accessKey,omitempty"`
-	SecretKey    string `json:"secretKey,omitempty"`
-	SessionToken string `json:"sessionToken,omitempty"`
-	Password     string `json:"password,omitempty"`
-	Region       string `json:"region,omitempty"`
+	Provider string `json:"provider"`
+}
+
+// ResticS3 defines the S3 storage of one backing's restic repositories.
+// A nil setting uses the backing's local filesystem. Secrets are write-only
+// in admin responses; passwords are derived from each backing's bucket keys.
+type ResticS3 struct {
+	Endpoint     string `json:"endpoint" yaml:"endpoint"`
+	Bucket       string `json:"bucket" yaml:"bucket"`
+	Prefix       string `json:"prefix,omitempty" yaml:"prefix,omitempty"`
+	Region       string `json:"region,omitempty" yaml:"region,omitempty"`
+	AccessKey    string `json:"accessKey,omitempty" yaml:"access_key,omitempty"`
+	SecretKey    string `json:"secretKey,omitempty" yaml:"secret_key,omitempty"`
+	SessionToken string `json:"sessionToken,omitempty" yaml:"session_token,omitempty"`
+}
+
+type ResticBackingBackend interface {
+	ResticBackingSettings(context.Context) (*ResticS3, bool, error)
+	ConfigureResticBacking(context.Context, *ResticS3) error
+}
+
+func (s *ResticS3) Validate() error {
+	if s == nil {
+		return nil
+	}
+	u, err := url.Parse(s.Endpoint)
+	if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" || u.User != nil || u.RawQuery != "" || u.Fragment != "" || (u.Path != "" && u.Path != "/") {
+		return errors.New("restic S3 endpoint must be http(s)://host without credentials, path, query, or fragment")
+	}
+	if len(s.Endpoint) > 2048 || len(s.Bucket) < 3 || len(s.Bucket) > 63 || strings.ContainsAny(s.Bucket, "/\\?# \t\r\n") || len(s.Prefix) > 1024 || len(s.Region) > 128 || len(s.AccessKey) > 1024 || len(s.SecretKey) > 4096 || len(s.SessionToken) > 16384 {
+		return errors.New("invalid restic S3 bucket or setting length")
+	}
+	for _, part := range strings.Split(s.Prefix, "/") {
+		if part == "." || part == ".." {
+			return errors.New("restic S3 prefix cannot contain dot segments")
+		}
+	}
+	if s.AccessKey == "" || s.SecretKey == "" {
+		return errors.New("restic S3 access key and secret key are required")
+	}
+	return nil
 }
 
 // EncryptionBackend verifies that encrypted writes are supported and prepares

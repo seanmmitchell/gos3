@@ -339,6 +339,7 @@ func (s *Server) openBackend() error {
 		}
 	default:
 		b, err := fsbackend.Open(s.cfg.Storage.Path, fsbackend.Options{
+			ResticS3:  s.cfg.Storage.ResticS3,
 			FsyncData: s.cfg.Storage.FsyncData,
 			Logger:    s.log.With("component", "storage"),
 		})
@@ -354,6 +355,7 @@ func (s *Server) openBackend() error {
 			continue
 		}
 		b, err := fsbackend.Open(bc.Path, fsbackend.Options{
+			ResticS3:  bc.ResticS3,
 			FsyncData: s.cfg.Storage.FsyncData,
 			Logger:    s.log.With("component", "storage", "backing", bc.Name),
 		})

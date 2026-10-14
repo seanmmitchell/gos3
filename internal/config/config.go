@@ -20,6 +20,7 @@ import (
 	"time"
 
 	"github.com/seanmmitchell/gos3/internal/discovery"
+	"github.com/seanmmitchell/gos3/internal/storage"
 )
 
 // Config is the full static configuration.
@@ -85,7 +86,8 @@ type ServerConfig struct {
 
 // StorageConfig selects the backend.
 type StorageConfig struct {
-	Backend string `yaml:"backend"` // "fs" (default) or "memory"
+	ResticS3 *storage.ResticS3 `yaml:"restic_s3,omitempty"`
+	Backend  string            `yaml:"backend"` // "fs" (default) or "memory"
 	// Path is the data directory for the fs backend AND for system state
 	// (<path>/.gos3/{iam.json,settings.json,server-id}). Empty with the memory
 	// backend means fully ephemeral.
@@ -107,6 +109,7 @@ type StorageConfig struct {
 
 // BackingConfig is one additional storage backing.
 type BackingConfig struct {
+	ResticS3 *storage.ResticS3 `yaml:"restic_s3,omitempty"`
 	// Name identifies the backing in placements and the admin API:
 	// 1-32 characters of [a-z0-9_-], starting with a letter or digit, not
 	// DefaultBackingName.

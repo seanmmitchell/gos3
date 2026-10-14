@@ -233,6 +233,27 @@ func TestResticLocalIntegration(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	settings, err := b.resticSettings(bid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	configPath := filepath.Join(settings.Repository, "config")
+	configData, err := os.ReadFile(configPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(configPath); err != nil {
+		t.Fatal(err)
+	}
+	if err := b.PrepareEncryption(ctx, "archive", storage.EncryptionRestic); err == nil {
+		t.Fatal("silently reinitialized a missing archive")
+	}
+	if _, err := os.Stat(configPath); !os.IsNotExist(err) {
+		t.Fatal("missing repository was replaced")
+	}
+	if err := os.WriteFile(configPath, configData, filePerm); err != nil {
+		t.Fatal(err)
+	}
 	if _, err = b.DeleteObject(ctx, "archive", "k", info.VersionID); err != nil {
 		t.Fatal(err)
 	}
@@ -252,7 +273,7 @@ func TestResticLocalIntegration(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	var cfg storage.EncryptionSettings
+	var cfg resticRepository
 	if err = json.Unmarshal(raw, &cfg); err != nil {
 		t.Fatal(err)
 	}

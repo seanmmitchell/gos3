@@ -202,6 +202,8 @@ func (a *api) routes() []route {
 		{"DELETE", "/buckets/{name}", "ForceDeleteBucket", bucket, a.deleteBucket},
 		// Storage backings and bucket placement
 		{"GET", "/backings", "ListBackings", service, a.listBackings},
+		{"GET", "/backings/{name}/restic", "ListBackings", service, a.getBackingRestic},
+		{"PUT", "/backings/{name}/restic", "UpdateConfig", service, a.putBackingRestic},
 		{"GET", "/buckets/{name}/placement", "GetBucketPlacement", bucket, a.getPlacement},
 		{"PUT", "/buckets/{name}/placement", "UpdateBucketPlacement", bucket, a.putPlacement},
 		{"POST", "/buckets/{name}/placement/move", "UpdateBucketPlacement", bucket, a.startMove},

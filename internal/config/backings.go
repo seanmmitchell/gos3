@@ -26,6 +26,12 @@ func (c Config) BackingNames() []string {
 // validateBackings checks storage.backings, storage.default_backing and
 // storage.replication.
 func (c Config) validateBackings() error {
+	if err := c.Storage.ResticS3.Validate(); err != nil {
+		return fmt.Errorf("storage.restic_s3: %w", err)
+	}
+	if c.Storage.Backend == BackendMemory && c.Storage.ResticS3 != nil {
+		return errors.New("storage.restic_s3 requires an fs backing")
+	}
 	if len(c.Storage.Backings) > MaxBackings {
 		return fmt.Errorf("storage.backings: at most %d backings allowed", MaxBackings)
 	}
@@ -38,6 +44,12 @@ func (c Config) validateBackings() error {
 	names := map[string]bool{DefaultBackingName: true}
 	for i, b := range c.Storage.Backings {
 		key := fmt.Sprintf("storage.backings[%d]", i)
+		if err := b.ResticS3.Validate(); err != nil {
+			return fmt.Errorf("%s.restic_s3: %w", key, err)
+		}
+		if b.Backend == BackendMemory && b.ResticS3 != nil {
+			return fmt.Errorf("%s.restic_s3 requires an fs backing", key)
+		}
 		switch {
 		case b.Name == DefaultBackingName:
 			return fmt.Errorf("%s.name: %q is reserved for the backing configured by storage.backend and storage.path", key, b.Name)

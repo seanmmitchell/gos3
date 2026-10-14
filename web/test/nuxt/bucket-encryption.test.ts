@@ -15,7 +15,7 @@ const INFO: Info = {
 function fakeServer(ready = true) {
   const writes: { path: string, method: string, body: string }[] = []
   let encrypted = false
-  let provider = { provider: 'AES256', repository: '', region: '', credentialsConfigured: false, passwordConfigured: false }
+  let provider = { provider: 'AES256' }
   const whoami: WhoAmI = { user: 'root', accessKey: 'AK', isRoot: true, policies: [], capabilities: { admin: true } as WhoAmI['capabilities'], server: INFO }
   vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL) => {
     const req = input instanceof Request ? input : new Request(String(input))
@@ -27,7 +27,7 @@ function fakeServer(ready = true) {
     if (url.pathname === '/_gos3/admin/v1/buckets/photos/encryption-provider') {
       if (req.method === 'GET') return json(provider)
       const body = await req.json()
-      provider = { provider: body.provider, repository: body.repository ?? '', region: body.region ?? '', credentialsConfigured: !!body.accessKey, passwordConfigured: true }
+      provider = { provider: body.provider }
       return json({ ...provider, ready, error: ready ? undefined : 'Provider settings saved, but repository preparation failed.' })
     }
     if (url.pathname === '/photos/' && url.searchParams.has('encryption')) {
@@ -54,7 +54,7 @@ async function mountTab() {
 }
 
 type TabVm = {
-  mode: string, repository: string, accessKey: string, secretKey: string, password: string
+  mode: string
   save: { run: () => Promise<unknown> }
 }
 
@@ -67,23 +67,20 @@ beforeEach(() => {
 afterEach(() => vi.unstubAllGlobals())
 
 describe('EncryptionTab', () => {
-  it('saves a remote restic provider, then enables standard S3 AES256 and clears secrets', async () => {
+  it('saves only the restic provider and enables standard S3 AES256', async () => {
     const writes = fakeServer()
     const w = await mountTab()
     expect(w.text()).not.toContain('SSE-KMS (aws:kms)')
     const vm = w.vm as unknown as TabVm
     vm.mode = 'restic'
-    vm.repository = 's3:https://s3.example.test/backup/photos'
-    vm.accessKey = 'REMOTE_AK'
-    vm.secretKey = 'REMOTE_SK'
-    vm.password = 'repo-password'
     await vm.save.run()
     await nextTick()
     expect(writes.map(r => r.path)).toEqual(['/_gos3/admin/v1/buckets/photos/encryption-provider', '/photos/'])
-    expect(JSON.parse(writes[0]!.body)).toMatchObject({ provider: 'restic', secretKey: 'REMOTE_SK', password: 'repo-password' })
+    expect(JSON.parse(writes[0]!.body)).toEqual({ provider: 'restic' })
     expect(writes[1]!.body).toContain('<SSEAlgorithm>AES256</SSEAlgorithm>')
     expect(vm.mode).toBe('restic')
-    expect([vm.accessKey, vm.secretKey, vm.password]).toEqual(['', '', ''])
+    expect(w.text()).toContain('inherited from this bucket’s placement')
+    expect(w.find('input[type="password"]').exists()).toBe(false)
     expect(w.emitted('changed')).toHaveLength(1)
   })
 
@@ -92,12 +89,10 @@ describe('EncryptionTab', () => {
     const w = await mountTab()
     const vm = w.vm as unknown as TabVm
     vm.mode = 'restic'
-    vm.password = 'repo-password'
     await vm.save.run()
     await nextTick()
     expect(writes).toHaveLength(1)
     expect(w.text()).toContain('repository preparation failed')
-    expect(vm.password).toBe('')
     expect(w.emitted('changed')).toBeUndefined()
   })
 

@@ -295,37 +295,36 @@ stores. See [operations.md](operations.md#compression).
 
 | Method | Path | Action | Response |
 |---|---|---|---|
-| GET | `/buckets/{name}/encryption-provider` | GetBucketEncryption | `BucketEncryptionProvider` (secrets omitted) |
-| PUT | `/buckets/{name}/encryption-provider` | PutBucketEncryption | Selects and prepares native AES256 or restic; returns `BucketEncryptionProvider` with `ready` and optional `error` |
+| GET | `/buckets/{name}/encryption-provider` | GetBucketEncryption | `{"provider":"AES256"\|"restic", "backings":["default",…]}` |
+| PUT | `/buckets/{name}/encryption-provider` | PutBucketEncryption | body `{"provider":"AES256"\|"restic"}`; prepares the provider and returns its saved selection with `ready` and optional `error` |
 
-Both actions use `arn:gos3:admin:::bucket/<name>`. Example PUT:
+Provider actions use `arn:gos3:admin:::bucket/<name>`. Storage and secret fields
+are rejected: restic derives its repository from each assigned backing. GET lists
+saved settings and assigned backings, not repository health. A failed preparation
+after saving returns 200 with `ready:false` so the configuration can be retried.
+Provider selection alone does not enable S3 bucket-default encryption; use
+PutBucketEncryption with AES256 (also for restic), or an AES256 upload header.
+
+| Method | Path | Action | Response |
+|---|---|---|---|
+| GET | `/backings/{name}/restic` | ListBackings | `ResticBacking`; credentials omitted |
+| PUT | `/backings/{name}/restic` | UpdateConfig | Sets local or S3 restic storage for the backing; validates credentials before saving |
+
+Both backing actions are evaluated at service level. A memory or unknown backing
+returns 404. PUT accepts `{"mode":"local"}` or:
 
 ```json
-{ "provider": "restic",
-  "repository": "s3:https://s3.example.com/backups/photos",
-  "region": "us-east-1",
-  "accessKey": "BACKUP_ACCESS_KEY", "secretKey": "BACKUP_SECRET_KEY" }
+{ "mode":"s3", "endpoint":"https://s3.example.com", "bucket":"archives",
+  "prefix":"gos3", "region":"us-east-1", "accessKey":"AK", "secretKey":"SK" }
 ```
 
-The provider is `AES256` (native, also the default) or `restic`. For restic,
-empty `repository` uses local storage; remote S3 requires credentials.
-Optional `sessionToken` and `password` are write-only, as are the access and
-secret keys. An empty password generates one on initial setup; for an existing
-repository supply its password. Blank credentials retain saved values. The
-repository location is fixed after setup. Switching to AES256 preserves
-credentials needed to read existing restic objects.
-
-Responses contain `provider`, `repository`, `region`,
-`credentialsConfigured`, and `passwordConfigured`; they never contain
-credentials. GET reports saved settings, not repository health. PUT checks
-credentials before saving; if repository initialization fails after saving,
-it returns 200 with `ready: false` and `error`, preserving the password for
-retry. A successful PUT has `ready: true`. Validation failures return 400.
-
-Provider selection alone does not enable bucket-default encryption. Use S3
-PutBucketEncryption with AES256 to enable it (also for restic), or an AES256
-upload header. Existing versions retain their actual encoding. See
-[encryption.md](encryption.md) for setup, archive behavior, and recovery.
+Optional `sessionToken` is write-only; `clearSessionToken:true` clears it.
+Blank credentials retain saved values. Responses contain `mode`, `endpoint`,
+`bucket`, `prefix`, `region`, `credentialsConfigured`,
+`sessionTokenConfigured`, and `locked`, never secrets. Locations are fixed
+once repositories have been prepared, including retained deleted-bucket archives;
+use a placement move to another backing to change storage. Settings persist in
+the backing's protected system directory. See [encryption.md](encryption.md).
 
 ### Storage backings and bucket placement
 

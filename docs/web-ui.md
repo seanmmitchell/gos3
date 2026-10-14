@@ -73,8 +73,9 @@ policies and clears that option.
   confirmation on the bucket list), which sends
   `bypassGovernanceRetention=true` and needs `s3:BypassGovernanceRetention`.
 - **Encryption.** Bucket settings offers native AES256 or restic on gos3.
-  Restic supports a local repository or a dedicated remote S3 prefix, with
-  server-managed passwords and credentials. This encrypts new writes; older
+  Restic inherits each assigned backing’s repository settings. Configure local
+  or S3 storage and credentials from the server Storage page. Repository
+  passwords are server-managed. This encrypts new writes; older
   objects are unchanged. See [encryption.md](encryption.md).
 - **Compression.** The server settings page has a Compression section where
   the administrator chooses the mode (Optional, Enforced, Disabled), the

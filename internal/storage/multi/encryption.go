@@ -30,3 +30,17 @@ func (r *Router) ValidateEncryptionSettings(ctx context.Context, bucket string, 
 	}
 	return e.ValidateEncryptionSettings(ctx, bucket, cfg)
 }
+
+func (r *Router) ResticBacking(name string) (storage.ResticBackingBackend, error) {
+	r.mu.RLock()
+	b := r.backings[name]
+	r.mu.RUnlock()
+	if b == nil {
+		return nil, ErrUnknownBacking
+	}
+	e, ok := b.Backend.(storage.ResticBackingBackend)
+	if !ok {
+		return nil, errors.ErrUnsupported
+	}
+	return e, nil
+}

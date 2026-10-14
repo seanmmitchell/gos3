@@ -100,6 +100,7 @@ var ErrClosed = errors.New("fs: backend closed")
 
 // Options configures Open.
 type Options struct {
+	ResticS3 *storage.ResticS3
 	// FsyncData fsyncs every data file (and its directory) before the
 	// metadata referencing it is committed. Slower, but committed objects
 	// survive power loss.
@@ -126,19 +127,21 @@ const (
 
 // Backend is a filesystem storage.Backend. Create it with Open.
 type Backend struct {
-	keyMu     sync.Mutex
-	keys      map[string][]byte
-	resticMu  sync.Mutex
-	root      string
-	sysDir    string
-	dataDir   string
-	tmpDir    string
-	uploadDir string
-	orphanDir string
-	retention time.Duration
-	fsync     bool
-	log       *slog.Logger
-	db        *bbolt.DB
+	keyMu          sync.Mutex
+	keys           map[string][]byte
+	resticMu       sync.Mutex
+	resticConfigMu sync.RWMutex
+	resticS3       *storage.ResticS3
+	root           string
+	sysDir         string
+	dataDir        string
+	tmpDir         string
+	uploadDir      string
+	orphanDir      string
+	retention      time.Duration
+	fsync          bool
+	log            *slog.Logger
+	db             *bbolt.DB
 
 	closed atomic.Bool
 	cancel context.CancelFunc
@@ -219,6 +222,10 @@ func Open(root string, opts Options) (*Backend, error) {
 		return nil, fmt.Errorf("fs: open metadata database %s: %w", dbPath, err)
 	}
 	b.db = db
+	if err := b.loadResticBacking(opts.ResticS3); err != nil {
+		_ = db.Close()
+		return nil, err
+	}
 	b.tightenPerm(dbPath)
 	if err := b.initSchema(); err != nil {
 		_ = db.Close()

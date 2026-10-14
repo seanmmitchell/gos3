@@ -88,8 +88,11 @@ func TestResticRemoteS3Integration(t *testing.T) {
 	if err = b.CreateBucket(ctx, "archive", storage.CreateBucketOptions{}); err != nil {
 		t.Fatal(err)
 	}
-	cfg := storage.EncryptionSettings{Provider: storage.EncryptionRestic, Repository: "s3:" + remote.srv.URL + "/repository/archive", AccessKey: testRoot.AccessKey, SecretKey: testRoot.SecretKey, Password: "remote-repository-test-password", Region: "us-east-1"}
-	raw, _ := json.Marshal(cfg)
+	cfg := storage.ResticS3{Endpoint: remote.srv.URL, Bucket: "repository", Prefix: "archive", AccessKey: testRoot.AccessKey, SecretKey: testRoot.SecretKey, Region: "us-east-1"}
+	if err = b.ConfigureResticBacking(ctx, &cfg); err != nil {
+		t.Fatal(err)
+	}
+	raw, _ := json.Marshal(storage.EncryptionSettings{Provider: storage.EncryptionRestic})
 	if err = b.PutBucketConfig(ctx, "archive", storage.ConfigEncryptionProvider, raw); err != nil {
 		t.Fatal(err)
 	}
@@ -130,9 +133,16 @@ func TestResticRemoteS3Integration(t *testing.T) {
 	}
 	// Invalid credentials fail the new write; the previous snapshot survives.
 	cfg.SecretKey = "invalid-secret"
-	raw, _ = json.Marshal(cfg)
-	_ = b.PutBucketConfig(ctx, "archive", storage.ConfigEncryptionProvider, raw)
-	if err = b.PrepareEncryption(ctx, "archive", storage.EncryptionRestic); err == nil {
+	if err = b.ConfigureResticBacking(ctx, &cfg); err == nil {
 		t.Fatal("wrong remote credentials accepted")
 	}
+	saved, locked, err := b.ResticBackingSettings(ctx)
+	if err != nil || !locked || saved.SecretKey != testRoot.SecretKey {
+		t.Fatal("failed update replaced working backing settings")
+	}
+	r = source.signed("GET", "/archive/key", nil, nil)
+	if r.StatusCode != 200 || !bytes.Equal(r.Data, data) {
+		t.Fatal("failed update lost archive access")
+	}
+
 }

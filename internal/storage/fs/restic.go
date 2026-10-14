@@ -10,7 +10,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -18,53 +17,34 @@ import (
 
 	"github.com/seanmmitchell/gos3/internal/config"
 	"github.com/seanmmitchell/gos3/internal/storage"
-	"go.etcd.io/bbolt"
 )
 
 // Restic owns immutable snapshots. Keeping snapshots after S3 deletes provides
 // an archive and makes open readers safe across concurrent overwrites/deletes.
 // Operators must not forget snapshots still referenced by gos3 metadata.
-func (b *Backend) resticSettings(id string) (storage.EncryptionSettings, error) {
-	var cfg storage.EncryptionSettings
-	err := b.view(func(tx *bbolt.Tx) error {
-		bb := tx.Bucket(bucketDataName(id))
-		if bb == nil {
-			return storage.ErrBucketNotFound
-		}
-		raw := bb.Bucket(subConfig).Get([]byte(storage.ConfigEncryptionProvider))
-		if len(raw) == 0 {
-			return nil
-		}
-		return json.Unmarshal(raw, &cfg)
-	})
-	if err != nil {
-		return cfg, err
-	}
-	return b.resolveResticSettings(id, cfg)
+type resticRepository struct {
+	Initialized  bool   `json:"initialized,omitempty"`
+	Repository   string `json:"repository"`
+	Password     string `json:"password"`
+	AccessKey    string `json:"-"`
+	SecretKey    string `json:"-"`
+	SessionToken string `json:"-"`
+	Region       string `json:"-"`
 }
 
-func (b *Backend) resolveResticSettings(id string, cfg storage.EncryptionSettings) (storage.EncryptionSettings, error) {
-	if cfg.Repository == "" {
-		cfg.Repository = filepath.Join(b.sysDir, "restic", id)
-		key, err := b.bucketKey(id, false)
-		if err != nil {
-			return cfg, err
-		}
-		if cfg.Password == "" {
-			cfg.Password = resticPassword(key)
-		}
-	} else {
-		if !strings.HasPrefix(cfg.Repository, "s3:") {
-			return cfg, errors.New("restic: remote repository must use s3:https://host/bucket/prefix")
-		}
-		u, err := url.Parse(strings.TrimPrefix(cfg.Repository, "s3:"))
-		if err != nil || (u.Scheme != "https" && u.Scheme != "http") || u.Host == "" || u.User != nil || u.RawQuery != "" || u.Fragment != "" || strings.Trim(u.Path, "/") == "" {
-			return cfg, errors.New("restic: invalid S3 repository URL")
-		}
-		if cfg.Password == "" {
-			return cfg, errors.New("restic: remote repository password is missing")
-		}
+func (cfg *resticRepository) withS3(s *storage.ResticS3) {
+	if s != nil {
+		cfg.AccessKey, cfg.SecretKey, cfg.SessionToken, cfg.Region = s.AccessKey, s.SecretKey, s.SessionToken, s.Region
 	}
+}
+func (b *Backend) resticSettings(id string) (resticRepository, error) {
+	key, err := b.bucketKey(id, false)
+	if err != nil {
+		return resticRepository{}, err
+	}
+	s3 := b.resticBacking()
+	cfg := resticRepository{Repository: b.resticRepository(id, s3), Password: resticPassword(key)}
+	cfg.withS3(s3)
 	return cfg, nil
 }
 
@@ -84,10 +64,13 @@ func (b *Backend) ValidateEncryptionSettings(ctx context.Context, bucket string,
 	if _, err = b.bucketKey(id, true); err != nil {
 		return err
 	}
-	cfg, err = b.resolveResticSettings(id, cfg)
+	repo, err := b.resticSettings(id)
 	if err != nil {
 		return err
 	}
+	return validateResticRepository(ctx, repo)
+}
+func validateResticRepository(ctx context.Context, cfg resticRepository) error {
 	cmd, err := resticCommandFor(ctx, cfg, "cat", "config")
 	if err != nil {
 		return err
@@ -96,7 +79,7 @@ func (b *Backend) ValidateEncryptionSettings(ctx context.Context, bucket string,
 	cmd.Stdout, cmd.Stderr = &out, &out
 	err = cmd.Run()
 	var exit *exec.ExitError
-	if errors.As(err, &exit) && exit.ExitCode() == 10 {
+	if errors.As(err, &exit) && exit.ExitCode() == 10 && !cfg.Initialized {
 		return nil
 	}
 	return err
@@ -118,7 +101,7 @@ func (b *Backend) resticCommand(ctx context.Context, id string, args ...string) 
 	return resticCommandFor(ctx, cfg, args...)
 }
 
-func resticCommandFor(ctx context.Context, cfg storage.EncryptionSettings, args ...string) (*exec.Cmd, error) {
+func resticCommandFor(ctx context.Context, cfg resticRepository, args ...string) (*exec.Cmd, error) {
 	bin, err := exec.LookPath("restic")
 	if err != nil {
 		return nil, errors.New("restic executable is unavailable; install restic on the server PATH")
@@ -148,11 +131,21 @@ func (b *Backend) prepareRestic(ctx context.Context, id string) error {
 	}
 	// Retain recovery credentials independently of the bucket's metadata.
 	// Deleting a bucket must not make its retained archive unrecoverable.
+	recoveryPath := filepath.Join(b.sysDir, "keys", id+".restic.json")
+	if old, readErr := os.ReadFile(recoveryPath); readErr == nil {
+		var saved resticRepository
+		if err := json.Unmarshal(old, &saved); err != nil {
+			return err
+		}
+		cfg.Initialized = saved.Initialized
+	} else if !errors.Is(readErr, os.ErrNotExist) {
+		return readErr
+	}
 	raw, err := json.Marshal(cfg)
 	if err != nil {
 		return err
 	}
-	if err := config.WriteFileAtomic(filepath.Join(b.sysDir, "keys", id+".restic.json"), raw, filePerm); err != nil {
+	if err := config.WriteFileAtomic(recoveryPath, raw, filePerm); err != nil {
 		return err
 	}
 	cmd, err := b.resticCommand(ctx, id, "cat", "config")
@@ -162,13 +155,18 @@ func (b *Backend) prepareRestic(ctx context.Context, id string) error {
 	var output limitedOutput
 	cmd.Stdout, cmd.Stderr = &output, &output
 	if err = cmd.Run(); err == nil {
-		return nil
+		cfg.Initialized = true
+		raw, _ = json.Marshal(cfg)
+		return config.WriteFileAtomic(recoveryPath, raw, filePerm)
 	}
 	// Only restic's documented repository-not-found exit code permits init.
 	// Wrong passwords, network and access errors must never initialize anew.
 	var exit *exec.ExitError
 	if !errors.As(err, &exit) || exit.ExitCode() != 10 {
 		return fmt.Errorf("restic: cannot open repository: %w", err)
+	}
+	if cfg.Initialized {
+		return errors.New("restic: initialized repository is missing; restore the repository from backup")
 	}
 	cmd, err = b.resticCommand(ctx, id, "init")
 	if err != nil {
@@ -178,7 +176,9 @@ func (b *Backend) prepareRestic(ctx context.Context, id string) error {
 	if err := cmd.Run(); err != nil {
 		return fmt.Errorf("restic: initialize repository: %w", err)
 	}
-	return nil
+	cfg.Initialized = true
+	raw, _ = json.Marshal(cfg)
+	return config.WriteFileAtomic(recoveryPath, raw, filePerm)
 }
 
 func (b *Backend) finishRestic(ctx context.Context, t *tmpFile, id, bucket, key string) (string, string, error) {
