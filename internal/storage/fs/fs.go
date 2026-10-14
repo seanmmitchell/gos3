@@ -12,19 +12,37 @@
 //	orphans/<run>/...               files the recovery pass found
 //	                                unreferenced, kept for a while (see
 //	                                Recovery)
+//	keys/<bucket-id>                a bucket's 32-byte encryption master key
+//	                                (secret; created when encryption is first
+//	                                prepared for the bucket)
+//	keys/<bucket-id>.restic.json    a bucket's restic repository location and
+//	                                password (secret)
+//	restic/<bucket-id>/             a bucket's local restic repository (when
+//	                                the backing has no restic S3 storage)
+//	restic-cache/                   restic's local repository cache
+//	restic-backing.json             the backing's restic S3 storage settings,
+//	                                including credentials (secret; written by
+//	                                ConfigureResticBacking)
 //
-// The schema of meta.db is documented in schema.go.
+// Keys, recovery records and repositories are kept when a bucket is
+// deleted, so that its restic archive stays recoverable.
+//
+// The schema of meta.db is documented in schema.go; encryption.go and
+// restic*.go describe encrypted and restic-archived data.
 //
 // # Write path
 //
-// Object data is streamed into a fresh file in tmp/ (optionally fsync'd,
+// Object data (already encrypted when the version is stored encrypted, see
+// encryption.go) is streamed into a fresh file in tmp/ (optionally fsync'd,
 // see Options.FsyncData), renamed to its final, never reused name under
 // data/ and only then is the metadata committed in a single bbolt write
 // transaction, which also evaluates conditional-write preconditions. The
 // bbolt write transaction is never held while streaming data. Data files of
 // versions replaced or deleted by a transaction are unlinked after it
 // commits; when a commit fails (precondition failed, bucket deleted, ...)
-// the new data file is removed. Empty objects have no data file.
+// the new data file is removed. Empty objects have no data file unless they
+// are archived in restic: the data file of a restic-archived version holds
+// only its snapshot ID (the content is in the bucket's restic repository).
 //
 // Multipart parts are written the same way into uploads/<upload-id>/ with a
 // unique file name per part upload, so re-uploading a part number never
@@ -33,10 +51,13 @@
 //
 // # Readers
 //
-// OpenObject returns an *os.File. Because data files are immutable and
-// unlinked (never rewritten) when superseded, an open reader keeps returning
-// the content of the version it opened even if the object is concurrently
-// overwritten or deleted (POSIX unlink semantics). On Windows an open file
+// OpenObject returns an *os.File, or a reader decrypting or decompressing
+// one for encrypted or compressed versions; a restic-archived version is
+// read from its snapshot (see restic.go). Because data files are immutable
+// and unlinked (never rewritten) when superseded, and snapshots are never
+// removed by gos3, an open reader keeps returning the content of the version
+// it opened even if the object is concurrently overwritten or deleted (POSIX
+// unlink semantics). On Windows an open file
 // cannot be deleted: unlinking a superseded data file that is still being
 // read fails, the failure is logged and the orphan is removed by the
 // recovery pass at the next start.

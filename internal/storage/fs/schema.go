@@ -79,6 +79,10 @@ import (
 //	recordFormatVersionV2 (4): recordFormatVersionV1 plus the compression
 //	                      fields, used only for versions stored compressed
 //	                      (so other records stay readable by older builds).
+//	recordFormatVersionV3 (5): recordFormatVersionV2 plus the encryption
+//	                      provider, used only for versions stored encrypted
+//	                      (native AES256 or restic), compressed or not.
+//	                      Builds that predate it cannot read these records.
 //
 // The format byte also allows switching encodings later without migrating
 // existing values.
@@ -271,11 +275,7 @@ func decodeRecord(data []byte, v any) error {
 		if !ok {
 			return fmt.Errorf("%w: version record format for %T", errCorrupt, v)
 		}
-		if data[0] == recordFormatVersionV3 {
-			err = decodeVersionRecord(data[1:], r, true, true)
-		} else {
-			err = decodeVersionRecord(data[1:], r, data[0] == recordFormatVersionV2)
-		}
+		err = decodeVersionRecord(data[1:], r, data[0])
 	default:
 		return fmt.Errorf("%w: unknown record format %d", errCorrupt, data[0])
 	}
