@@ -24,7 +24,7 @@
 # Base images are pinned by digest; Dependabot proposes updates. Change the
 # tag and the digest together (both stages use the same image).
 
-FROM node:22-bookworm-slim@sha256:c3de60bf2f9dd0ac6370e6117950ff62d6e339527e7472301c9c78a017978392 AS build
+FROM node:23-bookworm-slim@sha256:86191b94d2a163be41f3dc7fe5e5fcaca8ba2f1be7275d98a06343483c17414a AS build
 ENV PNPM_HOME=/pnpm \
     COREPACK_ENABLE_DOWNLOAD_PROMPT=0 \
     NUXT_TELEMETRY_DISABLED=1 \
@@ -42,7 +42,7 @@ RUN --mount=type=cache,id=gos3-pnpm,target=/pnpm/store \
     pnpm install --frozen-lockfile --offline && \
     pnpm build
 
-FROM node:22-bookworm-slim@sha256:c3de60bf2f9dd0ac6370e6117950ff62d6e339527e7472301c9c78a017978392
+FROM node:23-bookworm-slim@sha256:86191b94d2a163be41f3dc7fe5e5fcaca8ba2f1be7275d98a06343483c17414a
 ENV NODE_ENV=production \
     HOST=0.0.0.0 \
     PORT=3000 \
