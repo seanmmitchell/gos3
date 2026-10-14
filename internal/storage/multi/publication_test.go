@@ -73,7 +73,7 @@ func TestBeforePublishRejectionKeepsPrimaryHealthy(t *testing.T) {
 			if err != denied {
 				t.Fatalf("caller error changed: %v", err)
 			}
-			if !r.backings["a"].healthy.Load() {
+			if !r.topology.Load().backings["a"].healthy.Load() {
 				t.Fatal("publication rejection marked the primary unhealthy")
 			}
 			primary, err := r.primary("bucket")

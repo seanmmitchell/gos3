@@ -30,7 +30,7 @@ func (c Config) validateBackings() error {
 		return fmt.Errorf("storage.backings: at most %d backings allowed", MaxBackings)
 	}
 	paths := map[string]string{} // cleaned absolute path -> key naming it
-	if c.Storage.Backend == BackendFS && c.Storage.Path != "" {
+	if c.Storage.Path != "" {
 		if abs, err := filepath.Abs(c.Storage.Path); err == nil {
 			paths[abs] = "storage.path"
 		}
@@ -72,7 +72,7 @@ func (c Config) validateBackings() error {
 	// (gos3 keeps its metadata in <path>/.gos3).
 	for p, k := range paths {
 		for q, kq := range paths {
-			if p != q && strings.HasPrefix(q, filepath.Join(p, SystemDirName)+string(filepath.Separator)) {
+			if p != q && (q == filepath.Join(p, SystemDirName) || strings.HasPrefix(q, filepath.Join(p, SystemDirName)+string(filepath.Separator))) {
 				return fmt.Errorf("%s: %q is inside the system directory of %s", kq, q, k)
 			}
 		}

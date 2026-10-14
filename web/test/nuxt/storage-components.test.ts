@@ -9,6 +9,7 @@ import type { Backing, Capabilities, Info, Placement, WhoAmI } from '~/types/adm
 import { NO_CAPABILITIES, useConnectionsStore } from '~/stores/connections'
 import { clearClientCache } from '~/utils/clients'
 import BackingCard from '~/components/admin/BackingCard.vue'
+import BackingConfiguration from '~/components/admin/BackingConfiguration.vue'
 import PlacementTab from '~/components/bucket-settings/PlacementTab.vue'
 
 const INFO: Info = {
@@ -48,6 +49,7 @@ interface Seen { method: string, path: string, body: string }
 function fakeServer(caps: Partial<Capabilities>, placement: Placement = basePlacement()) {
   const seen: Seen[] = []
   let current = placement
+  let config = { backings: [{ name: 'fast', backend: 'fs', path: '/mnt/fast' }], defaultBacking: 'default', revision: 'v1', persistent: true }
   const whoami = (): WhoAmI => ({ user: 'alice', accessKey: 'AKALICE', isRoot: false, policies: [], capabilities: { ...NO_CAPABILITIES, ...caps }, server: INFO })
   const fetch = vi.fn(async (input: RequestInfo | URL) => {
     const req = input instanceof Request ? input : new Request(String(input))
@@ -60,6 +62,11 @@ function fakeServer(caps: Partial<Capabilities>, placement: Placement = basePlac
     if (url.pathname === '/_gos3/info') return json(INFO)
     if (p === '/whoami') return json(whoami())
     if (p === '/backings') return json({ defaultBacking: 'default', autoFailover: false, backings: BACKINGS })
+    if (p === '/backings/config' && req.method === 'GET') return json(config)
+    if (p === '/backings/config' && req.method === 'PUT') {
+      config = { ...JSON.parse(body), revision: 'v2' }
+      return json(config)
+    }
     if (p === '/buckets/photos/placement' && req.method === 'GET') return json(current)
     if (p === '/buckets/photos/placement' && req.method === 'PUT') {
       const r = JSON.parse(body) as { mode: Placement['mode'], replicas: string[] }
@@ -121,6 +128,49 @@ describe('BackingCard', () => {
     expect(w.text()).toContain('boom')
     expect(w.text()).toContain('In memory')
     expect(w.find('[role="meter"]').exists()).toBe(false)
+  })
+})
+
+describe('BackingConfiguration', () => {
+  it('loads, validates and saves a new backing without reloading the server', async () => {
+    const { seen } = fakeServer({ admin: true, manageConfig: true, viewStorage: true })
+    await connect()
+    const { w, inner } = await mountInApp(BackingConfiguration, { backings: BACKINGS })
+    const button = (label: string) => w.findAll('button').find(b => b.text() === label)!
+    await button('Configure backings').trigger('click')
+    await vi.waitFor(() => expect(w.find('form').exists()).toBe(true))
+    expect(w.find('input[aria-label="Backing name"]').attributes('disabled')).toBeDefined()
+    expect(w.find('input[aria-label="Directory on the server"]').attributes('disabled')).toBeDefined()
+    expect(button('Remove').attributes('disabled')).toBeDefined()
+    await button('Add backing').trigger('click')
+    await w.find('form').trigger('submit')
+    expect(seen.some(s => s.method === 'PUT')).toBe(false)
+    const inputs = w.findAll('input[aria-label="Backing name"]')
+    await inputs[1]!.setValue('fast')
+    // A duplicate typed into a new row must remain editable.
+    expect(inputs[1]!.attributes('disabled')).toBeUndefined()
+    await inputs[1]!.setValue('cold')
+    await w.findAll('input[aria-label="Directory on the server"]')[1]!.setValue('/mnt/archive')
+    await w.find('form').trigger('submit')
+    await vi.waitFor(() => expect(inner.emitted('saved')).toHaveLength(1))
+    const request = JSON.parse(seen.find(s => s.method === 'PUT')!.body)
+    expect(request.revision).toBe('v1')
+    expect(request.backings[1]).toEqual({ name: 'cold', backend: 'fs', path: '/mnt/archive' })
+    expect(button('Save backing configuration').attributes('disabled')).toBeDefined()
+    w.unmount()
+  })
+
+  it('removes an empty backing and saves the remaining configuration', async () => {
+    const { seen } = fakeServer({ admin: true, manageConfig: true })
+    await connect()
+    const { w, inner } = await mountInApp(BackingConfiguration, { backings: [backing('fast', { buckets: 0 })] })
+    await w.findAll('button').find(b => b.text() === 'Configure backings')!.trigger('click')
+    await vi.waitFor(() => expect(w.find('form').exists()).toBe(true))
+    await w.findAll('button').find(b => b.text() === 'Remove')!.trigger('click')
+    await w.find('form').trigger('submit')
+    await vi.waitFor(() => expect(inner.emitted('saved')).toHaveLength(1))
+    expect(JSON.parse(seen.find(s => s.method === 'PUT')!.body).backings).toEqual([])
+    w.unmount()
   })
 })
 

@@ -303,6 +303,8 @@ for the semantics.
 | Method | Path | Action | Response |
 |---|---|---|---|
 | GET | `/backings` | ListBackings | `{"defaultBacking": "default", "autoFailover": false, "backings": Backing[]}` |
+| GET | `/backings/config` | GetConfig | `BackingConfiguration` (404 when live configuration is unavailable) |
+| PUT | `/backings/config` | UpdateConfig | full `BackingConfiguration` → updated configuration, applied live and persisted before success |
 | GET | `/buckets/{name}/placement` | GetBucketPlacement | `Placement` |
 | PUT | `/buckets/{name}/placement` | UpdateBucketPlacement | body `{"mode": "single" \| "active-passive" \| "active-active", "replicas": ["fast", …]}` → `Placement`. Sets the replication mode and the replica backings (the primary stays). `single` needs an empty `replicas`, the other modes at least one. New replicas start a full copy (`state` `syncing`); removed replicas lose their copy (deleted in the background). 400 `InvalidRequest` for an unknown backing, the primary listed as a replica, or a duplicate; 409 `Conflict` while a move is in progress or while the bucket's copy on a backing being added is still being deleted |
 | POST | `/buckets/{name}/placement/move` | UpdateBucketPlacement | body `{"to": "archive", "from"?: "<backing>"}` → 202 `Placement`. Moves the copy on `from` (default: the primary) to `to`, online: `to` is filled in the background while the bucket stays readable and writable, then a short cutover (writes to the bucket wait, at most 60 s, for in-flight writes to finish) makes `to` take `from`'s place and `from`'s copy is deleted. In-progress multipart uploads are not moved: after a move of the primary they fail with `NoSuchUpload`. 400 for an unknown backing or a `from` that is not a member; 409 when a move is already in progress or `to` already holds a copy |
@@ -314,6 +316,22 @@ for the semantics.
 `arn:gos3:admin:::bucket/<name>`, `ListBackings` at service level. The
 built-in `diagnostics` policy allows `ListBackings` and `GetBucketPlacement`.
 404 `NotFound` for an unknown bucket.
+
+`BackingConfiguration` is `{"backings":[{"name":"archive","backend":"fs","path":"/mnt/archive"}],"defaultBacking":"default","revision":"<opaque token>","persistent":true}`.
+`backings` contains only additional backings; the system backing named
+`default` cannot be replaced or removed. Backends are `fs` (directory
+required) or `memory` (empty path). Send the revision from the last GET to
+prevent overwriting concurrent changes; stale revisions return 409
+`Conflict`. `persistent` is informational and ignored on PUT. Without a
+system data directory, changes apply live but are lost at restart.
+
+Invalid names, duplicate directories, and invalid defaults return 400
+`InvalidRequest`. Replacing or removing a backing holding a bucket, replica,
+move target, pending cleanup, or untracked bucket returns 409 `Conflict`.
+New backings must have no existing buckets. A failed open or save leaves
+the running configuration unchanged. `GetConfig` and `UpdateConfig` are
+evaluated at service level. The saved `backings.json` overrides static
+backing definitions on restart, like the runtime settings overlay.
 
 ```jsonc
 // Backing
