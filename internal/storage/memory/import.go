@@ -134,9 +134,6 @@ func (w *versionWriter) Commit(ctx context.Context, info storage.ObjectInfo) (st
 		v.meta = cloneMeta(info.ObjectMeta)
 		v.meta.Encryption = w.encryption
 	}
-	if err := encryptVersion(v); err != nil {
-		return storage.ObjectInfo{}, err
-	}
 	v.stamp, _ = w.b.nextStamp()
 
 	obj, ok := w.bk.objects.Get(w.key)
