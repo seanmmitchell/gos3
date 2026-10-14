@@ -44,6 +44,7 @@ test.describe('server settings', () => {
       const nameInput = page.getByRole('textbox', { name: /Server name/ })
       await expect(nameInput).toHaveValue(original.name)
       await nameInput.fill(name)
+      await page.getByRole('tab', { name: /^Discovery/ }).click()
       await page.getByRole('switch', { name: 'UDP beacon' }).click()
       const interval = page.getByRole('spinbutton', { name: /Beacon interval/ })
       await interval.fill('25')
@@ -59,9 +60,11 @@ test.describe('server settings', () => {
       expect(saved.discovery.beacon).toBe(true)
       expect((await (await fetch(`${primary.url}/_gos3/info`)).json()).name).toBe(name)
 
+      // The reload keeps the section (?tab=discovery).
       await page.reload()
-      await expect(page.getByRole('textbox', { name: /Server name/ })).toHaveValue(name)
       await expect(page.getByRole('spinbutton', { name: /Beacon interval/ })).toHaveValue('25')
+      await page.getByRole('tab', { name: /^General/ }).click()
+      await expect(page.getByRole('textbox', { name: /Server name/ })).toHaveValue(name)
     } finally {
       // Restore for the other specs (the server name shows up in several places).
       const cur = await api.admin<Record<string, unknown> & { discovery: Record<string, unknown> }>('GET', '/config')
@@ -73,6 +76,7 @@ test.describe('server settings', () => {
     const before = JSON.stringify(await api.admin('GET', '/config'))
     await signIn(page, { redirect: `/servers/${THIS_SERVER}/settings` })
     // The interval input is bounded like the server (1 s – 1 h).
+    await page.getByRole('tab', { name: /^Discovery/ }).click()
     await page.getByRole('switch', { name: 'UDP beacon' }).click()
     const interval = page.getByRole('spinbutton', { name: /Beacon interval/ })
     await interval.fill('7200')
@@ -82,6 +86,9 @@ test.describe('server settings', () => {
     await group.fill('10.0.0.1:7373')
     await page.getByRole('button', { name: /^Save/ }).click()
     await expect(page.getByText(/must be a multicast address/)).toBeVisible()
+    // The chip counts the section's invalid fields: here the beacon group, and
+    // the peer TTL too when it is now under twice the (clamped) interval.
+    await expect(page.getByRole('tab', { name: /^Discovery/ })).toContainText(/\(\d+ issues?/)
     expect(JSON.stringify(await api.admin('GET', '/config'))).toBe(before)
   })
 })

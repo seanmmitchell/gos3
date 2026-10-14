@@ -239,6 +239,18 @@ func (t *cbTracker) isCaller(err error) bool {
 	return t.err != nil && errors.Is(err, t.err)
 }
 
+// commitOptions returns opts with its BeforePublish routed through t, so
+// a publication the caller refuses (authorization, retention) is not
+// taken for a backing failure that would mark the backing unhealthy.
+func (t *cbTracker) commitOptions(opts storage.CommitOptions) storage.CommitOptions {
+	if bp := opts.BeforePublish; bp != nil {
+		opts.BeforePublish = func(meta, current *storage.ObjectMeta, created time.Time, config func(string) []byte) error {
+			return t.note(bp(meta, current, created, config))
+		}
+	}
+	return opts
+}
+
 // --- buckets ---
 
 // ListBuckets returns every bucket, as its first reachable copy describes
@@ -736,8 +748,13 @@ func (r *Router) CompleteMultipartUpload(ctx context.Context, bucket, key, uploa
 // Replicas store their copy compressed when the primary did.
 func (r *Router) CompleteMultipartUploadWith(ctx context.Context, bucket, key, uploadID string, partNumbers []int,
 	meta storage.ObjectMeta, opts storage.CommitOptions, wopts storage.WriteOptions) (storage.ObjectInfo, error) {
+	if err := checkCompression(wopts.Compression); err != nil {
+		return storage.ObjectInfo{}, err
+	}
 	var info storage.ObjectInfo
-	err := r.objectWrite(ctx, bucket, key, nil, func(b storage.Backend) error {
+	cb := &cbTracker{}
+	opts = cb.commitOptions(opts)
+	err := r.objectWrite(ctx, bucket, key, cb, func(b storage.Backend) error {
 		var err error
 		if !wopts.Compression.Enabled() {
 			info, err = b.CompleteMultipartUpload(ctx, bucket, key, uploadID, partNumbers, meta, opts)

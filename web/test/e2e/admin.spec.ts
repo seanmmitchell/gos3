@@ -439,11 +439,21 @@ test.describe('admin pages', () => {
   test('settings: edits durations in seconds and saves nanoseconds', async ({ page }) => {
     const st = await mockGos3(page)
     await page.goto(`/_gos3/ui/servers/${CONN_ID}/settings`)
+    // One section at a time: the chips under the header switch (?tab=).
+    const chips = page.getByRole('tablist', { name: 'Settings sections' })
+    await expect(chips.getByRole('tab', { name: 'General' })).toHaveAttribute('aria-selected', 'true')
+    await expect(page.getByLabel('Beacon interval (seconds)')).toBeHidden()
+    const discovery = chips.getByRole('tab', { name: /^Discovery/ })
+    await discovery.click()
+    await expect(page).toHaveURL(/[?&]tab=discovery/)
+    await expect(page.getByRole('tabpanel', { name: 'Discovery' })).toBeVisible()
+    await expect(page.getByLabel('Server name')).toBeHidden()
     const interval = page.getByLabel('Beacon interval (seconds)')
     await expect(interval).toHaveValue('10')
     await interval.fill('5')
     await interval.blur()
     await expect(page.getByText('You have unsaved changes.')).toBeVisible()
+    await expect(discovery).toContainText('unsaved changes')
     await page.getByRole('button', { name: 'Save settings' }).click()
     await expect(page.getByText('All changes saved.')).toBeVisible()
     const put = JSON.parse(st.bodies['PUT /_gos3/admin/v1/config']!) as { discovery: { beaconInterval: number, peerTtl: number } }
