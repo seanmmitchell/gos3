@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"testing"
 )
@@ -143,15 +144,67 @@ func TestFallbacksExist(t *testing.T) {
 	}
 }
 
+func TestExecutableEntries(t *testing.T) {
+	entries, err := executableEntries()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != len(executables) {
+		t.Fatalf("entries = %+v", entries)
+	}
+	for _, e := range entries {
+		if e.license == "" || e.source == "" || len(e.texts) != 1 || e.texts[0].body == "" ||
+			strings.Join(e.artifacts, ",") != artifactGos3Image {
+			t.Errorf("entry = %+v", e)
+		}
+	}
+}
+
+// TestExecutableVersionsMatchDockerfile checks that the license text of each
+// bundled executable is from the version the Dockerfile and the CI setup
+// action install, so a version update cannot forget the notices.
+func TestExecutableVersionsMatchDockerfile(t *testing.T) {
+	root := filepath.Join("..", "..", "..")
+	pins := map[string]*regexp.Regexp{
+		"Dockerfile": regexp.MustCompile(`(?m)^ARG RESTIC_VERSION=(\S+)\r?$`),
+		filepath.Join(".github", "actions", "setup-restic", "action.yml"): regexp.MustCompile(`(?m)^\s*version=(\S+)\r?$`),
+	}
+	var restic *executable
+	for i := range executables {
+		if executables[i].name == "restic" {
+			restic = &executables[i]
+		}
+	}
+	if restic == nil {
+		t.Fatal("restic is not in executables")
+	}
+	for file, re := range pins {
+		data, err := os.ReadFile(filepath.Join(root, file))
+		if err != nil {
+			t.Fatal(err)
+		}
+		m := re.FindSubmatch(data)
+		if m == nil {
+			t.Fatalf("%s: no restic version pin", file)
+		}
+		if want := "/blob/v" + string(m[1]) + "/"; !strings.Contains(restic.source, want) {
+			t.Errorf("%s installs restic %s, but the license text is from %s", file, m[1], restic.source)
+		}
+	}
+}
+
 func TestRender(t *testing.T) {
 	out := string(render(
 		[]entry{{name: "Go standard library", artifacts: []string{artifactGos3}, texts: []text{{"LICENSE", "BSD"}}}},
 		[]entry{{name: "pkg", license: "MIT", artifacts: []string{artifactGos3, artifactGos3UI}, source: "https://example.com/LICENSE",
 			texts: []text{{"LICENSE", "MIT text"}, {"NOTICE", "Notice"}}}},
+		[]entry{{name: "tool", license: "BSD-2-Clause", artifacts: []string{artifactGos3Image}, texts: []text{{"LICENSE", "BSD text"}}}},
 	))
 	for _, want := range []string{
 		"  Go standard library  gos3\n",
 		"  pkg                  gos3, gos3-ui\n",
+		"Executables\n  tool                 gos3-image\n",
+		"\ntool\nLicense: BSD-2-Clause\nIncluded in: gos3-image\n",
 		"\npkg\nLicense: MIT\nIncluded in: gos3, gos3-ui\nLicense text from https://example.com/LICENSE",
 		"\n--- LICENSE ---\n\nMIT text\n\n--- NOTICE ---\n\nNotice\n",
 	} {
