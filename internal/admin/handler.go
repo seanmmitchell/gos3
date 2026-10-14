@@ -12,7 +12,6 @@ import (
 	"path"
 	"strconv"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/seanmmitchell/gos3/internal/auth"
@@ -125,12 +124,14 @@ func pathTarget(arn func(string) string, param string) target {
 
 // api is the admin API handler.
 type api struct {
-	encryptionMu sync.Mutex
-	d            Deps
-	log          *slog.Logger
-	mux          *http.ServeMux
-	started      time.Time
-	now          func() time.Time
+	// configLocks serializes encryption provider changes per bucket and
+	// restic storage changes per backing.
+	configLocks keyedMutex
+	d           Deps
+	log         *slog.Logger
+	mux         *http.ServeMux
+	started     time.Time
+	now         func() time.Time
 
 	usage  *ttlCache[storage.BucketUsage] // per bucket
 	totals *ttlCache[storageTotals]       // key ""

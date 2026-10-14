@@ -4,26 +4,34 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"io"
+	"fmt"
 	"net/http"
-	"strings"
+	"slices"
+	"sync"
 
 	"github.com/seanmmitchell/gos3/internal/storage"
 )
 
+// encryptionDocument is the response of GET/PUT
+// /buckets/{name}/encryption-provider: the bucket's SSE-S3 implementation,
+// the providers it can use right now (omitted when the backend cannot
+// tell) and the backings its restic repositories live on.
 type encryptionDocument struct {
-	Provider string   `json:"provider"`
-	Backings []string `json:"backings,omitempty"`
-	Ready    *bool    `json:"ready,omitempty"`
-	Error    string   `json:"error,omitempty"`
+	Provider  string   `json:"provider"`
+	Available []string `json:"available,omitempty"`
+	Backings  []string `json:"backings,omitempty"`
 }
 
-func describeEncryption(s storage.EncryptionSettings) encryptionDocument {
-	return encryptionDocument{Provider: s.Provider}
-}
-
-func (a *api) describeBucketEncryption(bucket string, s storage.EncryptionSettings) encryptionDocument {
-	doc := describeEncryption(s)
+// describeBucketEncryption builds the encryptionDocument of bucket with
+// provider. Availability and placement are informational: failing to read
+// them is logged, not fatal.
+func (a *api) describeBucketEncryption(ctx context.Context, bucket, provider string) encryptionDocument {
+	doc := encryptionDocument{Provider: provider}
+	if p, err := a.encryptionProviders(ctx, bucket); err != nil {
+		a.log.Warn("admin: cannot list encryption providers", "bucket", bucket, "err", err)
+	} else {
+		doc.Available = p
+	}
 	if r, err := a.router(); err == nil {
 		if p, err := r.Summary(bucket); err == nil {
 			doc.Backings = append([]string{p.Primary}, p.Replicas...)
@@ -32,73 +40,147 @@ func (a *api) describeBucketEncryption(bucket string, s storage.EncryptionSettin
 	return doc
 }
 
-func (a *api) encryptionSettings(ctx context.Context, bucket string) (storage.EncryptionSettings, error) {
-	s := storage.EncryptionSettings{Provider: storage.EncryptionAES256}
-	raw, err := a.d.Backend.GetBucketConfig(ctx, bucket, storage.ConfigEncryptionProvider)
-	if errors.Is(err, storage.ErrConfigNotFound) {
-		return s, nil
+// encryptionProviders returns the providers bucket can use, or nil when
+// the backend does not implement storage.EncryptionProvidersBackend.
+func (a *api) encryptionProviders(ctx context.Context, bucket string) ([]string, error) {
+	pb, ok := a.d.Backend.(storage.EncryptionProvidersBackend)
+	if !ok {
+		return nil, nil
 	}
-	if err != nil {
-		return s, err
+	p, err := pb.EncryptionProviders(ctx, bucket)
+	if p == nil && err == nil {
+		p = []string{}
 	}
-	err = json.Unmarshal(raw, &s)
-	return s, err
+	return p, err
 }
 
+// getBucketEncryption returns the bucket's provider. It reads the document
+// with storage.EncryptionProvider, the parser writes use, so an invalid
+// stored provider is an error here too instead of being shown as valid.
 func (a *api) getBucketEncryption(rc *reqCtx) (int, any, error) {
-	s, err := a.encryptionSettings(rc.ctx, rc.r.PathValue("name"))
+	bucket := rc.r.PathValue("name")
+	provider, err := storage.EncryptionProvider(rc.ctx, a.d.Backend, bucket)
 	if err != nil {
-		return 0, nil, err
+		if errors.Is(err, storage.ErrBucketNotFound) {
+			return 0, nil, err
+		}
+		return 0, nil, fmt.Errorf("reading the encryption provider: %w (PUT a provider to replace it)", err)
 	}
-	return http.StatusOK, a.describeBucketEncryption(rc.r.PathValue("name"), s), nil
+	return http.StatusOK, a.describeBucketEncryption(rc.ctx, bucket, provider), nil
 }
 
-// PUT selects the implementation of SSE-S3, independently of whether bucket
-// default SSE is enabled. Secrets never leave the protected configuration store.
-// Storage settings are inherited from the bucket’s placement.
+// putBucketEncryption selects the implementation of SSE-S3, independently
+// of whether bucket default SSE is enabled. Storage settings and secrets
+// are not bucket state: restic repositories are derived from the bucket's
+// placement and the backings' settings (/backings/{name}/restic).
+//
+// The new provider is stored only once it is ready: the backend validates
+// it and prepares its keys or repository first, so a failure leaves the
+// previous provider in effect instead of switching the bucket's writes to
+// a provider that cannot store them. Changes are serialized per bucket.
 func (a *api) putBucketEncryption(rc *reqCtx) (int, any, error) {
-	// Serialize read/validate/store so concurrent setup cannot replace a
-	// provider after another request has started using it.
-	a.encryptionMu.Lock()
-	defer a.encryptionMu.Unlock()
 	bucket := rc.r.PathValue("name")
-	raw, err := rc.readBody()
-	if err != nil {
+	var in storage.EncryptionSettings
+	if err := rc.decodeBody(&in, false); err != nil {
 		return 0, nil, err
 	}
-	var s storage.EncryptionSettings
-	dec := json.NewDecoder(strings.NewReader(string(raw)))
-	dec.DisallowUnknownFields()
-	if err := dec.Decode(&s); err != nil {
-		return 0, nil, badRequest("invalid encryption settings")
-	}
-	if dec.Decode(new(any)) != io.EOF {
-		return 0, nil, badRequest("expected a single JSON document")
-	}
-	if s.Provider != storage.EncryptionAES256 && s.Provider != storage.EncryptionRestic {
-		return 0, nil, badRequest("provider must be AES256 or restic")
+	if !storage.ValidEncryptionProvider(in.Provider) {
+		return 0, nil, badRequest("provider must be %s or %s", storage.EncryptionAES256, storage.EncryptionRestic)
 	}
 	e, ok := a.d.Backend.(storage.EncryptionBackend)
 	if !ok {
-		return 0, nil, badRequest("this backend does not support encryption")
+		return 0, nil, badRequest("this storage backend does not support encryption")
 	}
-	if err := e.ValidateEncryptionSettings(rc.ctx, bucket, s); err != nil {
-		a.log.Error("admin: encryption settings validation failed", "bucket", bucket, "err", err)
-		return 0, nil, badRequest("Cannot open the encryption repository. Check the server log, restic installation, and backing storage configuration.")
+	defer a.configLocks.lock("bucket/" + bucket)()
+	available, err := a.encryptionProviders(rc.ctx, bucket)
+	if err != nil {
+		return 0, nil, err
 	}
-	data, _ := json.Marshal(s)
+	if available != nil && !slices.Contains(available, in.Provider) {
+		return 0, nil, badRequest("%s", unavailableProviderMessage(in.Provider))
+	}
+	if err := e.ValidateEncryptionSettings(rc.ctx, bucket, in); err != nil {
+		return 0, nil, a.encryptionSetupError(bucket, in.Provider, "validation", err)
+	}
+	if err := e.PrepareEncryption(rc.ctx, bucket, in.Provider); err != nil {
+		return 0, nil, a.encryptionSetupError(bucket, in.Provider, "preparation", err)
+	}
+	data, err := json.Marshal(in)
+	if err != nil {
+		return 0, nil, err
+	}
 	if err := a.d.Backend.PutBucketConfig(rc.ctx, bucket, storage.ConfigEncryptionProvider, data); err != nil {
 		return 0, nil, err
 	}
-	doc := a.describeBucketEncryption(bucket, s)
-	ready := true
-	doc.Ready = &ready
-	if err := e.PrepareEncryption(rc.ctx, bucket, s.Provider); err != nil {
-		// The backing retains its recovery key if init's result is uncertain.
-		// Report the saved provider so preparation can safely be retried.
-		ready = false
-		doc.Error = "Provider settings saved, but repository preparation failed. Check the server log and retry."
-		a.log.Error("admin: encryption provider preparation failed", "bucket", bucket, "err", err)
+	a.log.Info("admin: bucket encryption provider set", "bucket", bucket, "provider", in.Provider, "by", rc.id.User)
+	return http.StatusOK, a.describeBucketEncryption(rc.ctx, bucket, in.Provider), nil
+}
+
+// unavailableProviderMessage explains why provider is not in a bucket's
+// available list (only restic can be missing).
+func unavailableProviderMessage(provider string) string {
+	if provider == storage.EncryptionRestic {
+		return "restic is not available for this bucket: the restic executable must be installed on the server, " +
+			"and every backing holding the bucket (primary, replicas, move target) must be a filesystem backing. " +
+			"The provider was not changed."
 	}
-	return http.StatusOK, doc, nil
+	return fmt.Sprintf("the %s provider is not available for this bucket; the provider was not changed", provider)
+}
+
+// encryptionSetupError maps a failed validation or preparation (stage) of
+// provider for bucket to the API error. A missing bucket and canceled
+// requests keep their own errors; the rest are logged with their cause,
+// which can mention repository locations.
+func (a *api) encryptionSetupError(bucket, provider, stage string, err error) error {
+	switch {
+	case errors.Is(err, storage.ErrBucketNotFound), errors.Is(err, context.Canceled), errors.Is(err, context.DeadlineExceeded):
+		return err
+	case errors.Is(err, errors.ErrUnsupported):
+		return badRequest("the storage backing of this bucket does not support the %s provider; the provider was not changed", provider)
+	}
+	a.log.Error("admin: encryption provider "+stage+" failed", "bucket", bucket, "provider", provider, "err", err)
+	if provider == storage.EncryptionRestic {
+		return badRequest("Cannot prepare the restic repository of this bucket; the provider was not changed. " +
+			"Check the server log, the restic installation and the restic storage settings of the bucket's backings.")
+	}
+	return badRequest("Cannot prepare encryption keys for this bucket; the provider was not changed. Check the server log.")
+}
+
+// keyedMutex serializes work per key (one bucket's encryption provider,
+// one backing's restic storage) without blocking other keys: preparing a
+// remote restic repository can take long. The zero value is ready to use.
+type keyedMutex struct {
+	mu sync.Mutex
+	m  map[string]*keyedEntry
+}
+
+// keyedEntry is the mutex of one key and the number of its holders and
+// waiters; it is dropped when the last one unlocks.
+type keyedEntry struct {
+	mu sync.Mutex
+	n  int
+}
+
+// lock locks key and returns the unlock function.
+func (k *keyedMutex) lock(key string) func() {
+	k.mu.Lock()
+	if k.m == nil {
+		k.m = map[string]*keyedEntry{}
+	}
+	e := k.m[key]
+	if e == nil {
+		e = &keyedEntry{}
+		k.m[key] = e
+	}
+	e.n++
+	k.mu.Unlock()
+	e.mu.Lock()
+	return func() {
+		e.mu.Unlock()
+		k.mu.Lock()
+		if e.n--; e.n == 0 {
+			delete(k.m, key)
+		}
+		k.mu.Unlock()
+	}
 }

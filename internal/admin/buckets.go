@@ -337,7 +337,8 @@ func (a *api) forceDeleteBucket(rc *reqCtx, name string, bypass bool) error {
 		"bucket %q kept receiving new objects while being deleted (%d attempts): %v", name, forceDeleteAttempts, lastErr)
 }
 
-// emptyBucket deletes all versions, uploads and configuration documents.
+// emptyBucket deletes all versions, uploads and configuration documents
+// (except the encryption ones, see keepUntilBucketDeleted).
 // Each version is deleted only if guard allows it, atomically with the
 // delete when the backend is a storage.ConditionalDeleter (both built-in
 // backends are), so a lock applied after lockGuard's scan still holds.
@@ -396,11 +397,24 @@ func (a *api) emptyBucket(ctx context.Context, name string, guard *lockGuard) er
 		}
 	}
 	for _, key := range storage.AllConfigKeys {
+		if keepUntilBucketDeleted(key) {
+			continue
+		}
 		if err := b.DeleteBucketConfig(ctx, name, key); err != nil && !errors.Is(err, storage.ErrConfigNotFound) {
 			return fmt.Errorf("deleting %s configuration: %w", key, err)
 		}
 	}
 	return nil
+}
+
+// keepUntilBucketDeleted reports whether emptyBucket leaves the
+// configuration document key for DeleteBucket to remove with the bucket.
+// The encryption documents decide how writes are stored and how restic
+// objects are read: if DeleteBucket then fails (a concurrent writer), the
+// surviving bucket must neither store new objects in plaintext nor lose
+// the provider of its archived objects.
+func keepUntilBucketDeleted(key string) bool {
+	return key == storage.ConfigEncryption || key == storage.ConfigEncryptionProvider
 }
 
 // deleteVersionIf permanently deletes one version if check allows it,

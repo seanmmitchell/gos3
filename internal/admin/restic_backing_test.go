@@ -3,6 +3,7 @@ package admin
 import (
 	"bytes"
 	"context"
+	"strings"
 	"testing"
 	"time"
 
@@ -37,6 +38,19 @@ func TestResticBackingAPI(t *testing.T) {
 		t.Fatal("wrong backing response")
 	}
 	e.root("PUT", path, map[string]any{"mode": "local", "secretKey": "unexpected"}).expectStatus(t, 400)
+	// Strict decoding names unknown fields; endpoint checks match
+	// config.ValidateBaseURL's and are reported for the endpoint.
+	if msg := e.root("PUT", path, map[string]any{"mode": "s3", "repository": "x"}).expectError(t, 400, codeInvalidRequest); !strings.Contains(msg, "repository") {
+		t.Fatalf("unknown field: %q", msg)
+	}
+	for _, endpoint := range []string{"https://:443", "https://s3.example.test:99999", "https://s3.example.test:0", "https://s3.example.test:", "https://s3.example.test/?", "https://s3.example.test/path"} {
+		if msg := e.root("PUT", path, map[string]any{"mode": "s3", "endpoint": endpoint, "bucket": "archives"}).expectError(t, 400, codeInvalidRequest); !strings.Contains(msg, "endpoint") {
+			t.Fatalf("%s: %q", endpoint, msg)
+		}
+	}
+	if msg := e.root("PUT", path, map[string]any{"mode": "s3", "endpoint": "https://s3.example.test", "bucket": "archives", "region": "US East"}).expectError(t, 400, codeInvalidRequest); !strings.Contains(msg, "region") {
+		t.Fatalf("region: %q", msg)
+	}
 	e.root("PUT", path, map[string]any{"mode": "local"}).expectStatus(t, 200)
 	// Listing permission allows inspecting the redacted backing, while
 	// changing endpoint/credentials requires server configuration permission.
