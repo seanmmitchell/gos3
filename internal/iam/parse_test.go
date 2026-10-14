@@ -108,8 +108,10 @@ func TestParseBucketPolicy(t *testing.T) {
 	}{
 		{"public read", stmt(`{"Sid":"P","Effect":"Allow","Principal":"*","Action":"s3:GetObject","Resource":"arn:aws:s3:::photos/*"}`), ""},
 		{"aws star", stmt(`{"Effect":"Allow","Principal":{"AWS":"*"},"Action":["s3:ListBucket"],"Resource":"arn:aws:s3:::photos"}`), ""},
-		{"users and arns", stmt(`{"Effect":"Allow","Principal":{"AWS":["alice","arn:aws:iam::123456789012:user/bob","arn:aws:iam::123456789012:root","123456789012","AKIAEXAMPLE"]},"Action":"s3:*","Resource":["arn:aws:s3:::photos","arn:aws:s3:::photos/*"]}`), ""},
-		{"user path arn", stmt(`{"Effect":"Allow","Principal":{"AWS":"arn:aws:iam::1:user/dev/team/bob"},"Action":"s3:*","Resource":"arn:aws:s3:::photos/*"}`), ""},
+		{"users and account", stmt(`{"Effect":"Allow","Principal":{"AWS":["alice","bob","arn:aws:iam::123456789012:root","123456789012","AKIAEXAMPLE"]},"Action":"s3:*","Resource":["arn:aws:s3:::photos","arn:aws:s3:::photos/*"]}`), ""},
+		{"user arn", stmt(`{"Effect":"Allow","Principal":{"AWS":"arn:aws:iam::1:user/bob"},"Action":"s3:*","Resource":"arn:aws:s3:::photos/*"}`), "Invalid principal in policy"},
+		{"user path arn", stmt(`{"Effect":"Allow","Principal":{"AWS":"arn:aws:iam::1:user/dev/team/bob"},"Action":"s3:*","Resource":"arn:aws:s3:::photos/*"}`), "Invalid principal in policy"},
+		{"user arn in not principal", stmt(`{"Effect":"Deny","NotPrincipal":{"AWS":"arn:aws:iam::1:user/alice"},"Action":"s3:*","Resource":"arn:aws:s3:::photos/*"}`), "Invalid principal in policy"},
 		{"canonical", stmt(`{"Effect":"Allow","Principal":{"CanonicalUser":"alice"},"Action":"s3:*","Resource":"arn:aws:s3:::photos/*"}`), ""},
 		{"wildcard bucket", stmt(`{"Effect":"Allow","Principal":"*","Action":"s3:*","Resource":"arn:aws:s3:::pho*/*"}`), ""},
 		{"wildcard all buckets", stmt(`{"Effect":"Deny","Principal":"*","Action":"s3:*","Resource":"arn:aws:s3:::*"}`), ""},

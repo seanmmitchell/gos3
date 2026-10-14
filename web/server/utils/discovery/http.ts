@@ -172,6 +172,41 @@ export function isAllowedHost(host: string | undefined, allowed: string[] = allo
 }
 
 /**
+ * Names that cannot be registered in public DNS: single-label names and the
+ * special-use or never-delegated suffixes below. A DNS-rebinding attacker
+ * needs a public name it controls, so these are safe Host values for the
+ * console's own pages (not for the discovery routes, which accept only IP
+ * literals, localhost and listed names).
+ */
+const PRIVATE_SUFFIXES = ['.local', '.localhost', '.internal', '.home.arpa', '.localdomain', '.lan', '.home', '.corp']
+
+/** True for a host name a public website cannot rebind (see PRIVATE_SUFFIXES). */
+export function isPrivateName(name: string): boolean {
+  const h = name.toLowerCase().replace(/\.$/, '')
+  if (!h) return false
+  if (!h.includes('.')) return /^[a-z0-9_-]+$/.test(h)
+  return PRIVATE_SUFFIXES.some(sfx => h.endsWith(sfx))
+}
+
+/**
+ * Host values a request was addressed to: the Host header plus, behind a
+ * reverse proxy, every X-Forwarded-Host and Forwarded `host=` value (the
+ * name the browser used when the proxy rewrites Host). Each must pass the
+ * Host check.
+ */
+export function requestHosts(event: H3Event): (string | undefined)[] {
+  const out: (string | undefined)[] = [getRequestHeader(event, 'host')]
+  for (const h of (getRequestHeader(event, 'x-forwarded-host') ?? '').split(',')) {
+    if (h.trim()) out.push(h.trim())
+  }
+  for (const m of (getRequestHeader(event, 'forwarded') ?? '').matchAll(/(?:^|[;,\s])host\s*=\s*("(?:[^"\\]|\\.)*"|[^;,\s]*)/gi)) {
+    const v = m[1]!.replace(/^"(.*)"$/, '$1').replace(/\\(.)/g, '$1').trim()
+    if (v) out.push(v)
+  }
+  return out
+}
+
+/**
  * True when origin is an http(s) origin whose host name is listed
  * explicitly in GOS3_UI_ALLOWED_HOSTS (the "*" wildcard does not count).
  */
@@ -187,22 +222,37 @@ export function isListedOrigin(origin: string, allowed: string[] = allowedHostsF
   return name !== '' && name !== '*' && allowed.includes(name)
 }
 
+/** Header a script on the console sends with discovery requests (see rejectForeignRequest). */
+export const DISCOVERY_HEADER = 'x-gos3-discovery'
+
 /**
- * Rejects requests a browser made on behalf of another site: a Host header
- * that is not allowed (DNS rebinding), an Origin that differs from the Host
- * and is not listed in GOS3_UI_ALLOWED_HOSTS (cross-origin), or Sec-Fetch-Site cross-site / same-site. Returns the
- * error envelope to send, or undefined when the request may proceed.
+ * Rejects requests a browser made on behalf of another site: a Host (or,
+ * behind a proxy, X-Forwarded-Host / Forwarded host) that is not allowed
+ * (DNS rebinding), an Origin that differs from the Host and is not listed
+ * in GOS3_UI_ALLOWED_HOSTS (cross-origin) and Sec-Fetch-Site cross-site /
+ * same-site. With opts.browserSignal (GET routes that start work, where a
+ * cross-site `<img>` needs no Origin), a browser request without
+ * Sec-Fetch-Site (an older browser) is refused too unless it carries the
+ * X-Gos3-Discovery header, which a cross-site page cannot send without a
+ * CORS preflight. (POST routes need application/json, which already forces
+ * a preflight.) Returns the error envelope to send, or undefined when the
+ * request may proceed.
  */
-export function rejectForeignRequest(event: H3Event): ErrorEnvelope | undefined {
-  const host = getRequestHeader(event, 'host')
-  if (!isAllowedHost(host)) {
-    return errorResponse(event, 403, 'AccessDenied', `Host "${host}" is not allowed for discovery requests: open the console via localhost or an IP address, or add the name to GOS3_UI_ALLOWED_HOSTS.`)
+export function rejectForeignRequest(event: H3Event, opts: { browserSignal?: boolean } = {}): ErrorEnvelope | undefined {
+  const hosts = requestHosts(event)
+  const host = hosts[0]
+  for (const h of hosts) {
+    if (!isAllowedHost(h)) {
+      return errorResponse(event, 403, 'AccessDenied', `Host "${clipHeader(h)}" is not allowed for discovery requests: open the console via localhost or an IP address, or add the name to GOS3_UI_ALLOWED_HOSTS.`)
+    }
   }
   const origin = getRequestHeader(event, 'origin')
   if (origin !== undefined) {
     let sameOrigin = false
     try {
-      sameOrigin = origin !== 'null' && !!host && new URL(origin).host === new URL(`http://${host}`).host
+      // Behind a proxy that forwards the original host, the Origin matches
+      // that (already checked) forwarded host rather than Host.
+      sameOrigin = origin !== 'null' && hosts.some(h => !!h && new URL(origin).host === new URL(`http://${h}`).host)
     } catch {
       sameOrigin = false
     }
@@ -215,7 +265,15 @@ export function rejectForeignRequest(event: H3Event): ErrorEnvelope | undefined 
   }
   const site = getRequestHeader(event, 'sec-fetch-site')
   if (site === 'cross-site' || site === 'same-site') return errorResponse(event, 403, 'AccessDenied', 'Cross-site discovery requests are not allowed.')
+  if (opts.browserSignal && site === undefined && /\bMozilla\//.test(getRequestHeader(event, 'user-agent') ?? '') && getRequestHeader(event, DISCOVERY_HEADER) === undefined) {
+    return errorResponse(event, 403, 'AccessDenied', 'This browser does not send Sec-Fetch-Site: discovery requests need the X-Gos3-Discovery header.')
+  }
   return undefined
+}
+
+function clipHeader(v: string | undefined): string {
+  const s = (v ?? '').replace(/[^\x20-\x7e]/g, '?')
+  return s.length > 64 ? `${s.slice(0, 64)}…` : s
 }
 
 /**
@@ -267,4 +325,22 @@ export const probeSlots = new Slots(MAX_CONCURRENT_PROBES)
 export function tooManyRequests(event: H3Event, what: string, max: number): ErrorEnvelope {
   setResponseHeader(event, 'retry-after', 5)
   return errorResponse(event, 429, 'TooManyRequests', `${max} ${what} are already running on this UI server; retry when one has finished.`)
+}
+
+/**
+ * True when the console's own pages may be served under this Host value:
+ * what the discovery routes accept (isAllowedHost) plus names that cannot
+ * exist in public DNS (isPrivateName). See server/middleware/00-allowed-hosts.ts.
+ */
+export function isConsoleHost(host: string | undefined, allowed: string[] = allowedHostsFromEnv()): boolean {
+  if (isAllowedHost(host, allowed)) return true
+  return isPrivateName(hostnameOf(host ?? ''))
+}
+
+/** True when runtimeConfig.public.servers (NUXT_PUBLIC_SERVERS) holds presets. */
+export function hasConfiguredPresets(servers: unknown): boolean {
+  if (Array.isArray(servers)) return servers.length > 0
+  if (typeof servers !== 'string') return !!servers && typeof servers === 'object'
+  const s = servers.trim()
+  return s !== '' && s !== '[]' && s !== '{}' && s !== 'null'
 }

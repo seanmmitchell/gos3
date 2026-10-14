@@ -83,8 +83,11 @@ type Result struct {
 	// (e.g. "X-Amz-Checksum-Crc32"), available once Body returned io.EOF.
 	// Returns an empty header if there were none. Never nil.
 	Trailer func() http.Header
-	// PayloadMode is the x-amz-content-sha256 value (or "" for anonymous /
-	// presigned requests, which are UNSIGNED-PAYLOAD).
+	// PayloadMode is the signed x-amz-content-sha256 value: the header of
+	// header-authenticated requests, the query parameter (or a signed
+	// header) of presigned URLs. "" for anonymous requests and presigned
+	// URLs whose payload is unsigned, even when an unsigned header declares
+	// a hash (that header still decides how the body is verified).
 	PayloadMode string
 	// SignedAt is when the request was signed (X-Amz-Date, or Date for
 	// header authentication); the s3:signatureAge condition key is measured

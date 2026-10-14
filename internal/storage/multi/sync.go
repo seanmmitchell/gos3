@@ -1,0 +1,577 @@
+package multi
+
+import (
+	"bytes"
+	"context"
+	"errors"
+	"fmt"
+	"io"
+	"maps"
+	"reflect"
+	"slices"
+	"time"
+
+	"github.com/seanmmitchell/gos3/internal/storage"
+	"github.com/seanmmitchell/gos3/internal/storage/compress"
+)
+
+// errSourceChanged: a key changed on the source while it was being
+// copied; it is copied again.
+var errSourceChanged = errors.New("multi: source changed during copy")
+
+// walkBatchKeys is the number of keys a full comparison collects per walk.
+const walkBatchKeys = 256
+
+// syncMemberKey copies key from the bucket's primary to member ms, under
+// the key's lock. prog, when non-nil, counts the work.
+func (r *Router) syncMemberKey(ctx context.Context, ms *memberState, key string, prog *Progress) error {
+	r.mu.RLock()
+	src := ms.bucket.members[ms.bucket.rec.primary()].backing
+	removed := ms.bucket.removed
+	r.mu.RUnlock()
+	if removed || ms.isCanceled() {
+		return errCanceled
+	}
+	if src == ms.backing {
+		return nil // promoted meanwhile
+	}
+	unlock := r.keys.lock(ms.bucket.name, key)
+	defer unlock()
+	err := r.syncKey(ctx, src, ms.backing, ms.bucket.name, key, prog)
+	if errors.Is(err, errSourceChanged) {
+		r.markDirty(ms, key)
+		return nil
+	}
+	return err
+}
+
+// syncKey makes the versions of bucket/key on dst identical to those on
+// src (IDs, order, data, metadata). The caller holds the key's lock.
+//
+// Versions are compared by identity (ID, LastModified, ETag, size,
+// delete marker). dst versions that do not exist on src are deleted;
+// then, oldest first, the longest common prefix of both histories is
+// kept (with metadata updated where it differs) and the rest of dst is
+// replaced by the rest of src. In the common case (new versions added on
+// src) that copies just the new versions.
+func (r *Router) syncKey(ctx context.Context, src, dst *backing, bucket, key string, prog *Progress) error {
+	sv, err := keyVersions(ctx, src.Backend, bucket, key)
+	if err != nil {
+		return r.observe(src, fmt.Errorf("listing %s/%s on backing %q: %w", bucket, key, src.Name, err))
+	}
+	dv, err := keyVersions(ctx, dst.Backend, bucket, key)
+	if err != nil {
+		return r.observe(dst, fmt.Errorf("listing %s/%s on backing %q: %w", bucket, key, dst.Name, err))
+	}
+	if prog != nil {
+		prog.Keys++
+	}
+	srcByID := make(map[string]storage.ObjectInfo, len(sv))
+	for _, v := range sv {
+		srcByID[v.VersionID] = v
+	}
+	del := func(id string) error {
+		_, err := dst.Backend.DeleteObject(ctx, bucket, key, id)
+		if err != nil && !errors.Is(err, storage.ErrVersionNotFound) && !errors.Is(err, storage.ErrObjectNotFound) {
+			return r.observe(dst, fmt.Errorf("deleting %s/%s version %s on backing %q: %w", bucket, key, id, dst.Name, err))
+		}
+		return nil
+	}
+	// Oldest first from here on.
+	slices.Reverse(sv)
+	slices.Reverse(dv)
+	keep := dv[:0:0]
+	for _, d := range dv {
+		if s, ok := srcByID[d.VersionID]; ok && sameVersion(s, d) {
+			keep = append(keep, d)
+			continue
+		}
+		if err := del(d.VersionID); err != nil {
+			return err
+		}
+	}
+	common := 0
+	for common < len(keep) && common < len(sv) && keep[common].VersionID == sv[common].VersionID {
+		common++
+	}
+	for _, d := range keep[common:] {
+		if err := del(d.VersionID); err != nil {
+			return err
+		}
+	}
+	for i := range common {
+		s, d := sv[i], keep[i]
+		if s.DeleteMarker || metaEqual(s.ObjectMeta, d.ObjectMeta) {
+			continue
+		}
+		meta := cloneMeta(s.ObjectMeta)
+		_, err := dst.Backend.UpdateObjectMeta(ctx, bucket, key, s.VersionID, func(m *storage.ObjectMeta) error {
+			*m = cloneMeta(meta)
+			return nil
+		})
+		if err != nil && !errors.Is(err, storage.ErrVersionNotFound) {
+			return r.observe(dst, fmt.Errorf("updating %s/%s version %s on backing %q: %w", bucket, key, s.VersionID, dst.Name, err))
+		}
+	}
+	changed := false
+	for _, s := range sv[common:] {
+		n, err := r.importVersion(ctx, src, dst, bucket, key, s)
+		if errors.Is(err, errSourceChanged) {
+			changed = true
+			continue
+		}
+		if err != nil {
+			return err
+		}
+		if prog != nil {
+			prog.Versions++
+			prog.Bytes += n
+		}
+	}
+	if changed {
+		return errSourceChanged
+	}
+	return nil
+}
+
+// importVersion copies version v of bucket/key from src to dst. It returns
+// the number of bytes copied.
+func (r *Router) importVersion(ctx context.Context, src, dst *backing, bucket, key string, v storage.ObjectInfo) (int64, error) {
+	opts := storage.WriteOptions{Encryption: v.Encryption}
+	if v.Compression == storage.CompressionDeflate {
+		// Keep the copy compressed like its source (the level the source
+		// used is not recorded).
+		opts.Compression = storage.Compression{Algorithm: storage.CompressionDeflate, Level: compress.DefaultLevel}
+	}
+	w, err := newVersionWriter(ctx, dst, bucket, key, opts)
+	if err != nil {
+		return 0, r.observe(dst, fmt.Errorf("copying %s/%s to backing %q: %w", bucket, key, dst.Name, err))
+	}
+	info := v
+	var n int64
+	if !v.DeleteMarker {
+		oi, rc, err := src.Backend.OpenObject(ctx, bucket, key, v.VersionID)
+		if err != nil {
+			_ = w.Abort()
+			if errors.Is(err, storage.ErrVersionNotFound) || errors.Is(err, storage.ErrObjectNotFound) {
+				return 0, errSourceChanged
+			}
+			return 0, r.observe(src, fmt.Errorf("reading %s/%s version %s on backing %q: %w", bucket, key, v.VersionID, src.Name, err))
+		}
+		if oi.Encryption != opts.Encryption {
+			if rc != nil {
+				_ = rc.Close()
+			}
+			_ = w.Abort()
+			return 0, errSourceChanged
+		}
+		if rc != nil { // nil: the null version became a delete marker meanwhile
+			n, err = io.Copy(w, rc)
+			_ = rc.Close()
+		}
+		if err != nil {
+			_ = w.Abort()
+			return 0, fmt.Errorf("copying %s/%s version %s from %q to %q: %w", bucket, key, v.VersionID, src.Name, dst.Name, err)
+		}
+		// Store what was read: data and metadata are consistent even if
+		// the null version was replaced in between (then the key is
+		// copied again).
+		info = oi
+	}
+	if _, err := w.Commit(ctx, info); err != nil {
+		return 0, r.observe(dst, fmt.Errorf("copying %s/%s version %s to backing %q: %w", bucket, key, v.VersionID, dst.Name, err))
+	}
+	if !sameVersion(info, v) {
+		return n, errSourceChanged
+	}
+	return n, nil
+}
+
+// newVersionWriter starts an imported version on b, stored as opts asks
+// when b can compress (else as is). errors.ErrUnsupported when b cannot
+// import versions at all.
+func newVersionWriter(ctx context.Context, b *backing, bucket, key string, opts storage.WriteOptions) (storage.VersionWriter, error) {
+	if withOptions(opts) {
+		if ci, ok := b.Backend.(storage.CompressingImporter); ok {
+			return ci.NewVersionWriterWith(ctx, bucket, key, opts)
+		}
+		if opts.Encryption != "" {
+			return nil, errNoWriteOptions(b.Name, opts)
+		}
+	}
+	imp, ok := b.Backend.(storage.VersionImporter)
+	if !ok {
+		return nil, fmt.Errorf("backing %q cannot receive copies: %w", b.Name, errors.ErrUnsupported)
+	}
+	return imp.NewVersionWriter(ctx, bucket, key)
+}
+
+// keyVersions returns the versions of bucket/key, newest first.
+func keyVersions(ctx context.Context, b storage.Backend, bucket, key string) ([]storage.ObjectInfo, error) {
+	var out []storage.ObjectInfo
+	err := b.WalkVersions(ctx, bucket, key, "", "", func(oi storage.ObjectInfo) error {
+		if oi.Key != key {
+			return storage.ErrStopWalk
+		}
+		out = append(out, oi)
+		return nil
+	})
+	return out, err
+}
+
+// sameVersion reports whether a and b are the same stored version.
+func sameVersion(a, b storage.ObjectInfo) bool {
+	return a.Encryption == b.Encryption && a.VersionID == b.VersionID && a.DeleteMarker == b.DeleteMarker && a.Size == b.Size &&
+		a.LastModified.Equal(b.LastModified) && a.ETag == b.ETag
+}
+
+// metaEqual compares object metadata, treating nil and empty maps and
+// slices as equal and comparing times by instant.
+func metaEqual(a, b storage.ObjectMeta) bool {
+	return reflect.DeepEqual(normMeta(a), normMeta(b))
+}
+
+func normMeta(m storage.ObjectMeta) storage.ObjectMeta {
+	m = cloneMeta(m)
+	norm := func(mm map[string]string) map[string]string {
+		if len(mm) == 0 {
+			return nil
+		}
+		return mm
+	}
+	m.UserMeta, m.Tags, m.Checksums = norm(m.UserMeta), norm(m.Tags), norm(m.Checksums)
+	if len(m.PartSizes) == 0 {
+		m.PartSizes = nil
+	}
+	if len(m.PartChecksums) == 0 {
+		m.PartChecksums = nil
+	}
+	for i, pc := range m.PartChecksums {
+		m.PartChecksums[i] = norm(pc)
+	}
+	if m.RetainUntil.IsZero() {
+		m.RetainUntil = time.Time{}
+	} else {
+		m.RetainUntil = time.Unix(0, m.RetainUntil.UnixNano()).UTC()
+	}
+	return m
+}
+
+func cloneMeta(m storage.ObjectMeta) storage.ObjectMeta {
+	m.UserMeta = maps.Clone(m.UserMeta)
+	m.Tags = maps.Clone(m.Tags)
+	m.Checksums = maps.Clone(m.Checksums)
+	m.PartSizes = slices.Clone(m.PartSizes)
+	if m.PartChecksums != nil {
+		pc := make([]map[string]string, len(m.PartChecksums))
+		for i, c := range m.PartChecksums {
+			pc[i] = maps.Clone(c)
+		}
+		m.PartChecksums = pc
+	}
+	return m
+}
+
+// walkKeys calls fn with the keys of bucket on b (each key once,
+// ascending) in batches, outside of the walk, so fn may call into any
+// backing.
+func walkKeys(ctx context.Context, b storage.Backend, bucket string, fn func(keys []string) error) error {
+	after := ""
+	for {
+		var keys []string
+		more := false
+		err := b.WalkVersions(ctx, bucket, "", after, "", func(oi storage.ObjectInfo) error {
+			if n := len(keys); n > 0 && keys[n-1] == oi.Key {
+				return nil
+			}
+			if len(keys) == walkBatchKeys {
+				more = true
+				return storage.ErrStopWalk
+			}
+			keys = append(keys, oi.Key)
+			return nil
+		})
+		if err != nil {
+			return err
+		}
+		if len(keys) > 0 {
+			if err := fn(keys); err != nil {
+				// fn reports (and observes) its own backings' errors.
+				return &callerError{err: err}
+			}
+		}
+		if !more {
+			return nil
+		}
+		after = keys[len(keys)-1]
+	}
+}
+
+// fullSync compares member ms with the bucket's primary in full: bucket
+// settings and configuration, every key present on either side, and
+// in-progress uploads (removed from ms: uploads live on the primary only).
+func (r *Router) fullSync(ctx context.Context, ms *memberState) error {
+	bs := ms.bucket
+	r.mu.RLock()
+	src := bs.members[bs.rec.primary()].backing
+	r.mu.RUnlock()
+	if src == ms.backing {
+		return nil
+	}
+	if !src.healthy.Load() {
+		return fmt.Errorf("primary backing %q is unhealthy", src.Name)
+	}
+	dst := ms.backing
+	if err := r.syncBucket(ctx, src, dst, bs.name); err != nil {
+		return err
+	}
+	if err := abortUploads(ctx, dst, bs.name, r); err != nil {
+		return err
+	}
+	canceled := func() error {
+		if ms.isCanceled() {
+			return errCanceled
+		}
+		return ctx.Err()
+	}
+	prog := func() *Progress {
+		ms.mu.Lock()
+		defer ms.mu.Unlock()
+		return ms.progress
+	}
+	// Every key of the source.
+	err := walkKeys(ctx, src.Backend, bs.name, func(keys []string) error {
+		for _, k := range keys {
+			if err := canceled(); err != nil {
+				return err
+			}
+			p := &Progress{}
+			if err := r.syncMemberKey(ctx, ms, k, p); err != nil {
+				return err
+			}
+			r.addProgress(ms, prog(), p)
+		}
+		return nil
+	})
+	if err != nil {
+		return r.walkErr(src, err)
+	}
+	// Keys only the member has.
+	err = walkKeys(ctx, dst.Backend, bs.name, func(keys []string) error {
+		for _, k := range keys {
+			if err := canceled(); err != nil {
+				return err
+			}
+			_, err := src.Backend.GetObjectInfo(ctx, bs.name, k, "")
+			if err == nil {
+				continue
+			}
+			if !errors.Is(err, storage.ErrObjectNotFound) {
+				return r.observe(src, err)
+			}
+			if err := r.syncMemberKey(ctx, ms, k, nil); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		return r.walkErr(dst, err)
+	}
+	return nil
+}
+
+func (r *Router) addProgress(ms *memberState, total, p *Progress) {
+	if total == nil {
+		return
+	}
+	ms.mu.Lock()
+	total.Keys += p.Keys
+	total.Versions += p.Versions
+	total.Bytes += p.Bytes
+	ms.mu.Unlock()
+}
+
+// walkErr observes a walk error unless it came from the walk callback
+// (which reports its own backing's errors).
+func (r *Router) walkErr(b *backing, err error) error {
+	if errors.Is(err, errCanceled) || errors.Is(err, context.Canceled) {
+		return err
+	}
+	return r.observe(b, err)
+}
+
+// syncBucket makes the bucket on dst match src: existence, versioning,
+// object lock and every configuration document.
+func (r *Router) syncBucket(ctx context.Context, src, dst *backing, bucket string) error {
+	info, err := src.Backend.GetBucket(ctx, bucket)
+	if err != nil {
+		return r.observe(src, err)
+	}
+	cur, err := dst.Backend.GetBucket(ctx, bucket)
+	if errors.Is(err, storage.ErrBucketNotFound) {
+		err = dst.Backend.CreateBucket(ctx, bucket, storage.CreateBucketOptions{
+			Region: info.Region, ObjectLockEnabled: info.ObjectLockEnabled, Owner: info.Owner,
+		})
+		if err != nil && !errors.Is(err, storage.ErrBucketExists) {
+			return r.observe(dst, fmt.Errorf("creating bucket %q on backing %q: %w", bucket, dst.Name, err))
+		}
+		cur, err = dst.Backend.GetBucket(ctx, bucket)
+	}
+	if err != nil {
+		return r.observe(dst, err)
+	}
+	if cur.Versioning != info.Versioning && info.Versioning != storage.VersioningUnversioned {
+		if err := dst.Backend.SetBucketVersioning(ctx, bucket, info.Versioning); err != nil {
+			return r.observe(dst, err)
+		}
+	}
+	if cur.ObjectLockEnabled != info.ObjectLockEnabled {
+		if err := dst.Backend.SetBucketObjectLock(ctx, bucket, info.ObjectLockEnabled); err != nil {
+			return r.observe(dst, err)
+		}
+	}
+	for _, k := range storage.AllConfigKeys {
+		if err := r.syncConfig(ctx, src, dst, bucket, k); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// syncConfig copies one configuration document from src to dst.
+func (r *Router) syncConfig(ctx context.Context, src, dst *backing, bucket, key string) error {
+	want, err := src.Backend.GetBucketConfig(ctx, bucket, key)
+	if err != nil && !errors.Is(err, storage.ErrConfigNotFound) {
+		return r.observe(src, err)
+	}
+	missing := errors.Is(err, storage.ErrConfigNotFound)
+	have, err := dst.Backend.GetBucketConfig(ctx, bucket, key)
+	if err != nil && !errors.Is(err, storage.ErrConfigNotFound) {
+		return r.observe(dst, err)
+	}
+	dstMissing := errors.Is(err, storage.ErrConfigNotFound)
+	switch {
+	case missing && dstMissing:
+		return nil
+	case missing:
+		return r.observe(dst, dst.Backend.DeleteBucketConfig(ctx, bucket, key))
+	case !dstMissing && bytes.Equal(want, have):
+		return nil
+	}
+	return r.observe(dst, dst.Backend.PutBucketConfig(ctx, bucket, key, want))
+}
+
+// abortUploads aborts every in-progress multipart upload of bucket on b.
+func abortUploads(ctx context.Context, b *backing, bucket string, r *Router) error {
+	ups, err := b.Backend.ListMultipartUploads(ctx, bucket)
+	if err != nil {
+		return r.observe(b, err)
+	}
+	for _, u := range ups {
+		err := b.Backend.AbortMultipartUpload(ctx, bucket, u.Key, u.UploadID)
+		if err != nil && !errors.Is(err, storage.ErrUploadNotFound) {
+			return r.observe(b, err)
+		}
+	}
+	return nil
+}
+
+// --- purges ---
+
+// purgeJob deletes a bucket's copy from a backing in the background.
+type purgeJob struct {
+	rec     purgeRecord
+	running bool // guarded by Router.mu
+}
+
+// addPurgeLocked records a copy to delete. Router.mu must be held (or
+// Open must be running).
+func (r *Router) addPurgeLocked(bucket, backingName string) {
+	p := purgeRecord{Bucket: bucket, Backing: backingName}
+	if r.purges[p] == nil {
+		r.purges[p] = &purgeJob{rec: p}
+	}
+}
+
+// startPurge runs j in the background unless it runs already. Router.mu
+// must be held (read or write).
+func (r *Router) startPurge(j *purgeJob) {
+	if j == nil || j.running || r.ctx.Err() != nil {
+		return
+	}
+	j.running = true
+	r.wg.Add(1)
+	go func() {
+		defer r.wg.Done()
+		backoff := minBackoff
+		for {
+			err := r.purge(r.ctx, j.rec)
+			if err == nil {
+				r.mu.Lock()
+				delete(r.purges, j.rec)
+				r.mu.Unlock()
+				r.log.Info("deleted a bucket copy", "bucket", j.rec.Bucket, "backing", j.rec.Backing)
+				r.saveLogged("deleting a bucket copy")
+				return
+			}
+			if r.ctx.Err() != nil {
+				return
+			}
+			r.log.Warn("deleting a bucket copy failed; retrying", "bucket", j.rec.Bucket,
+				"backing", j.rec.Backing, "retry_in", backoff, "err", err)
+			select {
+			case <-r.ctx.Done():
+				return
+			case <-time.After(backoff):
+			}
+			backoff = min(backoff*2, maxBackoff)
+		}
+	}()
+}
+
+// purge deletes every version, upload and configuration document of the
+// bucket on the backing, then the bucket itself.
+func (r *Router) purge(ctx context.Context, p purgeRecord) error {
+	b := r.topology.Load().backings[p.Backing]
+	if b == nil {
+		return nil
+	}
+	_, err := b.Backend.GetBucket(ctx, p.Bucket)
+	if errors.Is(err, storage.ErrBucketNotFound) {
+		return nil
+	}
+	if err != nil {
+		return r.observe(b, err)
+	}
+	if err := abortUploads(ctx, b, p.Bucket, r); err != nil {
+		return err
+	}
+	for {
+		var vs []storage.ObjectInfo
+		err := b.Backend.WalkVersions(ctx, p.Bucket, "", "", "", func(oi storage.ObjectInfo) error {
+			vs = append(vs, oi)
+			if len(vs) == 1000 {
+				return storage.ErrStopWalk
+			}
+			return nil
+		})
+		if err != nil {
+			return r.observe(b, err)
+		}
+		if len(vs) == 0 {
+			break
+		}
+		for _, v := range vs {
+			_, err := b.Backend.DeleteObject(ctx, p.Bucket, v.Key, v.VersionID)
+			if err != nil && !errors.Is(err, storage.ErrVersionNotFound) && !errors.Is(err, storage.ErrObjectNotFound) {
+				return r.observe(b, err)
+			}
+		}
+	}
+	err = b.Backend.DeleteBucket(ctx, p.Bucket)
+	if err != nil && !errors.Is(err, storage.ErrBucketNotFound) {
+		return r.observe(b, err)
+	}
+	return nil
+}

@@ -277,6 +277,11 @@ func mapStorageError(err error) error {
 	case errors.Is(err, context.DeadlineExceeded), errors.Is(err, context.Canceled),
 		errors.Is(err, os.ErrDeadlineExceeded): // a stalled request body (countingBody)
 		return s3err.ErrRequestTimeout
+	case errors.Is(err, storage.ErrEncryptionUnavailable):
+		// The details (restic's diagnostics) are in the server log only.
+		return s3err.ErrInternalError.WithMessage("The bucket's encryption provider is unavailable. Please try again later.")
+	case errors.Is(err, errors.ErrUnsupported):
+		return s3err.ErrNotImplemented.WithMessage("This storage backend does not support the requested operation.")
 	case errors.As(err, &maxBytes):
 		return s3err.ErrMaxMessageLengthExceeded
 	case errors.Is(err, io.ErrUnexpectedEOF):

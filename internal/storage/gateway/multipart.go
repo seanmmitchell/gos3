@@ -507,19 +507,10 @@ func (s *Store) CompleteMultipartUpload(ctx context.Context, bucket, key, upload
 
 	unlock := s.lockObject(bucket, key)
 	defer unlock()
-	ifMatch := ""
-	if opts.IfMatch != "" {
-		cur, a, err := s.head(ctx, bucket, key, "")
-		if errors.Is(err, storage.ErrObjectNotFound) {
-			return storage.ObjectInfo{}, fmt.Errorf("%w: %s/%s does not exist (If-Match)", storage.ErrPreconditionFailed, bucket, key)
-		}
-		if err != nil {
-			return storage.ObjectInfo{}, err
-		}
-		if !etagMatches(opts.IfMatch, cur.ETag) {
-			return storage.ObjectInfo{}, fmt.Errorf("%w: ETag mismatch (If-Match)", storage.ErrPreconditionFailed)
-		}
-		ifMatch = a.ETag
+	meta = cloneMeta(meta)
+	ifMatch, err := s.prePublish(ctx, bucket, key, &meta, opts)
+	if err != nil {
+		return storage.ObjectInfo{}, err
 	}
 	info := storage.ObjectInfo{
 		ObjectMeta: cloneMeta(meta),

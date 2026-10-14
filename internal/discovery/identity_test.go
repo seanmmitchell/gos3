@@ -2,8 +2,12 @@ package discovery
 
 import (
 	"context"
+	"encoding/json"
+	"net/http"
+	"net/http/httptest"
 	"slices"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -240,4 +244,91 @@ func TestPeerTableIdentityRules(t *testing.T) {
 func evil2(in Info) Info {
 	in.Endpoints.S3 = "https://evil.example"
 	return in
+}
+
+// TestPeerConflictUndecided: when the caller's deadline cuts the re-probes
+// of a verified peer's known addresses short (a host that is down, whose
+// addresses each take a full probe timeout), the claim is neither recorded
+// as a conflict nor accepted as a move; once the addresses fail on their
+// own, the peer moves.
+func TestPeerConflictUndecided(t *testing.T) {
+	defer checkLeaks(t)()
+	const id = "undecided0000001"
+	a := newGos3Server(t, id, "nas")
+	// b serves a's document until hang is set, then never answers (until
+	// the client gives up), like an address whose host went down.
+	var hang atomic.Bool
+	b := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if hang.Load() {
+			<-r.Context().Done()
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(a.Info())
+	}))
+	t.Cleanup(b.Close)
+	a.mu.Lock()
+	a.info.Endpoints.All = []string{a.URL, b.URL}
+	a.mu.Unlock()
+
+	s := New(quietConfig(), nil, testLogger(t))
+	clk := newFakeClock()
+	s.now = clk.Now
+	for _, u := range []string{a.URL, b.URL} {
+		if _, err := s.Probe(context.Background(), u); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if p, _ := s.table.get(id); len(p.Addresses) != 2 || !p.Verified {
+		t.Fatalf("setup: %+v", p)
+	}
+	a.Close() // refused at once
+	hang.Store(true)
+	evil := impostor(t, id)
+	clk.Advance(conflictFresh)
+
+	check := func(step string) {
+		t.Helper()
+		p, _ := s.table.get(id)
+		if p.Name != "nas" || len(p.Addresses) != 2 || slices.Contains(p.Addresses, evil.URL) {
+			t.Errorf("%s: peer moved on an undecided check: %+v", step, p)
+		}
+		if strings.Contains(p.Error, "claimed") {
+			t.Errorf("%s: conflict recorded on an undecided check: %q", step, p.Error)
+		}
+	}
+
+	// The admin probe's deadline ends while b is being re-probed: the
+	// caller sees what the URL serves, and nothing is recorded.
+	ctx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
+	p, err := s.Probe(ctx, evil.URL)
+	cancel()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if p.Endpoints.S3 != "https://evil.example" || !slices.Equal(p.Addresses, []string{evil.URL}) {
+		t.Errorf("probe result = %+v", p)
+	}
+	check("probe")
+
+	// The same from a sighting whose context is cancelled mid-check.
+	ctx, cancel = context.WithCancel(context.Background())
+	time.AfterFunc(200*time.Millisecond, cancel)
+	s.verify(ctx, candidate{id: id, source: SourceBeacon, urls: []string{evil.URL}}, time.Second)
+	cancel()
+	check("cancelled sighting")
+	if st := s.knownStillAnswer(ctx, id); st != knownUndecided {
+		t.Errorf("knownStillAnswer with a done ctx = %v, want undecided", st)
+	}
+
+	// With both addresses failing on their own, the peer moves.
+	b.CloseClientConnections()
+	b.Close()
+	if _, err := s.Probe(context.Background(), evil.URL); err != nil {
+		t.Fatal(err)
+	}
+	if p, _ := s.table.get(id); !slices.Equal(p.Addresses, []string{evil.URL}) || p.Error != "" {
+		t.Errorf("after the known addresses failed: %+v", p)
+	}
+	s.Stop()
 }

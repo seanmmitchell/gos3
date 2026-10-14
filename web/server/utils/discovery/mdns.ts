@@ -2,9 +2,15 @@
 // Pure functions over the record shape produced by `multicast-dns`
 // (dns-packet); the socket handling lives in ./local.ts.
 import { isIP } from 'node:net'
+import { isValidPeerId } from './beacon'
+import { canonicalIp, hostNets, type LocalNets } from './netlocal'
 import { baseUrl } from './targets'
 
 export const MDNS_SERVICE = '_gos3._tcp.local'
+/** Service instances taken from one sender (as the gos3 server). */
+export const MDNS_MAX_PER_SOURCE = 16
+/** Addresses kept per host name and sender. */
+const MDNS_MAX_HOST_ADDRS = 16
 
 /** Minimal structural view of a dns-packet answer. */
 export interface MdnsRecord {
@@ -23,9 +29,9 @@ export interface MdnsCandidate {
   scheme: 'http' | 'https'
   /** Decoded TXT key/values (id, name, v, api, region, scheme, info). */
   txt: Record<string, string>
-  /** A/AAAA addresses of the target (IPv4 first). */
+  /** Accepted A/AAAA addresses of the target: the first IPv4 and IPv6 address. */
   addresses: string[]
-  /** Candidate base URLs: one per address, else the target host name. */
+  /** Candidate base URLs, one per address (IPv4 first). */
   urls: string[]
 }
 
@@ -70,60 +76,75 @@ export function isGos3Instance(name: string): boolean {
 }
 
 /**
- * Builds candidates from all records collected during a browse window
- * (answers + additionals of every response). Instances come from PTR
+ * Builds candidates from the records one sender (src) sent during a browse
+ * window (answers + additionals of all its responses). Records of different
+ * senders must never be pooled: answers are unauthenticated, so a sender
+ * may only advertise its own address (or, when it is this host, loopback
+ * and local addresses; see LocalNets.advertisedBy). Instances come from PTR
  * records of the service type and from SRV/TXT records named like an
- * instance; each needs an SRV record to become a candidate.
+ * instance; each needs an SRV and a TXT record and an accepted address of
+ * the SRV target (the target name is never resolved). Instances whose TXT
+ * `id` is not a valid server ID are dropped; at most MDNS_MAX_PER_SOURCE
+ * instances are taken.
  */
-export function parseMdnsRecords(records: readonly MdnsRecord[]): MdnsCandidate[] {
+export function parseMdnsRecords(records: readonly MdnsRecord[], src: string, nets: Pick<LocalNets, 'advertisedBy'> = hostNets): MdnsCandidate[] {
   const instances = new Set<string>()
   const srv = new Map<string, SrvData>()
   const txt = new Map<string, Record<string, string>>()
   const addrs = new Map<string, string[]>()
+  const addInstance = (name: string) => {
+    if (instances.has(name) || instances.size < MDNS_MAX_PER_SOURCE) {
+      instances.add(name)
+      return true
+    }
+    return false
+  }
 
   for (const r of records) {
     if (!r || typeof r.name !== 'string') continue
     const name = dnsName(r.name)
     switch (r.type) {
       case 'PTR':
-        if (name === MDNS_SERVICE && typeof r.data === 'string' && isGos3Instance(r.data)) instances.add(dnsName(r.data))
+        if (name === MDNS_SERVICE && typeof r.data === 'string' && isGos3Instance(r.data)) addInstance(dnsName(r.data))
         break
       case 'SRV':
-        if (isSrvData(r.data) && isGos3Instance(name)) {
-          instances.add(name)
+        if (isSrvData(r.data) && isGos3Instance(name) && addInstance(name)) {
           srv.set(name, { target: dnsName(r.data.target), port: r.data.port })
         }
         break
       case 'TXT':
-        if (isGos3Instance(name)) {
-          instances.add(name)
+        if (isGos3Instance(name) && addInstance(name)) {
           txt.set(name, { ...decodeTxt(r.data), ...txt.get(name) })
         }
         break
       case 'A':
-      case 'AAAA':
-        if (typeof r.data === 'string' && isIP(r.data)) {
+      case 'AAAA': {
+        const ip = typeof r.data === 'string' ? canonicalIp(r.data) : undefined
+        if (ip && nets.advertisedBy(ip, src)) {
           const list = addrs.get(name) ?? []
-          if (!list.includes(r.data)) list.push(r.data)
+          if (!list.includes(ip) && list.length < MDNS_MAX_HOST_ADDRS) list.push(ip)
           addrs.set(name, list)
         }
         break
+      }
     }
   }
 
   const out: MdnsCandidate[] = []
   for (const instance of instances) {
     const s = srv.get(instance)
-    if (!s || s.port < 1 || s.port > 65535) continue
-    const t = txt.get(instance) ?? {}
+    const t = txt.get(instance)
+    if (!s || !t || s.port < 1 || s.port > 65535) continue
+    if (t.id !== undefined && t.id !== '' && !isValidPeerId(t.id)) continue
     const scheme = t.scheme?.toLowerCase() === 'https' ? 'https' : 'http'
     const all = addrs.get(s.target) ?? []
-    // IPv4 first; IPv6 link-local addresses need a zone id and are not usable in URLs.
-    const v4 = all.filter(a => isIP(a) === 4)
-    const v6 = all.filter(a => isIP(a) === 6 && !/^fe80:/i.test(a))
-    const addresses = [...v4, ...v6]
-    const urls = addresses.length ? addresses.map(a => baseUrl(scheme, a, s.port)) : s.target ? [baseUrl(scheme, s.target, s.port)] : []
-    out.push({ instance, host: s.target, port: s.port, scheme, txt: t, addresses, urls })
+    // The first IPv4 and IPv6 address, IPv4 first; IPv6 link-local addresses
+    // need a zone id and are not usable in URLs.
+    const v4 = all.find(a => isIP(a) === 4)
+    const v6 = all.find(a => isIP(a) === 6 && !/^fe[89ab][0-9a-f]:/i.test(a))
+    const addresses = [v4, v6].filter((a): a is string => !!a)
+    if (!addresses.length) continue
+    out.push({ instance, host: s.target, port: s.port, scheme, txt: t, addresses, urls: addresses.map(a => baseUrl(scheme, a, s.port)) })
   }
   return out
 }

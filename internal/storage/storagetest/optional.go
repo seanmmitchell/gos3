@@ -1,6 +1,7 @@
 package storagetest
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
 	"slices"
@@ -18,6 +19,12 @@ func optionalTests() []testCase {
 		{"DeleteObjectIf", testDeleteObjectIf},
 		{"DeleteObjectIfRace", testDeleteObjectIfRace},
 		{"WalkMultipartUploads", testWalkUploads},
+		{"DeleteObjectChecked", testDeleteObjectChecked},
+		{"UpdateObjectMetaIf", testUpdateObjectMetaIf},
+		{"UpdateObjectMetaIfRace", testUpdateObjectMetaIfRace},
+		{"ViewBucketConfig", testViewBucketConfig},
+		{"VersionImporter", testVersionImporter}, // importer.go
+		{"Compression", testCompression},
 	}
 }
 
@@ -348,4 +355,195 @@ func testWalkUploads(e *env) {
 			e.t.Errorf("paged walk: %d uploads, unpaged %d (want 200)", len(resumed), len(got))
 		}
 	})
+}
+
+func (e *env) conditionalMetaUpdater() storage.ConditionalMetaUpdater {
+	e.t.Helper()
+	cu, ok := e.b.(storage.ConditionalMetaUpdater)
+	if !ok {
+		e.t.Skip("backend does not implement storage.ConditionalMetaUpdater")
+	}
+	return cu
+}
+
+func testUpdateObjectMetaIf(e *env) {
+	cu := e.conditionalMetaUpdater()
+	setACL := func(m *storage.ObjectMeta) error { m.ACL = "public-read"; return nil }
+	e.run("MissingKeyVersionOrDeleteMarker", func(e *env) {
+		e.mkVersioned("m", storage.VersioningEnabled)
+		called := false
+		check := func(storage.ObjectInfo) error { called = true; return nil }
+		_, err := cu.UpdateObjectMetaIf(e.ctx, "m", "nokey", "", check, setACL)
+		e.wantErr("UpdateObjectMetaIf of a missing key", err, storage.ErrObjectNotFound)
+		v := e.put("m", "k", []byte("x"))
+		_, err = cu.UpdateObjectMetaIf(e.ctx, "m", "k", "no-such-version", check, setACL)
+		e.wantErr("UpdateObjectMetaIf of a missing version", err, storage.ErrVersionNotFound)
+		dm := e.del("m", "k", "")
+		_, err = cu.UpdateObjectMetaIf(e.ctx, "m", "k", "", check, setACL)
+		e.wantErr("UpdateObjectMetaIf of a latest delete marker", err, storage.ErrObjectNotFound, storage.ErrVersionNotFound)
+		_, err = cu.UpdateObjectMetaIf(e.ctx, "m", "k", dm.VersionID, check, setACL)
+		e.wantErr("UpdateObjectMetaIf of a delete marker version", err, storage.ErrObjectNotFound, storage.ErrVersionNotFound)
+		_, err = cu.UpdateObjectMetaIf(e.ctx, "nobucket", "k", "", check, setACL)
+		e.wantErr("UpdateObjectMetaIf in a missing bucket", err, storage.ErrBucketNotFound)
+		if called {
+			e.t.Error("check was called for a missing key, version, delete marker or bucket")
+		}
+		// A version behind the delete marker can be updated.
+		out, err := cu.UpdateObjectMetaIf(e.ctx, "m", "k", v.VersionID, check, setACL)
+		e.noErr("UpdateObjectMetaIf of a noncurrent version", err)
+		if out.VersionID != v.VersionID || out.ACL != "public-read" || out.IsLatest {
+			e.t.Errorf("UpdateObjectMetaIf of a noncurrent version: result %+v", out)
+		}
+	})
+	e.run("RefusedAndAccepted", func(e *env) {
+		e.mkBucket("u")
+		v := e.put("u", "k", []byte("data"))
+		var got storage.ObjectInfo
+		fnCalled := false
+		_, err := cu.UpdateObjectMetaIf(e.ctx, "u", "k", "", func(o storage.ObjectInfo) error { got = o; return errCheckRefused },
+			func(*storage.ObjectMeta) error { fnCalled = true; return nil })
+		if !errors.Is(err, errCheckRefused) {
+			e.t.Errorf("refused UpdateObjectMetaIf: err = %v, want the check's error", err)
+		}
+		if fnCalled {
+			e.t.Error("refused UpdateObjectMetaIf called the update function")
+		}
+		if got.VersionID != v.VersionID || !got.IsLatest || got.ETag != v.ETag || got.Size != v.Size || !got.LastModified.Equal(v.LastModified) {
+			e.t.Errorf("check got %+v, want the current version %+v", got, v)
+		}
+		if cur := e.info("u", "k", ""); cur.ACL != "" {
+			e.t.Errorf("refused update changed the ACL to %q", cur.ACL)
+		}
+		out, err := cu.UpdateObjectMetaIf(e.ctx, "u", "k", storage.NullVersionID, func(storage.ObjectInfo) error { return nil }, setACL)
+		e.noErr("accepted UpdateObjectMetaIf", err)
+		if out.ACL != "public-read" || out.ETag != v.ETag || !out.LastModified.Equal(v.LastModified) {
+			e.t.Errorf("accepted UpdateObjectMetaIf result %+v", out)
+		}
+		if cur := e.info("u", "k", ""); cur.ACL != "public-read" {
+			e.t.Errorf("accepted update: stored ACL %q", cur.ACL)
+		}
+	})
+}
+
+// testUpdateObjectMetaIfRace checks atomicity: an update conditional on the
+// version it last saw never modifies a version committed concurrently over
+// the same (null) version ID.
+func testUpdateObjectMetaIfRace(e *env) {
+	cu := e.conditionalMetaUpdater()
+	e.mkBucket("race")
+	for i := range 200 {
+		old := e.put("race", "k", []byte("old"))
+		newData := []byte{byte(i), 'n', 'e', 'w'}
+		var wg sync.WaitGroup
+		wg.Add(2)
+		go func() {
+			defer wg.Done()
+			if _, err := putObject(e.ctx, e.b, "race", "k", newData, simpleMeta(newData), storage.CommitOptions{}); err != nil {
+				e.t.Error(err)
+			}
+		}()
+		go func() {
+			defer wg.Done()
+			_, err := cu.UpdateObjectMetaIf(e.ctx, "race", "k", storage.NullVersionID, func(o storage.ObjectInfo) error {
+				if o.ETag != old.ETag || !o.LastModified.Equal(old.LastModified) {
+					return errCheckRefused
+				}
+				return nil
+			}, func(m *storage.ObjectMeta) error { m.ACL = "public-read"; return nil })
+			if err != nil && !errors.Is(err, errCheckRefused) {
+				e.t.Error(err)
+			}
+		}()
+		wg.Wait()
+		if o, data := e.read("race", "k", ""); !bytes.Equal(data, newData) || o.ACL != "" {
+			e.t.Fatalf("iteration %d: concurrently written object was updated (data %q, ACL %q)", i, data, o.ACL)
+		}
+	}
+}
+
+func testViewBucketConfig(e *env) {
+	cv, ok := e.b.(storage.ConfigViewer)
+	if !ok {
+		e.t.Skip("backend does not implement storage.ConfigViewer")
+	}
+	e.mkBucket("c")
+	called := false
+	fn := func([]byte) error { called = true; return nil }
+	e.wantErr("ViewBucketConfig in a missing bucket", cv.ViewBucketConfig(e.ctx, "nobucket", storage.ConfigLifecycle, fn), storage.ErrBucketNotFound)
+	e.wantErr("ViewBucketConfig of a missing document", cv.ViewBucketConfig(e.ctx, "c", storage.ConfigLifecycle, fn), storage.ErrConfigNotFound)
+	if called {
+		e.t.Error("fn was called for a missing bucket or document")
+	}
+	doc := []byte("<LifecycleConfiguration/>")
+	e.noErr("PutBucketConfig", e.b.PutBucketConfig(e.ctx, "c", storage.ConfigLifecycle, doc))
+	var got []byte
+	e.noErr("ViewBucketConfig", cv.ViewBucketConfig(e.ctx, "c", storage.ConfigLifecycle, func(data []byte) error {
+		got = bytes.Clone(data)
+		return nil
+	}))
+	if !bytes.Equal(got, doc) {
+		e.t.Errorf("ViewBucketConfig saw %q, want %q", got, doc)
+	}
+	if err := cv.ViewBucketConfig(e.ctx, "c", storage.ConfigLifecycle, func([]byte) error { return errCheckRefused }); !errors.Is(err, errCheckRefused) {
+		e.t.Errorf("ViewBucketConfig: err = %v, want fn's error", err)
+	}
+	e.noErr("DeleteBucketConfig", e.b.DeleteBucketConfig(e.ctx, "c", storage.ConfigLifecycle))
+	e.wantErr("ViewBucketConfig of a deleted document", cv.ViewBucketConfig(e.ctx, "c", storage.ConfigLifecycle, fn), storage.ErrConfigNotFound)
+}
+
+func testDeleteObjectChecked(e *env) {
+	cd, ok := e.b.(storage.CheckedDeleter)
+	if !ok {
+		e.t.Skip("backend does not implement storage.CheckedDeleter")
+	}
+	e.mkBucket("u")
+	e.mkVersioned("v", storage.VersioningEnabled)
+	e.mkVersioned("s", storage.VersioningSuspended)
+	for _, b := range []string{"u", "v", "s"} {
+		// A missing key: check sees found = false; a refusal changes nothing.
+		var gotFound *bool
+		_, err := cd.DeleteObjectChecked(e.ctx, b, "k", "", func(o storage.ObjectInfo, found bool) error {
+			gotFound = &found
+			return errCheckRefused
+		})
+		if !errors.Is(err, errCheckRefused) || gotFound == nil || *gotFound {
+			e.t.Errorf("%s: refused check on a missing key: err %v, found %v", b, err, gotFound)
+		}
+		if _, err := e.b.GetObjectInfo(e.ctx, b, "k", ""); !errors.Is(err, storage.ErrObjectNotFound) {
+			e.t.Errorf("%s: refused delete of a missing key left %v", b, err)
+		}
+		// Accepted: DeleteObject's semantics (a marker when versioned).
+		res, err := cd.DeleteObjectChecked(e.ctx, b, "k", "", func(storage.ObjectInfo, bool) error { return nil })
+		e.noErr(b+": accepted DeleteObjectChecked of a missing key", err)
+		if b == "u" {
+			if res.DeleteMarker {
+				e.t.Errorf("unversioned delete of a missing key: %+v", res)
+			}
+		} else {
+			info, err := e.b.GetObjectInfo(e.ctx, b, "k", "")
+			if err != nil || !res.DeleteMarker || !info.DeleteMarker || info.VersionID != res.VersionID {
+				e.t.Errorf("%s: no delete marker for a missing key: %+v %+v %v", b, res, info, err)
+			}
+		}
+		// An existing version: found = true with its info.
+		v := e.put(b, "x", []byte("data"))
+		var got storage.ObjectInfo
+		_, err = cd.DeleteObjectChecked(e.ctx, b, "x", "", func(o storage.ObjectInfo, found bool) error {
+			if !found {
+				return errors.New("found = false for an existing object")
+			}
+			got = o
+			return errCheckRefused
+		})
+		if !errors.Is(err, errCheckRefused) || got.VersionID != v.VersionID {
+			e.t.Errorf("%s: check on an existing object: err %v, got %+v", b, err, got)
+		}
+		e.wantContent(b, "x", "", []byte("data"))
+		// A missing version: ErrVersionNotFound without calling check.
+		_, err = cd.DeleteObjectChecked(e.ctx, b, "x", "no-such-version", func(storage.ObjectInfo, bool) error {
+			e.t.Errorf("%s: check called for a missing version", b)
+			return nil
+		})
+		e.wantErr(b+": DeleteObjectChecked of a missing version", err, storage.ErrVersionNotFound)
+	}
 }

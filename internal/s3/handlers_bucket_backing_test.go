@@ -8,26 +8,35 @@ import (
 
 	"github.com/seanmmitchell/gos3/internal/s3err"
 	"github.com/seanmmitchell/gos3/internal/storage"
-	"github.com/seanmmitchell/gos3/internal/storage/routed"
+	"github.com/seanmmitchell/gos3/internal/storage/memory"
+	"github.com/seanmmitchell/gos3/internal/storage/multi"
 )
 
 // TestCreateBucketBacking covers the x-gos3-backing extension header of
 // CreateBucket and HeadBucket.
 func TestCreateBucketBacking(t *testing.T) {
 	e := newTestEnv(t, withOptions(func(o *Options) {
-		o.Backend = routed.New(routed.Options{Primary: o.Backend, PrimaryBackings: []string{"archive"}})
+		r, err := multi.Open(t.Context(), multi.Options{Backings: []multi.Backing{
+			{Name: "default", Kind: "memory", Backend: o.Backend},
+			{Name: "archive", Kind: "memory", Backend: memory.New()},
+		}})
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = r.Close() })
+		o.Backend = r
 	}))
 	tests := []struct {
 		name, bucket, header string
 		status               int
 		code, backing        string
 	}{
-		{name: "default", bucket: "bk-default", status: 200, backing: "local"},
-		{name: "local", bucket: "bk-local", header: "local", status: 200, backing: "local"},
+		{name: "default", bucket: "bk-default", status: 200, backing: "default"},
+		{name: "explicit default", bucket: "bk-local", header: "default", status: 200, backing: "default"},
 		{name: "configured", bucket: "bk-archive", header: "archive", status: 200, backing: "archive"},
 		{name: "case and space", bucket: "bk-upper", header: " Archive ", status: 200, backing: "archive"},
 		{name: "unknown", bucket: "bk-unknown", header: "nope", status: 400, code: "InvalidArgument"},
-		{name: "malformed", bucket: "bk-bad", header: "a_b", status: 400, code: "InvalidArgument"},
+		{name: "malformed", bucket: "bk-bad", header: "a b", status: 400, code: "InvalidArgument"},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {

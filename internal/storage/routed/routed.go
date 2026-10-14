@@ -21,6 +21,7 @@ import (
 	"io"
 	"log/slog"
 	"sync"
+	"time"
 
 	"github.com/seanmmitchell/gos3/internal/storage"
 )
@@ -294,7 +295,11 @@ func (b *Backend) NewObjectWriter(ctx context.Context, bucket, key string) (stor
 		return nil, err
 	}
 	if s != nil {
-		return s.NewObjectWriter(ctx, bucket, key)
+		w, err := s.NewObjectWriter(ctx, bucket, key)
+		if err != nil {
+			return nil, err
+		}
+		return &storeWriter{ObjectWriter: w, b: b, bucket: bucket}, nil
 	}
 	return b.primary.NewObjectWriter(ctx, bucket, key)
 }
@@ -458,7 +463,7 @@ func (b *Backend) CompleteMultipartUpload(ctx context.Context, bucket, key, uplo
 		return storage.ObjectInfo{}, err
 	}
 	if s != nil {
-		return s.CompleteMultipartUpload(ctx, bucket, key, uploadID, partNumbers, meta, opts)
+		return s.CompleteMultipartUpload(ctx, bucket, key, uploadID, partNumbers, meta, b.withConfigs(ctx, bucket, opts))
 	}
 	return b.primary.CompleteMultipartUpload(ctx, bucket, key, uploadID, partNumbers, meta, opts)
 }
@@ -472,6 +477,37 @@ func (b *Backend) AbortMultipartUpload(ctx context.Context, bucket, key, uploadI
 		return s.AbortMultipartUpload(ctx, bucket, key, uploadID)
 	}
 	return b.primary.AbortMultipartUpload(ctx, bucket, key, uploadID)
+}
+
+// withConfigs makes opts.BeforePublish see the bucket's configuration
+// documents, which the primary keeps (a DataStore passes none).
+func (b *Backend) withConfigs(ctx context.Context, bucket string, opts storage.CommitOptions) storage.CommitOptions {
+	hook := opts.BeforePublish
+	if hook == nil {
+		return opts
+	}
+	opts.BeforePublish = func(meta, current *storage.ObjectMeta, created time.Time, _ func(string) []byte) error {
+		return hook(meta, current, created, func(key string) []byte {
+			data, err := b.primary.GetBucketConfig(ctx, bucket, key)
+			if err != nil {
+				return nil
+			}
+			return data
+		})
+	}
+	return opts
+}
+
+// storeWriter is a DataStore's object writer whose commits see the
+// bucket's configuration documents (withConfigs).
+type storeWriter struct {
+	storage.ObjectWriter
+	b      *Backend
+	bucket string
+}
+
+func (w *storeWriter) Commit(ctx context.Context, meta storage.ObjectMeta, opts storage.CommitOptions) (storage.ObjectInfo, error) {
+	return w.ObjectWriter.Commit(ctx, meta, w.b.withConfigs(ctx, w.bucket, opts))
 }
 
 // Close closes the stores and then the primary, returning the first error.

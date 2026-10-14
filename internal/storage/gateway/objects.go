@@ -140,26 +140,18 @@ func (w *objectWriter) Commit(ctx context.Context, meta storage.ObjectMeta, opts
 	}
 	size := w.spool.Size()
 	multipart := size > s.singlePutLimit(size)
-	// The remote ETag is the MD5 of the content for single PUTs, so the gos3
-	// ETag only needs to be kept when it differs.
-	h := encodeHeaders(meta, headerOpts{etag: multipart || meta.ETag != sum})
 
 	unlock := s.lockObject(w.bucket, w.key)
 	defer unlock()
-	up := s3client.UploadOptions{PutOptions: s3client.PutOptions{Header: h, IfNoneMatch: opts.IfNoneMatch}, PartSize: s.partSize}
-	if opts.IfMatch != "" {
-		cur, a, err := s.head(ctx, w.bucket, w.key, "")
-		if errors.Is(err, storage.ErrObjectNotFound) {
-			return storage.ObjectInfo{}, fmt.Errorf("%w: %s/%s does not exist (If-Match)", storage.ErrPreconditionFailed, w.bucket, w.key)
-		}
-		if err != nil {
-			return storage.ObjectInfo{}, err
-		}
-		if !etagMatches(opts.IfMatch, cur.ETag) {
-			return storage.ObjectInfo{}, fmt.Errorf("%w: ETag mismatch (If-Match)", storage.ErrPreconditionFailed)
-		}
-		up.IfMatch = a.ETag
+	meta = cloneMeta(meta)
+	ifMatch, err := s.prePublish(ctx, w.bucket, w.key, &meta, opts)
+	if err != nil {
+		return storage.ObjectInfo{}, err
 	}
+	// The remote ETag is the MD5 of the content for single PUTs, so the gos3
+	// ETag only needs to be kept when it differs.
+	h := encodeHeaders(meta, headerOpts{etag: multipart || meta.ETag != sum})
+	up := s3client.UploadOptions{PutOptions: s3client.PutOptions{Header: h, IfNoneMatch: opts.IfNoneMatch, IfMatch: ifMatch}, PartSize: s.partSize}
 	rb, rk := s.remoteKey(w.bucket, w.key)
 	etag, _, err := s.c.Upload(ctx, rb, rk, w.spool, size, up)
 	if err != nil {
@@ -184,6 +176,46 @@ func (w *objectWriter) Abort() error {
 		return w.spool.Close()
 	}
 	return nil
+}
+
+// prePublish evaluates a commit's preconditions and BeforePublish hook
+// under the object's lock (held by the caller), just before the object is
+// published. The current object is read (HEAD) when either needs it.
+// IfMatch is checked against the gos3 ETag; the remote ETag seen is
+// returned, to pin the upload to it with "If-Match". The hook may change
+// meta (not its encoding); the bucket configuration it is given is
+// supplied by the router (routed.Backend), so here it sees none.
+func (s *Store) prePublish(ctx context.Context, bucket, key string, meta *storage.ObjectMeta, opts storage.CommitOptions) (remoteIfMatch string, err error) {
+	if opts.IfMatch == "" && opts.BeforePublish == nil {
+		return "", nil
+	}
+	cur, a, err := s.head(ctx, bucket, key, "")
+	exists := err == nil
+	if err != nil && !errors.Is(err, storage.ErrObjectNotFound) {
+		return "", err
+	}
+	if opts.IfMatch != "" {
+		if !exists {
+			return "", fmt.Errorf("%w: %s/%s does not exist (If-Match)", storage.ErrPreconditionFailed, bucket, key)
+		}
+		if !etagMatches(opts.IfMatch, cur.ETag) {
+			return "", fmt.Errorf("%w: ETag mismatch (If-Match)", storage.ErrPreconditionFailed)
+		}
+		remoteIfMatch = a.ETag
+	}
+	if opts.BeforePublish != nil {
+		var current *storage.ObjectMeta
+		if exists {
+			m := cloneMeta(cur.ObjectMeta)
+			current = &m
+		}
+		encryption := meta.Encryption
+		if err := opts.BeforePublish(meta, current, truncTime(time.Now()), func(string) []byte { return nil }); err != nil {
+			return "", err
+		}
+		meta.Encryption = encryption // the encoding is the backend's choice
+	}
+	return remoteIfMatch, nil
 }
 
 // --- reads ---

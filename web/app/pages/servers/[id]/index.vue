@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import type { Stats } from '~/types/admin'
+import type { Stats, StorageStats } from '~/types/admin'
 import { overviewMode } from '~/components/admin/-capabilities'
 import { fillMinutes, type TrafficSeries } from '~/components/admin/-metrics'
 
@@ -14,7 +14,7 @@ const REFRESH_MS = 10_000
 const route = useRoute()
 const id = computed(() => routeParam(route.params.id))
 const { connection, requireS3, requireAdmin, status } = useConnection()
-const { capabilities, whoami, loading: whoamiLoading, can } = useWhoAmI()
+const { capabilities, whoami, loading: whoamiLoading } = useWhoAmI()
 const { info, serverInfo, error: infoError, refresh: refreshInfo } = useServerInfo()
 
 useHead({ title: () => `${connection.value?.name ?? 'Server'} · Overview` })
@@ -120,9 +120,6 @@ const identityRows = computed(() => {
   return rows
 })
 
-// Storage backings, when the server offers more than its own storage.
-const backings = computed(() => (backingChoices(whoami.value?.backings).length ? whoami.value?.backings ?? null : null))
-
 const endpoints = computed(() => {
   const e = info.value?.endpoints
   if (!e) return []
@@ -132,13 +129,19 @@ const endpoints = computed(() => {
   return out
 })
 
+/** "… incl. versions", after the compression saving of the current versions when there is one. */
+function storedHint(s: StorageStats): string {
+  const note = formatStoredNote(s.bytes, s.storedBytes)
+  return `${note ? `${note} · ` : ''}${formatBytes(s.versionBytes)} incl. versions`
+}
+
 const storageCards = computed(() => {
   const s = stats.value?.storage
   if (!s) return []
   return [
     { label: 'Buckets', value: formatNumber(s.buckets), icon: 'i-lucide-database' },
     { label: 'Objects', value: formatNumber(s.objects), icon: 'i-lucide-files', hint: `${formatNumber(s.versions)} versions` },
-    { label: 'Stored', value: formatBytes(s.bytes), icon: 'i-lucide-hard-drive', hint: `${formatBytes(s.versionBytes)} incl. versions` },
+    { label: 'Stored', value: formatBytes(s.bytes), icon: 'i-lucide-hard-drive', hint: storedHint(s) },
     { label: 'Delete markers', value: formatNumber(s.deleteMarkers), icon: 'i-lucide-eraser', hint: `${formatNumber(s.pendingUploads)} pending uploads` }
   ]
 })
@@ -237,12 +240,6 @@ const storageCards = computed(() => {
             <div class="flex flex-wrap gap-1.5">
               <UBadge v-for="f in info.features" :key="f" :label="f" color="neutral" variant="subtle" size="sm" />
             </div>
-          </div>
-          <div v-if="backings">
-            <h3 class="mb-2 text-xs font-medium uppercase tracking-wide text-muted">
-              Storage backings
-            </h3>
-            <AdminBackingsList :backings="backings" :can-list="can('listBackings')" />
           </div>
         </div>
       </div>

@@ -10,7 +10,7 @@ const sampleConfig = `# gos3 configuration file.
 # command line flags. "gos3 config env" lists the variables, "gos3 config
 # print" shows the effective configuration. Settings marked (runtime) can also
 # be changed while running through the admin API / web UI; those changes are
-# stored in <data>/.gos3/settings.json and win over this file.
+# stored in <data>/.gos3/settings.json and win over this file when admin is enabled.
 
 server:
   # Listen address, [host]:port.
@@ -37,14 +37,24 @@ server:
   # The client is the rightmost X-Forwarded-For entry that is not one of
   # trusted_proxies; the last X-Forwarded-Proto value decides aws:SecureTransport.
   trust_proxy_headers: false
-  # Addresses (CIDRs or IPs) of the reverse proxies in front of gos3. With
-  # trust_proxy_headers, requests from other addresses are taken at face
-  # value. Empty: any peer is trusted and the rightmost entry is the client
-  # (fine for a single proxy that gos3 alone can be reached through). List
-  # only the proxies, never subnets that also hold clients: a listed client
-  # could choose its own aws:SourceIp.
+  # Addresses (CIDRs or IPs) of the reverse proxies in front of gos3;
+  # required with trust_proxy_headers. Requests from other addresses are
+  # taken at face value. List only the proxies, never subnets that also hold
+  # clients: a listed client could choose its own aws:SourceIp.
   # trusted_proxies: ["10.0.0.5", "192.0.2.10"]
   trusted_proxies: []
+  # Extra host names clients use to reach this server (Host header, no
+  # port). IP addresses, localhost, the OS host name (and <name>.local) and
+  # the hosts of address, public_url and domains are always known. Empty:
+  # requests for other host names are served only when signed (no anonymous
+  # access, web UI or public metrics: protects against DNS rebinding).
+  # Non-empty: requests for other host names are refused. "*.example.com"
+  # allows subdomains; ["*"] turns the check off.
+  allowed_hosts: []
+  # Maximum simultaneously open client connections (0 = no limit). At the
+  # limit a new connection closes the longest-idle keep-alive connection, or
+  # is refused when none is idle.
+  max_connections: 0
 
 storage:
   # fs (files under path) or memory (lost on exit).
@@ -56,35 +66,50 @@ storage:
   path: ./data
   # fsync object data before acknowledging writes (durable across power loss).
   fsync_data: true
-  # Remote S3 services individual buckets can be stored on, chosen per
-  # bucket at creation (x-gos3-backing header or the web UI). mode: blob
-  # (opaque blobs, metadata stays here, every feature) or gateway (native
-  # remote objects, no versioning/object lock). See docs/backings.md.
+  # Additional backings (this one is named "default"): fs directories,
+  # memory, or remote S3 services (backend: s3, mode blob = opaque blobs
+  # with every feature, gateway = native remote objects without versioning).
+  # New buckets go to default_backing unless CreateBucket names another
+  # with the x-gos3-backing header. See docs/configuration.md and
+  # docs/backings.md.
   # backings:
+  #   - name: hdd
+  #     path: /mnt/hdd/gos3
   #   - name: cold
-  #     mode: blob
-  #     endpoint: https://s3.eu-central-1.amazonaws.com
-  #     region: eu-central-1
-  #     bucket: acme-gos3-blobs
-  #     prefix: prod/
-  #     # credentials: access_key / secret_key, or GOS3_BACKING_COLD_ACCESS_KEY
-  #     # and GOS3_BACKING_COLD_SECRET_KEY
+  #     backend: s3
+  #     path: /var/lib/gos3-cold     # local metadata of this backing
+  #     s3:
+  #       mode: blob
+  #       endpoint: https://s3.eu-central-1.amazonaws.com
+  #       region: eu-central-1
+  #       bucket: acme-gos3-blobs
+  #       # credentials: access_key / secret_key, or GOS3_BACKING_COLD_ACCESS_KEY
+  #       # and GOS3_BACKING_COLD_SECRET_KEY
   backings: []
-  # Backing of buckets created without a choice: local or a backing name.
   default_backing: ""
 
 auth:
   # Root credentials. Prefer the environment (GOS3_ROOT_ACCESS_KEY /
-  # GOS3_ROOT_SECRET_KEY). When unset, a pair is generated on first start,
-  # logged once and stored in <path>/.gos3/root-credentials.json.
+  # GOS3_ROOT_SECRET_KEY). When unset, a pair is generated on first start
+  # and stored in <path>/.gos3/root-credentials.json (the secret is never
+  # logged; the startup banner shows it on a terminal).
   # root_access_key: ""
   # root_secret_key: ""
   # Reject signatures whose credential scope names another region.
   strict_region: false
+  # Allow a published example root secret key (README / docker-compose
+  # demo keys). Anyone can sign requests with those, including websites
+  # opened in a browser on this machine: throwaway local demos only.
+  insecure_demo_credentials: false
+
+admin:
+  # Enable the management API and saved UI settings. False also disables UI.
+  enabled: true
 
 ui:
   # Serve the embedded web UI at /_gos3/ui/.
-  enabled: true
+  # Defaults to true, or false in builds with the noui tag.
+  # enabled: true
   # Redirect browsers opening / to the UI (runtime: uiRedirect).
   redirect_root: true
 
@@ -102,11 +127,11 @@ cors:
 discovery:
   # Find other gos3 servers and let them (and the UI) find this one
   # (runtime). See docs/discovery.md.
-  enabled: true
+  enabled: false
   # Announce this server (mDNS + beacon).
-  advertise: true
-  mdns: true
-  beacon: true
+  advertise: false
+  mdns: false
+  beacon: false
   beacon_group: 239.255.73.83:7373
   beacon_interval: 10s
   # Base URLs of known servers, e.g. ["http://nas:9000"].
@@ -115,7 +140,7 @@ discovery:
   dns_srv: []
   peer_ttl: 60s
   # Allow network scans through the admin API (admin:ScanNetwork).
-  allow_scan: true
+  allow_scan: false
   max_scan_hosts: 1024
 
 logging:
@@ -136,4 +161,43 @@ metrics:
   enabled: true
   # Without authentication (otherwise admin:GetStats is required) (runtime).
   public: false
+
+compression:
+  # Transparent compression of object data (runtime). optional: each
+  # bucket decides (admin API / web UI, off by default); enforced: every
+  # bucket compresses new objects; disabled: nothing new is compressed.
+  mode: optional
+  # DEFLATE level, 1 (fastest) to 9 (smallest).
+  level: 1
+  # Objects smaller than this (when their size is known) stay uncompressed.
+  min_size: 4096
+  # Media types stored uncompressed because they are compressed already
+  # ("video/*" and "prefix*" wildcards).
+  skip_content_types:
+    - image/jpeg
+    - image/png
+    - image/gif
+    - image/webp
+    - image/avif
+    - image/heic
+    - image/heif
+    - image/jxl
+    - video/*
+    - audio/*
+    - font/woff
+    - font/woff2
+    - application/zip
+    - application/gzip
+    - application/x-gzip
+    - application/zstd
+    - application/x-bzip2
+    - application/x-xz
+    - application/x-7z-compressed
+    - application/x-rar-compressed
+    - application/vnd.rar
+    - application/x-lz4
+    - application/java-archive
+    - application/epub+zip
+    - application/vnd.openxmlformats-officedocument.*
+    - application/vnd.oasis.opendocument.*
 `

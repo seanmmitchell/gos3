@@ -6,6 +6,7 @@ package s3
 import (
 	"encoding/xml"
 	"errors"
+	"maps"
 	"net/http"
 	"strings"
 	"time"
@@ -76,14 +77,63 @@ func (s *Server) subresourceTarget(w http.ResponseWriter, r *http.Request, rc *r
 	return info, versioned, err
 }
 
-// updateObjectMeta applies fn to the stored metadata of info's version.
-func (s *Server) updateObjectMeta(r *http.Request, rc *reqContext, info storage.ObjectInfo, fn func(*storage.ObjectMeta) error) (storage.ObjectInfo, error) {
-	out, err := s.backend.UpdateObjectMeta(r.Context(), rc.bucket, rc.key, info.VersionID, fn)
+// updateObjectMeta applies fn to the stored metadata of info's version, the
+// one subresourceTarget resolved. attrs are the object attribute condition
+// keys the operation was authorized with (nil: those of the request
+// headers; see authorizeOpWith).
+//
+// Before the update the request is re-validated (revalidateWrite: its
+// credentials, and its authorization when it has been in flight for a
+// while). The update is tied to the version resolved: when authorization
+// decided from the object itself (authzObject) and that version was
+// replaced or changed in the meantime (in unversioned and suspended
+// buckets an overwrite reuses the version ID "null"), it fails with
+// AccessDenied instead of changing an object the decision never saw. This
+// is atomic with the update when the backend is a
+// storage.ConditionalMetaUpdater (both built-in backends are).
+func (s *Server) updateObjectMeta(r *http.Request, rc *reqContext, info storage.ObjectInfo, attrs map[string][]string,
+	fn func(*storage.ObjectMeta) error) (storage.ObjectInfo, error) {
+	ctx := r.Context()
+	if err := s.revalidateWrite(rc, func() error { return s.reauthorizeOp(ctx, r, rc, attrs) }); err != nil {
+		return storage.ObjectInfo{}, err
+	}
+	var (
+		out storage.ObjectInfo
+		err error
+	)
+	if _, pinned := rc.authzObjects[objectRef{rc.bucket, rc.key, rc.versionID()}]; pinned {
+		check := func(cur storage.ObjectInfo) error {
+			if !sameObjectVersion(info, cur) {
+				return errObjectChanged
+			}
+			return nil
+		}
+		if cu, ok := s.backend.(storage.ConditionalMetaUpdater); ok {
+			out, err = cu.UpdateObjectMetaIf(ctx, rc.bucket, rc.key, info.VersionID, check, fn)
+		} else {
+			out, err = s.backend.UpdateObjectMeta(ctx, rc.bucket, rc.key, info.VersionID, func(m *storage.ObjectMeta) error {
+				// Without the full version, compare what the metadata has.
+				if m.ETag != info.ETag || m.ACL != info.ACL || !maps.Equal(m.Tags, info.Tags) {
+					return errObjectChanged
+				}
+				return fn(m)
+			})
+		}
+		if errors.Is(err, errObjectChanged) {
+			rc.authzReason = "object changed after authorization"
+			return storage.ObjectInfo{}, s3err.ErrAccessDenied
+		}
+	} else {
+		out, err = s.backend.UpdateObjectMeta(ctx, rc.bucket, rc.key, info.VersionID, fn)
+	}
 	if err != nil {
 		return out, objectLookupError(err, rc.bucket, rc.key, rc.versionID())
 	}
 	return out, nil
 }
+
+// errObjectChanged is the internal check error of updateObjectMeta.
+var errObjectChanged = errors.New("s3: object changed after authorization")
 
 // setVersionHeader sets x-amz-version-id when the bucket is versioned.
 func setVersionHeader(w http.ResponseWriter, versioned bool, vid string) {
@@ -124,10 +174,11 @@ func (s *Server) handlePutObjectTagging(w http.ResponseWriter, r *http.Request, 
 	if err != nil {
 		return err
 	}
+	attrs := requestTagConditions(tags)
 	if len(tags) == 0 {
 		tags = nil
 	}
-	if _, err := s.updateObjectMeta(r, rc, info, func(m *storage.ObjectMeta) error {
+	if _, err := s.updateObjectMeta(r, rc, info, attrs, func(m *storage.ObjectMeta) error {
 		m.Tags = tags
 		return nil
 	}); err != nil {
@@ -144,7 +195,7 @@ func (s *Server) handleDeleteObjectTagging(w http.ResponseWriter, r *http.Reques
 	if err != nil {
 		return err
 	}
-	if _, err := s.updateObjectMeta(r, rc, info, func(m *storage.ObjectMeta) error {
+	if _, err := s.updateObjectMeta(r, rc, info, nil, func(m *storage.ObjectMeta) error {
 		m.Tags = nil
 		return nil
 	}); err != nil {
@@ -186,6 +237,11 @@ func (s *Server) handleGetObjectAcl(w http.ResponseWriter, r *http.Request, rc *
 // (x-amz-acl) or an AccessControlPolicy body equivalent to one of the
 // canned ACLs private, public-read, public-read-write or
 // authenticated-read; other grant sets are NotImplemented.
+//
+// The body is read and validated before the target version is resolved,
+// and the ACL is then applied to exactly that version (updateObjectMeta):
+// a client that delays its body cannot have the ACL land on an object that
+// replaced the one it was authorized for.
 func (s *Server) handlePutObjectAcl(w http.ResponseWriter, r *http.Request, rc *reqContext) error {
 	ctx := r.Context()
 	h := r.Header
@@ -196,11 +252,13 @@ func (s *Server) handlePutObjectAcl(w http.ResponseWriter, r *http.Request, rc *
 	if err != nil {
 		return err
 	}
-	info, _, err := s.subresourceTarget(w, r, rc)
-	if err != nil {
+	if _, err := objectVersionParam(rc.query); err != nil {
 		return err
 	}
-	var acl string
+	var (
+		acl   string
+		attrs map[string][]string // nil: authorized by the core with the headers
+	)
 	if v := h.Get("X-Amz-Acl"); v != "" {
 		if acl, err = validateCannedACL(v, false); err != nil {
 			return err
@@ -228,14 +286,19 @@ func (s *Server) handlePutObjectAcl(w http.ResponseWriter, r *http.Request, rc *
 		if acl, err = cannedFromGrants(&p, owner.ID, ownerFor(rc.userName()).ID); err != nil {
 			return err
 		}
-		if err := s.authorizeOpWith(ctx, r, rc, aclBodyConditions(acl, &p)); err != nil {
+		attrs = aclBodyConditions(acl, &p)
+		if err := s.authorizeOpWith(ctx, r, rc, attrs); err != nil {
 			return err
 		}
+	}
+	info, _, err := s.subresourceTarget(w, r, rc)
+	if err != nil {
+		return err
 	}
 	if err := s.checkObjectACLAllowed(ctx, rc.bucket, acl); err != nil {
 		return err
 	}
-	if _, err := s.updateObjectMeta(r, rc, info, func(m *storage.ObjectMeta) error {
+	if _, err := s.updateObjectMeta(r, rc, info, attrs, func(m *storage.ObjectMeta) error {
 		m.ACL = acl
 		return nil
 	}); err != nil {
@@ -439,7 +502,7 @@ func (s *Server) handlePutObjectRetention(w http.ResponseWriter, r *http.Request
 	}
 	bypass := s.canBypassGovernance(r, rc, rc.bucket, rc.key, info.VersionID)
 	now := s.now()
-	if _, err := s.updateObjectMeta(r, rc, info, func(m *storage.ObjectMeta) error {
+	if _, err := s.updateObjectMeta(r, rc, info, attrs, func(m *storage.ObjectMeta) error {
 		if m.RetentionMode != "" && m.RetainUntil.After(now) {
 			extends := mode == m.RetentionMode && !until.Before(m.RetainUntil)
 			switch {
@@ -501,7 +564,7 @@ func (s *Server) handlePutObjectLegalHold(w http.ResponseWriter, r *http.Request
 	if err != nil {
 		return err
 	}
-	if _, err := s.updateObjectMeta(r, rc, info, func(m *storage.ObjectMeta) error {
+	if _, err := s.updateObjectMeta(r, rc, info, attrs, func(m *storage.ObjectMeta) error {
 		m.LegalHold = on
 		return nil
 	}); err != nil {

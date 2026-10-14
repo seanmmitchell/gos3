@@ -256,6 +256,21 @@ func (p scanPlan) generate(ctx context.Context, out chan<- string) {
 	}
 }
 
+// addFound adds the scan result p to found, merging the addresses of an
+// earlier result with the same ID. Like the peer table, found holds at
+// most maxPeers peers: hosts answering with a new ID on every port (or
+// request) add nothing beyond that.
+func addFound(found map[string]Peer, p Peer) {
+	if prev, dup := found[p.ID]; dup {
+		for _, a := range prev.Addresses {
+			addAddress(&p, a)
+		}
+	} else if len(found) >= maxPeers {
+		return
+	}
+	found[p.ID] = p
+}
+
 // scan implements Service.Scan.
 func (s *Service) scan(ctx context.Context, req ScanRequest) (ScanResult, error) {
 	if ctx == nil {
@@ -297,12 +312,7 @@ func (s *Service) scan(ctx context.Context, req ScanRequest) (ScanResult, error)
 					p = peerFromInfo(info, u, SourceScan, s.now())
 				}
 				mu.Lock()
-				if prev, dup := found[p.ID]; dup {
-					for _, a := range prev.Addresses {
-						addAddress(&p, a)
-					}
-				}
-				found[p.ID] = p
+				addFound(found, p)
 				mu.Unlock()
 			}
 		}()

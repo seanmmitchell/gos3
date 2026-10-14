@@ -8,7 +8,7 @@ worker and upgrades.
 | Endpoint | Meaning | Response |
 |---|---|---|
 | `GET /_gos3/health` | Liveness: the process serves HTTP. | `200 {"status":"ok"}` |
-| `GET /_gos3/ready` | Readiness: storage answers (bucket listing within 5 s), and the server is not shutting down. | `200 {"status":"ok"}` or `503 {"status":"unavailable","error":"…"}` |
+| `GET /_gos3/ready` | Readiness: storage answers (bucket listing within 5 s), and the server is not shutting down. | `200 {"status":"ok"}`, or `503 {"status":"unavailable","error":"storage unavailable"}` (`"shutting down"` during shutdown). The result is reused for 2 s; the storage error is logged when readiness changes, not returned. |
 
 Both are unauthenticated. `gos3 healthcheck [--ready] [--url URL]` wraps them
 and exits 0 when healthy; the container image uses it as its `HEALTHCHECK`.
@@ -59,8 +59,8 @@ uploads, and
 for latency.
 
 The admin API's `GET /_gos3/admin/v1/stats` (and the UI's server overview) add
-storage totals (objects, bytes, versions, delete markers, pending uploads;
-cached for 30 s), Go runtime numbers and disk usage of the data directory
+storage totals (objects, bytes, bytes stored on disk after compression,
+versions, delete markers, pending uploads; cached for 30 s), Go runtime numbers and disk usage of the data directory
 (fs backend on Linux and macOS).
 
 ## Logs
@@ -70,8 +70,15 @@ gos3 logs to stderr with Go's `log/slog`, as `text` (default) or `json`
 
 - Startup prints a banner with the endpoints, UI and admin URLs, the region,
   the storage backend, and where the root credentials came from. A generated
-  secret is shown only when it was just generated. With JSON logs the banner is
-  one structured line.
+  secret is shown only when it was just generated **and** standard error is a
+  terminal; otherwise the banner names the file holding it
+  (`<data>/.gos3/root-credentials.json`, or a temporary file deleted on exit
+  for a server without a data directory). The secret is never written to the
+  log. With JSON logs the banner is one structured line (with
+  `credentialsFile`).
+- A warning names each unknown `Host` the server is asked for (the first
+  request per name; see `server.allowed_hosts` in
+  [configuration.md](configuration.md#server)).
 - **Access log**: one line per request (S3 and admin) with `request_id`, `op`,
   `method`, `path`, `status`, `bytes_in`, `bytes_out`, `duration_ms`,
   `remote`, `bucket`, `key`, `auth` (signing method), `user` and `access_key`,
@@ -90,17 +97,31 @@ gos3 logs to stderr with Go's `log/slog`, as `text` (default) or `json`
 <data>/
 └── .gos3/
     ├── meta.db                  bbolt metadata: buckets, configs, object versions, uploads (fs backend)
-    ├── data/<bucket-id>/<xx>/…  object data files, immutable (fs backend)
+    ├── data/<bucket-id>/<xx>/…  object data files, immutable, possibly compressed (fs backend)
     ├── uploads/<upload-id>/…    multipart parts in progress (fs backend)
     ├── tmp/                     files being written (cleaned at startup)
     ├── orphans/<time>-<id>/     unreferenced files moved aside at startup (fs backend)
-    ├── gateway/<backing>/       multipart upload records of gateway backings (docs/backings.md)
+    ├── keys/                    per-bucket encryption keys and restic recovery records (fs backend) (secret)
+    │   ├── <bucket-id>              a bucket's encryption master key
+    │   └── <bucket-id>.restic.json  its restic repository location and password
+    ├── restic/<bucket-id>/      local restic repositories (fs backend)
+    ├── restic-cache/            restic's local repository cache (fs backend)
+    ├── restic-backing.json      restic S3 storage settings and credentials (fs backend) (secret)
     ├── lock                     held by the running server
     ├── iam.json                 IAM users, keys, policies        (secret)
     ├── root-credentials.json    generated root keys, if any      (secret)
     ├── settings.json            runtime settings, after the first change
+    ├── placements.json          which backings hold which buckets
+    ├── backings.json            backings configured in the web UI, after the first change
     └── server-id                this server's discovery ID
 ```
+
+Encrypted objects cannot be read without `keys/`, so back it up together
+with `meta.db` and the data (see
+[encryption.md](encryption.md#keys-and-recovery)). Keys, restic recovery
+records and local restic repositories stay after their bucket is deleted.
+Each additional fs backing has its own `keys/`, `restic/`, `restic-cache/`
+and `restic-backing.json`.
 
 With the memory backend and a data path, only the system files (`iam.json`,
 `settings.json`, `server-id`, `root-credentials.json`) are kept; objects live in
@@ -128,6 +149,80 @@ The fs backend refuses to start when `meta.db` is missing or empty while
 discard the index of every stored object. Restore `meta.db` from a backup, or
 move `data/` and `uploads/` aside to start with an empty store.
 
+## Multiple backings and replication
+
+Use **Storage → Configure backings** to add storage and choose the default
+for new buckets without restarting. You can edit or remove additional
+backings once their buckets and replicas have been moved or removed and
+background cleanup has finished. Backing definitions persist in
+`backings.json` in the system directory; the UI indicates when the server
+has no persistent settings directory. The system backing named `default`
+is fixed at startup.
+
+A server can store buckets on several backings (see
+[configuration.md](configuration.md#storage-backings)), typically one fs
+directory per disk. Each backing directory has its own `.gos3/` with its own
+`meta.db`, data files and lock; the system state (`iam.json`,
+`settings.json`, `placements.json`, ...) stays in the default backing's data
+directory. Every bucket has a **placement**, managed in the web UI (bucket
+settings, Placement tab, and the server's Storage page) or the admin API
+([admin-api.md](admin-api.md#storage-backings-and-bucket-placement)):
+
+| Mode | Writes | Reads | When the primary's backing fails |
+|---|---|---|---|
+| `single` | primary | primary | the bucket is unavailable |
+| `active-passive` | primary; changed keys are copied to the replicas in the background (usually within milliseconds) | primary | reads fall back to a synced replica at once; writes fail until a replica is promoted (by hand, or automatically with `storage.replication.auto_failover`); changes not yet copied are lost on promotion |
+| `active-active` | primary and every in-sync replica before the request is acknowledged | spread over the in-sync members | an in-sync replica is promoted automatically; nothing acknowledged is lost |
+
+Copies are exact: version IDs, `LastModified` times, metadata, tags, ACLs,
+object lock settings, bucket configuration (policy, CORS, lifecycle, ...) and
+versioning state are the same on every member, so clients notice nothing
+when the primary changes.
+
+**Adding a replica** (or switching a bucket to a replicated mode) starts a
+full copy in the background; the member shows `syncing` with a progress
+count, then `in-sync`. An active-active replica receives synchronous writes
+only once it is in sync. A replica whose backing fails, or that misses a
+write, drops to background copying (`lagging`, `degraded` or `offline`) and
+returns to synchronous writes by itself once it caught up. Removing a replica
+deletes its copy in the background.
+
+**Moving a bucket** (`POST /buckets/{name}/placement/move`, or Move in the UI)
+copies it to the target backing while it stays readable and writable, then
+performs a short cutover: new writes to the bucket wait while the writes in
+flight finish (at most `storage.replication.cutover_timeout`) and the last
+changes are copied; then the target takes the source's place and the source
+copy is deleted. A move can be canceled until the cutover starts. If the
+writes in flight do not finish in time, the cutover is retried later.
+
+**Promoting a replica** makes it the primary. A normal promotion copies the
+pending changes during a cutover first, so nothing is lost; a forced one
+(`"force": true`, for a failed primary) switches at once.
+
+Things to know:
+
+- In-progress multipart uploads live on the primary only. After the primary
+  changes (move, promotion, failover) they fail with `NoSuchUpload` and must
+  be restarted.
+- Changes waiting to be copied are kept in memory. After a restart every
+  replica is compared with its primary in full, in the background (cost:
+  reading the metadata of every object on both sides); active-active replicas
+  serve reads and receive synchronous writes again when that finishes.
+- Backing health: a backing is marked unhealthy when an operation on it fails
+  with an I/O error, or when it does not list its buckets within 5 s at the
+  periodic check (`storage.replication.health_interval`); it is healthy again
+  after the next successful check. `GET /_gos3/admin/v1/backings` and the
+  Storage page show the state and the last error.
+- Removing a backing from the configuration: replicas on it are forgotten (a
+  replica is promoted where it was the primary). gos3 refuses to start when a
+  bucket's only copy was on it; configure the backing again, or remove the
+  bucket from `placements.json` to forget it. A bucket found on a backing
+  without an entry in `placements.json` is adopted where it is (that is how
+  existing data directories keep working); a copy of a bucket that is placed
+  elsewhere is ignored with a warning and never deleted automatically.
+- Backups: with several backings, back up every backing directory together
+  with the default data directory (one snapshot per file system).
+
 ## Backups
 
 The data directory is the complete state of a server. Two approaches:
@@ -148,6 +243,11 @@ a snapshot like a power loss: committed objects are intact (with
 next start. Do
 not copy a live directory with `cp` or `rsync` without a snapshot: `meta.db`
 can end up inconsistent with the data files.
+
+The copy includes the encryption keys (`.gos3/keys/`), so protect it like
+the keys themselves. Restic repositories on a backing's S3 storage are
+outside the data directory: back them up at that S3 service, at the same
+time as the data directory (see [encryption.md](encryption.md#keys-and-recovery)).
 
 Restore by stopping gos3, replacing the directory contents (keep the owner and
 mode 0700) and starting it again. The restored server keeps its server ID,
@@ -208,6 +308,70 @@ worker off or change the interval at runtime in Settings
 (`lifecycle.enabled`, `lifecycle.intervalSeconds`); the change applies
 immediately. Each action and a summary per pass are logged.
 
+## Compression
+
+gos3 can store object data compressed. Compression is transparent: clients
+read back exactly the bytes they wrote, with the same ETag, checksums,
+`Content-Length` and `Content-Range`, and listings report the original
+sizes. Only the space used on disk (or in memory) changes.
+
+Who decides:
+
+- **The server administrator** sets the policy in Settings
+  (`compression.mode`, see [configuration.md](configuration.md#compression)),
+  through the web UI's server settings or `PUT /_gos3/admin/v1/config`:
+  - `optional` (default): each bucket's own setting decides; buckets are
+    uncompressed until enabled.
+  - `enforced`: every bucket compresses new objects. Buckets cannot opt out.
+  - `disabled`: nothing new is compressed and buckets cannot enable it.
+- **Per bucket**, with `admin:PutBucketCompression` on the bucket: the web
+  UI's bucket settings, or `PUT /_gos3/admin/v1/buckets/<name>/compression`
+  with `{"enabled": true}` (see [admin-api.md](admin-api.md#buckets-management-helpers-regular-bucket-ops-use-the-s3-api)).
+  While the administrator enforces or disables compression, a bucket setting
+  that contradicts it is refused with `409 Conflict`; settings stored before
+  the policy changed stay in place but have no effect until the mode is
+  `optional` again. `DELETE` on the same path returns the bucket to the
+  server default.
+
+What is compressed: new objects written by PutObject, CopyObject (following
+the destination bucket), PostObject and CompleteMultipartUpload, unless
+
+- the object is smaller than `compression.min_size` (4 KiB) and its size is
+  known up front,
+- its `Content-Type` is in `compression.skip_content_types` (by default
+  JPEG, PNG and other compressed images, `video/*`, `audio/*`, archives and
+  zip-based office formats), or
+- it has a compressing `Content-Encoding` (`gzip`, `br`, `zstd`, …): the
+  client compressed it already.
+
+Changing the policy or a bucket's setting applies to the next write; stored
+objects stay as they are and remain readable either way, so compressed and
+uncompressed versions coexist in a bucket. To compress existing objects,
+rewrite them: copy them into a bucket that compresses (CopyObject compresses
+by the destination bucket), or copy each object onto itself. S3 only allows
+a copy onto itself that changes something, typically
+`x-amz-metadata-directive: REPLACE`, which replaces the metadata, so pass the
+metadata you want to keep.
+
+How it is stored: DEFLATE (`compress/flate`, level `compression.level`, 1 by
+default) in independently compressed blocks of 256 KiB with a CRC-32C per
+block, so a range request inflates at most one block per 256 KiB it returns
+instead of everything before it, and damaged data is detected and reported as
+a read error rather than served. Blocks that do not shrink are stored as is;
+data that does not compress (already compressed content that the media type
+did not reveal) is detected and mostly skipped, costing little CPU. The
+admin API's bucket usage and `GET /stats` report both sizes: `bytes` (the
+content) and `storedBytes` (on disk), plus `compressedVersions`; the web UI
+shows the saving next to the bucket size. Multipart uploads keep their parts
+uncompressed until completion, which compresses them while concatenating.
+
+Compression costs CPU on writes and some on reads. As a guide, on source
+code and documentation one core compresses about 280 MB/s at level 1 (to
+32 % of the size), 165 MB/s at level 6 (27 %) and 40 MB/s at level 9 (26 %),
+and reads back about 330 MB/s; each request uses one core. It pays off for text, logs, CSV/JSON, source code,
+uncompressed images and backups of such data; it does nothing for media and
+archives, which the default skip list leaves alone.
+
 ## Graceful shutdown and restarts
 
 SIGTERM or SIGINT stops accepting connections, lets in-flight requests finish
@@ -221,11 +385,31 @@ manager a longer stop timeout than `shutdown_timeout`; the systemd unit uses
 
 1. Read the release notes.
 2. Back up the data directory (see above).
-3. Replace the binary or image, and restart.
+3. Verify the new archive or image with `gh attestation verify`
+   ([releasing.md](releasing.md#verifying-a-release)).
+4. Replace the binary or image (on Kubernetes, raise `newTag`, and `digest`
+   if you pin one, in `kustomization.yaml`), and restart.
 
 The fs metadata database records a format version. A gos3 version that does
 not understand it refuses to start rather than risk the data, so rolling back
-after an upgrade that changed the format means restoring the backup. Runtime
+after an upgrade that changed the format means restoring the backup.
+
+Some object versions are also recorded in a newer record format than older
+gos3 versions understand. Such a version starts, but reports their metadata
+as corrupt (`unknown record format`), and listings, lifecycle passes and
+usage counts that reach one of them fail for the whole bucket:
+
+- Compressed versions use record format 4. Roll back to a gos3 version
+  without compression support only after rewriting them uncompressed.
+- Encrypted versions (SSE-S3 `AES256`, native or restic) use record format
+  5. Roll back to a gos3 version without object encryption only after
+  removing every encrypted version, current and noncurrent: disable the
+  bucket's default encryption, copy each object onto itself with
+  `x-amz-metadata-directive: REPLACE` (repeating its metadata) and without
+  `x-amz-server-side-encryption`, then permanently delete the encrypted
+  versions (Object Lock retention can prevent that until it expires).
+
+Otherwise restore the backup. Runtime
 settings in `settings.json` and IAM data in `iam.json` are kept across upgrades.
 `gos3 version` (or `GET /_gos3/info`) shows the running version.
 

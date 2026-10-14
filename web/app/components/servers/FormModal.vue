@@ -11,16 +11,22 @@
  *   error mapping (CORS vs network vs wrong secret vs unknown key vs clock skew).
  * - Presets and the embedded server keep their definition from configuration:
  *   only the credentials (and name/color where allowed) can be changed.
+ * - Discovery is unauthenticated: reusing `credentialsFrom`'s keys for another
+ *   host is opt-in, names that host, and needs an explicit confirmation
+ *   before anything is signed for it. A server ID shared with a configured
+ *   connection at another address is flagged, not treated as a duplicate.
  */
 import type { Connection, ConnectionInput } from '~/types/connection'
 import { useConnectionsStore } from '~/stores/connections'
 import {
   CONNECTION_COLORS,
+  credentialReuseHost,
   emptyServerForm,
   formFromConnection,
   formFromInput,
   formToInput,
   isDefinitionLocked,
+  validateRegion,
   validateServerForm,
   type KindChoice,
   type ServerFormModel
@@ -36,6 +42,8 @@ const props = defineProps<{
   prefill?: ConnectionInput
   /** Offer to reuse the credentials of this connection (discovery "add as server"). */
   credentialsFrom?: Connection
+  /** Unverified endpoint the server advertises about itself (discovery), shown as a hint. */
+  advertisedEndpoint?: string
 }>()
 
 const emit = defineEmits<{ saved: [connection: Connection] }>()
@@ -48,6 +56,8 @@ const touched = ref<Partial<Record<keyof ServerFormModel, boolean>>>({})
 const submitted = ref(false)
 const showSecret = ref(false)
 const reuseCredentials = ref(false)
+/** The user confirmed signing with credentialsFrom's keys for reuseHost. */
+const reuseConfirmed = ref(false)
 const saving = ref(false)
 const saveError = ref<unknown>(null)
 
@@ -77,6 +87,7 @@ watch(open, (v) => {
   submitted.value = false
   showSecret.value = false
   reuseCredentials.value = false
+  reuseConfirmed.value = false
   saveError.value = null
   report.value = null
   detection.value = null
@@ -96,7 +107,29 @@ watch(reuseCredentials, (v) => {
   }
 })
 
-const errors = computed(() => validateServerForm(model.value))
+const fromName = computed(() => props.credentialsFrom?.name ?? '')
+/** credentialsFrom's identity is root (when its status is known). */
+const fromIsRoot = computed(() => !!props.credentialsFrom && !!store.statusOf(props.credentialsFrom.id).whoami?.isRoot)
+/**
+ * Host that would receive requests signed with credentialsFrom's keys: set
+ * while the form holds those keys and the endpoint is another host.
+ */
+const reuseHost = computed(() => {
+  const from = props.credentialsFrom
+  if (!from || !hasCredentials(from) || editing.value) return undefined
+  if (model.value.accessKeyId.trim() !== from.accessKeyId || model.value.secretAccessKey !== from.secretAccessKey) return undefined
+  return credentialReuseHost(model.value.endpoint, from)
+})
+// A confirmation is for the host it named.
+watch(reuseHost, () => {
+  reuseConfirmed.value = false
+})
+
+const errors = computed(() => {
+  const e = validateServerForm(model.value)
+  if (reuseHost.value && !reuseConfirmed.value) e.accessKeyId ??= `Confirm that ${reuseHost.value} may receive requests signed with ${fromName.value}'s keys, or enter other credentials`
+  return e
+})
 function fieldError(k: keyof ServerFormModel): string | undefined {
   return submitted.value || touched.value[k] ? errors.value[k] : undefined
 }
@@ -150,23 +183,32 @@ const regionPlaceholder = computed(() => detectedInfo.value?.region || 'us-east-
 
 // -- duplicates ------------------------------------------------------------------
 
-const duplicate = computed<Connection | undefined>(() => {
+const serverIdMatch = computed<Connection | undefined>(() => {
   if (editing.value || errors.value.endpoint) return undefined
   const serverId = detectedInfo.value?.id ?? model.value.serverId
-  return (serverId ? store.findByServerId(serverId) : undefined) ?? store.findByEndpoint(model.value.endpoint)
+  return serverId ? store.findByServerId(serverId) : undefined
 })
+const duplicate = computed<Connection | undefined>(() => {
+  if (editing.value || errors.value.endpoint) return undefined
+  const m = serverIdMatch.value
+  return (m && sameEndpoint(m.endpoint, model.value.endpoint) ? m : undefined) ?? store.findByEndpoint(model.value.endpoint)
+})
+/** A configured connection with the same server ID at another address (IDs are not authenticated). */
+const idConflict = computed(() => (!duplicate.value ? serverIdMatch.value : undefined))
 
 // -- test --------------------------------------------------------------------------
 
 async function runTest() {
   submitted.value = true
   if (errors.value.endpoint || errors.value.region) return
+  // Testing signs requests too: same confirmation as saving.
+  if (reuseHost.value && !reuseConfirmed.value) return
   testing.value = true
   report.value = null
   try {
     report.value = await testConnection({
       endpoint: model.value.endpoint,
-      region: model.value.region.trim() || detectedInfo.value?.region || 'us-east-1',
+      region: model.value.region.trim() || (detectedInfo.value?.region && !validateRegion(detectedInfo.value.region) ? detectedInfo.value.region : 'us-east-1'),
       accessKeyId: model.value.accessKeyId.trim(),
       secretAccessKey: model.value.secretAccessKey,
       forcePathStyle: model.value.forcePathStyle,
@@ -190,7 +232,7 @@ async function save() {
     const info = det?.info ?? report.value?.info
     const input = formToInput(model.value, det?.kind ?? report.value?.detectedKind)
     input.name ??= info?.name || props.prefill?.name
-    if (!model.value.region.trim() && info?.region) input.region = info.region
+    if (!model.value.region.trim() && info?.region && !validateRegion(info.region)) input.region = info.region
     if (info?.id) input.serverId = info.id
     if (input.kind !== 'gos3' && !model.value.serverId) input.serverId = undefined
 
@@ -271,6 +313,10 @@ const description = computed(() => editing.value
             {{ detectionText }}
           </p>
 
+          <p v-if="advertisedEndpoint && !locked" class="-mt-2 text-xs text-muted" data-testid="advertised-endpoint">
+            The server advertises <code class="font-mono">{{ advertisedEndpoint }}</code> for itself. That address was not verified; the field above holds the address it was found at.
+          </p>
+
           <UAlert
             v-if="duplicate"
             color="warning"
@@ -278,6 +324,15 @@ const description = computed(() => editing.value
             icon="i-lucide-copy"
             :title="`Already configured as “${duplicate.name}”`"
             description="You can still add it again, e.g. with different credentials."
+          />
+          <UAlert
+            v-else-if="idConflict"
+            color="warning"
+            variant="subtle"
+            icon="i-lucide-shield-question"
+            :title="`Claims to be “${idConflict.name}”, at another address`"
+            :description="`This server reports the same server ID as ${idConflict.name} (${idConflict.endpoint}). Server IDs are not authenticated: any host can claim one. It is added as a separate server; ${idConflict.name} is not changed.`"
+            data-testid="id-conflict"
           />
 
           <div class="grid gap-4 sm:grid-cols-2">
@@ -340,8 +395,30 @@ const description = computed(() => editing.value
             v-if="credentialsFrom && hasCredentials(credentialsFrom)"
             v-model="reuseCredentials"
             :label="`Use the same credentials as ${credentialsFrom.name}`"
-            description="Handy for clusters sharing IAM users or root credentials."
+            :description="fromIsRoot ? `These are root credentials. Handy for clusters sharing keys; you will be asked to confirm the host.` : 'Handy for clusters sharing IAM users. You will be asked to confirm the host.'"
           />
+          <UAlert
+            v-if="reuseHost"
+            color="warning"
+            variant="subtle"
+            icon="i-lucide-shield-alert"
+            :title="`${reuseHost} will receive requests signed with ${fromName}'s keys`"
+            data-testid="reuse-warning"
+          >
+            <template #description>
+              <p>
+                Discovery is not authenticated: any host on the network can announce a server with this name and ID. The secret key is never sent, but {{ reuseHost }} gets the access key ID and signed requests it could replay against {{ fromName }} for a few minutes.
+                <strong v-if="fromIsRoot">These are root credentials.</strong>
+                Prefer a separate access key for this server.
+              </p>
+              <UCheckbox
+                v-model="reuseConfirmed"
+                class="mt-2"
+                :label="`I trust ${reuseHost} with ${fromName}'s keys`"
+                data-testid="reuse-confirm"
+              />
+            </template>
+          </UAlert>
           <div class="grid gap-4 sm:grid-cols-2">
             <UFormField label="Access key ID" :error="fieldError('accessKeyId')">
               <UInput v-model.trim="model.accessKeyId" class="w-full font-mono" autocomplete="username" spellcheck="false" placeholder="AKIA…" @blur="touched.accessKeyId = true" />

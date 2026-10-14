@@ -332,8 +332,10 @@ multipart upload needs `ETag` (else `S3Error` code `MissingETag`).
 - Capability gating: `const { can, isAdmin, isGos3 } = useWhoAmI()` →
   `can('manageUsers')` etc. (`Capabilities` in `types/admin.ts`). Generic S3 →
   every capability false. The sidebar shows Users / Policies / Settings /
-  Discovery only for `manageUsers` / `managePolicies` / `manageConfig` /
-  `discovery`. Pages should still handle `AccessDenied` gracefully.
+  Storage / Discovery only for `manageUsers` / `managePolicies` /
+  `manageConfig` / `viewStorage` / `discovery`; the bucket settings
+  Placement tab needs `viewStorage` (`bucketSettingsTabs()`) and its actions
+  `manageStorage`. Pages should still handle `AccessDenied` gracefully.
 - `EMBEDDED_CONNECTION_ID` (`'this-server'`) is the connection for the hosting gos3.
 - Default server: `store.defaultId` (persisted with the connections; the
   former `gos3.defaultServer.v1` key is migrated) orders the dashboard, the

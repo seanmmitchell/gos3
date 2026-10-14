@@ -1,7 +1,6 @@
 package gateway_test
 
 import (
-	"maps"
 	"testing"
 
 	"github.com/seanmmitchell/gos3/internal/s3client/s3clienttest"
@@ -47,6 +46,11 @@ var gatewaySkips = map[string]string{
 	// Without remote versioning the replaced content is gone: the reader
 	// fails with an error once it has to issue a new request (Seek).
 	"Objects/ReaderSurvivesOverwrite/Unversioned": "a gateway reader cannot re-read content replaced on the remote",
+	// S3 services refuse keys with characters XML cannot represent (they
+	// could not be listed); the gateway rejects them with ErrInvalidName.
+	"Objects/Keys":            "keys with control characters cannot be stored on an S3 service",
+	"Walk/ObjectsOrder":       "uses a key with a NUL byte, which S3 services refuse",
+	"Walk/ObjectsPrefixAfter": "uses a key with a NUL byte, which S3 services refuse",
 }
 
 func TestConformancePerBucket(t *testing.T) {
@@ -55,11 +59,9 @@ func TestConformancePerBucket(t *testing.T) {
 }
 
 func TestConformanceShared(t *testing.T) {
-	skips := maps.Clone(gatewaySkips)
-	// The suite stores 1024-byte keys; in shared mode the remote key also
-	// holds the prefix and the bucket name, beyond S3's 1024-byte limit
-	// (such keys are rejected with storage.ErrInvalidName).
-	skips["Objects/Keys"] = "remote keys hold the prefix and bucket name, so gos3 keys are shorter than 1024 bytes"
+	// Objects/Keys is skipped in both modes; in shared mode its 1024-byte
+	// keys would also exceed S3's limit once the prefix and bucket name are
+	// added (rejected with storage.ErrInvalidName).
 	storagetest.RunWithOptions(t, func(t *testing.T) storage.Backend { return newRouted(t, true) },
-		storagetest.Options{Skip: skips})
+		storagetest.Options{Skip: gatewaySkips})
 }

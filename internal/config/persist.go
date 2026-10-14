@@ -75,6 +75,9 @@ func writeSettingsFile(path string, s Settings) error {
 // directory: write, fsync, chmod perm, rename, then fsync of the directory.
 // The directory is created (0700) when missing. Readers never observe a
 // partially written file, and a failure leaves any previous file intact.
+// On Windows, where modes do not restrict access, a private perm (no group
+// or other bits, e.g. 0600) gives the file a DACL that only grants the
+// current user, SYSTEM and Administrators access (see RestrictDir).
 // Errors wrap the underlying *fs.PathError.
 func WriteFileAtomic(path string, data []byte, perm fs.FileMode) (err error) {
 	dir := filepath.Dir(path)
@@ -95,6 +98,16 @@ func WriteFileAtomic(path string, data []byte, perm fs.FileMode) (err error) {
 	if err = f.Chmod(perm); err != nil {
 		return fmt.Errorf("config: %w", err)
 	}
+	if perm&0o077 == 0 {
+		// Best effort, like RestrictDir: file systems without ACLs (FAT,
+		// exFAT, some SMB shares) or a missing privilege must not make
+		// settings, IAM or credentials unwritable. The file then keeps the
+		// directory's ACL.
+		if aerr := restrictFile(tmp, false); aerr != nil {
+			slog.Default().Warn("could not restrict access to a secret file to this user; "+
+				"make sure other local users cannot read its directory", "file", path, "err", aerr)
+		}
+	}
 	if _, err = f.Write(data); err != nil {
 		return fmt.Errorf("config: %w", err)
 	}
@@ -110,6 +123,18 @@ func WriteFileAtomic(path string, data []byte, perm fs.FileMode) (err error) {
 	syncDir(dir)
 	return nil
 }
+
+// restrictFile is restrictPath (a variable for tests).
+var restrictFile = restrictPath
+
+// RestrictDir makes dir private to the user running gos3. On Windows,
+// where file modes do not restrict access, it replaces the directory's ACL
+// with one granting only the current user, SYSTEM and Administrators
+// access, inherited by everything inside (existing files included); the
+// system directory holds root-credentials.json, iam.json (IAM secret keys)
+// and settings.json. Elsewhere it does nothing (the directory is created
+// with mode 0700 and secret files with 0600).
+func RestrictDir(dir string) error { return restrictPath(dir, true) }
 
 // syncDir fsyncs a directory so a rename is durable (best effort; not
 // supported on Windows).
@@ -149,16 +174,21 @@ type rootCredentialsFile struct {
 // they come from. systemDir is the system state directory (normally
 // cfg.SystemDir(); "" = nothing is persisted).
 //
-//   - Configured keys are validated and kept; the secret is never logged.
+//   - Configured keys are validated and kept. A secret shorter than
+//     MinRootSecretLen characters, or a published example secret allowed by
+//     auth.insecure_demo_credentials, is warned about.
 //   - Otherwise keys stored in <systemDir>/root-credentials.json by an
 //     earlier start are reused (the access key is logged at info level).
 //   - Otherwise random keys are generated (iam.GenerateAccessKey /
-//     GenerateSecretKey), stored there with mode 0600 and logged once,
-//     including the secret, as a warning.
+//     GenerateSecretKey) and stored there with mode 0600; a warning names
+//     the access key and the file.
 //   - With systemDir "" (memory backend without a data path) random keys are
-//     generated and logged as a warning on every start.
+//     generated on every start, with a warning naming the access key.
 //
-// A nil logger means slog.Default().
+// The secret key is never logged: logs are collected and kept by systems
+// (journald, docker, Kubernetes) that many more people can read than the
+// credentials file. The CLI shows a generated secret in its startup banner
+// when that is printed to a terminal. A nil logger means slog.Default().
 func ResolveRootCredentials(cfg *Config, systemDir string, logger *slog.Logger) error {
 	if logger == nil {
 		logger = slog.Default()
@@ -171,16 +201,27 @@ func ResolveRootCredentials(cfg *Config, systemDir string, logger *slog.Logger) 
 	switch source {
 	case CredentialsConfigured:
 		logger.Info("root credentials: using the configured access key", "accessKey", ak)
+		sk := cfg.Auth.RootSecretKey
+		switch {
+		case IsDemoSecret(sk):
+			logger.Warn("root credentials: the root secret key is a published example (auth.insecure_demo_credentials is on); " +
+				"anyone who can reach this server, including websites opened in a browser on this machine, can act as root. " +
+				"Use this only for a throwaway local demo")
+		case len(sk) < MinRootSecretLen:
+			logger.Warn(fmt.Sprintf("root credentials: the root secret key is shorter than %d characters; a short secret can be "+
+				"guessed offline from a single captured signed request (use \"gos3 keygen\" for a random one)", MinRootSecretLen))
+		}
 	case CredentialsStored:
 		logger.Info("root credentials: using the stored generated credentials", "accessKey", ak, "file", file)
 	case CredentialsGenerated:
-		logger.Warn("root credentials: none configured, generated new ones; they are logged only this once "+
-			"and stored for later starts (set GOS3_ROOT_ACCESS_KEY / GOS3_ROOT_SECRET_KEY to choose your own)",
-			"accessKey", ak, "secretKey", cfg.Auth.RootSecretKey, "file", file)
+		logger.Warn("root credentials: none configured, generated new ones and stored them for later starts; "+
+			"the secret key is not logged: read it from the file (set GOS3_ROOT_ACCESS_KEY / GOS3_ROOT_SECRET_KEY to choose your own)",
+			"accessKey", ak, "file", file)
 	case CredentialsEphemeral:
 		logger.Warn("root credentials: none configured and no data directory, generated temporary ones "+
-			"valid until this process exits (set GOS3_ROOT_ACCESS_KEY / GOS3_ROOT_SECRET_KEY to choose your own)",
-			"accessKey", ak, "secretKey", cfg.Auth.RootSecretKey)
+			"valid until this process exits; the secret key is not logged "+
+			"(set GOS3_ROOT_ACCESS_KEY / GOS3_ROOT_SECRET_KEY to choose your own)",
+			"accessKey", ak)
 	}
 	return nil
 }

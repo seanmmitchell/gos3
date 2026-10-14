@@ -9,8 +9,8 @@
  */
 import type { ConnectionInput, Connection } from '~/types/connection'
 import type { ScanRequest } from '~/types/admin'
-import { findConfigured, parseUrlList, probeUrlFor, type DiscoveredServer } from '~/components/discovery/-aggregate'
-import { prefillFromPeer } from '~/components/servers/-form'
+import { credentialsSourceFor, findConfigured, parseUrlList, probeUrlFor, type DiscoveredServer } from '~/components/discovery/-aggregate'
+import { peerAdvertisedEndpoint, prefillFromPeer } from '~/components/servers/-form'
 import { useConnectionsStore } from '~/stores/connections'
 
 useHead({ title: 'Discover servers' })
@@ -96,6 +96,7 @@ onBeforeUnmount(cancelScan)
 const addOpen = ref(false)
 const addPrefill = ref<ConnectionInput | undefined>()
 const addCredentialsFrom = ref<Connection | undefined>()
+const addAdvertised = ref<string | undefined>()
 
 function addServer(s: DiscoveredServer) {
   const prefill = prefillFromPeer(s)
@@ -104,10 +105,11 @@ function addServer(s: DiscoveredServer) {
     return
   }
   addPrefill.value = prefill
-  // Offer the credentials of a connected server that reported this peer.
-  addCredentialsFrom.value = s.foundBy
-    .map(f => (f.connectionId ? store.byId(f.connectionId) : undefined))
-    .find(c => !!c && hasCredentials(c))
+  addAdvertised.value = peerAdvertisedEndpoint(s, prefill.endpoint)
+  // Offer the credentials of a connected server whose own peer table lists
+  // this server at the prefilled address (never for a conflicting ID).
+  const fromId = credentialsSourceFor(s, prefill.endpoint, id => hasCredentials(store.byId(id)))
+  addCredentialsFrom.value = fromId ? store.byId(fromId) : undefined
   addOpen.value = true
 }
 
@@ -309,6 +311,6 @@ const STATE_CLASSES = {
       </section>
     </div>
 
-    <ServersFormModal v-model:open="addOpen" :prefill="addPrefill" :credentials-from="addCredentialsFrom" />
+    <ServersFormModal v-model:open="addOpen" :prefill="addPrefill" :credentials-from="addCredentialsFrom" :advertised-endpoint="addAdvertised" />
   </div>
 </template>

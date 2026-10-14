@@ -65,13 +65,14 @@ func TestPeerTableMergeAndTTL(t *testing.T) {
 	}
 
 	// A beacon hint of a verified healthy peer at a known address needs no probe
-	// and does not override verified fields.
+	// and does not override verified fields, nor refresh LastSeen (only a
+	// successful probe does).
 	clk.Advance(10 * time.Second)
 	if tb.hint(candidate{id: "p1", name: "spoof", source: SourceBeacon, urls: []string{"http://10.0.0.2:9000"}}, clk.Now(), "self") {
 		t.Error("known verified address should not need a probe")
 	}
 	p, _ = tb.get("p1")
-	if p.Name != "real-name" || !p.LastSeen.Equal(clk.Now()) {
+	if p.Name != "real-name" || !p.LastSeen.Equal(t1) {
 		t.Errorf("hint on verified peer: %+v", p)
 	}
 	// ... but a new address does.

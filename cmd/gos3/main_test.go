@@ -93,8 +93,8 @@ func TestConfigFlags(t *testing.T) {
 		t.Fatalf("overrides = %v", o)
 	}
 
-	// Positional arguments and unknown flags are usage errors.
-	if code, _, _ := runCmd(t, "serve", "extra"); code != 2 {
+	// Multiple directories and unknown flags are usage errors.
+	if code, _, _ := runCmd(t, "serve", "one", "two"); code != 2 {
 		t.Fatalf("positional arg: exit %d", code)
 	}
 	if code, _, _ := runCmd(t, "serve", "--bogus"); code != 2 {

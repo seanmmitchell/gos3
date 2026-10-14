@@ -6,12 +6,15 @@
 #   install -d -m 0755 /etc/gos3
 #   install -m 0600 deploy/systemd/gos3.env.example /etc/gos3/gos3.env   # edit it
 #   systemctl daemon-reload && systemctl enable --now gos3
-#   journalctl -u gos3        # startup banner; generated root keys if none are set
+#   journalctl -u gos3        # startup banner (generated root keys: see below)
 #
 # Data and system state (iam.json, settings.json, root-credentials.json,
 # server-id) live in /var/lib/gos3, owned by a dynamic service user. The
 # environment file is read by systemd as root, so it may hold the root keys
-# with mode 0600. A YAML config (GOS3_CONFIG=/etc/gos3/config.yaml) is read
+# with mode 0600 (`gos3 keygen` prints a pair in its format). Without them,
+# gos3 generates a pair on first start: read it with
+# `sudo cat /var/lib/gos3/.gos3/root-credentials.json` (it is not logged).
+# A YAML config (GOS3_CONFIG=/etc/gos3/config.yaml) is read
 # by the service user: keep it free of secrets and world-readable (0644).
 # The same goes for a TLS certificate; pass the TLS private key with
 # LoadCredential= (see gos3.env.example and docs/deployment.md).

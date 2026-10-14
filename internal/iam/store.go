@@ -136,7 +136,32 @@ func open(opts Options) (*Manager, error) {
 		return nil, fmt.Errorf("iam: load %s: %w", m.path, err)
 	}
 	m.st = st
+	m.warnAmbiguousNames()
 	return m, nil
+}
+
+// warnAmbiguousNames logs the names in a loaded iam.json that break the
+// namespace rules of CreateUser and CreateAccessKey (see keyIDConflict).
+// Such a file was written by an older version; it still loads, but keys
+// with ambiguous IDs are refused at authentication.
+func (m *Manager) warnAmbiguousNames() {
+	st := m.st
+	for _, ak := range slices.Sorted(maps.Keys(st.keys)) {
+		if why := keyIDConflict(st, ak); why != "" {
+			m.warnOnce("load:"+ak, "iam: access key will be refused: its ID is ambiguous in bucket-policy principals; "+
+				"delete it and create a new key", "accessKey", ak, "user", st.keys[ak].User, "reason", why)
+		}
+	}
+	for _, name := range slices.Sorted(maps.Keys(st.users)) {
+		switch {
+		case isAccountID(name):
+			m.warnOnce("load:user:"+name, "iam: user name is a 12-digit account ID: a bare 12-digit bucket-policy "+
+				"principal names the account, not this user; recreate the user with a nonnumeric name before using it as a principal", "user", name)
+		case name == m.opts.RootAccessKey:
+			m.warnOnce("load:user:"+name, "iam: user name equals the root access key: a bare bucket-policy "+
+				"principal with this value also names the user; re-create it under another name", "user", name)
+		}
+	}
 }
 
 func readLimited(path string, limit int64) ([]byte, error) {

@@ -39,7 +39,7 @@ type mdnsEntry struct {
 	name   string // instance FQDN as received
 	host   string // lower-cased SRV target
 	port   int
-	txt    []string
+	txt    []string // raw TXT strings (unescaped)
 	hasSRV bool
 	hasTXT bool
 	zone   string // IPv6 zone of the sender (for link-local addresses)
@@ -152,7 +152,11 @@ func (b *mdnsBrowser) handle(data []byte, src netip.AddrPort) []dns.Question {
 		case *dns.TXT:
 			if instanceOf(rr.Hdr.Name) {
 				if e := entry(rr.Hdr.Name); e != nil {
-					e.txt = append([]string(nil), rr.Txt[:min(len(rr.Txt), mdnsMaxTXTFields)]...)
+					// rr.Txt is in presentation format (see txtUnescape).
+					e.txt = make([]string, 0, min(len(rr.Txt), mdnsMaxTXTFields))
+					for _, t := range rr.Txt[:min(len(rr.Txt), mdnsMaxTXTFields)] {
+						e.txt = append(e.txt, txtUnescape(t))
+					}
 					e.hasTXT = true
 					touched = append(touched, e)
 				}
@@ -311,13 +315,18 @@ type mdnsReceived struct {
 	data []byte
 	src  netip.AddrPort
 	ttl  int // IP TTL / IPv6 hop limit, 0 when unknown
+	// ttlMissing: the socket reports control messages but this datagram
+	// came without a TTL / hop limit.
+	ttlMissing bool
 }
 
 // receive handles one datagram read by a browse socket. A datagram from
 // another host that a router forwarded (TTL / hop limit below 255) is
-// dropped: its on-link source address is spoofed.
+// dropped: its on-link source address is spoofed. So is one from another
+// host whose TTL is missing although the socket reports it, rather than
+// letting the check pass on a missing value.
 func (b *mdnsBrowser) receive(p mdnsReceived) []dns.Question {
-	if b.local.routed(p.src.Addr(), p.ttl) {
+	if b.local.routed(p.src.Addr(), p.ttl) || (p.ttlMissing && !b.local.isLocal(p.src.Addr().WithZone(""))) {
 		return nil
 	}
 	return b.handle(p.data, p.src)
@@ -350,7 +359,7 @@ func runMDNSBrowse(ctx context.Context, timeout time.Duration, queriers, socks [
 					continue
 				}
 				select {
-				case ch <- mdnsReceived{data: append([]byte(nil), buf[:n]...), src: src, ttl: meta.ttl}:
+				case ch <- mdnsReceived{data: append([]byte(nil), buf[:n]...), src: src, ttl: meta.ttl, ttlMissing: s.cmsg && meta.ttl == 0}:
 				case <-done:
 					return
 				}

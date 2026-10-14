@@ -1,133 +1,105 @@
 package server
 
 import (
-	"context"
-	"strings"
+	"encoding/json"
+	"path/filepath"
 	"testing"
 
 	"github.com/seanmmitchell/gos3/internal/config"
-	"github.com/seanmmitchell/gos3/internal/s3client"
-	"github.com/seanmmitchell/gos3/internal/s3client/s3clienttest"
+	"github.com/seanmmitchell/gos3/internal/storage"
+	"github.com/seanmmitchell/gos3/internal/storage/multi"
 )
 
-// TestBackingsEndToEnd runs a server with a blob and a gateway backing on
-// an in-process remote S3 service and stores one bucket on each.
-func TestBackingsEndToEnd(t *testing.T) {
-	remote := s3clienttest.Start(t)
-	remote.CreateBucket(t, "blobs")
-	rc := remote.Client(t)
-
+func TestBackingManagementRetainsStartupResticSettings(t *testing.T) {
 	cfg := testConfig()
 	cfg.Storage.Backend = config.BackendFS
 	cfg.Storage.Path = t.TempDir()
-	backing := func(name, mode, bucket, prefix string) config.BackingConfig {
-		return config.BackingConfig{
-			Name: name, Mode: mode, Endpoint: remote.URL, Region: s3clienttest.Region,
-			Bucket: bucket, Prefix: prefix, Addressing: "path",
-			AccessKey: s3clienttest.AccessKey, SecretKey: s3clienttest.SecretKey,
-		}
-	}
-	cfg.Storage.Backings = []config.BackingConfig{
-		backing("cold", config.BackingModeBlob, "blobs", "p/"),
-		backing("gw", config.BackingModeGateway, "", ""),
-	}
+	cfg.Storage.Backings = []config.BackingConfig{{Name: "archive", Backend: config.BackendFS, Path: t.TempDir(),
+		ResticS3: &storage.ResticS3{Endpoint: "https://s3.example.test", Bucket: "archives", AccessKey: "test-access", SecretKey: "test-secret"}}}
 	srv := start(t, cfg)
-	creds := rootCreds
-
-	buckets := map[string]string{"b-local": "", "b-cold": "cold", "b-gw": "gw"}
-	for bucket, b := range buckets {
-		hdr := map[string]string{}
-		if b != "" {
-			hdr["X-Gos3-Backing"] = b
-		}
-		if r := do(t, "PUT", srv.url+"/"+bucket, nil, &creds, hdr); r.status != 200 {
-			t.Fatalf("CreateBucket %s: %d %s", bucket, r.status, r.body)
-		}
-		if r := do(t, "PUT", srv.url+"/"+bucket+"/dir/obj.txt", []byte("hello "+bucket), &creds, nil); r.status != 200 {
-			t.Fatalf("PutObject %s: %d %s", bucket, r.status, r.body)
-		}
+	const definitions = "/_gos3/admin/v1/backings/config"
+	var in multi.BackingConfiguration
+	do(t, "GET", srv.url+definitions, nil, &rootCreds, nil).json(t, &in)
+	raw, _ := json.Marshal(in)
+	res := do(t, "PUT", srv.url+definitions, raw, &rootCreds, nil)
+	if res.status != 200 {
+		t.Fatalf("saving backing definitions: %d %s", res.status, res.body)
 	}
-	if r := do(t, "PUT", srv.url+"/b-nope", nil, &creds, map[string]string{"X-Gos3-Backing": "nope"}); r.status != 400 {
-		t.Fatalf("unknown backing: %d %s", r.status, r.body)
-	}
-
-	check := func(srv *running) {
-		t.Helper()
-		for bucket, b := range buckets {
-			r := do(t, "GET", srv.url+"/"+bucket+"/dir/obj.txt", nil, &creds, nil)
-			if r.status != 200 || string(r.body) != "hello "+bucket {
-				t.Errorf("GetObject %s: %d %q", bucket, r.status, r.body)
-			}
-			want := b
-			if want == "" {
-				want = "local"
-			}
-			if got := do(t, "HEAD", srv.url+"/"+bucket, nil, &creds, nil).header.Get("X-Gos3-Backing"); got != want {
-				t.Errorf("HeadBucket %s: x-gos3-backing %q, want %q", bucket, got, want)
-			}
-		}
-	}
-	check(srv)
-
-	// The blob bucket's data is on the remote under the prefix; the gateway
-	// bucket is a native remote bucket.
-	var blobKeys []string
-	if err := rc.Walk(context.Background(), "blobs", "", "", func(o s3client.ObjectAttrs) error {
-		blobKeys = append(blobKeys, o.Key)
-		return nil
-	}); err != nil {
-		t.Fatal(err)
-	}
-	if len(blobKeys) != 1 || !strings.HasPrefix(blobKeys[0], "p/data/") {
-		t.Errorf("remote blobs = %q", blobKeys)
-	}
-	body, _, err := rc.GetObject(context.Background(), "b-gw", "dir/obj.txt", s3client.GetOptions{})
-	if err != nil {
-		t.Fatalf("native gateway object: %v", err)
-	}
-	body.Close()
-
-	// Gateway buckets are unversioned.
-	versioning := []byte(`<VersioningConfiguration><Status>Enabled</Status></VersioningConfiguration>`)
-	if r := do(t, "PUT", srv.url+"/b-gw?versioning", versioning, &creds, nil); r.status != 501 {
-		t.Errorf("versioning on a gateway bucket: %d %s", r.status, r.body)
-	}
-	if r := do(t, "PUT", srv.url+"/b-cold?versioning", versioning, &creds, nil); r.status != 200 {
-		t.Errorf("versioning on a blob bucket: %d %s", r.status, r.body)
-	}
-
-	// The admin API offers the backings.
-	var who struct {
-		Backings struct {
-			Default   string `json:"default"`
-			Available []struct{ Name, Mode string }
-		} `json:"backings"`
-	}
-	do(t, "GET", srv.url+"/_gos3/admin/v1/whoami", nil, &creds, nil).json(t, &who)
-	if who.Backings.Default != "local" || len(who.Backings.Available) != 3 {
-		t.Errorf("whoami backings = %+v", who.Backings)
-	}
-
-	// Everything survives a restart.
 	if err := srv.stop(); err != nil {
 		t.Fatal(err)
 	}
-	check(start(t, cfg))
+	srv = start(t, cfg)
+	var settings struct {
+		Mode, Endpoint, Bucket string
+		CredentialsConfigured  bool
+	}
+	do(t, "GET", srv.url+"/_gos3/admin/v1/backings/archive/restic", nil, &rootCreds, nil).json(t, &settings)
+	if settings.Mode != "s3" || settings.Endpoint != "https://s3.example.test" || settings.Bucket != "archives" || !settings.CredentialsConfigured {
+		t.Fatalf("backing overlay discarded startup restic settings: %+v", settings)
+	}
 }
 
-// TestBackingsConfigErrors checks configuration errors surface at New.
-func TestBackingsConfigErrors(t *testing.T) {
-	cfg := testConfig() // memory backend
-	cfg.Storage.Backings = []config.BackingConfig{{
-		Name: "cold", Mode: config.BackingModeBlob, Endpoint: "http://127.0.0.1:1", Bucket: "blobs",
-		AccessKey: "a", SecretKey: "s",
-	}}
-	if _, err := New(cfg, testLogger(t)); err == nil || !strings.Contains(err.Error(), "fs storage backend") {
-		t.Fatalf("blob backing on memory: %v", err)
+func TestLiveBackingConfigurationSurvivesRestart(t *testing.T) {
+	cfg := testConfig()
+	cfg.Storage.Backend = config.BackendFS
+	cfg.Storage.Path = t.TempDir()
+	srv := start(t, cfg)
+	const endpoint = "/_gos3/admin/v1/backings/config"
+	var in multi.BackingConfiguration
+	do(t, "GET", srv.url+endpoint, nil, &rootCreds, nil).json(t, &in)
+	if !in.Persistent {
+		t.Fatal("filesystem configuration is not persistent")
 	}
-	cfg.Storage.Backings[0].Mode = config.BackingModeGateway
-	cfg.Storage.DefaultBacking = "other"
-	if _, err := New(cfg, testLogger(t)); err == nil || !strings.Contains(err.Error(), "default_backing") {
-		t.Fatalf("unknown default backing: %v", err)
+	in.Backings = []config.BackingDefinition{{Name: "archive", Backend: "fs", Path: filepath.Join(t.TempDir(), "archive")}}
+	in.DefaultBacking = "archive"
+	raw, _ := json.Marshal(in)
+	res := do(t, "PUT", srv.url+endpoint, raw, &rootCreds, nil)
+	if res.status != 200 {
+		t.Fatalf("configure: %d %s", res.status, res.body)
+	}
+	res.json(t, &in)
+	res = do(t, "PUT", srv.url+"/photos", nil, &rootCreds, nil)
+	if res.status != 200 {
+		t.Fatalf("create bucket: %d %s", res.status, res.body)
+	}
+	res = do(t, "PUT", srv.url+"/photos/hello", []byte("live backing"), &rootCreds, nil)
+	if res.status != 200 {
+		t.Fatalf("write: %d %s", res.status, res.body)
+	}
+	if err := srv.stop(); err != nil {
+		t.Fatal(err)
+	}
+	srv = start(t, cfg)
+	res = do(t, "GET", srv.url+"/photos/hello", nil, &rootCreds, nil)
+	if res.status != 200 || string(res.body) != "live backing" {
+		t.Fatalf("read after restart: %d %s", res.status, res.body)
+	}
+	var restored multi.BackingConfiguration
+	do(t, "GET", srv.url+endpoint, nil, &rootCreds, nil).json(t, &restored)
+	if restored.DefaultBacking != "archive" || len(restored.Backings) != 1 || restored.Revision != in.Revision {
+		t.Fatalf("restored: %+v", restored)
+	}
+	// An unchanged form must keep the existing backend open, even while in use.
+	raw, _ = json.Marshal(restored)
+	res = do(t, "PUT", srv.url+endpoint, raw, &rootCreds, nil)
+	if res.status != 200 {
+		t.Fatalf("unchanged save: %d %s", res.status, res.body)
+	}
+	// An empty filesystem backing can be added, edited and removed live.
+	res.json(t, &restored)
+	restored.Backings = append(restored.Backings, config.BackingDefinition{Name: "spare", Backend: "fs", Path: t.TempDir()})
+	for step := range 3 {
+		if step == 1 {
+			restored.Backings[1].Path = t.TempDir()
+		}
+		if step == 2 {
+			restored.Backings = restored.Backings[:1]
+		}
+		raw, _ = json.Marshal(restored)
+		res = do(t, "PUT", srv.url+endpoint, raw, &rootCreds, nil)
+		if res.status != 200 {
+			t.Fatalf("step %d: %d %s", step, res.status, res.body)
+		}
+		res.json(t, &restored)
 	}
 }

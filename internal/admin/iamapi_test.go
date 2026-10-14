@@ -73,11 +73,11 @@ func TestUsers(t *testing.T) {
 	e.root("PATCH", "/users/alice", map[string]any{"name": "x"}).expectError(t, 400, codeInvalidRequest)
 
 	// access keys
-	r = e.root("POST", "/users/bob/keys", map[string]any{"description": "ci", "accessKey": "BOBKEY1", "secretKey": "bob-secret-123"})
+	r = e.root("POST", "/users/bob/keys", map[string]any{"description": "ci", "accessKey": "BOBKEY1", "secretKey": "bob-test-secret-key"})
 	r.expectStatus(t, 201)
 	var k iam.AccessKey
 	r.json(t, &k)
-	if k.AccessKey != "BOBKEY1" || k.SecretKey != "bob-secret-123" || k.Status != iam.KeyActive || k.Description != "ci" {
+	if k.AccessKey != "BOBKEY1" || k.SecretKey != "bob-test-secret-key" || k.Status != iam.KeyActive || k.Description != "ci" {
 		t.Errorf("key = %+v", k)
 	}
 	e.root("POST", "/users/bob/keys", map[string]any{"accessKey": "BOBKEY1"}).expectError(t, 409, codeConflict)
@@ -85,7 +85,7 @@ func TestUsers(t *testing.T) {
 	e.root("POST", "/users/nobody/keys", nil).expectError(t, 404, codeNotFound)
 	e.root("POST", "/users/bob/keys", nil).expectStatus(t, 201) // body optional
 
-	bob := auth.Credentials{AccessKey: "BOBKEY1", SecretKey: "bob-secret-123"}
+	bob := auth.Credentials{AccessKey: "BOBKEY1", SecretKey: "bob-test-secret-key"}
 	e.root("PATCH", "/keys/BOBKEY1", map[string]any{"status": "Inactive"}).expectStatus(t, 204)
 	e.do(&bob, "GET", Prefix+"/whoami", nil).expectError(t, 401, codeUnauthenticated)
 	e.root("PATCH", "/keys/BOBKEY1", map[string]any{"status": "Active"}).expectStatus(t, 204)

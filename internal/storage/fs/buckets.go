@@ -2,6 +2,7 @@ package fs
 
 import (
 	"bytes"
+	"cmp"
 	"context"
 	"errors"
 	"fmt"
@@ -42,7 +43,8 @@ func (b *Backend) ListBuckets(ctx context.Context) ([]storage.BucketInfo, error)
 
 // CreateBucket creates a bucket. Any non-empty, valid UTF-8 name of at most
 // 1024 bytes is accepted (validation is the S3 layer's job); other names
-// yield ErrInvalidName.
+// yield ErrInvalidName. An empty opts.Backing records
+// Options.DefaultBacking; other backings are recorded as given.
 func (b *Backend) CreateBucket(ctx context.Context, name string, opts storage.CreateBucketOptions) error {
 	if err := b.begin(ctx); err != nil {
 		return err
@@ -77,7 +79,7 @@ func (b *Backend) CreateBucket(ctx context.Context, name string, opts storage.Cr
 			Region:            opts.Region,
 			ObjectLockEnabled: opts.ObjectLockEnabled,
 			Owner:             opts.Owner,
-			Backing:           opts.Backing,
+			Backing:           cmp.Or(opts.Backing, b.defaultBacking),
 		}
 		if opts.ObjectLockEnabled {
 			rec.Versioning = storage.VersioningEnabled
@@ -104,8 +106,9 @@ func (b *Backend) GetBucket(ctx context.Context, name string) (storage.BucketInf
 }
 
 // DeleteBucket removes an empty bucket, its configuration documents and its
-// data directory (or its remaining blobs on a remote backing). In-progress multipart uploads do not count: they are
-// aborted along with the bucket and their part directories removed.
+// data directory (or its remaining blobs on a remote backing). In-progress
+// multipart uploads do not count: they are aborted along with the bucket
+// and their part directories removed.
 func (b *Backend) DeleteBucket(ctx context.Context, name string) error {
 	if err := b.begin(ctx); err != nil {
 		return err
@@ -227,6 +230,29 @@ func (b *Backend) GetBucketConfig(ctx context.Context, bucket, key string) ([]by
 		return nil
 	})
 	return data, err
+}
+
+// ViewBucketConfig calls fn with a stored configuration document inside a
+// read transaction, without copying it (see storage.ConfigViewer): data
+// points into the database's memory map and is only valid during the call.
+func (b *Backend) ViewBucketConfig(ctx context.Context, bucket, key string, fn func([]byte) error) error {
+	if err := b.begin(ctx); err != nil {
+		return err
+	}
+	return b.view(func(tx *bbolt.Tx) error {
+		_, bb, err := loadBucket(tx, bucket)
+		if err != nil {
+			return err
+		}
+		var v []byte
+		if validConfigKey(key) {
+			v = bb.Bucket(subConfig).Get([]byte(key))
+		}
+		if v == nil {
+			return fmt.Errorf("%w: %s/%.64s", storage.ErrConfigNotFound, bucket, key)
+		}
+		return fn(v)
+	})
 }
 
 // PutBucketConfig stores a copy of a configuration document.

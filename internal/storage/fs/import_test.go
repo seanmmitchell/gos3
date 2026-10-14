@@ -1,0 +1,250 @@
+package fs
+
+import (
+	"errors"
+	"io"
+	"slices"
+	"strings"
+	"testing"
+	"time"
+
+	"go.etcd.io/bbolt"
+
+	"github.com/seanmmitchell/gos3/internal/storage"
+)
+
+// importV imports data as version id of bucket/key into b.
+func importV(t testing.TB, b *Backend, bucket, key, id, data string, mtime time.Time) storage.ObjectInfo {
+	t.Helper()
+	oi, err := tryImport(b, bucket, key, data, storage.ObjectInfo{
+		VersionID: id, LastModified: mtime, ObjectMeta: storage.ObjectMeta{ETag: md5hex(data)},
+	})
+	if err != nil {
+		t.Fatalf("import %s@%s: %v", key, id, err)
+	}
+	return oi
+}
+
+func tryImport(b *Backend, bucket, key, data string, info storage.ObjectInfo) (storage.ObjectInfo, error) {
+	w, err := b.NewVersionWriter(ctx, bucket, key)
+	if err != nil {
+		return storage.ObjectInfo{}, err
+	}
+	if _, err := io.WriteString(w, data); err != nil {
+		_ = w.Abort()
+		return storage.ObjectInfo{}, err
+	}
+	oi, err := w.Commit(ctx, info)
+	if err != nil {
+		_ = w.Abort()
+	}
+	return oi, err
+}
+
+// importIndex returns the entries of the bucket's "imp" index as
+// "key@versionID" (nil when the index does not exist).
+func importIndex(t testing.TB, b *Backend, bucket string) []string {
+	t.Helper()
+	var out []string
+	err := b.view(func(tx *bbolt.Tx) error {
+		_, bb, err := loadBucket(tx, bucket)
+		if err != nil {
+			return err
+		}
+		imp := bb.Bucket(subImported)
+		if imp == nil {
+			return nil
+		}
+		return imp.ForEach(func(k, v []byte) error {
+			// k is keyVersionsPrefix(key) + versionID; the test keys
+			// contain no 0x00 byte.
+			i := slices.Index(k, 0)
+			if i < 0 || len(v) != 8 {
+				t.Errorf("malformed imp entry %q -> %x", k, v)
+				return nil
+			}
+			out = append(out, string(k[:i])+"@"+string(k[i+2:]))
+			return nil
+		})
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return out
+}
+
+// TestImportPersists: imported versions, the "imp" index and their data
+// files survive Close and reopen, and the recovery pass does not move the
+// data files to the quarantine.
+func TestImportPersists(t *testing.T) {
+	dir := t.TempDir()
+	b := openTest(t, dir)
+	mkBucket(t, b, "bkt", storage.VersioningEnabled)
+	mtime := time.Date(2020, 5, 6, 7, 8, 9, 123456789, time.UTC)
+	native := put(t, b, "bkt", "k", "native")
+	importV(t, b, "bkt", "k", "3HL4kqtJlcpXroDTDmJ.rmSpXd3dIbrHY", "aws", mtime)
+	importV(t, b, "bkt", "k", "17f0a1b2c3d4e5f6deadbeef", "mem", mtime.Add(time.Second))
+	importV(t, b, "bkt", "k", storage.NullVersionID, "null", mtime.Add(2*time.Second))
+	importV(t, b, "bkt", "k", "gone", "to be deleted", mtime)
+	if _, err := b.DeleteObject(ctx, "bkt", "k", "gone"); err != nil {
+		t.Fatal(err)
+	}
+	eq(t, "imp index", joinStrings(importIndex(t, b, "bkt")), "k@17f0a1b2c3d4e5f6deadbeef k@3HL4kqtJlcpXroDTDmJ.rmSpXd3dIbrHY")
+	eq(t, "data files", len(dataFiles(t, b)), 4)
+	if err := b.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	b = openTest(t, dir)
+	waitRecovery(t, b)
+	eq(t, "data files after recovery", len(dataFiles(t, b)), 4)
+	eq(t, "quarantined files", len(listFiles(t, b.orphanDir)), 0)
+	eq(t, "versions", joinVers(versions(t, b, "bkt", "", "", "")),
+		"k@null* k@17f0a1b2c3d4e5f6deadbeef k@3HL4kqtJlcpXroDTDmJ.rmSpXd3dIbrHY k@"+native.VersionID)
+	eq(t, "aws", read(t, b, "bkt", "k", "3HL4kqtJlcpXroDTDmJ.rmSpXd3dIbrHY"), "aws")
+	eq(t, "mem", read(t, b, "bkt", "k", "17f0a1b2c3d4e5f6deadbeef"), "mem")
+	eq(t, "null", read(t, b, "bkt", "k", storage.NullVersionID), "null")
+	eq(t, "native", read(t, b, "bkt", "k", native.VersionID), "native")
+	oi, err := b.GetObjectInfo(ctx, "bkt", "k", "17f0a1b2c3d4e5f6deadbeef")
+	if err != nil || !oi.LastModified.Equal(mtime.Add(time.Second)) {
+		t.Fatalf("GetObjectInfo after reopen: %+v, %v", oi, err)
+	}
+
+	// Re-importing replaces the version and unlinks its old data file;
+	// deleting removes the index entry.
+	importV(t, b, "bkt", "k", "17f0a1b2c3d4e5f6deadbeef", "mem2", mtime)
+	eq(t, "data files after re-import", len(dataFiles(t, b)), 4)
+	eq(t, "mem2", read(t, b, "bkt", "k", ""), "mem2")
+	if _, err := b.DeleteObject(ctx, "bkt", "k", "3HL4kqtJlcpXroDTDmJ.rmSpXd3dIbrHY"); err != nil {
+		t.Fatal(err)
+	}
+	eq(t, "imp index after delete", joinStrings(importIndex(t, b, "bkt")), "k@17f0a1b2c3d4e5f6deadbeef")
+	eq(t, "data files after delete", len(dataFiles(t, b)), 3)
+
+	// Deleting the bucket's last versions and the bucket drops the index
+	// with the bucket.
+	for _, v := range versions(t, b, "bkt", "", "", "") {
+		if _, err := b.DeleteObject(ctx, "bkt", v.key, v.id); err != nil {
+			t.Fatal(err)
+		}
+	}
+	eq(t, "imp index when empty", len(importIndex(t, b, "bkt")), 0)
+	if err := b.DeleteBucket(ctx, "bkt"); err != nil {
+		t.Fatal(err)
+	}
+	mkBucket(t, b, "bkt", storage.VersioningEnabled)
+	if idx := importIndex(t, b, "bkt"); idx != nil {
+		t.Errorf("recreated bucket has an imp index: %q", idx)
+	}
+}
+
+// joinStrings returns s sorted and space-separated.
+func joinStrings(s []string) string {
+	slices.Sort(s)
+	return strings.Join(s, " ")
+}
+
+// TestImportIDsOfAnotherFSBackend: version IDs generated by another fs
+// backend embed sequence numbers of that backend, which here point at other
+// versions or at nothing. They must still resolve to the imported versions.
+func TestImportIDsOfAnotherFSBackend(t *testing.T) {
+	src, _ := newBucket(t, storage.VersioningEnabled)
+	dst, _ := newBucket(t, storage.VersioningEnabled)
+	var srcVers, dstVers []storage.ObjectInfo
+	for _, d := range []string{"s1", "s2", "s3"} {
+		srcVers = append(srcVers, put(t, src, "bkt", "k", d))
+	}
+	for _, d := range []string{"d1", "d2", "d3"} {
+		dstVers = append(dstVers, put(t, dst, "bkt", "k", d))
+	}
+	// Same per-bucket sequences, so the embedded positions collide.
+	for i := range srcVers {
+		a, _ := parseVersionID(srcVers[i].VersionID)
+		c, _ := parseVersionID(dstVers[i].VersionID)
+		eq(t, "embedded sequence", a, c)
+	}
+	for _, v := range srcVers {
+		in, err := src.GetObjectInfo(ctx, "bkt", "k", v.VersionID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		importV(t, dst, "bkt", "k", v.VersionID, read(t, src, "bkt", "k", v.VersionID), in.LastModified)
+	}
+	// Into an empty key and bucket too, where the positions are vacant.
+	mkBucket(t, dst, "empty", storage.VersioningEnabled)
+	importV(t, dst, "empty", "k", srcVers[2].VersionID, "s3", srcVers[2].LastModified)
+
+	want := []string{"s3", "s2", "s1", "d3", "d2", "d1"}
+	ids := []string{srcVers[2].VersionID, srcVers[1].VersionID, srcVers[0].VersionID, dstVers[2].VersionID, dstVers[1].VersionID, dstVers[0].VersionID}
+	vs := versions(t, dst, "bkt", "", "", "")
+	if len(vs) != len(ids) {
+		t.Fatalf("versions = %s", joinVers(vs))
+	}
+	for i, v := range vs {
+		eq(t, "version order", v.id, ids[i])
+		eq(t, "content of "+v.id, read(t, dst, "bkt", "k", v.id), want[i])
+		oi, err := dst.GetObjectInfo(ctx, "bkt", "k", v.id)
+		if err != nil {
+			t.Fatal(err)
+		}
+		eq(t, "latest "+v.id, oi.IsLatest, i == 0)
+	}
+	for i := range srcVers {
+		in, _ := src.GetObjectInfo(ctx, "bkt", "k", srcVers[i].VersionID)
+		out, _ := dst.GetObjectInfo(ctx, "bkt", "k", srcVers[i].VersionID)
+		if !out.LastModified.Equal(in.LastModified) {
+			t.Errorf("LastModified of %s: %v, want %v", srcVers[i].VersionID, out.LastModified, in.LastModified)
+		}
+	}
+	eq(t, "empty bucket", read(t, dst, "empty", "k", srcVers[2].VersionID), "s3")
+	if _, err := dst.GetObjectInfo(ctx, "empty", "k", srcVers[1].VersionID); !errors.Is(err, storage.ErrVersionNotFound) {
+		t.Errorf("GetObjectInfo of a version not imported: %v", err)
+	}
+
+	// WalkVersions resumes after imported IDs.
+	got := versions(t, dst, "bkt", "", "k", srcVers[1].VersionID)
+	if len(got) != 4 || got[0].id != srcVers[0].VersionID || got[1].id != dstVers[2].VersionID {
+		t.Errorf("WalkVersions after %s: %s", srcVers[1].VersionID, joinVers(got))
+	}
+
+	// Deleting the native version at the colliding position leaves the
+	// imported one alone, and vice versa.
+	if _, err := dst.DeleteObject(ctx, "bkt", "k", dstVers[0].VersionID); err != nil {
+		t.Fatal(err)
+	}
+	eq(t, "s1 after deleting d1", read(t, dst, "bkt", "k", srcVers[0].VersionID), "s1")
+	if _, err := dst.DeleteObject(ctx, "bkt", "k", srcVers[1].VersionID); err != nil {
+		t.Fatal(err)
+	}
+	eq(t, "d2 after deleting s2", read(t, dst, "bkt", "k", dstVers[1].VersionID), "d2")
+	if _, err := dst.GetObjectInfo(ctx, "bkt", "k", srcVers[1].VersionID); !errors.Is(err, storage.ErrVersionNotFound) {
+		t.Errorf("GetObjectInfo of the deleted imported version: %v", err)
+	}
+	eq(t, "imp index", joinStrings(importIndex(t, dst, "bkt")),
+		joinStrings([]string{"k@" + srcVers[0].VersionID, "k@" + srcVers[2].VersionID}))
+}
+
+// TestImportIndeterminateCommitKeepsData mirrors
+// TestIndeterminateCommitKeepsData for imports.
+func TestImportIndeterminateCommitKeepsData(t *testing.T) {
+	b, bkt := newBucket(t, storage.VersioningEnabled)
+	boom := errors.New("fdatasync: input/output error")
+	b.commitFault = func() error { return boom }
+	_, err := tryImport(b, bkt, "k", "data", storage.ObjectInfo{VersionID: "v1", LastModified: time.Now()})
+	b.commitFault = nil
+	if !errors.Is(err, boom) {
+		t.Fatalf("import with failing commit: %v", err)
+	}
+	eq(t, "after indeterminate commit", read(t, b, bkt, "k", "v1"), "data")
+
+	// Rejected imports leave no data or temporary files behind.
+	before := len(dataFiles(t, b))
+	if _, err := tryImport(b, bkt, "k", "data", storage.ObjectInfo{VersionID: "dm", DeleteMarker: true}); !errors.Is(err, storage.ErrInvalidName) {
+		t.Fatalf("delete marker with data: %v", err)
+	}
+	if _, err := tryImport(b, bkt, "k", "data", storage.ObjectInfo{VersionID: "a/b"}); !errors.Is(err, storage.ErrInvalidName) {
+		t.Fatalf("invalid version ID: %v", err)
+	}
+	eq(t, "data files after rejected imports", len(dataFiles(t, b)), before)
+	eq(t, "tmp files after rejected imports", len(tmpFiles(t, b)), 0)
+}

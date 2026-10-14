@@ -2,7 +2,8 @@ name: Dev build
 
 # Every push to dev builds what the next release would ship: archives for all
 # platforms (bin-<os>-<arch> artifacts of this run, kept 30 days) and the
-# multi-arch image ghcr.io/<owner>/<repo>:dev, also tagged dev-<commit>. The
+# multi-arch image ghcr.io/<owner>/<repo>:dev, also tagged dev-<commit>.
+# Headless archives and image tags append -headless. The
 # version is the next patch release as a prerelease, e.g.
 # v0.1.1-dev.42+0123456789ab. Nothing is published on the Releases page. See
 # docs/releasing.md.
@@ -30,6 +31,7 @@ jobs:
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
         with:
+          persist-credentials: false
           fetch-depth: 0
       - id: version
         run: |
@@ -41,9 +43,13 @@ jobs:
   build:
     name: Build
     needs: version
+    # id-token and attestations: build.yml's image job attests the image's
+    # build provenance (verifiable with --source-ref refs/heads/dev).
     permissions:
       contents: read
       packages: write
+      id-token: write
+      attestations: write
     uses: ./.github/workflows/build.yml
     with:
       ref: ${{ github.sha }}

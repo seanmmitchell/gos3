@@ -3,7 +3,7 @@
 //
 // Usage:
 //
-//	gos3 [serve] [flags]        run the server (default command)
+//	gos3 [serve|server] [flags] [data] run the server (default command)
 //	gos3 version                print the version
 //	gos3 config print [flags]   print the effective configuration (secrets redacted)
 //	gos3 config init [-o file]  write a commented sample configuration
@@ -12,7 +12,7 @@
 //	gos3 keygen                 generate a random access/secret key pair
 //	gos3 healthcheck [--url]    probe a server's health endpoint (exit code)
 //
-// Configuration is read from defaults < YAML file (--config / GOS3_CONFIG)
+// Configuration is read from defaults < JSON/YAML file (--config / GOS3_CONFIG)
 // < GOS3_* environment variables < flags.
 package main
 
@@ -52,7 +52,7 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 	}
 	var err error
 	switch cmd {
-	case "serve":
+	case "serve", "server":
 		err = cmdServe(ctx, rest, stdout, stderr)
 	case "version":
 		err = cmdVersion(rest, stdout, stderr)
@@ -95,16 +95,16 @@ func usage(w io.Writer) {
 	fmt.Fprint(w, `gos3 — S3-compatible object storage server
 
 Usage:
-  gos3 [serve] [flags]          run the server (default; see "gos3 serve -h")
+  gos3 [serve|server] [flags] [data] run the server (default; see "gos3 serve -h")
   gos3 version                  print the version
   gos3 config print [flags]     print the effective configuration (secrets redacted)
-  gos3 config init [-o FILE]    write a commented sample configuration file
+  gos3 config init [--json] [-o FILE] write a sample configuration file
   gos3 config env               list the GOS3_* environment variables
   gos3 discover [flags]         find gos3 servers on the local network
   gos3 keygen [--json]          generate a random access/secret key pair
   gos3 healthcheck [--url URL]  check a server's health (exit 0 = healthy)
 
-Configuration: defaults < YAML file (--config or GOS3_CONFIG) < GOS3_*
+Configuration: defaults < JSON/YAML file (--config or GOS3_CONFIG) < GOS3_*
 environment variables < flags. Root credentials are set only via the
 environment (GOS3_ROOT_ACCESS_KEY / GOS3_ROOT_SECRET_KEY) or the config file;
 without them gos3 generates a pair on first start and stores it in

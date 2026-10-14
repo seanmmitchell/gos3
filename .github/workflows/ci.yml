@@ -26,6 +26,8 @@ jobs:
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          persist-credentials: false
       - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
         with:
           go-version-file: go.mod
@@ -42,8 +44,15 @@ jobs:
         run: go vet ./...
       - name: govulncheck
         run: go run golang.org/x/vuln/cmd/govulncheck@v1.8.0 ./...
+      # The real local and remote-S3 restic repository tests skip without
+      # restic; install the pinned release the container images bundle.
+      - uses: ./.github/actions/setup-restic
       - name: Unit tests (race)
         run: go test -race -count=1 ./cmd/... ./internal/...
+      - name: Headless build and mode tests
+        run: |
+          go build -tags noui ./cmd/gos3
+          go test -race -tags noui ./internal/config ./internal/webui ./internal/server ./cmd/gos3
       - name: End-to-end tests (race)
         run: go test -race -count=1 ./test/e2e/...
 
@@ -60,10 +69,15 @@ jobs:
         os: [macos-latest, windows-latest]
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          persist-credentials: false
       - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
         with:
           go-version-file: go.mod
           cache: true
+      # Run the restic repository tests here too (process handling, paths
+      # and file locking differ).
+      - uses: ./.github/actions/setup-restic
       - name: Unit tests
         run: go test -count=1 ./cmd/... ./internal/...
       - name: End-to-end tests
@@ -78,6 +92,8 @@ jobs:
         working-directory: web
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          persist-credentials: false
       - uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5.0.0
         with:
           node-version: ${{ env.NODE_VERSION }}
@@ -107,7 +123,7 @@ jobs:
       - name: THIRD_PARTY_NOTICES is up to date
         working-directory: .
         run: go run ./internal/tools/notices -check
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: ui-embed
           path: web/.output/public/
@@ -122,6 +138,8 @@ jobs:
       PLAYWRIGHT_BROWSERS_PATH: ${{ github.workspace }}/.pw-browsers
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          persist-credentials: false
       - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
         with:
           go-version-file: go.mod
@@ -157,7 +175,7 @@ jobs:
         env:
           GOS3_BIN: ${{ github.workspace }}/bin/gos3
         run: pnpm test:e2e:standalone
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         if: failure()
         with:
           name: playwright-results
@@ -175,11 +193,13 @@ jobs:
       GOS3_COMPAT_VENV: ${{ github.workspace }}/.compat-venv
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          persist-credentials: false
       - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
         with:
           go-version-file: go.mod
           cache: true
-      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         id: python
         with:
           python-version: "3.13"
@@ -199,9 +219,11 @@ jobs:
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
-      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3.12.0
+        with:
+          persist-credentials: false
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
       - name: Build gos3 image
-        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6.19.2
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: .
           load: true
@@ -225,9 +247,34 @@ jobs:
           curl -fsS http://127.0.0.1:9000/_gos3/ready
           curl -fsS http://127.0.0.1:9000/_gos3/info | grep -q '"ui"'
           curl -fsS http://127.0.0.1:9000/_gos3/ui/ | grep -qi '<html'
+          # The bundled restic (Dockerfile, restic stage) runs in the image.
+          docker exec gos3 /usr/local/bin/restic version
           docker rm -f gos3
+      - name: Build headless gos3 image
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          target: headless
+          load: true
+          tags: gos3:headless-ci
+          cache-from: type=gha,scope=gos3
+      - name: Smoke test headless S3-only image
+        run: |
+          docker run -d --name gos3-headless -p 9000:9000 \
+            -e MINIO_ROOT_USER=ciroot -e MINIO_ROOT_PASSWORD=ciroot-secret \
+            gos3:headless-ci server /data --address :9000 --no-admin
+          for i in $(seq 1 30); do
+            curl -fsS http://127.0.0.1:9000/minio/health/ready && break
+            sleep 2
+          done
+          curl -fsS http://127.0.0.1:9000/minio/health/ready
+          curl -fsS http://127.0.0.1:9000/minio/health/live
+          test "$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:9000/_gos3/ui/)" = 404
+          test "$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:9000/_gos3/admin/v1/config)" = 404
+          docker exec gos3-headless /usr/local/bin/restic version
+          docker rm -f gos3-headless
       - name: Build standalone UI image
-        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6.19.2
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: .
           file: deploy/docker/web.Dockerfile
@@ -236,4 +283,10 @@ jobs:
           cache-from: type=gha,scope=gos3-ui
           cache-to: type=gha,mode=max,scope=gos3-ui
       - name: Validate docker-compose.yml
-        run: docker compose --profile ui config --quiet
+        # The demo has no default root keys; it must refuse to start without.
+        run: |
+          if docker compose --profile ui config --quiet 2>/dev/null; then
+            echo "::error::docker-compose.yml accepted missing root keys"; exit 1
+          fi
+          GOS3_ROOT_ACCESS_KEY=ciroot GOS3_ROOT_SECRET_KEY=ciroot-secret \
+            docker compose --profile ui config --quiet

@@ -94,10 +94,28 @@ func (s *Server) authorizeOpWith(ctx context.Context, r *http.Request, rc *reqCo
 	if err := s.authorizeTarget(ctx, r, rc, t); err != nil {
 		return err
 	}
+	if err := s.authorizeObjectRead(ctx, r, rc, t); err != nil {
+		return err
+	}
 	// An AuthzByHandler handler has authorized the caller: the rest of its
 	// body (if any) is no longer read before authorization.
 	rc.clearPreAuthLimit()
 	return nil
+}
+
+// authorizeObjectRead completes the authorization of an operation with
+// RequiresObjectRead: t, already allowed for the operation's own action, is
+// asked again for reading the object (s3:GetObject, or s3:GetObjectVersion
+// for a versionId), with the object-ACL fallback. Both decisions must
+// allow, so an explicit Deny of either action, or no Allow for either,
+// yields AccessDenied. Other operations return nil.
+func (s *Server) authorizeObjectRead(ctx context.Context, r *http.Request, rc *reqContext, t authzTarget) error {
+	if !rc.op.RequiresObjectRead || t.Key == "" {
+		return nil
+	}
+	t.Action = objectReadAction(t.VersionID)
+	t.ObjectRead = true
+	return s.authorizeTarget(ctx, r, rc, t)
 }
 
 // authorize is the handler helper for secondary resources: it authorizes
@@ -139,6 +157,11 @@ func (s *Server) authorizeTarget(ctx context.Context, r *http.Request, rc *reqCo
 	if id.IsRoot && !id.IsAnonymous {
 		rc.authzReason = "root user"
 		return nil
+	}
+	if id.IsAnonymous {
+		if err := s.checkAnonymousRequest(ctx, r, rc); err != nil {
+			return err
+		}
 	}
 	if s.iam == nil {
 		rc.authzReason = "no IAM manager configured"

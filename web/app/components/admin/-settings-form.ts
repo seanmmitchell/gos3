@@ -4,13 +4,16 @@
 // the settings form edits seconds and plain arrays. These helpers convert
 // both ways, normalise list editors and validate the form before saving.
 // The server still validates (400 InvalidSettings) and its message is shown.
+// Sections a server may not have (compression, on servers that predate it)
+// are null in the form and left out of the saved document.
 //
 // File name starts with "-" so Nuxt does not register it as a component.
-import type { Settings } from '~/types/admin'
+import type { CompressionMode, Settings } from '~/types/admin'
 import { nsToSeconds, secondsToNs } from '~/utils/format'
 
 export const LOG_LEVELS = ['debug', 'info', 'warn', 'error'] as const
 export const LOG_FORMATS = ['text', 'json'] as const
+export const COMPRESSION_MODES = ['optional', 'enforced', 'disabled'] as const satisfies readonly CompressionMode[]
 
 export interface SettingsForm {
   name: string
@@ -50,6 +53,14 @@ export interface SettingsForm {
     enabled: boolean
     intervalSeconds: number
   }
+  /** null when the server has no compression settings (older gos3). */
+  compression: {
+    mode: string
+    level: number
+    /** Bytes. */
+    minSize: number
+    skipContentTypes: string[]
+  } | null
 }
 
 /** Field path → error message. Paths match the form (e.g. "discovery.beaconGroup"). */
@@ -109,7 +120,8 @@ export function emptySettingsForm(): SettingsForm {
       maxScanHosts: 0
     },
     logging: { level: 'info', format: 'text', accessLog: false },
-    lifecycle: { enabled: false, intervalSeconds: 0 }
+    lifecycle: { enabled: false, intervalSeconds: 0 },
+    compression: null
   }
 }
 
@@ -150,14 +162,25 @@ export function settingsToForm(s: Settings): SettingsForm {
     lifecycle: {
       enabled: !!s.lifecycle?.enabled,
       intervalSeconds: s.lifecycle?.intervalSeconds ?? 0
-    }
+    },
+    compression: s.compression
+      ? {
+          mode: s.compression.mode ?? 'optional',
+          level: s.compression.level ?? 1,
+          minSize: s.compression.minSize ?? 0,
+          skipContentTypes: [...(s.compression.skipContentTypes ?? [])]
+        }
+      : null
   }
 }
 
 /**
  * Form → full settings document for PUT /config. Fields of `base` (the
  * settings last loaded from the server) that the form does not know are
- * preserved, so a newer server never loses settings through this UI.
+ * preserved, so a newer server never loses settings through this UI. A
+ * null form section (the server did not send it) is not added: an older
+ * server gets no compression object, and a newer one keeps its current
+ * compression settings when the document has none.
  */
 export function formToSettings(f: SettingsForm, base?: Settings): Settings {
   return {
@@ -200,7 +223,18 @@ export function formToSettings(f: SettingsForm, base?: Settings): Settings {
       ...(base?.lifecycle ?? {}),
       enabled: f.lifecycle.enabled,
       intervalSeconds: Math.round(f.lifecycle.intervalSeconds)
-    }
+    },
+    ...(f.compression
+      ? {
+          compression: {
+            ...(base?.compression ?? {}),
+            mode: f.compression.mode,
+            level: Math.round(f.compression.level),
+            minSize: Math.round(f.compression.minSize),
+            skipContentTypes: normalizeList(f.compression.skipContentTypes)
+          }
+        }
+      : {})
   }
 }
 
@@ -228,7 +262,11 @@ export const SETTINGS_LIMITS = {
   maxPeerTtlSeconds: 7 * 24 * 3600,
   maxScanHosts: 65536,
   minLifecycleSeconds: 60,
-  maxLifecycleSeconds: 365 * 24 * 3600
+  maxLifecycleSeconds: 365 * 24 * 3600,
+  minCompressionLevel: 1,
+  maxCompressionLevel: 9,
+  /** 5 TiB, the S3 object size limit. */
+  maxCompressionMinSize: 5 * 1024 ** 4
 } as const
 
 const REGION_RE = /^[a-z0-9]([a-z0-9-]{0,62}[a-z0-9])?$/
@@ -238,6 +276,9 @@ const LABEL_RE = /^(?!-)[a-z0-9_-]{1,63}(?<!-)$/i
 const HOST_PORT_RE = /^([^\s:/]+|\[[0-9a-f:.]+\]):(\d{1,5})$/i
 // RFC 7230 header field token (also allows '*' patterns for allowed headers).
 const HEADER_TOKEN_RE = /^[!#$%&'*+.^_`|~0-9a-z-]+$/i
+// compression.skipContentTypes pattern (internal/config mediaTypePatternRe):
+// "type/subtype", "type/*" or a prefix ending in "*".
+const MEDIA_TYPE_PATTERN_RE = /^[a-z0-9][a-z0-9!#$&^_.+-]*\/(\*|[a-z0-9][a-z0-9!#$&^_.+-]*\*?)$/i
 
 function isHostname(s: string): boolean {
   return s.length >= 1 && s.length <= 253 && s.split('.').every(l => LABEL_RE.test(l))
@@ -298,6 +339,11 @@ export function validateBeaconGroup(g: string): string | undefined {
   if (octets[0]! < 224 || octets[0]! > 239) return 'The address must be a multicast address (224.0.0.0 – 239.255.255.255)'
   if (!validPort(m[5]!)) return 'Invalid port'
   return undefined
+}
+
+/** Media type pattern stored uncompressed: "image/jpeg", "video/*" or "application/vnd.oasis.opendocument.*". */
+export function validateMediaTypePattern(t: string): string | undefined {
+  return MEDIA_TYPE_PATTERN_RE.test(t) ? undefined : `"${t}" is not a media type pattern (use type/subtype, type/* or a prefix ending in *)`
 }
 
 /** Static seed: a base URL without path (http[s]://host:port) or host[:port]. */
@@ -374,12 +420,69 @@ export function validateSettingsForm(f: SettingsForm): SettingsErrors {
   if (!Number.isInteger(f.lifecycle.intervalSeconds) || !inRange(f.lifecycle.intervalSeconds, L.minLifecycleSeconds, L.maxLifecycleSeconds)) {
     set('lifecycle.intervalSeconds', `Must be a whole number of seconds between ${L.minLifecycleSeconds} and ${L.maxLifecycleSeconds} (1 year)`)
   }
+
+  const c = f.compression
+  if (c) {
+    if (!(COMPRESSION_MODES as readonly string[]).includes(c.mode)) set('compression.mode', 'Unknown compression mode')
+    if (!Number.isInteger(c.level) || !inRange(c.level, L.minCompressionLevel, L.maxCompressionLevel)) {
+      set('compression.level', `Must be a whole number between ${L.minCompressionLevel} and ${L.maxCompressionLevel}`)
+    }
+    if (!Number.isInteger(c.minSize) || !inRange(c.minSize, 0, L.maxCompressionMinSize)) {
+      set('compression.minSize', `Must be a whole number of bytes between 0 and ${L.maxCompressionMinSize} (5 TiB)`)
+    }
+    set('compression.skipContentTypes', firstListError(c.skipContentTypes, validateMediaTypePattern))
+  }
   return e
 }
 
-/** Which form section a field path belongs to (for error badges on section headers). */
-export function sectionOf(path: string): 'general' | 'cors' | 'discovery' | 'logging' | 'lifecycle' {
+/** A section of the server settings page (one chip each). */
+export type SettingsSection = 'general' | 'cors' | 'discovery' | 'logging' | 'lifecycle' | 'compression'
+
+export interface SettingsSectionDef {
+  value: SettingsSection
+  label: string
+  icon: string
+}
+
+/** Settings page sections in display order (see settingsSections). */
+export const SETTINGS_SECTIONS: readonly SettingsSectionDef[] = [
+  { value: 'general', label: 'General', icon: 'i-lucide-server' },
+  { value: 'cors', label: 'CORS', icon: 'i-lucide-globe' },
+  { value: 'discovery', label: 'Discovery', icon: 'i-lucide-radar' },
+  { value: 'logging', label: 'Logging', icon: 'i-lucide-scroll-text' },
+  { value: 'lifecycle', label: 'Lifecycle worker', icon: 'i-lucide-timer' },
+  { value: 'compression', label: 'Compression', icon: 'i-lucide-file-archive' }
+]
+
+/** The sections a form has: compression only when the server reported it. */
+export function settingsSections(f: SettingsForm | null | undefined): readonly SettingsSectionDef[] {
+  return SETTINGS_SECTIONS.filter(s => s.value !== 'compression' || !!f?.compression)
+}
+
+/** Normalises a `?tab=` query value to one of `sections` (default general). */
+export function resolveSettingsSection(v: unknown, sections: readonly SettingsSectionDef[] = SETTINGS_SECTIONS): SettingsSection {
+  const s = Array.isArray(v) ? v[0] : v
+  return sections.find(t => t.value === s)?.value ?? 'general'
+}
+
+/** Which form section a field path belongs to (for error badges on section chips). */
+export function sectionOf(path: string): SettingsSection {
   const head = path.split('.')[0]
-  if (head === 'cors' || head === 'discovery' || head === 'logging' || head === 'lifecycle') return head
+  if (head === 'cors' || head === 'discovery' || head === 'logging' || head === 'lifecycle' || head === 'compression') return head
   return 'general'
+}
+
+/**
+ * The sections whose saved document would change, compared like
+ * isFormDirty (normalised lists), so the chips can mark unsaved sections.
+ */
+export function dirtySections(current: SettingsForm, original: SettingsForm | null | undefined): Set<SettingsSection> {
+  const out = new Set<SettingsSection>()
+  if (!original) return out
+  const a = formToSettings(current) as unknown as Record<string, unknown>
+  const b = formToSettings(original) as unknown as Record<string, unknown>
+  for (const k of new Set([...Object.keys(a), ...Object.keys(b)])) {
+    if (JSON.stringify(a[k]) !== JSON.stringify(b[k])) out.add(sectionOf(k))
+  }
+  return out
 }

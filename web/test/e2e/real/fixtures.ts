@@ -55,9 +55,12 @@ export class ServerApi {
     if (!r.ok) throw new Error(`create bucket ${bucket}: ${r.status} ${await r.text()}`)
   }
 
-  /** Force-deletes a bucket (all versions); ignores a missing bucket. */
+  /**
+   * Force-deletes a bucket (all versions); ignores a missing bucket. Object
+   * lock: GOVERNANCE retention is bypassed (the test identity is root).
+   */
   async forceDeleteBucket(bucket: string): Promise<void> {
-    const r = await this.fetch(`/_gos3/admin/v1/buckets/${bucket}?force=true`, { method: 'DELETE' })
+    const r = await this.fetch(`/_gos3/admin/v1/buckets/${bucket}?force=true&bypassGovernanceRetention=true`, { method: 'DELETE' })
     if (!r.ok && r.status !== 404) throw new Error(`force delete ${bucket}: ${r.status} ${await r.text()}`)
   }
 }

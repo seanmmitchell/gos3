@@ -1,21 +1,22 @@
 # kubectl apply -k deploy/kubernetes   (add -n <namespace> or set namespace below)
 #
 # Root credentials are NOT part of this kustomization, so the repository's
-# example keys can never be deployed by accident. Either create the Secret
-# first (see secret.example.yaml):
+# example keys can never be deployed by accident. Create the Secret first
+# (see secret.example.yaml); the pods do not start without it:
 #
 #   kubectl create secret generic gos3-root-credentials \
 #     --from-literal=access-key=... --from-literal=secret-key=...
 #
-# or apply without it: each server then generates its own root keys on first
-# start and logs them once (kubectl logs gos3-0). A secretGenerator reading
-# a git-ignored env file works too:
+# A secretGenerator reading a git-ignored env file works too:
 #
 #   secretGenerator:
 #     - name: gos3-root-credentials
 #       envs: [root-credentials.env]   # access-key=... / secret-key=...
 #       options:
 #         disableNameSuffixHash: true
+#
+# networkpolicy.yaml is an optional example that limits who can reach gos3;
+# adapt its namespace selectors to your cluster before enabling it below.
 apiVersion: kustomize.config.k8s.io/v1beta1
 kind: Kustomization
 # namespace: gos3
@@ -23,8 +24,13 @@ resources:
   - configmap.yaml
   - service.yaml
   - statefulset.yaml
+  # - networkpolicy.yaml
 images:
   - name: ghcr.io/seanmmitchell/gos3
-    # Pin a release (e.g. newTag: "1.2.3") for reproducible deployments.
-    # "latest" is pulled again whenever a pod starts.
-    newTag: latest
+    # A release version (the image tags are X.Y.Z without the v). Avoid
+    # "latest": it is pulled again whenever a pod starts, so whatever was
+    # pushed last runs. Tags can be re-pushed; for an immutable reference,
+    # also pin the digest that `gh attestation verify` checked
+    # (docs/releasing.md#verifying-a-release):
+    #   digest: sha256:...
+    newTag: "0.1.0"

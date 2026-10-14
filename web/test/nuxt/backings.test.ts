@@ -9,7 +9,7 @@ import { describe, expect, it } from 'vitest'
 import { nextTick } from 'vue'
 import CreateBucketModal from '~/components/browser/CreateBucketModal.vue'
 import VersioningTab from '~/components/bucket-settings/VersioningTab.vue'
-import type { BackingChoices } from '~/types/admin'
+import type { AvailableBackings } from '~/types/admin'
 import type { CreateBucketOptions } from '~/types/s3'
 import type { S3Client } from '~/utils/s3/client'
 
@@ -36,15 +36,15 @@ async function createNamed(name: string) {
   await flushPromises()
 }
 
-const backings = (def: string): BackingChoices => ({
+const backings = (def: string): AvailableBackings => ({
   default: def,
-  available: [{ name: 'local', mode: 'local' }, { name: 'aws', mode: 'gateway' }, { name: 'archive', mode: 'blob' }]
+  available: [{ name: 'default', kind: 'fs' }, { name: 'aws', kind: 's3', mode: 'gateway' }, { name: 'archive', kind: 's3', mode: 'blob' }]
 })
 
 describe('CreateBucketModal storage backing', () => {
   it('has no selector and sends no backing without a choice', async () => {
     const { client, created } = fakeClient()
-    const w = await mountSuspended(CreateBucketModal, { props: { open: true, client, backings: { default: 'local', available: [{ name: 'local', mode: 'local' }] } } as never })
+    const w = await mountSuspended(CreateBucketModal, { props: { open: true, client, backings: { default: 'default', available: [{ name: 'default', kind: 'fs' }] } } as never })
     await flushPromises()
     expect(body()).not.toContain('Storage backing')
     await createNamed('plain-bucket')

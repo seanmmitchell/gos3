@@ -244,7 +244,7 @@ func (r *recordSink) snapshot() ([]candidate, []string) {
 
 // quietConfig is a running config with every network mechanism disabled.
 func quietConfig() Config {
-	c := DefaultConfig()
+	c := enabledConfig()
 	c.MDNS = false
 	c.Beacon = false
 	return c

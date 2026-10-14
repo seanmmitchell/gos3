@@ -16,8 +16,8 @@ import (
 
 	"go.etcd.io/bbolt"
 
-	"github.com/seanmmitchell/gos3/internal/s3client"
 	"github.com/seanmmitchell/gos3/internal/storage"
+	"github.com/seanmmitchell/gos3/internal/storage/compress"
 )
 
 // MaxPartNumber is the largest part number accepted (S3 allows 1..10000).
@@ -134,11 +134,10 @@ type partWriter struct {
 	key      string
 	uploadID string
 	number   int
-	rem      *remote // nil: local part file
+	rem      *remote // remote blob backing of the bucket (nil: local)
 
 	mu   sync.Mutex
-	t    *tmpFile        // local
-	sp   *s3client.Spool // remote
+	t    *tmpFile
 	done bool
 }
 
@@ -151,16 +150,23 @@ func (b *Backend) NewPartWriter(ctx context.Context, bucket, key, uploadID strin
 	if err := b.begin(ctx); err != nil {
 		return nil, err
 	}
-	var id, backing string
+	var id, mode, backing string
 	err := b.view(func(tx *bbolt.Tx) error {
 		br, bb, err := loadBucket(tx, bucket)
 		if err != nil {
 			return err
 		}
-		if _, err := loadUpload(bb, key, uploadID); err != nil {
+		up, err := loadUpload(bb, key, uploadID)
+		if err != nil {
 			return err
 		}
-		id, backing = br.ID, br.Backing
+		id, mode, backing = br.ID, up.Meta.Encryption, br.Backing
+		// Uploads created by builds that only recorded SSE have no
+		// Encryption, but completion encrypts them: stage their new parts
+		// encrypted too.
+		if mode == "" && up.Meta.SSE != "" {
+			mode = storage.EncryptionAES256
+		}
 		return nil
 	})
 	if err != nil {
@@ -170,13 +176,11 @@ func (b *Backend) NewPartWriter(ctx context.Context, bucket, key, uploadID strin
 	if err != nil {
 		return nil, err
 	}
-	w := &partWriter{b: b, bucket: bucket, bucketID: id, key: key, uploadID: uploadID, number: partNumber, rem: rem}
-	if rem != nil {
-		w.sp = b.newSpool()
-	} else {
-		w.t = b.newTemp()
+	t, err := b.encryptedTemp(id, mode)
+	if err != nil {
+		return nil, err
 	}
-	return w, nil
+	return &partWriter{b: b, bucket: bucket, bucketID: id, key: key, uploadID: uploadID, number: partNumber, rem: rem, t: t}, nil
 }
 
 func (w *partWriter) Write(p []byte) (int, error) {
@@ -184,9 +188,6 @@ func (w *partWriter) Write(p []byte) (int, error) {
 	defer w.mu.Unlock()
 	if w.done {
 		return 0, errWriterDone
-	}
-	if w.sp != nil {
-		return w.sp.Write(p)
 	}
 	return w.t.Write(p)
 }
@@ -199,37 +200,26 @@ func (w *partWriter) Commit(ctx context.Context, meta storage.PartMeta) (storage
 	}
 	w.done = true
 	b := w.b
-	if w.sp != nil {
-		defer w.sp.Close()
-	}
 	if err := b.begin(ctx); err != nil {
-		if w.t != nil {
-			w.t.discard()
-		}
+		w.t.discard()
 		return storage.PartInfo{}, err
 	}
 	// Parts always get a file or blob (even when empty) so completion can
 	// treat all parts alike.
+	if err := w.t.finish(b.fsync && w.rem == nil, true); err != nil {
+		return storage.PartInfo{}, err
+	}
 	file := partFileName(w.number)
 	var path, blobKey string
-	var size int64
-	if w.sp != nil {
-		if err := w.sp.Finish(); err != nil {
-			return storage.PartInfo{}, fmt.Errorf("fs: spool part: %w", err)
-		}
-		size = w.sp.Size()
+	if w.rem != nil {
 		blobKey = w.rem.partKey(w.uploadID, file)
-		id := w.rem.blobID(blobKey)
-		b.pending.add(id)
-		defer b.pending.done(id)
-		if err := b.putBlob(ctx, w.rem, blobKey, w.sp, size); err != nil {
+		path = w.rem.blobID(blobKey)
+		b.pending.add(path)
+		defer b.pending.done(path)
+		if err := b.uploadTemp(ctx, w.rem, blobKey, w.t); err != nil {
 			return storage.PartInfo{}, err
 		}
 	} else {
-		if err := w.t.finish(b.fsync, true); err != nil {
-			return storage.PartInfo{}, err
-		}
-		size = w.t.size
 		path = b.partPath(w.uploadID, file)
 		b.pending.add(path)
 		defer b.pending.done(path)
@@ -240,8 +230,9 @@ func (w *partWriter) Commit(ctx context.Context, meta storage.PartMeta) (storage
 	}
 
 	rec := partRecord{
+		KeyID:        w.t.cryptoID,
 		File:         file,
-		Size:         size,
+		Size:         w.t.size,
 		LastModified: time.Now().UTC(),
 		ETag:         meta.ETag,
 		Checksums:    maps.Clone(meta.Checksums),
@@ -306,10 +297,6 @@ func (w *partWriter) Abort() error {
 		return nil
 	}
 	w.done = true
-	if w.sp != nil {
-		_ = w.sp.Close()
-		return nil
-	}
 	w.t.discard()
 	return nil
 }
@@ -447,20 +434,29 @@ var errPartsChanged = errors.New("fs: multipart upload parts changed during comp
 // CompleteMultipartUpload concatenates the listed parts into a new object
 // version (committed like ObjectWriter.Commit) and removes the upload with
 // all its parts. If the commit fails (e.g. preconditions) the upload is
-// kept, so the client may retry. On a remote blob backing the parts are
-// composed server-side where the service's multipart limits allow it (see
-// composeRemote).
+// kept, so the client may retry.
 //
 // The commit transaction verifies that every listed part still refers to the
 // file that was copied; if a part was re-uploaded concurrently the
 // completion starts over (a bounded number of times), so the committed
 // object always consists of the parts current at commit time.
 func (b *Backend) CompleteMultipartUpload(ctx context.Context, bucket, key, uploadID string, partNumbers []int, meta storage.ObjectMeta, opts storage.CommitOptions) (storage.ObjectInfo, error) {
+	return b.CompleteMultipartUploadWith(ctx, bucket, key, uploadID, partNumbers, meta, opts, storage.WriteOptions{})
+}
+
+// CompleteMultipartUploadWith is CompleteMultipartUpload with write
+// options: with wopts.Compression the parts are compressed into the new
+// data file as they are concatenated (see storage.CompressingBackend).
+func (b *Backend) CompleteMultipartUploadWith(ctx context.Context, bucket, key, uploadID string, partNumbers []int,
+	meta storage.ObjectMeta, opts storage.CommitOptions, wopts storage.WriteOptions) (storage.ObjectInfo, error) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
+	if err := checkCompression(wopts.Compression); err != nil {
+		return storage.ObjectInfo{}, err
+	}
 	for attempt := 1; ; attempt++ {
-		info, err := b.completeOnce(ctx, bucket, key, uploadID, partNumbers, meta, opts)
+		info, err := b.completeOnce(ctx, bucket, key, uploadID, partNumbers, meta, opts, wopts)
 		if errors.Is(err, errPartsChanged) && attempt < completeRetries {
 			continue
 		}
@@ -474,7 +470,8 @@ func (b *Backend) CompleteMultipartUpload(ctx context.Context, bucket, key, uplo
 // completeOnce is one attempt of CompleteMultipartUpload. It returns
 // errPartsChanged when a listed part was replaced or vanished while the
 // upload still exists.
-func (b *Backend) completeOnce(ctx context.Context, bucket, key, uploadID string, partNumbers []int, meta storage.ObjectMeta, opts storage.CommitOptions) (storage.ObjectInfo, error) {
+func (b *Backend) completeOnce(ctx context.Context, bucket, key, uploadID string, partNumbers []int,
+	meta storage.ObjectMeta, opts storage.CommitOptions, wopts storage.WriteOptions) (storage.ObjectInfo, error) {
 	if err := b.begin(ctx); err != nil {
 		return storage.ObjectInfo{}, err
 	}
@@ -487,11 +484,10 @@ func (b *Backend) completeOnce(ctx context.Context, bucket, key, uploadID string
 	// next attempt see (and reject) its new ETag.
 	var (
 		bucketID, backing string
-		files             []string
-		sizes             []int64
+		parts             []partRecord // in partNumbers order
 	)
 	err := b.view(func(tx *bbolt.Tx) error {
-		files, sizes = files[:0], sizes[:0]
+		parts = parts[:0]
 		br, bb, err := loadBucket(tx, bucket)
 		if err != nil {
 			return err
@@ -500,11 +496,11 @@ func (b *Backend) completeOnce(ctx context.Context, bucket, key, uploadID string
 			return err
 		}
 		bucketID, backing = br.ID, br.Backing
-		parts := bb.Bucket(subParts)
+		pb := bb.Bucket(subParts)
 		for i, n := range partNumbers {
 			var v []byte
 			if n >= 1 && n <= maxPartNumber {
-				v = parts.Get(partKey(uploadID, n))
+				v = pb.Get(partKey(uploadID, n))
 			}
 			if v == nil {
 				return fmt.Errorf("%w: part %d of upload %q", storage.ErrPartNotFound, n, uploadID)
@@ -520,8 +516,7 @@ func (b *Backend) completeOnce(ctx context.Context, bucket, key, uploadID string
 				return fmt.Errorf("%w: part %d of upload %q was replaced (ETag %q, want %q)",
 					storage.ErrPartNotFound, n, uploadID, rec.ETag, opts.PartETags[i])
 			}
-			files = append(files, rec.File)
-			sizes = append(sizes, rec.Size)
+			parts = append(parts, rec)
 		}
 		return checkPreconditions(bb, key, opts)
 	})
@@ -532,74 +527,77 @@ func (b *Backend) completeOnce(ctx context.Context, bucket, key, uploadID string
 	if err != nil {
 		return storage.ObjectInfo{}, err
 	}
-	// partsGone handles a part that vanished while its data was copied: the
-	// part was replaced (retry) or the upload was aborted or completed
-	// concurrently (report that instead).
-	partsGone := func(err error) error {
-		if errors.Is(err, errPartsChanged) {
-			if _, gerr := b.GetMultipartUpload(ctx, bucket, key, uploadID); gerr != nil {
-				return gerr
-			}
-		}
-		return err
-	}
 
 	var (
-		dataID string
-		size   int64
+		size, stored int64
+		compression  string
+		dataID, path string
 	)
-	if rem != nil {
-		for _, s := range sizes {
-			size += s
-		}
-		if size > 0 {
-			dataID = randomHex(16)
-			dst := rem.dataKey(bucketID, dataID)
-			id := rem.blobID(dst)
-			b.pending.add(id)
-			defer b.pending.done(id)
-			if err := b.composeRemote(ctx, rem, dst, uploadID, files, sizes, partNumbers); err != nil {
-				return storage.ObjectInfo{}, partsGone(err)
+	if wopts.Encryption == storage.EncryptionRestic {
+		// Restic gets the parts directly (it compresses itself). The parts
+		// and preconditions are checked again before the snapshot is saved,
+		// so that a retry or a refused completion archives nothing.
+		size, dataID, path, err = b.archiveParts(ctx, rem, bucket, bucketID, key, uploadID, partNumbers, parts, func() error {
+			if afterPartsCopied != nil {
+				afterPartsCopied(uploadID)
 			}
-		}
+			return b.view(func(tx *bbolt.Tx) error {
+				_, bb, err := loadBucketID(tx, bucket, bucketID)
+				if err != nil {
+					return err
+				}
+				if _, err := loadUpload(bb, key, uploadID); err != nil {
+					return err
+				}
+				for i, n := range partNumbers {
+					var rec partRecord
+					if v := bb.Bucket(subParts).Get(partKey(uploadID, n)); v == nil || decodeRecord(v, &rec) != nil || rec.File != parts[i].File {
+						return errPartsChanged
+					}
+				}
+				return checkPreconditions(bb, key, opts)
+			})
+		})
 	} else {
-		t := b.newTemp()
-		for i, file := range files {
-			if err := b.appendPart(ctx, t, uploadID, file, sizes[i], partNumbers[i]); err != nil {
-				t.discard()
-				return storage.ObjectInfo{}, partsGone(err)
+		size, compression, stored, dataID, path, err = b.concatParts(ctx, rem, bucketID, uploadID, partNumbers, parts, wopts)
+		if err == nil && afterPartsCopied != nil {
+			afterPartsCopied(uploadID)
+		}
+	}
+	if err != nil {
+		if errors.Is(err, errPartsChanged) {
+			// A part file vanished or changed: the part was replaced (retry)
+			// or the upload was aborted or completed concurrently (report
+			// that instead).
+			if _, gerr := b.GetMultipartUpload(ctx, bucket, key, uploadID); gerr != nil {
+				return storage.ObjectInfo{}, gerr
 			}
 		}
-		var path string
-		dataID, path, err = b.finishData(t, bucketID)
-		if err != nil {
-			return storage.ObjectInfo{}, err
-		}
-		if path != "" {
-			defer b.pending.done(path)
-		}
-		size = t.size
+		return storage.ObjectInfo{}, err
 	}
-	if afterPartsCopied != nil {
-		afterPartsCopied(uploadID)
+	if path != "" {
+		defer b.pending.done(path)
 	}
+	meta.Encryption = wopts.Encryption
 	info, err := b.commitObject(commitReq{
-		bucket:   bucket,
-		bucketID: bucketID,
-		rem:      rem,
-		key:      key,
-		dataID:   dataID,
-		size:     size,
-		meta:     cloneMeta(meta),
-		opts:     opts,
+		rem:         rem,
+		bucket:      bucket,
+		bucketID:    bucketID,
+		key:         key,
+		dataID:      dataID,
+		size:        size,
+		compression: compression,
+		storedSize:  stored,
+		meta:        cloneMeta(meta),
+		opts:        opts,
 		pre: func(tx *bbolt.Tx, bb *bbolt.Bucket) error {
 			up, err := loadUpload(bb, key, uploadID)
 			if err != nil {
 				return err
 			}
-			parts := bb.Bucket(subParts)
+			pb := bb.Bucket(subParts)
 			for i, n := range partNumbers {
-				v := parts.Get(partKey(uploadID, n))
+				v := pb.Get(partKey(uploadID, n))
 				if v == nil {
 					return fmt.Errorf("%w: part %d of upload %q", storage.ErrPartNotFound, n, uploadID)
 				}
@@ -607,7 +605,7 @@ func (b *Backend) completeOnce(ctx context.Context, bucket, key, uploadID string
 				if err := decodeRecord(v, &rec); err != nil {
 					return err
 				}
-				if rec.File != files[i] {
+				if rec.File != parts[i].File {
 					return errPartsChanged
 				}
 			}
@@ -621,37 +619,195 @@ func (b *Backend) completeOnce(ctx context.Context, bucket, key, uploadID string
 	return info, nil
 }
 
-// appendPart copies one part file into t, verifying its size. The copy goes
-// file to file (copy_file_range on Linux), so the context is checked between
-// parts.
-func (b *Backend) appendPart(ctx context.Context, t *tmpFile, uploadID, file string, size int64, n int) error {
+// concatParts concatenates the parts (part numbers partNumbers) of the
+// upload into a new data file (or, on the remote blob backing rem, blob)
+// stored as wopts ask (not restic), returning what sealData and finishData
+// return. On a remote, parts stored as plain content are composed
+// server-side when the service's multipart limits allow it (see
+// composeRemote); everything else streams through the local pipeline.
+func (b *Backend) concatParts(ctx context.Context, rem *remote, bucketID, uploadID string, partNumbers []int, parts []partRecord,
+	wopts storage.WriteOptions) (size int64, compression string, stored int64, dataID, path string, err error) {
+	if rem != nil {
+		if size, dataID, path, ok, err := b.composeParts(ctx, rem, bucketID, uploadID, partNumbers, parts, wopts); ok || err != nil {
+			return size, "", 0, dataID, path, err
+		}
+	}
+	t, err := b.encryptedTemp(bucketID, wopts.Encryption)
+	if err != nil {
+		return 0, "", 0, "", "", err
+	}
+	defer t.discard()
+	cw, err := newCompressor(t, wopts.Compression)
+	if err != nil {
+		return 0, "", 0, "", "", err
+	}
+	for i, part := range parts {
+		if err := b.appendPart(ctx, rem, t, cw, bucketID, uploadID, partNumbers[i], part); err != nil {
+			if cw != nil {
+				cw.Abandon()
+			}
+			return 0, "", 0, "", "", err
+		}
+	}
+	if size, compression, stored, err = sealData(t, cw, wopts.Compression.Algorithm); err != nil {
+		return 0, "", 0, "", "", err
+	}
+	dataID, path, err = b.finishData(ctx, t, bucketID, rem)
+	return size, compression, stored, dataID, path, err
+}
+
+// composeParts composes the parts server-side into a new data blob of rem
+// when the result is their plain concatenation (no compression or
+// encryption, plain parts) and the sizes allow it; ok reports whether it
+// did (or failed trying, with err).
+func (b *Backend) composeParts(ctx context.Context, rem *remote, bucketID, uploadID string, partNumbers []int, parts []partRecord,
+	wopts storage.WriteOptions) (size int64, dataID, path string, ok bool, err error) {
+	if wopts.Compression.Enabled() || wopts.Encryption != "" {
+		return 0, "", "", false, nil
+	}
+	files := make([]string, len(parts))
+	sizes := make([]int64, len(parts))
+	for i, p := range parts {
+		if p.encrypted() {
+			return 0, "", "", false, nil
+		}
+		files[i], sizes[i] = p.File, p.Size
+		size += p.Size
+	}
+	if size == 0 || !composable(sizes) {
+		// Empty objects have no blob; the local path handles them.
+		return 0, "", "", false, nil
+	}
 	if err := ctx.Err(); err != nil {
+		return 0, "", "", true, err
+	}
+	dataID = randomHex(16)
+	dst := rem.dataKey(bucketID, dataID)
+	path = rem.blobID(dst)
+	b.pending.add(path)
+	if err := b.composeRemote(ctx, rem, dst, uploadID, files, sizes, partNumbers); err != nil {
+		b.pending.done(path)
+		return 0, "", "", true, err
+	}
+	return size, dataID, path, true, nil
+}
+
+// archiveParts streams the parts (part numbers partNumbers) of the upload
+// into a restic snapshot of bucket/key, decrypting encrypted part files on
+// the way, and finishes it with check (see resticWriter.finish). It returns
+// the content size and the snapshot reference's data ID and pending path.
+func (b *Backend) archiveParts(ctx context.Context, rem *remote, bucket, bucketID, key, uploadID string, partNumbers []int, parts []partRecord,
+	check func() error) (size int64, dataID, path string, err error) {
+	w, err := b.newResticWriter(ctx, bucketID, bucket, key)
+	if err != nil {
+		return 0, "", "", err
+	}
+	w.rem = rem
+	defer w.abort()
+	for i, part := range parts {
+		if err := b.copyPart(ctx, rem, w, bucketID, uploadID, partNumbers[i], part); err != nil {
+			return 0, "", "", err
+		}
+	}
+	dataID, path, err = w.finish(check)
+	return w.size, dataID, path, err
+}
+
+// copyPart copies the content of part number n of the upload to w,
+// verifying its size.
+func (b *Backend) copyPart(ctx context.Context, rem *remote, w io.Writer, bucketID, uploadID string, n int, part partRecord) error {
+	src, _, c, err := b.openPart(ctx, rem, bucketID, uploadID, n, part)
+	if err != nil {
 		return err
 	}
-	f, err := openShared(b.partPath(uploadID, file))
+	defer c.Close()
+	copied, err := io.Copy(w, io.LimitReader(src, part.Size+1))
+	if err != nil {
+		return fmt.Errorf("fs: copy part %d: %w", n, err)
+	}
+	if copied != part.Size {
+		return fmt.Errorf("%w: part %d of upload %q has %d bytes, expected %d", errCorrupt, n, uploadID, copied, part.Size)
+	}
+	return nil
+}
+
+// openPart opens the file (or, on the remote blob backing rem, the blob) of
+// part number n of the upload and returns a reader over its content
+// (decrypting an encrypted part), the local file (nil for a blob) and the
+// closer the caller must close. The context is checked first.
+func (b *Backend) openPart(ctx context.Context, rem *remote, bucketID, uploadID string, n int, part partRecord) (io.Reader, *os.File, io.Closer, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, nil, nil, err
+	}
+	if rem != nil {
+		stored := part.Size
+		if part.encrypted() {
+			stored = storage.EncryptedSize(part.Size)
+		}
+		br := b.newBlobReader(ctx, rem, rem.partKey(uploadID, part.File), stored, false, vanishedPart(n))
+		if !part.encrypted() {
+			return br, nil, br, nil
+		}
+		r, err := b.decryptStored(br, bucketID, part.KeyID, part.Size, br.Close)
+		if err != nil {
+			_ = br.Close()
+			return nil, nil, nil, fmt.Errorf("fs: open part %d: %w", n, err)
+		}
+		return r, nil, r, nil
+	}
+	f, err := openShared(b.partPath(uploadID, part.File))
 	if err != nil {
 		if errors.Is(err, iofs.ErrNotExist) || openRaced(err) {
 			// Replaced, aborted or completed concurrently.
-			return fmt.Errorf("%w: part %d vanished", errPartsChanged, n)
+			return nil, nil, nil, fmt.Errorf("%w: part %d vanished", errPartsChanged, n)
 		}
-		return fmt.Errorf("fs: open part %d: %w", n, err)
+		return nil, nil, nil, fmt.Errorf("fs: open part %d: %w", n, err)
 	}
-	defer f.Close()
-	// Bypass t's buffer: flush it, then copy straight into the file.
-	if err := t.open(); err != nil {
+	if !part.encrypted() {
+		return f, f, f, nil
+	}
+	r, err := b.openEncrypted(f, bucketID, part.KeyID, part.Size)
+	if err != nil {
+		_ = f.Close()
+		return nil, nil, nil, fmt.Errorf("fs: open part %d: %w", n, err)
+	}
+	return r, f, f, nil
+}
+
+// appendPart copies part number n of the upload into t, or through the
+// compressor cw into t when cw is not nil, decrypting an encrypted part
+// file and verifying its size. An uncompressed copy of a plain part into a
+// plain t goes file to file (copy_file_range on Linux). The context is
+// checked between parts.
+func (b *Backend) appendPart(ctx context.Context, rem *remote, t *tmpFile, cw *compress.Writer, bucketID, uploadID string, n int, part partRecord) error {
+	if cw != nil {
+		return b.copyPart(ctx, rem, cw, bucketID, uploadID, n, part)
+	}
+	src, f, c, err := b.openPart(ctx, rem, bucketID, uploadID, n, part)
+	if err != nil {
 		return err
 	}
-	if err := t.flush(); err != nil {
-		return err
+	defer c.Close()
+	var copied int64
+	if f != nil && t.key == nil && !part.encrypted() {
+		// Preserve direct file copying for ordinary unencrypted uploads.
+		if err := t.open(); err != nil {
+			return err
+		}
+		if err := t.flush(); err != nil {
+			return err
+		}
+		copied, err = io.Copy(t.f, io.LimitReader(f, part.Size+1))
+		t.size += copied
+	} else {
+		copied, err = io.Copy(t, io.LimitReader(src, part.Size+1))
 	}
-	copied, err := io.Copy(t.f, io.LimitReader(f, size+1))
-	t.size += copied
 	if err != nil {
 		t.err = err
 		return fmt.Errorf("fs: copy part %d: %w", n, err)
 	}
-	if copied != size {
-		return fmt.Errorf("%w: part %d of upload %q has %d bytes, expected %d", errCorrupt, n, uploadID, copied, size)
+	if copied != part.Size {
+		return fmt.Errorf("%w: part %d of upload %q has %d bytes, expected %d", errCorrupt, n, uploadID, copied, part.Size)
 	}
 	return nil
 }

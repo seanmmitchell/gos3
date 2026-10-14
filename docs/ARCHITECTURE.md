@@ -15,7 +15,7 @@ discovery of gos3 servers on the network.
   object + composite), tagging, bucket policies + IAM users/policies, canned
   ACLs, CORS, lifecycle expiration, object lock (retention/legal hold),
   presigned URLs, browser POST uploads, virtual-hosted-style addressing.
-- **Simple ops**: one binary, `gos3 serve --data ./data`, YAML/env/flags,
+- **Simple ops**: one binary, `gos3 serve --data ./data`, JSON/YAML/env/flags,
   Prometheus metrics, JSON admin API, embedded UI, graceful shutdown.
 - **Discovery**: servers advertise via mDNS + UDP beacon, follow static seeds
   and DNS SRV, and can scan networks; the UI aggregates all of it.
@@ -32,10 +32,14 @@ discovery of gos3 servers on the network.
 | `internal/storage/` | Backend contract + generic list helpers (`list.go`) | contract / storage-memory |
 | `internal/storage/memory/` | in-memory backend | storage-memory |
 | `internal/storage/fs/` | filesystem backend (bbolt index + data files) | storage-fs |
+| `internal/storage/multi/` | multi-backing router: bucket placement, replication (active-passive / active-active), online moves, backing health | storage-multi |
 | `internal/storage/storagetest/` | backend conformance suite | storage-conformance |
-| `internal/storage/routed/` | backing router: places each bucket's objects on its backing (`DataStore` contract) | backings |
+| `internal/storage/routed/` | gateway s3 backings: bucket records on an fs backend, objects on a `DataStore` | backings |
 | `internal/storage/gateway/` | gateway backing: objects stored natively in a remote S3 service | backings |
 | `internal/s3client/` | minimal SigV4 S3 client for remote backings (+ `s3clienttest` in-process remote) | backings |
+| `internal/storage/compress/` | seekable block-compressed data format used by both backends | storage-compression |
+| `internal/storage/crypt/` | authenticated AES-256-GCM chunked stream format for natively encrypted (SSE-S3) data | storage-encryption |
+| `internal/compression/` | compression policy: bucket setting document, server mode, per-object decision | storage-compression |
 | `internal/auth/` | SigV4 verification, aws-chunked decoding, POST policy, client signer | auth |
 | `internal/iam/` | users, keys, policies, bucket policy parsing, authorization engine | iam |
 | `internal/s3/` | S3 HTTP layer (see file ownership below) | s3-core + s3-* |
@@ -55,13 +59,18 @@ exported helpers in your own files are fine.
 
 ## Top-level routing (`internal/server`)
 
-One listener (default `:9000`, optional TLS) serves everything:
+One listener (default `:9000`, optional TLS) serves everything. Before
+routing, response writes get a progress deadline, the TLS state is taken from
+the connection, and the `Host` header is checked against the server's names
+(`server.allowed_hosts`; unknown hosts get no anonymous access, UI or public
+metrics, or are refused outright when the list is set; see
+docs/security.md#dns-rebinding-and-the-host-header):
 
 1. Virtual-hosted-style request (Host is `<bucket>.<domain>` for a configured
-   domain) → **S3 handler**, always (even if the path starts with `/_gos3/`;
-   that is then an object key).
+   domain, and is not itself a configured domain) → **S3 handler**, always
+   (even if the path starts with `/_gos3/`; that is then an object key).
 2. Path starts with `/_gos3/`:
-   - `/_gos3/admin/v1/...` → admin API
+   - `/_gos3/admin/v1/...` → admin API (404 when `admin.enabled` is false)
    - `/_gos3/ui/...` → embedded web UI (SPA, `index.html`/`200.html` fallback)
    - `/_gos3/info` → public `discovery.Info` JSON (CORS `*`; requires auth when `publicInfo` is false)
    - `/_gos3/health` (liveness) and `/_gos3/ready` (backend reachable within 5 s; 503 while shutting down) → `{"status":"ok"}`
@@ -71,6 +80,12 @@ One listener (default `:9000`, optional TLS) serves everything:
 4. Everything else → **S3 handler**.
 
 `_gos3` can never be a bucket name (underscore is invalid), so there is no clash.
+
+Anonymous path-style `/minio/health/live` and `/minio/health/ready` without
+a query string are also probes; signed and virtual-host requests still go
+to S3. Management can be disabled independently of S3; doing so also disables
+UI and the saved settings overlay. The `noui` build tag excludes embedded
+assets and defaults UI off. Every discovery switch defaults off.
 
 ## S3 layer (`internal/s3`)
 
@@ -124,7 +139,8 @@ Unknown subresources → `NotImplemented`. Unsupported method for a resource →
   HTTP `Last-Modified` is RFC1123 GMT.
 - `x-amz-version-id` header is sent only when the bucket's versioning status is
   not Unversioned (then `null` versions are reported as `null`).
-- Limits: key ≤ 1024 bytes UTF-8; user metadata ≤ 2 KiB; ≤ 10 object tags
+- Limits: key ≤ 1024 bytes UTF-8 (keys objects are created at: XML 1.0
+  characters only, see `validateNewObjectKey`); user metadata ≤ 2 KiB; ≤ 10 object tags
   (key ≤ 128, value ≤ 256 chars); ≤ 50 bucket tags; single PUT ≤ 5 GiB
   (configurable); parts 1..10000, each ≥ 5 MiB except the last; max-keys ≤ 1000;
   DeleteObjects ≤ 1000 keys.
@@ -183,17 +199,53 @@ See the doc comments in `storage.go`. Key points:
   and listing order.
 - Version IDs for versioned writes must be unique, URL-safe, ≤ 64 chars and
   never `null`.
-- Optional Backend extensions (`optional.go`), discovered by type
-  assertion; both built-in backends implement both:
+- Optional Backend extensions (`optional.go`, `encryption.go`), discovered
+  by type assertion; both built-in backends implement all of them except
+  where noted:
   - `ConditionalDeleter.DeleteObjectIf` looks up the addressed version and
     deletes it only if a check on it passes, atomically (same transaction or
-    lock). The S3 DeleteObject/DeleteObjects `If-Match` and object lock path
-    and the lifecycle worker use it; without it the S3 layer checks just
-    before the delete and the lifecycle worker skips permanent deletes (it
-    still adds delete markers).
+    lock). The S3 DeleteObject/DeleteObjects `If-Match`, object lock and
+    authorized-version (`s3:ExistingObjectTag`) paths and the lifecycle
+    worker use it; without it the S3 layer checks just before the delete and
+    the lifecycle worker skips permanent deletes (it still adds delete
+    markers).
+  - `CheckedDeleter.DeleteObjectChecked` is `DeleteObjectIf` whose check
+    is also consulted when the key has no versions (and the delete then
+    adds the delete marker of a versioned bucket), so a delete authorized
+    on "no object here" still creates its marker but not over an object
+    that appeared meanwhile.
+  - `ConditionalMetaUpdater.UpdateObjectMetaIf` is `UpdateObjectMeta` with
+    such a check, so ACL, tagging, retention and legal hold updates apply
+    to exactly the version that was authorized; without it the S3 layer
+    compares the metadata it can see in the update function.
+  - `ConfigViewer.ViewBucketConfig` lends a stored configuration document
+    to a callback without copying it (the S3 layer hashes lifecycle
+    documents per request to recognise the cached parse).
   - `UploadWalker.WalkMultipartUploads` walks in-progress uploads in listing
     order (key, Initiated, UploadID) from an `UploadPosition`, without loading
     all of a bucket's uploads.
+  - `CompressingBackend.NewObjectWriterWith` / `CompleteMultipartUploadWith`
+    store a version's data compressed (`WriteOptions.Compression`), see
+    [Compression](#compression), and encrypted (`WriteOptions.Encryption`:
+    `AES256` or `restic`; an unsupported provider fails, never falls back to
+    plaintext). `ObjectMeta.Encryption` of the result records how the data
+    is actually stored.
+  - In `encryption.go`: `EncryptionBackend.PrepareEncryption` prepares a
+    bucket for encrypted writes (the fs backend creates its key and, for
+    restic, initializes its repository; `errors.ErrUnsupported` for a
+    provider the backend cannot store), and
+    `ValidateEncryptionSettings` checks a provider before the admin API
+    saves it; `ResticBackingBackend` reads and changes a backing's restic S3
+    storage. The memory backend implements `EncryptionBackend` for `AES256`
+    only and not `ResticBackingBackend`. See
+    [encryption.md](encryption.md).
+  - In `encryption_providers.go`: `EncryptionProvidersBackend` reports which
+    SSE-S3 providers a bucket can use, so the admin API and web UI offer
+    only those: fs reports `restic` only while the restic executable is on
+    `PATH`, memory reports `AES256` only, and the multi router reports the
+    intersection over the bucket's backings.
+  `storage.ListObjects`, `ListObjectVersions` and `ListUploads` return
+  entries trimmed to the fields a listing reports (`storage.ListingInfo`).
   `uploads.go` builds on them: `storage.ListUploads` (S3
   ListMultipartUploads paging: prefix, delimiter, key/upload-ID markers),
   `storage.WalkMultipartUploads` and `storage.CountMultipartUploads`, each
@@ -205,7 +257,12 @@ See the doc comments in `storage.go`. Key points:
   checked against the upload records, at `Open`, so existing data
   directories are indexed on first start with no schema version change.
   Paged upload listings, the lifecycle abort pass and usage counts seek it
-  instead of decoding every upload) +
+  instead of decoding every upload; and a per-bucket `imp` index, imported
+  version ID -> version position, for versions stored through
+  `storage.VersionImporter` with an ID from another backend, which does not
+  embed the position the way generated IDs do. It is created by a bucket's
+  first import, so existing databases need no migration and the schema
+  version is unchanged) +
   `<root>/.gos3/data/<bucket-id>/<2-hex>/<random-id>` data
   files (written to `<root>/.gos3/tmp/` then renamed; fsync configurable) +
   multipart parts under `<root>/.gos3/uploads/<upload-id>/<part>`. Data files
@@ -213,14 +270,29 @@ See the doc comments in `storage.go`. Key points:
   transaction commits (open readers keep working on POSIX). If the commit
   reports an error after the transaction itself succeeded (e.g. an fsync
   error), the new data or part file is kept rather than deleted, because the
-  commit may have persisted; the client still gets an error.
+  commit may have persisted; the client still gets an error. Encryption
+  (see [encryption.md](encryption.md)) adds `<root>/.gos3/keys/<bucket-id>`
+  (the bucket's master key; data, staging and part files are encrypted
+  with keys derived from it or fresh ones) and
+  `<root>/.gos3/keys/<bucket-id>.restic.json` (restic repository location
+  and password), local restic repositories in
+  `<root>/.gos3/restic/<bucket-id>/`, restic's cache in
+  `<root>/.gos3/restic-cache/` and the backing's restic S3 settings in
+  `<root>/.gos3/restic-backing.json` (secret, like the keys). Keys,
+  recovery records and repositories stay after a bucket is deleted. The
+  data file of a restic-archived version holds only its snapshot ID.
 - `fs` blob mode: a bucket whose `Backing` names one of `fs.Options.Remotes`
-  (`fs.RemoteStore`: client, remote bucket, prefix) keeps all its metadata
+  (`fs.RemoteStore`: client, remote bucket, prefix; `Options.DefaultBacking`
+  puts every new bucket there) keeps all its metadata
   in `meta.db` but stores object data as `<prefix>data/<bucket-id>/<id>` and
-  parts as `<prefix>uploads/<upload-id>/<part>` blobs in the remote bucket
-  (written through an `s3client.Spool` in `tmp/`, uploaded before the
-  metadata commit). CompleteMultipartUpload composes server-side
-  (UploadPartCopy) when all parts but the last are >= 5 MiB, else streams.
+  parts as `<prefix>uploads/<upload-id>/<part>` blobs in the remote bucket:
+  the stored bytes (compressed and/or encrypted as for local data, a restic
+  version's snapshot reference) are built in a `tmp/` file exactly as
+  locally and uploaded before the metadata commit. CompleteMultipartUpload
+  composes server-side (UploadPartCopy) only when the result is the plain
+  concatenation of the stored parts (no compression or encryption, all
+  parts but the last >= 5 MiB); otherwise it runs the local pipeline over
+  the remote parts and uploads the result.
   Readers are lazy ranged GETs; open readers are refcounted per blob and the
   delete of a superseded blob is deferred until the last one closes. Other
   non-empty backings make data operations fail with
@@ -244,35 +316,120 @@ See the doc comments in `storage.go`. Key points:
   never on a later entry of the same key, even if the key changes during the
   walk (both backends). The lifecycle worker skips a key whose walk reports
   more than one latest version until the next pass.
-- `memory` keeps everything in maps guarded by RW mutexes.
-- Backings ([`docs/backings.md`](backings.md)): the server always wraps the
-  primary backend (fs or memory) in `routed.Backend`. Every bucket record
-  and configuration document lives in the primary; a bucket's
-  `BucketInfo.Backing` (set at CreateBucket from the `x-gos3-backing`
-  header or `storage.default_backing`, never changed) decides where its
-  objects and uploads go: `""` (local) and the fs backend's **blob**
-  backings (`fs.Options.Remotes`: data files and parts as blobs in a remote
-  bucket, metadata in `meta.db`) are handled by the primary; **gateway**
-  backings are `routed.DataStore`s (`internal/storage/gateway`) that store
-  native remote objects and keep only multipart upload records in
-  `<data>/.gos3/gateway/<name>/`. Gateway buckets are unversioned
-  (`storage.ErrNotSupported` → 501). Unknown names at creation are
-  `storage.ErrInvalidBacking` (400); remote failures and buckets whose
-  backing was removed from the configuration are
-  `storage.ErrBackingUnavailable` (503).
+- `memory` keeps everything in maps guarded by RW mutexes. Imported versions
+  get a fresh internal stamp (so they sort newest) but keep their foreign
+  ID; lookups by such IDs fall back to scanning the key's versions.
+- Compression: see [Compression](#compression). A compressed fs version
+  record uses record format 4 (format 3 plus the algorithm and the stored
+  size); uncompressed records stay format 3, so databases without
+  compressed objects remain readable by older builds. An encrypted version
+  record uses record format 5 (format 4 plus `ObjectMeta.Encryption`,
+  compressed or not), which builds before object encryption cannot read
+  (rollback: [operations.md](operations.md#upgrades)).
+- s3 backings ([`docs/backings.md`](backings.md)): a `storage.backings`
+  entry with `backend: s3` is one more backing of the multi router, with
+  its local metadata in its `path`. **blob** mode is an fs backend whose
+  buckets all store their data in the remote bucket (fs blob mode above).
+  **gateway** mode is `routed.Backend` over an fs backend (bucket records
+  and configuration documents) and a `routed.DataStore`
+  (`internal/storage/gateway`) that stores native remote objects and keeps
+  multipart upload records in `<path>/.gos3/gateway/`. Gateway buckets are
+  unversioned (`storage.ErrNotSupported` → 501) and cannot receive copies
+  (replicas, moves). Remote failures are `storage.ErrBackingUnavailable`
+  (503). CreateBucket's `x-gos3-backing` header picks the primary backing
+  of a new bucket (`storage.ErrInvalidBacking` → 400 for unknown names).
 - `list.go` turns `WalkObjects`/`WalkVersions` into S3 listings (prefix,
   delimiter grouping, markers, truncation). When a common prefix `p` is found
   it restarts the walk after `p + "\xff"` (UTF-8 never contains 0xFF) so huge
   "directories" are skipped in O(log n) per prefix.
 
+### Multiple backings (`internal/storage/multi`)
+
+The server's backend is always a `multi.Router` over one or more named
+backings (`default` = `storage.backend`/`storage.path`, plus
+`storage.backings`). It implements `storage.Backend` and every optional
+extension by routing each bucket to its placement: a primary backing and
+optional replicas, in mode `single`, `active-passive` (changed keys copied
+in the background, read fallback, promotion by hand or with
+`auto_failover`) or `active-active` (writes teed to every in-sync replica
+before they are acknowledged, reads spread, automatic failover). Placements
+are persisted in `<data>/.gos3/placements.json`; buckets without one are
+adopted where they are found at startup.
+
+- Copies use the optional `storage.VersionImporter` extension, which stores
+  a version under the ID, `LastModified` and position it has on the source.
+  A key is copied by comparing both version lists (`syncKey`): versions
+  missing on the source are deleted, the common oldest-first prefix is kept
+  (metadata updated where it differs) and the rest is replaced. Copying is
+  therefore idempotent, and every repair is just another comparison: changed
+  keys are queued per replica (in memory; a full comparison runs after a
+  restart, after a write to a replica fails and when a queue overflows).
+- A per-bucket gate counts writes in flight; cutovers (end of a move,
+  graceful promotion, an active-active replica switching to synchronous
+  writes, failover) close it, wait for in-flight writes, copy the last
+  queued keys and switch. Per-key locks keep an active-active replica's
+  versions in the primary's order.
+- A backing is unhealthy after an I/O error (any error that is not a
+  storage sentinel, a context error or the caller's callback error) or a
+  failed periodic `ListBuckets` probe. Reads skip unhealthy backings; walks
+  fall back only before the first entry was delivered.
+- Multipart uploads live on the primary only (not copied).
+- Compression: the router implements `storage.CompressingBackend` by
+  forwarding to the primary; active-active replicas receive the same write
+  options, and background copies of a compressed version are stored
+  compressed too (`storage.CompressingImporter`, at the default level).
+- Encryption: `PrepareEncryption` / `ValidateEncryptionSettings` go to the
+  bucket's primary, and `Router.ResticBacking(name)` gives the admin API a
+  backing's restic S3 settings. Copies of an encrypted version are
+  encrypted on the receiving backing with that backing's own key and
+  repository (`WriteOptions.Encryption`); a backing that cannot store the
+  provider fails the copy instead of storing plaintext.
+
 System state lives in `<data>/.gos3/`: `lock` (an exclusive lock held by the
 running server, whatever the backend; a no-op on platforms without
-`flock`/Windows sharing), `iam.json`, `settings.json` (written on
+`flock`/Windows sharing), `iam.json`, `placements.json` (bucket placements),
+`backings.json` (backings configured live through the admin API; it
+overrides `storage.backings` and `storage.default_backing` at the next
+start while management is enabled), `settings.json` (written on
 the first runtime settings update, then it wins over file/env/flags for the
 Settings fields), `server-id`, and `root-credentials.json` (only when root
 keys were generated). With the memory backend this needs `storage.path`;
 without it the server is fully ephemeral. Bucket names cannot start with `.`,
 so no clash.
+
+### Compression
+
+Object data can be stored compressed, transparently: the S3 layer computes
+ETags and checksums over the uncompressed stream as always, and
+`ObjectInfo.Size`, `OpenObject` and seeking are in uncompressed terms;
+`ObjectInfo.Compression` / `StoredSize` (and `PhysicalSize()`) say how a
+version is stored.
+
+- **Policy** (`internal/compression`): the server's `Settings.Compression`
+  (`mode` optional | enforced | disabled, `level`, `minSize`,
+  `skipContentTypes`) and the bucket's setting, a JSON document
+  `{"enabled": bool}` under the bucket config key `compression`
+  (`storage.ConfigCompression`), managed by the admin API. `Effective`
+  combines them; `Decide` refines per object (empty or smaller than
+  `minSize` when the size is known, skipped media type, compressing
+  `Content-Encoding` → uncompressed).
+- **S3 layer** (`internal/s3/compression.go`): `storeObject` (PutObject,
+  CopyObject, PostObject) and CompleteMultipartUpload ask the policy and
+  use the `CompressingBackend` methods; backends without them store
+  everything uncompressed.
+- **Format** (`internal/storage/compress`): 256 KiB blocks, each raw
+  DEFLATE (or stored as is when it does not shrink by 1/32, with a
+  backoff that skips attempts on incompressible data), then an index of
+  12-byte entries (cumulative end offset with a raw flag, CRC-32C of the
+  uncompressed block) and a 24-byte footer (magic `gos3blk1`, block size,
+  block count, uncompressed size). Readers locate any block with one
+  `ReadAt` of the index, verify every block's CRC and keep one decoded
+  block. Empty content is never compressed.
+- **fs**: the compressor sits between the object writer and the temporary
+  file; multipart completion compresses while concatenating the parts
+  (parts themselves are stored uncompressed). The data file's size is the
+  record's `StoredSize`, checked at open like `Size` is for plain files.
+- **memory**: keeps the compressed bytes in the version.
 
 ## Auth & IAM
 
@@ -345,7 +502,7 @@ seeds, DNS SRV and active scans; every candidate is verified by fetching
 
 ## Build, test & conventions
 
-- Go ≥ 1.25 (toolchain auto). `gofmt`, `go vet` clean. Std `log/slog`.
+- Go ≥ 1.26.9 (`go.mod`'s `go` line; toolchain auto). `gofmt`, `go vet` clean. Std `log/slog`.
   Stdlib `net/http` (Go 1.22+ mux patterns OK for the admin API).
 - Allowed third-party Go deps (already in go.mod): `go.etcd.io/bbolt`,
   `github.com/miekg/dns`, `gopkg.in/yaml.v3`, and for tests only

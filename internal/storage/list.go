@@ -32,6 +32,8 @@ type ListParams struct {
 
 // ListResult is the result of ListObjects.
 type ListResult struct {
+	// Objects are the listed versions with their metadata trimmed to what
+	// a listing reports (see ListingInfo).
 	Objects        []ObjectInfo
 	CommonPrefixes []string
 	IsTruncated    bool
@@ -50,7 +52,8 @@ type VersionListParams struct {
 }
 
 // VersionListResult is the result of ListObjectVersions. Versions contains
-// both object versions and delete markers (DeleteMarker=true), in order.
+// both object versions and delete markers (DeleteMarker=true), in order,
+// with their metadata trimmed to what a listing reports (see ListingInfo).
 type VersionListResult struct {
 	Versions            []ObjectInfo
 	CommonPrefixes      []string
@@ -91,6 +94,29 @@ func startMarker(marker, prefix, delimiter string) (walkMarker string, skippedPr
 		return marker + skipSuffix, marker
 	}
 	return marker, ""
+}
+
+// ListingInfo returns o without the metadata that listings never report:
+// the content headers (Content-Type, -Encoding, -Disposition, -Language,
+// Cache-Control, Expires), user metadata, tags, website redirect and the
+// per-part sizes and checksums. A page of a listing holds up to 1000
+// entries; keeping only the fixed-size fields bounds its memory
+// independently of what each object's writer stored. Everything else
+// (ETag, size, dates, storage class, checksums, ACL, encryption, object
+// lock) is kept.
+func ListingInfo(o ObjectInfo) ObjectInfo {
+	o.ObjectMeta = ListingMeta(o.ObjectMeta)
+	return o
+}
+
+// ListingMeta is ListingInfo for the metadata of an object or multipart
+// upload.
+func ListingMeta(m ObjectMeta) ObjectMeta {
+	m.ContentType, m.ContentEncoding, m.ContentDisposition = "", "", ""
+	m.ContentLanguage, m.CacheControl, m.Expires = "", "", ""
+	m.UserMeta, m.Tags, m.WebsiteRedirect = nil, nil, ""
+	m.PartSizes, m.PartChecksums = nil, nil
+	return m
 }
 
 func maxKeys(n int) int {
@@ -134,7 +160,7 @@ func ListObjects(ctx context.Context, b Backend, bucket string, p ListParams) (L
 				restart = true
 				return ErrStopWalk
 			}
-			res.Objects = append(res.Objects, o)
+			res.Objects = append(res.Objects, ListingInfo(o))
 			res.NextAfter = o.Key
 			return nil
 		})
@@ -196,7 +222,7 @@ func ListObjectVersions(ctx context.Context, b Backend, bucket string, p Version
 				restart = true
 				return ErrStopWalk
 			}
-			res.Versions = append(res.Versions, v)
+			res.Versions = append(res.Versions, ListingInfo(v))
 			res.NextKeyMarker, res.NextVersionIDMarker = v.Key, v.VersionID
 			return nil
 		})
@@ -218,13 +244,21 @@ func ListObjectVersions(ctx context.Context, b Backend, bucket string, p Version
 
 // BucketUsage returns the number of current objects and their total size
 // (latest versions only) and, separately, the total count/size of all versions.
+// Sizes are those of the content; the Stored* fields count the bytes the
+// backend stores for it, which is less for compressed versions and slightly
+// more for natively encrypted ones; restic versions count their content
+// size, as their repository data is shared (see ObjectInfo.PhysicalSize).
 type BucketUsage struct {
-	Objects        int64
-	Bytes          int64
-	Versions       int64 // all versions incl. noncurrent (excluding delete markers)
-	VersionBytes   int64
-	DeleteMarkers  int64
-	PendingUploads int64
+	Objects            int64
+	Bytes              int64
+	StoredBytes        int64
+	Versions           int64 // all versions incl. noncurrent (excluding delete markers)
+	VersionBytes       int64
+	StoredVersionBytes int64
+	// CompressedVersions counts the versions stored compressed.
+	CompressedVersions int64
+	DeleteMarkers      int64
+	PendingUploads     int64
 }
 
 // ComputeBucketUsage walks a bucket to compute usage statistics. It is
@@ -238,9 +272,14 @@ func ComputeBucketUsage(ctx context.Context, b Backend, bucket string) (BucketUs
 		}
 		u.Versions++
 		u.VersionBytes += v.Size
+		u.StoredVersionBytes += v.PhysicalSize()
+		if v.Compression != "" {
+			u.CompressedVersions++
+		}
 		if v.IsLatest {
 			u.Objects++
 			u.Bytes += v.Size
+			u.StoredBytes += v.PhysicalSize()
 		}
 		return nil
 	})

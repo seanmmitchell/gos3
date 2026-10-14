@@ -9,7 +9,7 @@
  * Pass `backings` for gos3 connections only: the x-gos3-backing header is
  * sent only when the selector is shown.
  */
-import type { BackingChoices } from '~/types/admin'
+import type { AvailableBackings } from '~/types/admin'
 import type { S3Client } from '~/utils/s3/client'
 
 const open = defineModel<boolean>('open', { required: true })
@@ -19,7 +19,7 @@ const props = defineProps<{
   defaultRegion?: string
   existingNames?: string[]
   /** gos3 WhoAmI.backings; the selector is shown when it offers a choice. */
-  backings?: BackingChoices | null
+  backings?: AvailableBackings | null
 }>()
 
 const emit = defineEmits<{ created: [name: string] }>()
@@ -43,10 +43,10 @@ const backing = computed<string>({
     pickedBacking.value = v
   }
 })
-const backingMode = computed(() => backingModeOf(backing.value, props.backings))
-const backingHelp = computed(() => backingModeInfo(backingMode.value).description)
+const selectedBacking = computed(() => findBacking(backing.value, props.backings))
+const backingHelp = computed(() => backingKindInfo(selectedBacking.value).description)
 /** Gateway backings support neither versioning nor object lock. */
-const noVersioning = computed(() => !backingSupportsVersioning(backingMode.value))
+const noVersioning = computed(() => isGatewayBacking(selectedBacking.value))
 
 watch(open, (v) => {
   if (!v) return

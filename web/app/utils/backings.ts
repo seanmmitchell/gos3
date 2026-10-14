@@ -1,56 +1,58 @@
-// Storage backings: where a gos3 bucket's data lives (auto-imported by Nuxt).
+// Storage backings as offered to bucket creators (auto-imported by Nuxt).
 //
-// A bucket's backing is chosen when it is created (CreateBucket header
-// x-gos3-backing) and reported by the admin BucketSummary
-// (backing/backingMode) and by HeadBucket (x-gos3-backing header). The
-// choices come from WhoAmI.backings. Generic S3 servers have no backings.
-import type { BackingChoices, BackingMode, BackingRef } from '~/types/admin'
+// A bucket's primary backing is chosen when it is created (CreateBucket
+// header x-gos3-backing) and reported by HeadBucket (x-gos3-backing header)
+// and the admin BucketSummary (placement.primary). The choices, with each
+// backing's kind and (kind "s3") mode, come from WhoAmI.backings, which every
+// authenticated caller gets. Generic S3 servers have no backings.
+import type { AvailableBacking, AvailableBackings } from '~/types/admin'
 
-/** Name of the server's own storage. */
-export const LOCAL_BACKING = 'local'
-
-export interface BackingModeInfo {
+/** What the UI needs to know about a backing's kind / mode. */
+export interface BackingKindInfo {
   label: string
   description: string
   icon: string
 }
 
-const MODE_INFO: Record<BackingMode, BackingModeInfo> = {
-  local: { label: 'Local', description: 'Stored on this server\'s own disks.', icon: 'i-lucide-hard-drive' },
-  blob: { label: 'Remote (blob)', description: 'Data stored in a remote S3 bucket; all features available.', icon: 'i-lucide-cloud' },
-  gateway: { label: 'Remote (gateway)', description: 'Objects stored directly in a remote S3 service; no versioning or object lock.', icon: 'i-lucide-cloud-cog' }
+const KIND_INFO: Record<string, BackingKindInfo> = {
+  'fs': { label: 'Disk', description: 'Stored on this server\'s disks.', icon: 'i-lucide-hard-drive' },
+  'memory': { label: 'Memory', description: 'Kept in this server\'s memory; lost on restart.', icon: 'i-lucide-memory-stick' },
+  's3-blob': { label: 'Remote S3 (blob)', description: 'Data stored in a remote S3 bucket; all features available.', icon: 'i-lucide-cloud' },
+  's3-gateway': { label: 'Remote S3 (gateway)', description: 'Objects stored directly in a remote S3 service; no versioning or object lock.', icon: 'i-lucide-cloud-cog' }
 }
 
-/** Label, one-line description and icon of a backing mode (unknown modes get a generic entry). */
-export function backingModeInfo(mode: string | undefined): BackingModeInfo {
-  return (mode && MODE_INFO[mode as BackingMode]) || { label: mode || 'Unknown', description: 'Stored on a remote backing.', icon: 'i-lucide-cloud' }
+/** Label, one-line description and icon of a backing kind (+ mode for kind "s3"). */
+export function backingKindInfo(b: Pick<AvailableBacking, 'kind' | 'mode'> | null | undefined): BackingKindInfo {
+  if (!b) return { label: 'Unknown', description: 'Storage backing of this server.', icon: 'i-lucide-database' }
+  const known = KIND_INFO[b.kind === 's3' ? `s3-${b.mode ?? ''}` : b.kind]
+  if (known) return known
+  const label = b.mode ? `${b.kind} (${b.mode})` : b.kind
+  return { label, description: 'Storage backing of this server.', icon: b.kind === 's3' ? 'i-lucide-cloud' : 'i-lucide-database' }
+}
+
+/** Gateway backings (kind "s3", mode "gateway") store objects natively: no versioning, no object lock. */
+export function isGatewayBacking(b: Pick<AvailableBacking, 'kind' | 'mode'> | null | undefined): boolean {
+  return b?.kind === 's3' && b.mode === 'gateway'
 }
 
 /**
  * The backings a user can choose from when creating a bucket, or [] when
- * there is nothing to choose (older server, or only local storage).
+ * there is nothing to choose (older server, or a single backing).
  */
-export function backingChoices(b: BackingChoices | null | undefined): BackingRef[] {
+export function backingChoices(b: AvailableBackings | null | undefined): AvailableBacking[] {
   const list = b?.available ?? []
   return list.length > 1 ? list : []
 }
 
-/** The server's default backing, if it is one of the available ones (else "local"). */
-export function defaultBacking(b: BackingChoices | null | undefined): string {
-  const d = b?.default
-  return d && b?.available.some(x => x.name === d) ? d : LOCAL_BACKING
+/** The server's default backing if it is one of the available ones, else the first one ('' when none). */
+export function defaultBacking(b: AvailableBackings | null | undefined): string {
+  const list = b?.available ?? []
+  return list.find(x => x.name === b?.default)?.name ?? list[0]?.name ?? ''
 }
 
-/** Mode of a backing name according to WhoAmI.backings ("local" is always local). */
-export function backingModeOf(name: string | undefined, b: BackingChoices | null | undefined): BackingMode | undefined {
-  if (!name) return undefined
-  if (name === LOCAL_BACKING) return 'local'
-  return b?.available.find(x => x.name === name)?.mode
-}
-
-/** Gateway backings store objects natively: no versioning, no object lock. */
-export function backingSupportsVersioning(mode: string | undefined): boolean {
-  return mode !== 'gateway'
+/** The available backing called `name`, if WhoAmI.backings lists it. */
+export function findBacking(name: string | undefined, b: AvailableBackings | null | undefined): AvailableBacking | undefined {
+  return name ? b?.available?.find(x => x.name === name) : undefined
 }
 
 export interface BackingSelectItem {
@@ -61,14 +63,14 @@ export interface BackingSelectItem {
 }
 
 /** USelect items for the create-bucket backing selector, the default marked. */
-export function backingSelectItems(b: BackingChoices | null | undefined): BackingSelectItem[] {
+export function backingSelectItems(b: AvailableBackings | null | undefined): BackingSelectItem[] {
   const def = defaultBacking(b)
   return backingChoices(b).map((x) => {
-    const info = backingModeInfo(x.mode)
+    const info = backingKindInfo(x)
     return {
       label: x.name === def ? `${x.name} (default)` : x.name,
       value: x.name,
-      description: x.mode === 'local' ? info.description : `${info.label}: ${info.description}`,
+      description: `${info.label}: ${info.description}`,
       icon: info.icon
     }
   })

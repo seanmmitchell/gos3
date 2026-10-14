@@ -32,21 +32,27 @@ type capabilities struct {
 	ListUsers      bool `json:"listUsers"`      // admin:ListUsers (also granted to delegated user managers)
 	ManagePolicies bool `json:"managePolicies"` // admin:PutPolicy
 	ManageBuckets  bool `json:"manageBuckets"`  // admin:ForceDeleteBucket
+	ViewStorage    bool `json:"viewStorage"`    // admin:ListBackings
+	ManageStorage  bool `json:"manageStorage"`  // admin:UpdateBucketPlacement
 	Discovery      bool `json:"discovery"`      // admin:GetDiscovery
 	Scan           bool `json:"scan"`           // admin:ScanNetwork
 	Probe          bool `json:"probe"`          // admin:ProbeNetwork
 	CreateOwnKeys  bool `json:"createOwnKeys"`  // admin:CreateOwnAccessKey (never root)
-	ListBackings   bool `json:"listBackings"`   // admin:ListBackings
+	// ManageCompression: admin:PutBucketCompression (bucket compression
+	// settings).
+	ManageCompression bool `json:"manageCompression"`
 }
 
 // adminActions are every admin:* action used by the API; "admin" in
 // capabilities is true when any of them is allowed.
 var adminActions = []string{
-	"ServerInfo", "GetStats", "GetConfig", "UpdateConfig", "ListBackings",
+	"ServerInfo", "GetStats", "GetConfig", "UpdateConfig",
 	"ListUsers", "CreateUser", "GetUser", "UpdateUser", "DeleteUser",
 	"CreateAccessKey", "UpdateAccessKey", "DeleteAccessKey",
 	"ListPolicies", "GetPolicy", "PutPolicy", "DeletePolicy", "SimulatePolicy",
-	"ListBuckets", "GetBucket", "ForceDeleteBucket",
+	"ListBuckets", "GetBucket", "ForceDeleteBucket", "GetBucketCompression", "PutBucketCompression",
+	"GetBucketEncryption", "PutBucketEncryption",
+	"ListBackings", "GetBucketPlacement", "UpdateBucketPlacement",
 	"GetDiscovery", "ScanNetwork", "ProbeNetwork",
 }
 
@@ -76,20 +82,22 @@ func (a *api) whoami(rc *reqCtx) (int, any, error) {
 		IsRoot:    rc.id.IsRoot,
 		Policies:  names,
 		Capabilities: capabilities{
-			Admin:          anyAllowed,
-			ViewInfo:       allowed["ServerInfo"],
-			ViewStats:      allowed["GetStats"],
-			ManageConfig:   allowed["UpdateConfig"],
-			ManageUsers:    allowed["CreateUser"],
-			ListUsers:      allowed["ListUsers"],
-			ManagePolicies: allowed["PutPolicy"],
-			ManageBuckets:  allowed["ForceDeleteBucket"],
-			Discovery:      allowed["GetDiscovery"],
-			Scan:           allowed["ScanNetwork"],
-			Probe:          allowed["ProbeNetwork"],
+			Admin:             anyAllowed,
+			ViewInfo:          allowed["ServerInfo"],
+			ViewStats:         allowed["GetStats"],
+			ManageConfig:      allowed["UpdateConfig"],
+			ManageUsers:       allowed["CreateUser"],
+			ListUsers:         allowed["ListUsers"],
+			ManagePolicies:    allowed["PutPolicy"],
+			ManageBuckets:     allowed["ForceDeleteBucket"],
+			ViewStorage:       allowed["ListBackings"],
+			ManageStorage:     allowed["UpdateBucketPlacement"],
+			Discovery:         allowed["GetDiscovery"],
+			Scan:              allowed["ScanNetwork"],
+			Probe:             allowed["ProbeNetwork"],
+			ManageCompression: allowed["PutBucketCompression"],
 			// Root has no IAM keys to manage (POST /whoami/keys answers 400).
 			CreateOwnKeys: !rc.id.IsRoot && a.authorize(rc, actionCreateOwnKey, "", nil).Allowed,
-			ListBackings:  allowed["ListBackings"],
 		},
 		Server:   a.info(),
 		Backings: a.backingChoices(),
@@ -190,7 +198,8 @@ func (a *api) deleteOwnKey(rc *reqCtx) (int, any, error) {
 		return 0, nil, errorf(http.StatusConflict, codeConflict,
 			"cannot delete access key %q: it was used to sign this request", ak)
 	}
-	if err := a.d.IAM.DeleteAccessKey(rc.ctx, ak); err != nil {
+	// Ownership is checked again atomically with the deletion.
+	if err := a.d.IAM.DeleteUserAccessKey(rc.ctx, rc.id.User, ak); err != nil {
 		return 0, nil, err
 	}
 	return http.StatusNoContent, nil, nil

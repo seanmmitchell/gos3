@@ -42,8 +42,8 @@ func TestDefault(t *testing.T) {
 		{"backend", c.Storage.Backend == BackendFS},
 		{"path", c.Storage.Path == "./data"},
 		{"fsync", c.Storage.FsyncData},
-		{"ui", c.UI.Enabled && c.UI.RedirectRoot},
-		{"discovery", c.Discovery.Enabled && c.Discovery.BeaconGroup == discovery.DefaultBeaconGroup},
+		{"ui", c.UI.Enabled == defaultUIEnabled && c.UI.RedirectRoot},
+		{"discovery", !c.Discovery.Enabled && !c.Discovery.Advertise && !c.Discovery.MDNS && !c.Discovery.Beacon && !c.Discovery.AllowScan && c.Discovery.BeaconGroup == discovery.DefaultBeaconGroup},
 		{"logging", c.Logging == LoggingConfig{Level: "info", Format: "text", AccessLog: true}},
 		{"lifecycle", c.Lifecycle == LifecycleConfig{Enabled: true, Interval: time.Hour}},
 		{"metrics", c.Metrics == MetricsConfig{Enabled: true}},
@@ -121,6 +121,7 @@ lifecycle:
 		"GOS3_PUBLIC_INFO":         "off",
 		"GOS3_MAX_OBJECT_SIZE":     "1GiB",
 		"GOS3_TRUST_PROXY_HEADERS": "yes",
+		"GOS3_TRUSTED_PROXIES":     "10.0.0.5",
 	}
 	c, err := load(file, env(vars), []Override{{"server.address", ":6000"}, {"GOS3_NAME", "from-flag"}})
 	if err != nil {
@@ -147,7 +148,7 @@ lifecycle:
 		{"public info (env)", c.Server.PublicInfo, false},
 		{"max object size (env)", c.Server.MaxObjectSize, int64(1 << 30)},
 		{"trust proxy (env)", c.Server.TrustProxyHeaders, true},
-		{"ui (default)", c.UI.Enabled, true},
+		{"ui (default)", c.UI.Enabled, defaultUIEnabled},
 	}
 	for _, ck := range checks {
 		if ck.got != ck.want {

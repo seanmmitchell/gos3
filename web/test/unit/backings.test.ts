@@ -1,62 +1,83 @@
 import { describe, expect, it } from 'vitest'
-import type { BackingChoices } from '~/types/admin'
+import type { AvailableBackings, Backing, Placement } from '~/types/admin'
+import { moveTargets, placementChips, replicaChoices } from '~/components/admin/-storage'
 import {
   backingChoices,
-  backingModeInfo,
-  backingModeOf,
+  backingKindInfo,
   backingSelectItems,
-  backingSupportsVersioning,
   defaultBacking,
-  LOCAL_BACKING
+  findBacking,
+  isGatewayBacking
 } from '~/utils/backings'
 
-const CHOICES: BackingChoices = {
-  default: 'archive',
+const CHOICES: AvailableBackings = {
+  default: 'cold',
   available: [
-    { name: 'local', mode: 'local' },
-    { name: 'aws', mode: 'gateway' },
-    { name: 'archive', mode: 'blob' }
+    { name: 'default', kind: 'fs' },
+    { name: 'gw', kind: 's3', mode: 'gateway' },
+    { name: 'cold', kind: 's3', mode: 'blob' }
   ]
 }
 
-describe('storage backings', () => {
-  it('offers a choice only when there is more than local storage', () => {
+describe('storage backing choices (WhoAmI.backings)', () => {
+  it('offers a choice only when there is more than one backing', () => {
     expect(backingChoices(undefined)).toEqual([])
-    expect(backingChoices({ default: 'local', available: [{ name: 'local', mode: 'local' }] })).toEqual([])
-    expect(backingChoices(CHOICES).map(b => b.name)).toEqual(['local', 'aws', 'archive'])
+    expect(backingChoices({ default: 'default', available: null })).toEqual([])
+    expect(backingChoices({ default: 'default', available: [{ name: 'default', kind: 'fs' }] })).toEqual([])
+    expect(backingChoices(CHOICES).map(b => b.name)).toEqual(['default', 'gw', 'cold'])
   })
 
-  it('resolves the default, falling back to local for unknown names', () => {
-    expect(defaultBacking(CHOICES)).toBe('archive')
-    expect(defaultBacking({ ...CHOICES, default: 'gone' })).toBe(LOCAL_BACKING)
-    expect(defaultBacking(null)).toBe(LOCAL_BACKING)
+  it('resolves the default, falling back to the first available backing', () => {
+    expect(defaultBacking(CHOICES)).toBe('cold')
+    expect(defaultBacking({ ...CHOICES, default: 'gone' })).toBe('default')
+    expect(defaultBacking(null)).toBe('')
   })
 
-  it('maps backing names to modes', () => {
-    expect(backingModeOf('aws', CHOICES)).toBe('gateway')
-    expect(backingModeOf('local', null)).toBe('local')
-    expect(backingModeOf('other', CHOICES)).toBeUndefined()
-    expect(backingModeOf(undefined, CHOICES)).toBeUndefined()
+  it('finds backings and recognises gateway ones', () => {
+    expect(findBacking('gw', CHOICES)).toEqual({ name: 'gw', kind: 's3', mode: 'gateway' })
+    expect(findBacking('other', CHOICES)).toBeUndefined()
+    expect(findBacking(undefined, CHOICES)).toBeUndefined()
+    expect(isGatewayBacking(findBacking('gw', CHOICES))).toBe(true)
+    expect(isGatewayBacking(findBacking('cold', CHOICES))).toBe(false)
+    expect(isGatewayBacking({ kind: 'fs', mode: 'gateway' })).toBe(false)
+    expect(isGatewayBacking(undefined)).toBe(false)
   })
 
-  it('knows that only gateway backings lack versioning', () => {
-    expect(backingSupportsVersioning('gateway')).toBe(false)
-    expect(backingSupportsVersioning('blob')).toBe(true)
-    expect(backingSupportsVersioning('local')).toBe(true)
-    expect(backingSupportsVersioning(undefined)).toBe(true)
+  it('describes kinds and s3 modes, with a generic fallback', () => {
+    expect(backingKindInfo({ kind: 'fs' }).label).toBe('Disk')
+    expect(backingKindInfo({ kind: 'memory' }).description).toMatch(/lost on restart/)
+    expect(backingKindInfo({ kind: 's3', mode: 'blob' }).description).toMatch(/all features/)
+    expect(backingKindInfo({ kind: 's3', mode: 'gateway' }).description).toMatch(/no versioning or object lock/)
+    expect(backingKindInfo({ kind: 's3', mode: 'tape' }).label).toBe('s3 (tape)')
+    expect(backingKindInfo({ kind: 'nfs' }).label).toBe('nfs')
+    expect(backingKindInfo(undefined).label).toBe('Unknown')
   })
 
-  it('builds select items with the default marked and the mode described', () => {
+  it('builds select items with the default marked and the kind described', () => {
     const items = backingSelectItems(CHOICES)
-    expect(items.map(i => [i.value, i.label])).toEqual([['local', 'local'], ['aws', 'aws'], ['archive', 'archive (default)']])
-    expect(items[0]!.description).toBe(backingModeInfo('local').description)
-    expect(items[1]!.description).toMatch(/^Remote \(gateway\): .*no versioning or object lock/)
-    expect(items[2]!.description).toMatch(/^Remote \(blob\): .*all features/)
-    expect(backingSelectItems({ default: 'local', available: [{ name: 'local', mode: 'local' }] })).toEqual([])
+    expect(items.map(i => [i.value, i.label])).toEqual([['default', 'default'], ['gw', 'gw'], ['cold', 'cold (default)']])
+    expect(items[0]!.description).toMatch(/^Disk: /)
+    expect(items[1]!.description).toMatch(/^Remote S3 \(gateway\): .*no versioning or object lock/)
+    expect(items[2]!.description).toMatch(/^Remote S3 \(blob\): .*all features/)
+  })
+})
+
+describe('gateway backings in bucket placement', () => {
+  const backing = (name: string, over: Partial<Backing> = {}): Backing => ({
+    name, kind: 'fs', path: `/mnt/${name}`, default: false, healthy: true, lastError: '', buckets: 0, replicas: 0, disk: null, ...over
+  })
+  const BACKINGS = [backing('default', { default: true }), backing('gw', { kind: 's3', mode: 'gateway', path: '' }), backing('cold', { kind: 's3', mode: 'blob', path: '' })]
+  const placement: Placement = { bucket: 'b', mode: 'single', primary: 'default', members: [{ backing: 'default', role: 'primary', state: 'in-sync', healthy: true, pending: 0, progress: null, lastError: '' }], move: null }
+
+  it('are neither replica choices nor selectable move targets', () => {
+    expect(replicaChoices(BACKINGS, placement).map(c => c.value)).toEqual(['cold'])
+    const targets = moveTargets(BACKINGS, placement)
+    expect(targets.find(t => t.value === 'gw')?.disabledReason).toBe('gateway backing')
+    expect(targets.find(t => t.value === 'cold')?.disabledReason).toBeUndefined()
   })
 
-  it('describes unknown modes generically', () => {
-    expect(backingModeInfo('tape').label).toBe('tape')
-    expect(backingModeInfo(undefined).label).toBe('Unknown')
+  it('give the primary chip their kind when described', () => {
+    const chips = placementChips({ mode: 'single', primary: 'gw', replicas: null, moving: false }, name => backingKindInfo(findBacking(name, CHOICES)))
+    expect(chips[0]).toMatchObject({ label: 'gw', icon: 'i-lucide-cloud-cog', title: 'Primary copy on gw · Remote S3 (gateway)' })
   })
 })

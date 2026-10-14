@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import type { AccessKey } from '~/types/admin'
-import { credentialsFileSnippet, downloadText, envSnippet, profileName } from './-credentials'
+import { credentialsFileSnippet, downloadText, envSnippet, profileName, snippetProblem } from './-credentials'
 
 /**
  * Shows a freshly created access key with its secret — the only time the
@@ -26,8 +26,12 @@ const input = computed(() => ({
   region: props.region,
   profile: props.user
 }))
-const env = computed(() => envSnippet(input.value))
-const credentials = computed(() => credentialsFileSnippet(input.value))
+// The response is not authenticated: values that do not look like gos3 keys
+// (e.g. with line breaks that would add lines to a credentials file) get no
+// snippets or downloads.
+const problem = computed(() => snippetProblem(input.value))
+const env = computed(() => (problem.value ? '' : envSnippet(input.value)))
+const credentials = computed(() => (problem.value ? '' : credentialsFileSnippet(input.value)))
 const baseName = computed(() => profileName(props.user || props.accessKey.accessKey))
 </script>
 
@@ -68,7 +72,16 @@ const baseName = computed(() => profileName(props.user || props.accessKey.access
             </dd>
           </div>
         </dl>
-        <div class="space-y-2">
+        <UAlert
+          v-if="problem"
+          color="error"
+          variant="subtle"
+          icon="i-lucide-shield-alert"
+          title="No configuration snippets"
+          :description="`${problem} Snippets and downloads are not offered; check the values above before using them.`"
+          data-testid="snippet-problem"
+        />
+        <div v-else class="space-y-2">
           <p class="text-sm font-medium text-default">
             Configuration snippets
           </p>

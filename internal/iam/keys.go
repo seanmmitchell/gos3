@@ -14,6 +14,13 @@ const (
 
 	generatedAccessKeyLen = 20
 	generatedSecretKeyLen = 40
+
+	// minNewSecretKeyLen is the minimum length of a caller supplied secret
+	// for a new key. Any SigV4 signature (a shared presigned URL, a logged
+	// request) lets an attacker test guesses of the secret offline, so short
+	// human-chosen secrets are refused. Keys already stored with shorter
+	// secrets (validSecretKey's 8 characters) keep loading and working.
+	minNewSecretKeyLen = 16
 )
 
 const (
@@ -71,8 +78,9 @@ func validAccessKey(s string) bool {
 	return true
 }
 
-// validSecretKey reports whether a caller supplied secret is acceptable:
-// 8..128 printable ASCII characters (no spaces).
+// validSecretKey reports whether a stored secret is acceptable: 8..128
+// printable ASCII characters (no spaces). New caller supplied secrets must
+// also be at least minNewSecretKeyLen long (validNewSecretKey).
 func validSecretKey(s string) bool {
 	if len(s) < 8 || len(s) > 128 {
 		return false
@@ -85,6 +93,12 @@ func validSecretKey(s string) bool {
 	return true
 }
 
+// validNewSecretKey reports whether a caller supplied secret for a new key
+// is acceptable: minNewSecretKeyLen..128 printable ASCII characters.
+func validNewSecretKey(s string) bool {
+	return len(s) >= minNewSecretKeyLen && validSecretKey(s)
+}
+
 // validUserName reports whether s is a valid, non-reserved user name.
 func validUserName(s string) bool {
 	return validName(s, maxUserNameLen) && !isReservedUserName(s)
@@ -93,6 +107,30 @@ func validUserName(s string) bool {
 // isReservedUserName reports whether s is "root" or "anonymous" (any case).
 func isReservedUserName(s string) bool {
 	return strings.EqualFold(s, "root") || strings.EqualFold(s, "anonymous")
+}
+
+// User names and access key IDs share one namespace in bucket-policy
+// principals: a bare entry such as "alice" names the user alice or the
+// access key alice (see principalEntryMatches), and a bare 12-digit entry
+// names the account. To keep every bare entry unambiguous, an access key ID
+// may not equal a user name, a reserved name or an account ID, and a user
+// name may not equal an access key ID (or the root access key) or an
+// account ID. CreateUser and CreateAccessKey enforce this; keys loaded from
+// an older iam.json that break the rule are refused at authentication
+// (keyIDConflict) and logged, rather than failing startup.
+
+// keyIDConflict returns why access key ID ak cannot be used next to the
+// users of st ("" when it can).
+func keyIDConflict(st *state, ak string) string {
+	switch {
+	case isReservedUserName(ak):
+		return "it equals a reserved user name"
+	case isAccountID(ak):
+		return "it is a 12-digit account ID"
+	case st.users[ak] != nil:
+		return "it equals the name of user " + ak
+	}
+	return ""
 }
 
 // normalizeKeyStatus canonicalizes a key status ("active" -> "Active").

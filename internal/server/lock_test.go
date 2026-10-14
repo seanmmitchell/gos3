@@ -50,7 +50,7 @@ func TestDataDirectoryLock(t *testing.T) {
 
 // TestPersistedSettingsOverrideWarning checks that a server whose
 // settings.json overrides explicitly configured runtime values (e.g.
-// --no-discovery after the settings were once saved in the UI) logs a
+// enabling discovery after it was disabled in the UI) logs a
 // warning naming the key; previously the flag was ignored silently.
 func TestPersistedSettingsOverrideWarning(t *testing.T) {
 	dir := t.TempDir()
@@ -62,7 +62,7 @@ func TestPersistedSettingsOverrideWarning(t *testing.T) {
 	}
 	if _, err := s.Settings().Update(func(st *config.Settings) error {
 		st.Name = "renamed"
-		st.Discovery.Enabled = true
+		st.Discovery.Enabled = false
 		return nil
 	}); err != nil {
 		t.Fatal(err)
@@ -70,18 +70,18 @@ func TestPersistedSettingsOverrideWarning(t *testing.T) {
 	s.Close()
 
 	var logs strings.Builder
-	cfg.Discovery.Enabled = false
+	cfg.Discovery.Enabled = true
 	cfg.CORS.AllowedOrigins = []string{"https://ui.example.com"}
 	s, err = New(cfg, slog.New(slog.NewTextHandler(&logs, nil)))
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer s.Close()
-	if !s.Settings().Get().Discovery.Enabled {
+	if s.Settings().Get().Discovery.Enabled {
 		t.Fatal("settings.json no longer wins")
 	}
 	out := logs.String()
-	if !strings.Contains(out, "level=WARN") || !strings.Contains(out, "key=discovery.enabled") || !strings.Contains(out, "configured=false") {
+	if !strings.Contains(out, "level=WARN") || !strings.Contains(out, "key=discovery.enabled") || !strings.Contains(out, "configured=true") {
 		t.Errorf("no warning for discovery.enabled:\n%s", out)
 	}
 	if !strings.Contains(out, "key=cors.allowed_origins") {

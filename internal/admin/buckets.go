@@ -5,14 +5,18 @@ import (
 	"encoding/xml"
 	"errors"
 	"fmt"
+	"maps"
 	"net/http"
+	"slices"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/seanmmitchell/gos3/internal/auth"
+	"github.com/seanmmitchell/gos3/internal/compression"
 	"github.com/seanmmitchell/gos3/internal/iam"
 	"github.com/seanmmitchell/gos3/internal/storage"
+	"github.com/seanmmitchell/gos3/internal/storage/multi"
 )
 
 // aclPrivate is the default canned ACL.
@@ -20,20 +24,21 @@ const aclPrivate = "private"
 
 // bucketSummary is the BucketSummary document of docs/admin-api.md.
 type bucketSummary struct {
-	Name       string    `json:"name"`
-	CreatedAt  time.Time `json:"createdAt"`
-	Region     string    `json:"region"`
-	Versioning string    `json:"versioning"`
-	ObjectLock bool      `json:"objectLock"`
-	Owner      string    `json:"owner"`
-	// Backing is the backing holding the bucket's data ("local" = the
-	// server's own storage) and BackingMode its mode ("local", "blob",
-	// "gateway", or "" when the backing is not configured any more).
-	Backing     string           `json:"backing"`
-	BackingMode string           `json:"backingMode"`
-	Configs     bucketConfigs    `json:"configs"`
-	Public      bool             `json:"public"`
-	Usage       *bucketUsageJSON `json:"usage"`
+	Name       string        `json:"name"`
+	CreatedAt  time.Time     `json:"createdAt"`
+	Region     string        `json:"region"`
+	Versioning string        `json:"versioning"`
+	ObjectLock bool          `json:"objectLock"`
+	Owner      string        `json:"owner"`
+	Configs    bucketConfigs `json:"configs"`
+	Public     bool          `json:"public"`
+	// Compression is the bucket's compression setting and whether new
+	// objects are compressed under the server's policy.
+	Compression bucketCompressionSummary `json:"compression"`
+	Usage       *bucketUsageJSON         `json:"usage"`
+	// Placement is where the bucket is stored (nil without the
+	// multi-backing router).
+	Placement *multi.PlacementSummary `json:"placement,omitempty"`
 }
 
 // bucketConfigs flags which configuration documents a bucket has.
@@ -46,16 +51,6 @@ type bucketConfigs struct {
 	Website    bool   `json:"website"`
 	ObjectLock bool   `json:"objectLock"`
 	ACL        string `json:"acl"`
-}
-
-// allConfigKeys are every bucket configuration document key (deleted by a
-// forced bucket delete).
-var allConfigKeys = []string{
-	storage.ConfigPolicy, storage.ConfigCORS, storage.ConfigLifecycle, storage.ConfigTagging,
-	storage.ConfigEncryption, storage.ConfigObjectLock, storage.ConfigACL, storage.ConfigWebsite,
-	storage.ConfigOwnership, storage.ConfigNotification, storage.ConfigLogging,
-	storage.ConfigPublicAccessBlock, storage.ConfigReplication, storage.ConfigAccelerate,
-	storage.ConfigRequestPayment,
 }
 
 // listUsageConcurrency bounds parallel usage computations for GET /buckets.
@@ -120,11 +115,14 @@ func (a *api) summarize(rc *reqCtx, info storage.BucketInfo, withUsage bool) (*b
 		Versioning: string(info.Versioning),
 		ObjectLock: info.ObjectLockEnabled,
 		Owner:      info.Owner,
-		Backing:    backingName(info.Backing),
 	}
-	s.BackingMode = a.backingMode(s.Backing)
 	if s.Owner == "" {
 		s.Owner = auth.RootUser
+	}
+	if r, ok := a.d.Backend.(*multi.Router); ok {
+		if p, err := r.Summary(info.Name); err == nil {
+			s.Placement = &p
+		}
 	}
 	has := func(key string) (bool, error) {
 		_, err := a.d.Backend.GetBucketConfig(rc.ctx, info.Name, key)
@@ -165,6 +163,14 @@ func (a *api) summarize(rc *reqCtx, info storage.BucketInfo, withUsage bool) (*b
 		return nil, err
 	}
 	s.Public = iam.IsPublicPolicy(pol) || iam.IsPublicACL(acl)
+	cs, err := compression.Load(rc.ctx, a.d.Backend, info.Name)
+	if err != nil {
+		return nil, err
+	}
+	s.Compression = bucketCompressionSummary{
+		Enabled:   cs.Enabled,
+		Effective: compression.Effective(a.d.Settings.Get().Compression, cs),
+	}
 	if withUsage {
 		u, at, err := a.bucketUsage(rc.ctx, info.Name)
 		switch {
@@ -264,6 +270,13 @@ func (a *api) deleteBucket(rc *reqCtx) (int, any, error) {
 	if err != nil {
 		return 0, nil, err
 	}
+	bypass, err := queryBool(rc.r, "bypassGovernanceRetention")
+	if err != nil {
+		return 0, nil, err
+	}
+	if bypass && !force {
+		return 0, nil, badRequest("bypassGovernanceRetention requires force=true")
+	}
 	if !force {
 		if err := a.d.Backend.DeleteBucket(rc.ctx, name); err != nil {
 			if errors.Is(err, storage.ErrBucketNotEmpty) {
@@ -276,10 +289,10 @@ func (a *api) deleteBucket(rc *reqCtx) (int, any, error) {
 		a.log.Info("admin: bucket deleted", "bucket", name, "by", rc.id.User)
 		return http.StatusNoContent, nil, nil
 	}
-	if err := a.forceDeleteBucket(rc.ctx, name); err != nil {
+	if err := a.forceDeleteBucket(rc, name, bypass); err != nil {
 		return 0, nil, err
 	}
-	a.log.Info("admin: bucket force-deleted", "bucket", name, "by", rc.id.User)
+	a.log.Info("admin: bucket force-deleted", "bucket", name, "by", rc.id.User, "bypassGovernanceRetention", bypass)
 	return http.StatusNoContent, nil, nil
 }
 
@@ -287,14 +300,27 @@ func (a *api) deleteBucket(rc *reqCtx) (int, any, error) {
 // and configuration document of a bucket, then the bucket itself. Writes
 // racing with it are retried a few times. A bucket that disappears midway
 // (deleted concurrently) counts as success.
-func (a *api) forceDeleteBucket(ctx context.Context, name string) error {
-	if _, err := a.d.Backend.GetBucket(ctx, name); err != nil {
+//
+// Object lock is honoured as by the S3 API (see lockGuard): a bucket holding
+// a version under legal hold or unexpired COMPLIANCE retention is refused
+// before anything is deleted, and so is unexpired GOVERNANCE retention
+// unless the caller asked to bypass it (bypass) and holds
+// s3:BypassGovernanceRetention on the object. admin:ForceDeleteBucket alone
+// therefore never destroys locked data.
+func (a *api) forceDeleteBucket(rc *reqCtx, name string, bypass bool) error {
+	ctx := rc.ctx
+	bi, err := a.d.Backend.GetBucket(ctx, name)
+	if err != nil {
+		return err
+	}
+	guard, err := a.lockGuard(rc, bi, bypass)
+	if err != nil {
 		return err
 	}
 	defer a.invalidateUsage(name)
 	var lastErr error
 	for range forceDeleteAttempts {
-		err := a.emptyBucket(ctx, name)
+		err := a.emptyBucket(ctx, name, guard)
 		if err == nil {
 			err = a.d.Backend.DeleteBucket(ctx, name)
 		}
@@ -311,8 +337,12 @@ func (a *api) forceDeleteBucket(ctx context.Context, name string) error {
 		"bucket %q kept receiving new objects while being deleted (%d attempts): %v", name, forceDeleteAttempts, lastErr)
 }
 
-// emptyBucket deletes all versions, uploads and configuration documents.
-func (a *api) emptyBucket(ctx context.Context, name string) error {
+// emptyBucket deletes all versions, uploads and configuration documents
+// (except the encryption ones, see keepUntilBucketDeleted).
+// Each version is deleted only if guard allows it, atomically with the
+// delete when the backend is a storage.ConditionalDeleter (both built-in
+// backends are), so a lock applied after lockGuard's scan still holds.
+func (a *api) emptyBucket(ctx context.Context, name string, guard *lockGuard) error {
 	b := a.d.Backend
 	stalls := 0
 	for {
@@ -336,12 +366,15 @@ func (a *api) emptyBucket(ctx context.Context, name string) error {
 		}
 		deleted := 0
 		for _, v := range batch {
-			_, err := b.DeleteObject(ctx, name, v.key, v.id)
+			err := deleteVersionIf(ctx, b, name, v.key, v.id, guard.check)
+			var locked *apiError
 			switch {
 			case err == nil:
 				deleted++
 			case errors.Is(err, storage.ErrVersionNotFound), errors.Is(err, storage.ErrObjectNotFound):
 				// removed concurrently
+			case errors.As(err, &locked):
+				return locked
 			default:
 				return fmt.Errorf("deleting %q version %q: %w", v.key, v.id, err)
 			}
@@ -363,10 +396,152 @@ func (a *api) emptyBucket(ctx context.Context, name string) error {
 			return fmt.Errorf("aborting upload %q of %q: %w", u.UploadID, u.Key, err)
 		}
 	}
-	for _, key := range allConfigKeys {
+	for _, key := range storage.AllConfigKeys {
+		if keepUntilBucketDeleted(key) {
+			continue
+		}
 		if err := b.DeleteBucketConfig(ctx, name, key); err != nil && !errors.Is(err, storage.ErrConfigNotFound) {
 			return fmt.Errorf("deleting %s configuration: %w", key, err)
 		}
 	}
 	return nil
+}
+
+// keepUntilBucketDeleted reports whether emptyBucket leaves the
+// configuration document key for DeleteBucket to remove with the bucket.
+// The encryption documents decide how writes are stored and how restic
+// objects are read: if DeleteBucket then fails (a concurrent writer), the
+// surviving bucket must neither store new objects in plaintext nor lose
+// the provider of its archived objects.
+func keepUntilBucketDeleted(key string) bool {
+	return key == storage.ConfigEncryption || key == storage.ConfigEncryptionProvider
+}
+
+// deleteVersionIf permanently deletes one version if check allows it,
+// atomically when b is a storage.ConditionalDeleter. check's error is
+// returned unchanged.
+func deleteVersionIf(ctx context.Context, b storage.Backend, bucket, key, versionID string, check func(storage.ObjectInfo) error) error {
+	if cd, ok := b.(storage.ConditionalDeleter); ok {
+		_, err := cd.DeleteObjectIf(ctx, bucket, key, versionID, check)
+		return err
+	}
+	info, err := b.GetObjectInfo(ctx, bucket, key, versionID)
+	if err != nil {
+		return err
+	}
+	if err := check(info); err != nil {
+		return err
+	}
+	_, err = b.DeleteObject(ctx, bucket, key, versionID)
+	return err
+}
+
+// maxLockedExamples bounds the keys named in a refused force delete.
+const maxLockedExamples = 5
+
+// lockGuard decides which versions a force delete may remove under object
+// lock, with the rules of S3 DeleteObject: versions under legal hold or
+// unexpired COMPLIANCE retention never; unexpired GOVERNANCE retention only
+// for keys in bypassKeys (the request asked to bypass it and the caller is
+// allowed s3:BypassGovernanceRetention on the object). check does no I/O, so
+// it can run inside a backend transaction.
+type lockGuard struct {
+	bucket     string
+	now        time.Time
+	bypassKeys map[string]bool
+}
+
+func (g *lockGuard) check(o storage.ObjectInfo) error {
+	if reason := g.lockedBy(o); reason != "" {
+		return errorf(http.StatusConflict, codeConflict,
+			"bucket %q: object %q version %q became protected by %s during the delete; the bucket was only partly emptied",
+			g.bucket, o.Key, o.VersionID, reason)
+	}
+	return nil
+}
+
+// lockedBy returns why object lock forbids deleting o ("" when it does not).
+func (g *lockGuard) lockedBy(o storage.ObjectInfo) string {
+	switch {
+	case o.DeleteMarker:
+		return ""
+	case o.LegalHold:
+		return "a legal hold"
+	case o.RetentionMode == "" || !o.RetainUntil.After(g.now):
+		return ""
+	case o.RetentionMode == "GOVERNANCE" && g.bypassKeys[o.Key]:
+		return ""
+	}
+	return o.RetentionMode + " retention until " + o.RetainUntil.UTC().Format(time.RFC3339)
+}
+
+// lockGuard scans the bucket before anything is deleted, so that a force
+// delete object lock forbids fails without removing a single version: legal
+// holds and COMPLIANCE retention give 409 Conflict; GOVERNANCE retention
+// gives 409 unless bypass was requested, and 403 when the caller may not
+// bypass it (s3:BypassGovernanceRetention on the object, as in S3). Buckets
+// without object lock cannot hold locked versions and are not scanned.
+func (a *api) lockGuard(rc *reqCtx, bi storage.BucketInfo, bypass bool) (*lockGuard, error) {
+	g := &lockGuard{bucket: bi.Name, now: a.now(), bypassKeys: map[string]bool{}}
+	if !bi.ObjectLockEnabled {
+		return g, nil
+	}
+	locked := 0           // versions nothing may delete (legal hold, COMPLIANCE)
+	var examples []string // a few of their keys
+	governance := map[string]bool{}
+	err := a.d.Backend.WalkVersions(rc.ctx, bi.Name, "", "", "", func(o storage.ObjectInfo) error {
+		switch reason := g.lockedBy(o); {
+		case reason == "":
+		case !o.LegalHold && o.RetentionMode == "GOVERNANCE":
+			governance[o.Key] = true
+		default:
+			locked++
+			if len(examples) < maxLockedExamples && !slices.Contains(examples, o.Key) {
+				examples = append(examples, o.Key)
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	if locked > 0 {
+		return nil, errorf(http.StatusConflict, codeConflict,
+			"bucket %q has %d object version(s) under legal hold or COMPLIANCE retention (e.g. %s); object lock forbids deleting them, nothing was deleted",
+			bi.Name, locked, quoteList(examples))
+	}
+	if len(governance) == 0 {
+		return g, nil
+	}
+	keys := slices.Sorted(maps.Keys(governance))
+	if !bypass {
+		return nil, errorf(http.StatusConflict, codeConflict,
+			"bucket %q has %d object(s) under GOVERNANCE retention (e.g. %s); nothing was deleted (add bypassGovernanceRetention=true, which requires s3:BypassGovernanceRetention, to delete them)",
+			bi.Name, len(keys), quoteList(keys[:min(len(keys), maxLockedExamples)]))
+	}
+	conds := requestConditions(rc.r, a.d.TrustProxyHeaders)
+	for _, key := range keys {
+		// Identity policies only: the admin API does not consult bucket
+		// policies.
+		d := a.d.IAM.Authorize(rc.ctx, iam.AuthzRequest{
+			Identity: rc.id, Action: "s3:BypassGovernanceRetention",
+			Bucket: bi.Name, Key: key, Conditions: conds,
+		})
+		if !d.Allowed {
+			return nil, errorf(http.StatusForbidden, codeAccessDenied,
+				"%s is not allowed to perform s3:BypassGovernanceRetention on %s; nothing was deleted",
+				describeIdentity(rc.id), iam.ObjectARN(bi.Name, key))
+		}
+		g.bypassKeys[key] = true
+	}
+	return g, nil
+}
+
+// quoteList formats keys as a comma-separated list of quoted strings.
+func quoteList(keys []string) string {
+	q := make([]string, len(keys))
+	for i, k := range keys {
+		q[i] = fmt.Sprintf("%q", k)
+	}
+	return strings.Join(q, ", ")
 }

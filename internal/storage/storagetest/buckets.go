@@ -45,9 +45,12 @@ func testBucketCreateAndGet(e *env) {
 		got, err := e.b.GetBucket(e.ctx, tc.name)
 		e.noErr("GetBucket("+tc.name+")", err)
 		e.checkTime("GetBucket("+tc.name+").CreatedAt", got.CreatedAt, start)
-		got.CreatedAt = time.Time{}
+		// Backing is placement information that routing backends
+		// (internal/storage/multi, routed) fill in for buckets created
+		// without one; ListBuckets must agree with GetBucket on it (below).
+		got.CreatedAt, got.Backing = time.Time{}, ""
 		if got != tc.want {
-			e.t.Errorf("GetBucket(%q) = %+v, want %+v (CreatedAt ignored)", tc.name, got, tc.want)
+			e.t.Errorf("GetBucket(%q) = %+v, want %+v (CreatedAt and Backing ignored)", tc.name, got, tc.want)
 		}
 	}
 

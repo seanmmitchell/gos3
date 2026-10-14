@@ -13,6 +13,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/seanmmitchell/gos3/internal/storage"
+	"github.com/seanmmitchell/gos3/internal/storage/compress"
 )
 
 // errWriterDone is returned when writing to or committing a writer that was
@@ -40,10 +41,31 @@ type objectWriter struct {
 	mu   sync.Mutex
 	buf  []byte
 	done bool
+	// zw compresses into buf when the version is stored compressed.
+	zw          *compress.Writer
+	compression string
+	encryption  string
 }
+
+// The optional storage interface implemented by NewObjectWriterWith and
+// CompleteMultipartUploadWith.
+var _ storage.CompressingBackend = (*Backend)(nil)
 
 // NewObjectWriter starts writing a new version of bucket/key.
 func (b *Backend) NewObjectWriter(ctx context.Context, bucketName, key string) (storage.ObjectWriter, error) {
+	return b.NewObjectWriterWith(ctx, bucketName, key, storage.WriteOptions{})
+}
+
+// NewObjectWriterWith is NewObjectWriter with write options: with
+// opts.Compression the data is kept in the compress package's format (see
+// storage.CompressingBackend).
+func (b *Backend) NewObjectWriterWith(ctx context.Context, bucketName, key string, opts storage.WriteOptions) (storage.ObjectWriter, error) {
+	if opts.Encryption != "" && opts.Encryption != storage.EncryptionAES256 {
+		return nil, errors.ErrUnsupported
+	}
+	if err := checkCompression(opts.Compression); err != nil {
+		return nil, err
+	}
 	if err := validKey(key); err != nil {
 		return nil, err
 	}
@@ -52,7 +74,14 @@ func (b *Backend) NewObjectWriter(ctx context.Context, bucketName, key string) (
 		return nil, err
 	}
 	bk.mu.RUnlock()
-	return &objectWriter{b: b, bk: bk, key: key}, nil
+	w := &objectWriter{b: b, bk: bk, key: key, encryption: opts.Encryption}
+	if opts.Compression.Enabled() {
+		w.compression = opts.Compression.Algorithm
+		if w.zw, err = compress.NewWriter((*appendWriter)(&w.buf), opts.Compression.Level); err != nil {
+			return nil, err
+		}
+	}
+	return w, nil
 }
 
 func (w *objectWriter) Write(p []byte) (int, error) {
@@ -61,8 +90,41 @@ func (w *objectWriter) Write(p []byte) (int, error) {
 	if w.done {
 		return 0, errWriterDone
 	}
+	if w.zw != nil {
+		return w.zw.Write(p)
+	}
 	w.buf = append(w.buf, p...)
 	return len(p), nil
+}
+
+// appendWriter is an io.Writer appending to a byte slice.
+type appendWriter []byte
+
+func (a *appendWriter) Write(p []byte) (int, error) {
+	*a = append(*a, p...)
+	return len(p), nil
+}
+
+// checkCompression validates c before any data is written.
+func checkCompression(c storage.Compression) error {
+	switch c.Algorithm {
+	case "":
+		return nil
+	case storage.CompressionDeflate:
+		if !compress.ValidLevel(c.Level) {
+			return fmt.Errorf("memory: invalid deflate level %d", c.Level)
+		}
+		return nil
+	default:
+		return fmt.Errorf("memory: unsupported compression algorithm %q", c.Algorithm)
+	}
+}
+
+// stored is how the data of a new version is kept: compressed (algorithm
+// set, size = content size) or as is (zero value).
+type stored struct {
+	compression string
+	size        int64
 }
 
 func (w *objectWriter) Commit(ctx context.Context, meta storage.ObjectMeta, opts storage.CommitOptions) (storage.ObjectInfo, error) {
@@ -72,6 +134,17 @@ func (w *objectWriter) Commit(ctx context.Context, meta storage.ObjectMeta, opts
 		return storage.ObjectInfo{}, errWriterDone
 	}
 	w.done = true
+	var enc stored
+	if w.zw != nil {
+		if err := w.zw.Close(); err != nil {
+			w.buf = nil
+			w.mu.Unlock()
+			return storage.ObjectInfo{}, err
+		}
+		if w.zw.Size() > 0 {
+			enc = stored{compression: w.compression, size: w.zw.Size()}
+		}
+	}
 	data := slices.Clip(w.buf)
 	w.buf = nil
 	w.mu.Unlock()
@@ -80,12 +153,16 @@ func (w *objectWriter) Commit(ctx context.Context, meta storage.ObjectMeta, opts
 		return storage.ObjectInfo{}, err
 	}
 	defer w.bk.mu.Unlock()
-	return w.b.commitLocked(w.bk, w.key, data, meta, opts)
+	meta.Encryption = w.encryption
+	return w.b.commitLocked(w.bk, w.key, data, enc, meta, opts)
 }
 
 func (w *objectWriter) Abort() error {
 	w.mu.Lock()
 	defer w.mu.Unlock()
+	if !w.done && w.zw != nil {
+		w.zw.Abandon()
+	}
 	w.done = true
 	w.buf = nil
 	return nil
@@ -122,18 +199,39 @@ func checkPreconditions(obj *object, opts storage.CommitOptions) error {
 	return nil
 }
 
-// commitLocked publishes data as a new version of key in bk, applying
-// conditional checks and versioning semantics. bk must be write-locked; data
-// is taken over by the backend and must not be modified afterwards.
-func (b *Backend) commitLocked(bk *bucket, key string, data []byte, meta storage.ObjectMeta, opts storage.CommitOptions) (storage.ObjectInfo, error) {
+// commitLocked publishes data (stored as enc says) as a new version of key
+// in bk, applying conditional checks and versioning semantics. bk must be
+// write-locked; data is taken over by the backend and must not be modified
+// afterwards.
+func (b *Backend) commitLocked(bk *bucket, key string, data []byte, enc stored, meta storage.ObjectMeta, opts storage.CommitOptions) (storage.ObjectInfo, error) {
 	obj, _ := bk.objects.Get(key)
 	if err := checkPreconditions(obj, opts); err != nil {
 		return storage.ObjectInfo{}, err
 	}
+	stamp, created := b.nextStamp()
+	if opts.BeforePublish != nil {
+		encryption := meta.Encryption
+		var current *storage.ObjectMeta
+		if obj != nil && len(obj.versions) > 0 {
+			latest := obj.versions[len(obj.versions)-1]
+			if !latest.deleteMarker {
+				m := cloneMeta(latest.meta)
+				current = &m
+			}
+		}
+		if err := opts.BeforePublish(&meta, current, created, func(key string) []byte {
+			return bk.configs[key]
+		}); err != nil {
+			return storage.ObjectInfo{}, err
+		}
+		// The encoding is the backend's choice, never the hook's.
+		meta.Encryption = encryption
+	}
 	if data == nil {
 		data = []byte{}
 	}
-	v := &version{meta: cloneMeta(meta), data: data}
+	v := &version{meta: cloneMeta(meta), data: data, stamp: stamp, lastModified: created,
+		compression: enc.compression, size: enc.size}
 	b.addVersionLocked(bk, key, obj, v)
 	return v.info(bk.info.Name, key, true), nil
 }
@@ -142,7 +240,9 @@ func (b *Backend) commitLocked(bk *bucket, key string, data []byte, meta storage
 // versioning status (replacing an existing null version when the new one is
 // null) and makes it the latest version of key. obj may be nil.
 func (b *Backend) addVersionLocked(bk *bucket, key string, obj *object, v *version) {
-	v.stamp, v.lastModified = b.nextStamp()
+	if v.lastModified.IsZero() {
+		v.stamp, v.lastModified = b.nextStamp()
+	}
 	if bk.info.Versioning == storage.VersioningEnabled {
 		v.id = newVersionID(v.stamp)
 	} else {
@@ -267,6 +367,13 @@ func (b *Backend) OpenObject(ctx context.Context, bucketName, key, versionID str
 	if v.deleteMarker {
 		return info, nil, nil
 	}
+	if v.compression != "" {
+		z, err := compress.NewReader(bytes.NewReader(v.data), int64(len(v.data)))
+		if err != nil {
+			return storage.ObjectInfo{}, nil, fmt.Errorf("memory: open %s/%s: %w", bucketName, key, err)
+		}
+		return info, z, nil
+	}
 	return info, newObjectReader(v.data), nil
 }
 
@@ -276,6 +383,22 @@ func (b *Backend) OpenObject(ctx context.Context, bucketName, key, versionID str
 // Addressing a delete marker yields ErrObjectNotFound (wrapped with a
 // "delete marker" message).
 func (b *Backend) UpdateObjectMeta(ctx context.Context, bucketName, key, versionID string, fn func(*storage.ObjectMeta) error) (storage.ObjectInfo, error) {
+	return b.updateObjectMeta(ctx, bucketName, key, versionID, nil, fn)
+}
+
+// UpdateObjectMetaIf is UpdateObjectMeta made conditional on check, which is
+// called with the addressed version under the bucket's write lock (see
+// storage.ConditionalMetaUpdater).
+func (b *Backend) UpdateObjectMetaIf(ctx context.Context, bucketName, key, versionID string, check func(storage.ObjectInfo) error, fn func(*storage.ObjectMeta) error) (storage.ObjectInfo, error) {
+	if check == nil {
+		return storage.ObjectInfo{}, errors.New("memory: nil update check")
+	}
+	return b.updateObjectMeta(ctx, bucketName, key, versionID, check, fn)
+}
+
+// updateObjectMeta implements UpdateObjectMeta and, with a non-nil check,
+// UpdateObjectMetaIf.
+func (b *Backend) updateObjectMeta(ctx context.Context, bucketName, key, versionID string, check func(storage.ObjectInfo) error, fn func(*storage.ObjectMeta) error) (storage.ObjectInfo, error) {
 	if fn == nil {
 		return storage.ObjectInfo{}, errors.New("memory: nil update function")
 	}
@@ -292,10 +415,16 @@ func (b *Backend) UpdateObjectMeta(ctx context.Context, bucketName, key, version
 	if v.deleteMarker {
 		return storage.ObjectInfo{}, fmt.Errorf("%w: %s/%s version %q is a delete marker", storage.ErrObjectNotFound, bk.info.Name, key, v.id)
 	}
+	if check != nil {
+		if err := check(v.info(bk.info.Name, key, i == len(obj.versions)-1)); err != nil {
+			return storage.ObjectInfo{}, err
+		}
+	}
 	m := cloneMeta(v.meta)
 	if err := fn(&m); err != nil {
 		return storage.ObjectInfo{}, err
 	}
+	m.Encryption = v.meta.Encryption
 	v.meta = cloneMeta(m)
 	return v.info(bk.info.Name, key, i == len(obj.versions)-1), nil
 }
@@ -319,16 +448,34 @@ func (b *Backend) DeleteObjectIf(ctx context.Context, bucketName, key, versionID
 	if check == nil {
 		return storage.DeleteResult{}, errors.New("memory: nil delete check")
 	}
+	return b.deleteChecked(ctx, bucketName, key, versionID, func(o storage.ObjectInfo, _ bool) error { return check(o) }, false)
+}
+
+// DeleteObjectChecked is DeleteObjectIf whose check is also consulted
+// when the key has no versions (see storage.CheckedDeleter).
+func (b *Backend) DeleteObjectChecked(ctx context.Context, bucketName, key, versionID string, check func(storage.ObjectInfo, bool) error) (storage.DeleteResult, error) {
+	if check == nil {
+		return storage.DeleteResult{}, errors.New("memory: nil delete check")
+	}
+	return b.deleteChecked(ctx, bucketName, key, versionID, check, true)
+}
+
+// deleteChecked implements DeleteObjectIf and, with absentOK,
+// DeleteObjectChecked.
+func (b *Backend) deleteChecked(ctx context.Context, bucketName, key, versionID string, check func(storage.ObjectInfo, bool) error, absentOK bool) (storage.DeleteResult, error) {
 	bk, err := b.lockBucket(ctx, bucketName)
 	if err != nil {
 		return storage.DeleteResult{}, err
 	}
 	defer bk.mu.Unlock()
 	obj, i, err := findVersion(bk, key, versionID)
-	if err != nil {
-		return storage.DeleteResult{}, err
+	switch {
+	case err == nil:
+		err = check(obj.versions[i].info(bk.info.Name, key, i == len(obj.versions)-1), true)
+	case absentOK && versionID == "" && errors.Is(err, storage.ErrObjectNotFound):
+		err = check(storage.ObjectInfo{}, false)
 	}
-	if err := check(obj.versions[i].info(bk.info.Name, key, i == len(obj.versions)-1)); err != nil {
+	if err != nil {
 		return storage.DeleteResult{}, err
 	}
 	return b.deleteLocked(bk, key, versionID)
@@ -462,8 +609,9 @@ func (b *Backend) WalkObjects(ctx context.Context, bucketName, prefix, after str
 // starting after (keyMarker, versionIDMarker) per S3 ListObjectVersions
 // semantics. If versionIDMarker is not a version of keyMarker, the walk
 // resumes at the position the ID would occupy when it is an ID generated by
-// this backend (e.g. a version deleted between pages), and otherwise after
-// all versions of keyMarker. fn runs with no lock held.
+// this backend (e.g. a version deleted between pages), with every version of
+// keyMarker when it is "null" (a deleted null version has no position), and
+// otherwise after all versions of keyMarker. fn runs with no lock held.
 func (b *Backend) WalkVersions(ctx context.Context, bucketName, prefix, keyMarker, versionIDMarker string, fn func(storage.ObjectInfo) error) error {
 	if fn == nil {
 		return errors.New("memory: nil walk function")
@@ -502,6 +650,11 @@ func (b *Backend) WalkVersions(ctx context.Context, bucketName, prefix, keyMarke
 		if below == 0 {
 			if s, ok := stampFromVersionID(versionIDMarker); ok {
 				below = s
+			} else if versionIDMarker == storage.NullVersionID {
+				// The null version was deleted (e.g. between pages) and
+				// "null" carries no position: resume with every remaining
+				// version of keyMarker rather than lose the older ones.
+				inclusive = true
 			}
 		}
 	}

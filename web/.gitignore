@@ -12,3 +12,7 @@ playwright-report/
 
 # real-server e2e: cached gos3 binary + run state
 .e2e-cache/
+
+# Preset connections of a local build (copy servers.example.json); never
+# commit them, and never put secret keys in them (the build refuses).
+public/servers.json

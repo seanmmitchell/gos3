@@ -210,11 +210,28 @@ func (s *Store) remoteKey(bucket, key string) (rbucket, rkey string) {
 // key fits the S3 limit of 1024 bytes (the prefix counts against it).
 func (s *Store) checkKey(bucket, key string) error {
 	_, rk := s.remoteKey(bucket, key)
+	if !xmlSafe(key) {
+		return fmt.Errorf("%w: object key %q (gateway %q cannot store characters that XML cannot represent: S3 listings could not return the key)",
+			storage.ErrInvalidName, key, s.name)
+	}
 	if key == "" || !utf8.ValidString(key) || len(rk) > maxKeyLength {
 		return fmt.Errorf("%w: object key %q (gateway %q stores keys of at most %d bytes)",
 			storage.ErrInvalidName, key, s.name, maxKeyLength-(len(rk)-len(key)))
 	}
 	return nil
+}
+
+// xmlSafe reports whether every character of s can appear in an XML 1.0
+// document (S3 services refuse keys that cannot be listed).
+func xmlSafe(s string) bool {
+	for _, r := range s {
+		switch {
+		case r == '\t', r == '\n', r == '\r':
+		case r < 0x20, r == 0xFFFE, r == 0xFFFF:
+			return false
+		}
+	}
+	return true
 }
 
 // --- errors ---

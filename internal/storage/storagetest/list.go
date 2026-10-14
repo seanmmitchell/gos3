@@ -178,7 +178,11 @@ func modelListObjects(keys []string, prefix, delimiter, after string) []listEntr
 }
 
 // modelListVersions returns the complete ListObjectVersions result for all
-// versions (keys ascending, newest first) with S3 marker semantics.
+// versions (keys ascending, newest first) with S3 marker semantics. A
+// vidMarker that is not a version of keyMarker includes every version of
+// keyMarker, which is what the contract requires of a "null" marker whose
+// null version was deleted; deleted generated IDs, which backends may
+// resolve by position, are covered by testWalkVersionsDeletedMarker instead.
 func modelListVersions(all []vref, prefix, delimiter, keyMarker, vidMarker string) []listEntry {
 	skip := ""
 	if cp, ok := refCommonPrefix(keyMarker, prefix, delimiter); ok && cp == keyMarker {
@@ -635,7 +639,8 @@ func testListBucketUsage(e *env) {
 
 	u, err = storage.ComputeBucketUsage(e.ctx, e.b, "b")
 	e.noErr("ComputeBucketUsage", err)
-	want := storage.BucketUsage{Objects: 2, Bytes: 7, Versions: 4, VersionBytes: 15, DeleteMarkers: 2, PendingUploads: 2}
+	want := storage.BucketUsage{Objects: 2, Bytes: 7, StoredBytes: 7, Versions: 4, VersionBytes: 15, StoredVersionBytes: 15,
+		DeleteMarkers: 2, PendingUploads: 2}
 	if u != want {
 		e.t.Errorf("ComputeBucketUsage = %+v, want %+v", u, want)
 	}

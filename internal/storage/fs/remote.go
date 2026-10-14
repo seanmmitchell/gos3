@@ -1,14 +1,18 @@
 package fs
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
 	"io"
+	"os"
 	"sort"
 	"strings"
 	"sync"
 	"time"
+
+	"go.etcd.io/bbolt"
 
 	"github.com/seanmmitchell/gos3/internal/s3client"
 	"github.com/seanmmitchell/gos3/internal/storage"
@@ -26,10 +30,6 @@ type RemoteStore struct {
 	Prefix   string // prefix of every remote key, e.g. "gos3/" ("" allowed)
 	PartSize int64  // multipart part size for uploads, 0 = s3client.DefaultPartSize
 }
-
-// spoolMemory is how much of an object or part being written is buffered
-// in memory before the spool spills to a file in tmp/.
-const spoolMemory = 8 << 20
 
 // remoteCleanupTimeout bounds remote deletes that run after a metadata
 // transaction committed; they must not depend on the request's context.
@@ -139,8 +139,53 @@ func cleanupCtx() (context.Context, context.CancelFunc) {
 
 // --- uploads ---
 
-// newSpool returns a spool for data headed to a remote.
-func (b *Backend) newSpool() *s3client.Spool { return s3client.NewSpool(b.tmpDir, spoolMemory) }
+// bucketPlacement returns the ID of bucket and the remote holding its data
+// (nil: local files). A bucket whose backing is not a configured blob
+// backing yields an error wrapping storage.ErrBackingUnavailable.
+func (b *Backend) bucketPlacement(ctx context.Context, bucket string) (string, *remote, error) {
+	if err := b.begin(ctx); err != nil {
+		return "", nil, err
+	}
+	var id, backing string
+	err := b.view(func(tx *bbolt.Tx) error {
+		br, _, err := loadBucket(tx, bucket)
+		if err == nil {
+			id, backing = br.ID, br.Backing
+		}
+		return err
+	})
+	if err != nil {
+		return "", nil, err
+	}
+	rem, err := b.remoteFor(backing)
+	if err != nil {
+		return "", nil, err
+	}
+	return id, rem, nil
+}
+
+// uploadTemp uploads the finished temporary file t as the blob key and
+// removes t. The blob's ID must already be registered as pending.
+func (b *Backend) uploadTemp(ctx context.Context, r *remote, key string, t *tmpFile) error {
+	defer t.remove()
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if t.path == "" {
+		// Nothing was written (an empty part): upload an empty blob.
+		return b.putBlob(ctx, r, key, bytes.NewReader(nil), 0)
+	}
+	f, err := os.Open(t.path)
+	if err != nil {
+		return fmt.Errorf("fs: open temporary file: %w", err)
+	}
+	defer f.Close()
+	st, err := f.Stat()
+	if err != nil {
+		return fmt.Errorf("fs: stat temporary file: %w", err)
+	}
+	return b.putBlob(ctx, r, key, f, st.Size())
+}
 
 // putBlob uploads size bytes of src as key. When the upload may have
 // reached the service anyway (a transport failure rather than an error
@@ -321,39 +366,135 @@ func (b *Backend) releaseBlob(r *remote, key string) {
 	}
 }
 
-// blobReader is the reader OpenObject returns for remote data: a lazy,
-// ranged-GET reader whose Close is idempotent and releases the blob.
+// blobReader reads a remote blob of known size: a lazy, ranged-GET reader
+// (s3client.Reader) with its own Read/Seek position and a ReadAt, so the
+// decryption and decompression layers can read it like a data file.
+// Sequential reads and ReadAts share one GET stream; a jump reopens it at
+// the new offset. Close is idempotent; for a tracked reader (OpenObject)
+// it releases the blob (see blobTracker).
 type blobReader struct {
-	b   *Backend
-	rem *remote
-	key string
-	ctx context.Context
-	r   *s3client.Reader
+	b       *Backend
+	rem     *remote
+	key     string
+	ctx     context.Context
+	tracked bool
+	// missing maps a 404 of the blob (errCorrupt for object data,
+	// errPartsChanged for parts).
+	missing func(err error) error
+
+	mu   sync.Mutex
+	r    *s3client.Reader
+	size int64
+	pos  int64
 
 	once sync.Once
 }
 
-func (r *blobReader) Read(p []byte) (int, error) {
-	n, err := r.r.Read(p)
-	if err != nil && !errors.Is(err, io.EOF) {
-		if s3client.IsNotFound(err) {
-			err = fmt.Errorf("%w: remote blob %s of backing %q is missing: %w", errCorrupt, r.key, r.rem.name, err)
-		} else {
-			err = r.rem.mapErr(r.ctx, "read "+r.key, err)
-		}
+// newBlobReader returns a reader over the size bytes of blob key. tracked
+// readers must have been registered with b.blobs.acquire.
+func (b *Backend) newBlobReader(ctx context.Context, rem *remote, key string, size int64, tracked bool, missing func(error) error) *blobReader {
+	if ctx == nil {
+		ctx = context.Background()
 	}
-	return n, err
+	return &blobReader{
+		b: b, rem: rem, key: key, ctx: ctx, tracked: tracked, missing: missing, size: size,
+		r: rem.client.NewReader(ctx, rem.bucket, key, size, ""),
+	}
 }
 
-func (r *blobReader) Seek(off int64, whence int) (int64, error) { return r.r.Seek(off, whence) }
+// mapErr translates a read error of the remote.
+func (r *blobReader) mapErr(err error) error {
+	switch {
+	case err == nil || errors.Is(err, io.EOF):
+		return err
+	case s3client.IsNotFound(err) && !s3client.IsCode(err, "NoSuchBucket"):
+		return r.missing(err)
+	default:
+		return r.rem.mapErr(r.ctx, "read "+r.key, err)
+	}
+}
+
+func (r *blobReader) Read(p []byte) (int, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if _, err := r.r.Seek(r.pos, io.SeekStart); err != nil {
+		return 0, err
+	}
+	n, err := r.r.Read(p)
+	r.pos += int64(n)
+	return n, r.mapErr(err)
+}
+
+// ReadAt implements io.ReaderAt (serialized; reads at the offset where the
+// previous one ended keep using the open GET stream).
+func (r *blobReader) ReadAt(p []byte, off int64) (int, error) {
+	if off < 0 {
+		return 0, errors.New("fs: negative read offset")
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if off >= r.size {
+		return 0, io.EOF
+	}
+	want := p
+	if rest := r.size - off; int64(len(want)) > rest {
+		want = want[:rest]
+	}
+	if _, err := r.r.Seek(off, io.SeekStart); err != nil {
+		return 0, err
+	}
+	n, err := io.ReadFull(r.r, want)
+	if err != nil {
+		return n, r.mapErr(err)
+	}
+	if n < len(p) {
+		return n, io.EOF
+	}
+	return n, nil
+}
+
+func (r *blobReader) Seek(off int64, whence int) (int64, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	var abs int64
+	switch whence {
+	case io.SeekStart:
+		abs = off
+	case io.SeekCurrent:
+		abs = r.pos + off
+	case io.SeekEnd:
+		abs = r.size + off
+	default:
+		return 0, errors.New("fs: invalid whence")
+	}
+	if abs < 0 {
+		return 0, errors.New("fs: negative position")
+	}
+	r.pos = abs
+	return abs, nil
+}
 
 // Close closes the reader; subsequent calls return nil.
 func (r *blobReader) Close() error {
 	r.once.Do(func() {
 		_ = r.r.Close()
-		r.b.releaseBlob(r.rem, r.key)
+		if r.tracked {
+			r.b.releaseBlob(r.rem, r.key)
+		}
 	})
 	return nil
+}
+
+// corruptBlob is the missing function of object data readers.
+func (r *remote) corruptBlob(key string) func(error) error {
+	return func(err error) error {
+		return fmt.Errorf("%w: remote blob %s of backing %q is missing: %w", errCorrupt, key, r.name, err)
+	}
+}
+
+// vanishedPart is the missing function of part readers.
+func vanishedPart(n int) func(error) error {
+	return func(error) error { return fmt.Errorf("%w: part %d vanished", errPartsChanged, n) }
 }
 
 // --- multipart completion ---
@@ -392,11 +533,23 @@ func composeRanges(keys []string, sizes []int64, numbers []int) ([]copyRange, bo
 	return out, len(out) > 0
 }
 
-// composeRemote writes the concatenation of the listed part blobs to dst.
-// A single part is copied, parts that satisfy the service's multipart
-// limits are composed server-side with UploadPartCopy, anything else is
-// streamed through a spool. A part blob that vanished yields
-// errPartsChanged.
+// composable reports whether parts of the given stored sizes can be
+// concatenated server-side: a single part, or parts that satisfy the
+// service's multipart limits (see composeRanges).
+func composable(sizes []int64) bool {
+	if len(sizes) == 1 {
+		return true
+	}
+	keys := make([]string, len(sizes))
+	nums := make([]int, len(sizes))
+	_, ok := composeRanges(keys, sizes, nums)
+	return ok
+}
+
+// composeRemote writes the concatenation of the listed part blobs (whose
+// stored bytes are the content as is) to dst server-side: a single part is
+// copied, more parts are composed with UploadPartCopy. The caller checks
+// composable first. A part blob that vanished yields errPartsChanged.
 func (b *Backend) composeRemote(ctx context.Context, r *remote, dst, uploadID string, files []string, sizes []int64, numbers []int) error {
 	keys := make([]string, len(files))
 	for i, f := range files {
@@ -405,13 +558,13 @@ func (b *Backend) composeRemote(ctx context.Context, r *remote, dst, uploadID st
 	var err error
 	if len(keys) == 1 {
 		_, err = r.client.Copy(ctx, r.bucket, dst, keys[0], sizes[0], s3client.CopyOptions{})
-		if s3client.IsNotFound(err) {
+		if s3client.IsNotFound(err) && !s3client.IsCode(err, "NoSuchBucket") {
 			return fmt.Errorf("%w: part %d vanished", errPartsChanged, numbers[0])
 		}
 	} else if ranges, ok := composeRanges(keys, sizes, numbers); ok {
 		err = b.composeServerSide(ctx, r, dst, ranges)
 	} else {
-		return b.composeStreaming(ctx, r, dst, keys, sizes, numbers)
+		return errors.New("fs: parts cannot be composed server-side")
 	}
 	if err != nil {
 		if errors.Is(err, errPartsChanged) || errors.Is(err, errCorrupt) {
@@ -489,37 +642,6 @@ func (b *Backend) composeServerSide(ctx context.Context, r *remote, dst string, 
 		return firstErr
 	}
 	return nil
-}
-
-// composeStreaming downloads the part blobs into a spool, verifying their
-// sizes, and uploads the result as dst.
-func (b *Backend) composeStreaming(ctx context.Context, r *remote, dst string, keys []string, sizes []int64, numbers []int) error {
-	sp := b.newSpool()
-	defer sp.Close()
-	for i, key := range keys {
-		if err := ctx.Err(); err != nil {
-			return err
-		}
-		body, _, err := r.client.GetObject(ctx, r.bucket, key, s3client.GetOptions{})
-		if err != nil {
-			if s3client.IsNotFound(err) && !s3client.IsCode(err, "NoSuchBucket") {
-				return fmt.Errorf("%w: part %d vanished", errPartsChanged, numbers[i])
-			}
-			return r.mapErr(ctx, "read part blob "+key, err)
-		}
-		n, err := io.Copy(sp, io.LimitReader(body, sizes[i]+1))
-		_ = body.Close()
-		if err != nil {
-			return r.mapErr(ctx, fmt.Sprintf("copy part %d", numbers[i]), err)
-		}
-		if n != sizes[i] {
-			return fmt.Errorf("%w: part %d blob has %d bytes, expected %d", errCorrupt, numbers[i], n, sizes[i])
-		}
-	}
-	if err := sp.Finish(); err != nil {
-		return err
-	}
-	return b.putBlob(ctx, r, dst, sp, sp.Size())
 }
 
 // --- startup check ---

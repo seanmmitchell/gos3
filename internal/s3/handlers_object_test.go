@@ -407,13 +407,13 @@ func TestObjectPutDefaultEncryptionAndACL(t *testing.T) {
 	if resp.Header.Get("X-Amz-Server-Side-Encryption") != "AES256" {
 		t.Errorf("explicit SSE: %v", resp.Header)
 	}
-	e.putBucketConfig("bkt", storage.ConfigEncryption, `<ServerSideEncryptionConfiguration><Rule><ApplyServerSideEncryptionByDefault><SSEAlgorithm>aws:kms</SSEAlgorithm><KMSMasterKeyID>key-1</KMSMasterKeyID></ApplyServerSideEncryptionByDefault></Rule></ServerSideEncryptionConfiguration>`)
+	e.putBucketConfig("bkt", storage.ConfigEncryption, `<ServerSideEncryptionConfiguration><Rule><ApplyServerSideEncryptionByDefault><SSEAlgorithm>AES256</SSEAlgorithm></ApplyServerSideEncryptionByDefault></Rule></ServerSideEncryptionConfiguration>`)
 	resp = e.signed("PUT", "/bkt/enc", []byte("x"), nil)
-	if resp.Header.Get("X-Amz-Server-Side-Encryption") != "aws:kms" || resp.Header.Get("X-Amz-Server-Side-Encryption-Aws-Kms-Key-Id") != "key-1" {
+	if resp.Header.Get("X-Amz-Server-Side-Encryption") != "AES256" || resp.Header.Get("X-Amz-Server-Side-Encryption-Aws-Kms-Key-Id") != "" {
 		t.Errorf("default SSE: %v", resp.Header)
 	}
 	h := e.signed("HEAD", "/bkt/enc", nil, nil)
-	if h.Header.Get("X-Amz-Server-Side-Encryption") != "aws:kms" {
+	if h.Header.Get("X-Amz-Server-Side-Encryption") != "AES256" {
 		t.Errorf("HEAD SSE: %v", h.Header)
 	}
 

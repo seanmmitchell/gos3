@@ -124,6 +124,26 @@ export function formatPercent(part: number, total: number): string {
   return `${+((part / total) * 100).toFixed(1)}%`
 }
 
+/**
+ * Share of `logical` bytes that storing only `stored` bytes saves (object
+ * compression), in percent: (1000, 250) → 75. Undefined when the stored
+ * size is unknown (servers without compression) or nothing is saved.
+ */
+export function savedPercent(logical: number | null | undefined, stored: number | null | undefined): number | undefined {
+  if (logical == null || stored == null || !Number.isFinite(logical) || !Number.isFinite(stored)) return undefined
+  if (logical <= 0 || stored < 0 || stored >= logical) return undefined
+  return ((logical - stored) / logical) * 100
+}
+
+/**
+ * "stored 300 MiB, 75% saved" when compression stores fewer bytes than the
+ * logical size, else "" (nothing to remark; also when `stored` is unknown).
+ */
+export function formatStoredNote(logical: number | null | undefined, stored: number | null | undefined): string {
+  if (savedPercent(logical, stored) === undefined) return ''
+  return `stored ${formatBytes(stored)}, ${formatPercent(logical! - stored!, logical!)} saved`
+}
+
 /** Truncates the middle of long strings: "averylongname…suffix". */
 export function truncateMiddle(s: string, max = 48): string {
   if (s.length <= max) return s

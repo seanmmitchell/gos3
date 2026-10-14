@@ -1,6 +1,7 @@
 package fs
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -29,21 +30,17 @@ const (
 	testPrefix  = "pfx/"
 )
 
-// blobBacked is a Backend whose buckets are all created on the blob
-// backing testBacking. It hides the backing in bucket infos so the
-// conformance suite's bucket comparisons hold; the optional interfaces
-// (DeleteObjectIf, WalkMultipartUploads) are promoted from *Backend.
+// blobBacked is a Backend opened with DefaultBacking testBacking, so all
+// its buckets live on the blob backing. It hides the backing in bucket
+// infos so the conformance suite's bucket comparisons hold; the optional
+// interfaces (DeleteObjectIf, WalkMultipartUploads, ...) are promoted from
+// *Backend.
 type blobBacked struct{ *Backend }
 
 var (
 	_ storage.ConditionalDeleter = blobBacked{}
 	_ storage.UploadWalker       = blobBacked{}
 )
-
-func (b blobBacked) CreateBucket(ctx context.Context, name string, opts storage.CreateBucketOptions) error {
-	opts.Backing = testBacking
-	return b.Backend.CreateBucket(ctx, name, opts)
-}
 
 func (b blobBacked) GetBucket(ctx context.Context, name string) (storage.BucketInfo, error) {
 	info, err := b.Backend.GetBucket(ctx, name)
@@ -199,7 +196,9 @@ func TestConformanceBlob(t *testing.T) {
 	r := s3clienttest.Start(t)
 	storagetest.Run(t, func(t *testing.T) storage.Backend {
 		tr := newTestRemote(t, r)
-		b, err := Open(t.TempDir(), tr.opts())
+		opts := tr.opts()
+		opts.DefaultBacking = testBacking
+		b, err := Open(t.TempDir(), opts)
 		if err != nil {
 			t.Fatalf("Open: %v", err)
 		}
@@ -890,4 +889,275 @@ func TestOpenRejectsBadRemotes(t *testing.T) {
 			t.Errorf("Open accepted remote %q = %+v", name, rs)
 		}
 	}
+}
+
+// TestRemoteDefaultBacking checks that DefaultBacking is recorded for
+// buckets created without a backing and is validated at Open.
+func TestRemoteDefaultBacking(t *testing.T) {
+	tr := newTestRemote(t, nil)
+	opts := tr.opts()
+	opts.DefaultBacking = "nope"
+	if _, err := Open(t.TempDir(), opts); err == nil {
+		t.Fatal("Open accepted an unknown default backing")
+	}
+	opts.DefaultBacking = testBacking
+	b := openRemoteTest(t, "", tr, opts)
+	if err := b.CreateBucket(ctx, "bkt", storage.CreateBucketOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	if err := b.CreateBucket(ctx, "other", storage.CreateBucketOptions{Backing: "gateway"}); err != nil {
+		t.Fatal(err)
+	}
+	for name, want := range map[string]string{"bkt": testBacking, "other": "gateway"} {
+		info, err := b.GetBucket(ctx, name)
+		if err != nil || info.Backing != want {
+			t.Fatalf("GetBucket(%s) = %+v, %v; want backing %q", name, info, err, want)
+		}
+	}
+	put(t, b, "bkt", "k", "on the remote")
+	if n := len(tr.keys(t, testPrefix+"data/")); n != 1 || len(dataFiles(t, b)) != 0 {
+		t.Fatalf("remote blobs = %d, local files = %v", n, dataFiles(t, b))
+	}
+}
+
+// remoteBlobOf returns the remote key and raw content of the data blob of
+// bucket/key@vid.
+func remoteBlobOf(t *testing.T, b *Backend, tr *testRemote, bucket, key, vid string) (string, []byte) {
+	t.Helper()
+	_, bid, did, err := b.lookupObject(ctx, bucket, key, vid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	k := b.remotes[testBacking].dataKey(bid, did)
+	raw, ok := tr.get(t, k)
+	if !ok {
+		t.Fatalf("no remote blob %s", k)
+	}
+	return k, []byte(raw)
+}
+
+// TestRemoteStoredFormats round-trips compressed and AES-encrypted objects
+// and multipart uploads on a blob backing: the blobs hold exactly the
+// bytes a local data file would (ciphertext, compressed data), nothing is
+// stored locally, ranged reads work, and damage is detected.
+func TestRemoteStoredFormats(t *testing.T) {
+	aes := storage.WriteOptions{Encryption: storage.EncryptionAES256}
+	both := storage.WriteOptions{Encryption: storage.EncryptionAES256, Compression: deflate.Compression}
+	for name, wopts := range map[string]storage.WriteOptions{"compressed": deflate, "aes": aes, "aes+compressed": both} {
+		t.Run(name, func(t *testing.T) {
+			tr := newTestRemote(t, nil)
+			opts := tr.opts()
+			opts.DefaultBacking = testBacking
+			b := openRemoteTest(t, "", tr, opts)
+			mkBucket(t, b, "bkt", storage.VersioningEnabled)
+			data := bytes.Repeat([]byte("confidential, compressible object content. "), 20000)
+
+			w, err := b.NewObjectWriterWith(ctx, "bkt", "k", wopts)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := w.Write(data); err != nil {
+				t.Fatal(err)
+			}
+			meta := storage.ObjectMeta{ETag: "e"}
+			if wopts.Encryption != "" {
+				meta.SSE = "AES256"
+			}
+			info, err := w.Commit(ctx, meta, storage.CommitOptions{})
+			if err != nil {
+				t.Fatal(err)
+			}
+			eq(t, "size", info.Size, int64(len(data)))
+			eq(t, "encryption", info.Encryption, wopts.Encryption)
+			blobKey, raw := remoteBlobOf(t, b, tr, "bkt", "k", info.VersionID)
+			eq(t, "blob size", int64(len(raw)), info.PhysicalSize())
+			if bytes.Contains(raw, data[:40]) {
+				t.Fatal("blob holds plaintext")
+			}
+			if wopts.Compression.Enabled() && info.PhysicalSize() >= info.Size/4 {
+				t.Fatalf("blob of %d bytes is not compressed", info.PhysicalSize())
+			}
+			if f := dataFiles(t, b); len(f) != 0 {
+				t.Fatalf("local data files: %v", f)
+			}
+
+			_, rd, err := b.OpenObject(ctx, "bkt", "k", info.VersionID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := rd.Seek(65530, io.SeekStart); err != nil {
+				t.Fatal(err)
+			}
+			part := make([]byte, 111)
+			if _, err := io.ReadFull(rd, part); err != nil || !bytes.Equal(part, data[65530:65641]) {
+				t.Fatalf("ranged read: %v", err)
+			}
+			_, _ = rd.Seek(0, io.SeekStart)
+			got, err := io.ReadAll(rd)
+			_ = rd.Close()
+			if err != nil || !bytes.Equal(got, data) {
+				t.Fatalf("round trip: %v (%d bytes)", err, len(got))
+			}
+
+			// Multipart: parts are stored in the upload's format on the
+			// remote, the completion re-encodes them as wopts ask.
+			umeta := storage.ObjectMeta{ETag: "m"}
+			if wopts.Encryption != "" {
+				umeta.SSE, umeta.Encryption = "AES256", storage.EncryptionAES256
+			}
+			up, err := b.CreateMultipartUpload(ctx, "bkt", "mp", umeta, "")
+			if err != nil {
+				t.Fatal(err)
+			}
+			writePart(t, b, "bkt", "mp", up.UploadID, 1, string(data[:100000]))
+			writePart(t, b, "bkt", "mp", up.UploadID, 2, string(data[100000:]))
+			for _, k := range tr.keys(t, testPrefix+"uploads/") {
+				raw, _ := tr.get(t, k)
+				if wopts.Encryption != "" && strings.Contains(raw, string(data[:40])) {
+					t.Fatalf("part blob %s holds plaintext", k)
+				}
+			}
+			if f := listFiles(t, b.uploadDir); len(f) != 0 {
+				t.Fatalf("local part files: %v", f)
+			}
+			mi, err := b.CompleteMultipartUploadWith(ctx, "bkt", "mp", up.UploadID, []int{1, 2}, umeta, storage.CommitOptions{}, wopts)
+			if err != nil {
+				t.Fatal(err)
+			}
+			eq(t, "multipart encryption", mi.Encryption, wopts.Encryption)
+			if got := read(t, b, "bkt", "mp", mi.VersionID); got != string(data) {
+				t.Fatalf("multipart content differs (%d bytes)", len(got))
+			}
+			if _, raw := remoteBlobOf(t, b, tr, "bkt", "mp", mi.VersionID); bytes.Contains(raw, data[:40]) {
+				t.Fatal("multipart blob holds plaintext")
+			}
+			if k := tr.keys(t, testPrefix+"uploads/"); len(k) != 0 {
+				t.Fatalf("part blobs left: %q", k)
+			}
+
+			// Damage to the blob is an error, never content.
+			raw[len(raw)/2] ^= 1
+			tr.put(t, blobKey, string(raw))
+			_, rd, err = b.OpenObject(ctx, "bkt", "k", info.VersionID)
+			if err == nil {
+				_, err = io.ReadAll(rd)
+				_ = rd.Close()
+			}
+			if err == nil {
+				t.Fatal("damaged blob was accepted")
+			}
+		})
+	}
+}
+
+// TestRemotePlainMultipartOfEncryptedParts completes an upload whose parts
+// are encrypted without encrypting the result: the parts cannot be
+// composed as they are, so they are decrypted through the local pipeline.
+func TestRemotePlainMultipartOfEncryptedParts(t *testing.T) {
+	tr := newTestRemote(t, nil)
+	b := openRemoteTest(t, "", tr, Options{})
+	mkRemoteBucket(t, b, "bkt", storage.VersioningUnversioned)
+	var cc copyCounter
+	cc.install(tr)
+	up, err := b.CreateMultipartUpload(ctx, "bkt", "k", storage.ObjectMeta{Encryption: storage.EncryptionAES256}, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	big := strings.Repeat("x", s3client.MinPartSize)
+	writePart(t, b, "bkt", "k", up.UploadID, 1, big)
+	writePart(t, b, "bkt", "k", up.UploadID, 2, "tail")
+	if _, err := b.CompleteMultipartUpload(ctx, "bkt", "k", up.UploadID, []int{1, 2}, storage.ObjectMeta{ETag: "x-2"}, storage.CommitOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	if got := read(t, b, "bkt", "k", ""); got != big+"tail" {
+		t.Fatalf("content differs (%d bytes)", len(got))
+	}
+	if pc, c := cc.get(); pc+c != 0 {
+		t.Fatalf("server-side copies of encrypted parts: %d/%d", pc, c)
+	}
+}
+
+// TestRemoteImport imports versions (as internal/storage/multi does when
+// copying buckets between backings) into a bucket on a blob backing.
+func TestRemoteImport(t *testing.T) {
+	tr := newTestRemote(t, nil)
+	b := openRemoteTest(t, "", tr, Options{})
+	mkRemoteBucket(t, b, "bkt", storage.VersioningEnabled)
+	mtime := time.Date(2024, 5, 6, 7, 8, 9, 0, time.UTC)
+	v1 := importV(t, b, "bkt", "k", "imported-v1", "first", mtime)
+	importV(t, b, "bkt", "k", "imported-v2", "second", mtime.Add(time.Hour))
+	if n := len(tr.keys(t, testPrefix+"data/")); n != 2 || len(dataFiles(t, b)) != 0 {
+		t.Fatalf("remote blobs = %d, local files %v", n, dataFiles(t, b))
+	}
+	eq(t, "v1", read(t, b, "bkt", "k", "imported-v1"), "first")
+	eq(t, "latest", read(t, b, "bkt", "k", ""), "second")
+	eq(t, "v1 mtime", v1.LastModified.Equal(mtime), true)
+
+	// Re-importing a version replaces its blob.
+	old, _ := remoteBlobOf(t, b, tr, "bkt", "k", "imported-v1")
+	importV(t, b, "bkt", "k", "imported-v1", "first again", mtime)
+	if slices.Contains(tr.keys(t, ""), old) {
+		t.Fatal("replaced imported blob still present")
+	}
+	eq(t, "re-imported", read(t, b, "bkt", "k", "imported-v1"), "first again")
+
+	// Compressed and encrypted imports land as remote blobs in their
+	// stored format too.
+	w, err := b.NewVersionWriterWith(ctx, "bkt", "z", storage.WriteOptions{Encryption: storage.EncryptionAES256, Compression: deflate.Compression})
+	if err != nil {
+		t.Fatal(err)
+	}
+	data := strings.Repeat("compressible ", 10000)
+	_, _ = io.WriteString(w, data)
+	zi, err := w.Commit(ctx, storage.ObjectInfo{VersionID: "imported-z", LastModified: mtime, ObjectMeta: storage.ObjectMeta{ETag: "z", SSE: "AES256"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, raw := remoteBlobOf(t, b, tr, "bkt", "z", zi.VersionID); int64(len(raw)) != zi.PhysicalSize() || zi.PhysicalSize() >= zi.Size/4 {
+		t.Fatalf("imported blob has %d bytes, info %+v", len(raw), zi)
+	}
+	eq(t, "imported z", read(t, b, "bkt", "z", "imported-z"), data)
+	if f := dataFiles(t, b); len(f) != 0 {
+		t.Fatalf("local data files: %v", f)
+	}
+}
+
+// TestRemoteRestic stores restic versions in a bucket on a blob backing:
+// the content goes to restic as usual, the snapshot reference is the
+// version's blob.
+func TestRemoteRestic(t *testing.T) {
+	installFakeRestic(t, "current")
+	tr := newTestRemote(t, nil)
+	b := openRemoteTest(t, "", tr, Options{})
+	mkRemoteBucket(t, b, "arc", storage.VersioningEnabled)
+	if err := b.PrepareEncryption(ctx, "arc", storage.EncryptionRestic); err != nil {
+		t.Fatal(err)
+	}
+	data := strings.Repeat("archived ", 5000)
+	info, err := putRestic(t, b, "arc", "k", data, storage.CommitOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	eq(t, "encryption", info.Encryption, storage.EncryptionRestic)
+	if _, raw := remoteBlobOf(t, b, tr, "arc", "k", info.VersionID); len(raw) != snapshotRefSize || !validSnapshot(string(raw)) {
+		t.Fatalf("snapshot reference blob = %q", raw)
+	}
+	if f := dataFiles(t, b); len(f) != 0 {
+		t.Fatalf("local data files: %v", f)
+	}
+	eq(t, "content", read(t, b, "arc", "k", info.VersionID), data)
+
+	// Multipart into restic reads the remote part blobs.
+	up, err := b.CreateMultipartUpload(ctx, "arc", "mp", storage.ObjectMeta{SSE: "AES256", Encryption: storage.EncryptionRestic}, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	writePart(t, b, "arc", "mp", up.UploadID, 1, "part one;")
+	writePart(t, b, "arc", "mp", up.UploadID, 2, "part two")
+	mi, err := b.CompleteMultipartUploadWith(ctx, "arc", "mp", up.UploadID, []int{1, 2}, storage.ObjectMeta{ETag: "x-2", SSE: "AES256"},
+		storage.CommitOptions{}, storage.WriteOptions{Encryption: storage.EncryptionRestic})
+	if err != nil {
+		t.Fatal(err)
+	}
+	eq(t, "multipart", read(t, b, "arc", "mp", mi.VersionID), "part one;part two")
 }

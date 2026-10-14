@@ -39,13 +39,7 @@ type Deps struct {
 	// BackendName is "fs" or "memory"; DataPath is the data directory ("" if none).
 	BackendName string
 	DataPath    string
-	// Backings are the storage backings buckets can be created on (the
-	// server's own storage first, named "local"); DefaultBacking is the
-	// backing of buckets created without a choice ("" = "local"). Empty
-	// Backings means only "local".
-	Backings       []Backing
-	DefaultBacking string
-	Logger         *slog.Logger
+	Logger      *slog.Logger
 	// TrustProxyHeaders derives the aws:SourceIp and aws:SecureTransport
 	// condition keys, honouring X-Forwarded-For / X-Forwarded-Proto from
 	// trusted reverse proxies (server.trust_proxy_headers and

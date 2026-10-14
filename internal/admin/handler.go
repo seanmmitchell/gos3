@@ -73,6 +73,17 @@ type reqCtx struct {
 	auth   *auth.Result
 	id     auth.Identity
 	action string // admin action, "" for endpoints open to any identity
+	// keyOwner is the owner of the {accessKey} path value that the route's
+	// action was authorized against (set by keyOwnerARN; "" when the key
+	// was unknown and the action was authorized at service level).
+	keyOwner string
+
+	start         time.Time // when the endpoint received the request
+	preAuthorized bool      // action was authorized on resource before the handler ran
+	resource      string    // the resource action was authorized against
+	// afterBody, when set, runs once readBody has read the whole body
+	// (api.revalidateAfterBody).
+	afterBody func() error
 }
 
 // handlerFunc is an authenticated endpoint. It returns the HTTP status and
@@ -113,11 +124,14 @@ func pathTarget(arn func(string) string, param string) target {
 
 // api is the admin API handler.
 type api struct {
-	d       Deps
-	log     *slog.Logger
-	mux     *http.ServeMux
-	started time.Time
-	now     func() time.Time
+	// configLocks serializes encryption provider changes per bucket and
+	// restic storage changes per backing.
+	configLocks keyedMutex
+	d           Deps
+	log         *slog.Logger
+	mux         *http.ServeMux
+	started     time.Time
+	now         func() time.Time
 
 	usage  *ttlCache[storage.BucketUsage] // per bucket
 	totals *ttlCache[storageTotals]       // key ""
@@ -168,7 +182,6 @@ func (a *api) routes() []route {
 		{"GET", "/stats", "GetStats", service, a.stats},
 		{"GET", "/config", "GetConfig", service, a.getConfig},
 		{"PUT", "/config", "UpdateConfig", service, a.putConfig},
-		{"GET", "/backings", "ListBackings", service, a.listBackings},
 		// Users & access keys
 		{"GET", "/users", "ListUsers", service, a.listUsers},
 		{"POST", "/users", "CreateUser", inHandler, a.createUser}, // user/<body name>, admin:PolicyName
@@ -188,6 +201,23 @@ func (a *api) routes() []route {
 		{"GET", "/buckets", "ListBuckets", service, a.listBuckets},
 		{"GET", "/buckets/{name}", "GetBucket", bucket, a.getBucket},
 		{"DELETE", "/buckets/{name}", "ForceDeleteBucket", bucket, a.deleteBucket},
+		// Storage backings and bucket placement
+		{"GET", "/backings", "ListBackings", service, a.listBackings},
+		{"GET", "/backings/{name}/restic", "ListBackings", service, a.getBackingRestic},
+		{"PUT", "/backings/{name}/restic", "UpdateConfig", service, a.putBackingRestic},
+		{"GET", "/backings/config", "GetConfig", service, a.getBackingConfig},
+		{"PUT", "/backings/config", "UpdateConfig", service, a.putBackingConfig},
+		{"GET", "/buckets/{name}/placement", "GetBucketPlacement", bucket, a.getPlacement},
+		{"PUT", "/buckets/{name}/placement", "UpdateBucketPlacement", bucket, a.putPlacement},
+		{"POST", "/buckets/{name}/placement/move", "UpdateBucketPlacement", bucket, a.startMove},
+		{"DELETE", "/buckets/{name}/placement/move", "UpdateBucketPlacement", bucket, a.cancelMove},
+		{"POST", "/buckets/{name}/placement/promote", "UpdateBucketPlacement", bucket, a.promote},
+		{"POST", "/buckets/{name}/placement/resync", "UpdateBucketPlacement", bucket, a.resync},
+		{"GET", "/buckets/{name}/encryption-provider", "GetBucketEncryption", bucket, a.getBucketEncryption},
+		{"PUT", "/buckets/{name}/encryption-provider", "PutBucketEncryption", bucket, a.putBucketEncryption},
+		{"GET", "/buckets/{name}/compression", "GetBucketCompression", bucket, a.getBucketCompression},
+		{"PUT", "/buckets/{name}/compression", "PutBucketCompression", bucket, a.putBucketCompression},
+		{"DELETE", "/buckets/{name}/compression", "PutBucketCompression", bucket, a.deleteBucketCompression},
 		// Discovery
 		{"GET", "/discovery", "GetDiscovery", service, a.getDiscovery},
 		{"POST", "/discovery/probe", "ProbeNetwork", service, a.probe},
@@ -197,12 +227,15 @@ func (a *api) routes() []route {
 
 // keyOwnerARN is the target of the {accessKey} routes: the user owning the
 // key, or service level for unknown keys (so a delegated administrator
-// cannot tell unknown keys from other users' keys).
+// cannot tell unknown keys from other users' keys). It records the owner
+// in rc.keyOwner so the handler can bind the change to it (see
+// updateAccessKey).
 func (a *api) keyOwnerARN(rc *reqCtx) string {
 	owner, err := a.d.IAM.AccessKeyOwner(rc.ctx, rc.r.PathValue("accessKey"))
 	if err != nil {
 		return ""
 	}
+	rc.keyOwner = owner
 	return iam.AdminUserARN(owner)
 }
 
@@ -300,16 +333,17 @@ func (a *api) endpoint(rt route) http.Handler {
 			writeError(w, e)
 			return
 		}
-		rc := &reqCtx{r: r, ctx: r.Context(), auth: res, id: res.Identity, action: action}
+		rc := &reqCtx{r: r, ctx: r.Context(), auth: res, id: res.Identity, action: action, start: a.now()}
+		rc.afterBody = func() error { return a.revalidateAfterBody(rc) }
 		if action != "" && !rt.res.inHandler {
-			resource := ""
 			if rt.res.resource != nil {
-				resource = rt.res.resource(rc)
+				rc.resource = rt.res.resource(rc)
 			}
-			if err := a.requireAction(rc, action, resource, nil); err != nil {
+			if err := a.requireAction(rc, action, rc.resource, nil); err != nil {
 				writeError(w, a.toAPIError(err))
 				return
 			}
+			rc.preAuthorized = true
 		}
 		status, body, err := rt.h(rc)
 		if err != nil {
@@ -458,6 +492,10 @@ func (a *api) toAPIError(err error) *apiError {
 	}
 	msg := strings.TrimPrefix(err.Error(), "iam: ")
 	msg = strings.TrimPrefix(msg, "storage: ")
+	msg = strings.TrimPrefix(msg, "multi: ")
+	if pe := placementError(err, msg); pe != nil {
+		return pe
+	}
 	switch {
 	// iam (order matters: some errors wrap others)
 	case errors.Is(err, iam.ErrUserNotFound), errors.Is(err, iam.ErrKeyNotFound), errors.Is(err, iam.ErrPolicyNotFound):
@@ -522,6 +560,8 @@ func writeJSON(w http.ResponseWriter, status int, v any) {
 
 // readBody reads the (verified) request body, bounded by maxBodySize.
 // Signature / payload hash failures surface here (auth verifies at EOF).
+// Once the body is read, rc.afterBody re-checks that the caller may still
+// make the request (see api.revalidateAfterBody).
 func (rc *reqCtx) readBody() ([]byte, error) {
 	if rc.auth == nil || rc.auth.Body == nil {
 		return nil, nil
@@ -539,6 +579,11 @@ func (rc *reqCtx) readBody() ([]byte, error) {
 	}
 	if len(data) > maxBodySize {
 		return nil, badRequest("request body exceeds %d bytes", maxBodySize)
+	}
+	if rc.afterBody != nil {
+		if err := rc.afterBody(); err != nil {
+			return nil, err
+		}
 	}
 	return data, nil
 }

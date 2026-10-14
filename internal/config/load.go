@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"math"
 	"net"
+	"net/netip"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -16,10 +17,11 @@ import (
 	"strings"
 	"time"
 
-	"gopkg.in/yaml.v3"
+	"go.yaml.in/yaml/v3"
 
 	"github.com/seanmmitchell/gos3/internal/clientip"
 	"github.com/seanmmitchell/gos3/internal/discovery"
+	"github.com/seanmmitchell/gos3/internal/storage/compress"
 )
 
 // Defaults that are not obvious from Default().
@@ -32,10 +34,42 @@ const (
 	DefaultShutdownTimeout = 30 * time.Second
 	DefaultLifecycleEvery  = time.Hour
 	DefaultCORSMaxAge      = 3600
+	// DefaultMaxConnections is the default server.max_connections (no
+	// limit: the process's file descriptor limit applies).
+	DefaultMaxConnections = 0
+	// DefaultCompressionLevel is the default compression.level (DEFLATE
+	// level 1: fastest, still about 3x on source code and text).
+	DefaultCompressionLevel = compress.DefaultLevel
+	// DefaultCompressionMinSize is the default compression.min_size: the
+	// smallest object that can save a file system block.
+	DefaultCompressionMinSize = 4096
+	// MinRootSecretLen is the root secret key length below which gos3
+	// warns at startup (a short secret can be brute-forced offline from a
+	// single captured signed request).
+	MinRootSecretLen = 16
 
-	// BackendFS and BackendMemory are the StorageConfig.Backend values.
+	// BackendFS and BackendMemory are the StorageConfig.Backend values;
+	// BackingConfig.Backend may also be BackendS3 (a remote S3 service,
+	// see docs/backings.md).
 	BackendFS     = "fs"
 	BackendMemory = "memory"
+	BackendS3     = "s3"
+
+	// DefaultBackingName names the backing configured by storage.backend
+	// and storage.path.
+	DefaultBackingName = "default"
+	// Replication defaults and limits (storage.replication).
+	DefaultReplicationWorkers = 2
+	MaxReplicationWorkers     = 64
+	DefaultHealthInterval     = 10 * time.Second
+	DefaultCutoverTimeout     = 60 * time.Second
+	// MaxBackings bounds storage.backings.
+	MaxBackings = 64
+
+	// Replication modes (storage.replication.default_mode).
+	ReplicationSingle        = "single"
+	ReplicationActivePassive = "active-passive"
+	ReplicationActiveActive  = "active-active"
 
 	// SystemDirName is the directory under the data path holding system
 	// state (iam.json, settings.json, server-id, root-credentials.json and
@@ -64,6 +98,18 @@ var DefaultExposeHeaders = []string{
 	"x-amz-abort-date", "x-amz-abort-rule-id", "x-amz-bucket-region", "x-gos3-backing",
 }
 
+// DefaultSkipContentTypes are the media types stored uncompressed by
+// default (compression.skip_content_types): formats that are compressed
+// already, where DEFLATE would spend CPU for nothing.
+var DefaultSkipContentTypes = []string{
+	"image/jpeg", "image/png", "image/gif", "image/webp", "image/avif", "image/heic", "image/heif", "image/jxl",
+	"video/*", "audio/*", "font/woff", "font/woff2",
+	"application/zip", "application/gzip", "application/x-gzip", "application/zstd", "application/x-bzip2",
+	"application/x-xz", "application/x-7z-compressed", "application/x-rar-compressed", "application/vnd.rar",
+	"application/x-lz4", "application/java-archive", "application/epub+zip",
+	"application/vnd.openxmlformats-officedocument.*", "application/vnd.oasis.opendocument.*",
+}
+
 // Default returns the default configuration. Name defaults to the host name
 // (truncated to MaxNameLen). Storage.Path is DefaultDataPath; note that Load
 // only keeps it for the fs backend: a memory backend whose path is not
@@ -81,13 +127,20 @@ func Default() Config {
 			MaxObjectSize:   DefaultMaxObjectSize,
 			PublicInfo:      true,
 			ShutdownTimeout: DefaultShutdownTimeout,
+			MaxConnections:  DefaultMaxConnections,
 		},
 		Storage: StorageConfig{
 			Backend:   BackendFS,
 			Path:      DefaultDataPath,
 			FsyncData: true,
+			Replication: ReplicationConfig{
+				Workers:        DefaultReplicationWorkers,
+				HealthInterval: DefaultHealthInterval,
+				CutoverTimeout: DefaultCutoverTimeout,
+			},
 		},
-		UI: UIConfig{Enabled: true, RedirectRoot: true},
+		UI:    UIConfig{Enabled: defaultUIEnabled, RedirectRoot: true},
+		Admin: AdminConfig{Enabled: true},
 		CORS: CORSConfig{
 			AllowedOrigins: []string{"*"},
 			AllowedHeaders: []string{"*"},
@@ -98,6 +151,12 @@ func Default() Config {
 		Logging:   LoggingConfig{Level: "info", Format: "text", AccessLog: true},
 		Lifecycle: LifecycleConfig{Enabled: true, Interval: DefaultLifecycleEvery},
 		Metrics:   MetricsConfig{Enabled: true},
+		Compression: CompressionConfig{
+			Mode:             CompressionOptional,
+			Level:            DefaultCompressionLevel,
+			MinSize:          DefaultCompressionMinSize,
+			SkipContentTypes: slices.Clone(DefaultSkipContentTypes),
+		},
 	}
 }
 
@@ -109,9 +168,9 @@ type Override struct {
 	Value string
 }
 
-// Load returns the configuration from defaults < YAML file < environment
-// (GOS3_*) < overrides (CLI flags). path is the YAML file ("" =
-// $GOS3_CONFIG, and no file when that is unset too). Unknown YAML fields are
+// Load returns the configuration from defaults < JSON/YAML file < environment
+// (GOS3_*, with MinIO aliases) < overrides (CLI flags). path is the config file ("" =
+// $GOS3_CONFIG, and no file when that is unset too). Unknown fields are
 // rejected. The result is normalized (see Normalize) but not validated:
 // call Validate before using it.
 //
@@ -133,7 +192,7 @@ func load(path string, lookup func(string) (string, bool), overrides []Override)
 		if err != nil {
 			return Config{}, fmt.Errorf("config: %w", err)
 		}
-		if err := decodeYAML(data, &cfg); err != nil {
+		if err := decodeFile(path, data, &cfg); err != nil {
 			return Config{}, fmt.Errorf("config: %s: %w", path, err)
 		}
 	}
@@ -182,15 +241,19 @@ var unknownFieldRe = regexp.MustCompile(`field (\S+) not found in type (\S+)`)
 
 // yamlSections maps the Go types of Config sections to their YAML keys.
 var yamlSections = map[string]string{
-	"config.ServerConfig":    "server",
-	"config.StorageConfig":   "storage",
-	"config.AuthConfig":      "auth",
-	"config.UIConfig":        "ui",
-	"config.CORSConfig":      "cors",
-	"discovery.Config":       "discovery",
-	"config.LoggingConfig":   "logging",
-	"config.LifecycleConfig": "lifecycle",
-	"config.MetricsConfig":   "metrics",
+	"config.AdminConfig":       "admin",
+	"config.ServerConfig":      "server",
+	"config.StorageConfig":     "storage",
+	"config.BackingConfig":     "storage.backings",
+	"config.ReplicationConfig": "storage.replication",
+	"config.AuthConfig":        "auth",
+	"config.UIConfig":          "ui",
+	"config.CORSConfig":        "cors",
+	"discovery.Config":         "discovery",
+	"config.LoggingConfig":     "logging",
+	"config.LifecycleConfig":   "lifecycle",
+	"config.MetricsConfig":     "metrics",
+	"config.CompressionConfig": "compression",
 }
 
 // describeUnknownField rewrites an unknown-field message in terms of YAML
@@ -201,7 +264,7 @@ func describeUnknownField(m string) string {
 		return fmt.Sprintf("unknown key %q in section %q", sub[1], sec)
 	}
 	if sub[2] == "config.Config" {
-		return fmt.Sprintf("unknown top-level key %q (expected server, storage, auth, ui, cors, discovery, logging, lifecycle or metrics)", sub[1])
+		return fmt.Sprintf("unknown top-level key %q (expected server, storage, auth, ui, admin, cors, discovery, logging, lifecycle, metrics or compression)", sub[1])
 	}
 	return fmt.Sprintf("unknown key %q", sub[1])
 }
@@ -210,6 +273,9 @@ func describeUnknownField(m string) string {
 // address, region and maximum object size when empty or zero), lower-cases
 // enumerations and trims list entries, dropping empty ones.
 func (c *Config) Normalize() {
+	if !c.Admin.Enabled {
+		c.UI.Enabled = false
+	}
 	c.Storage.Backend = strings.ToLower(strings.TrimSpace(c.Storage.Backend))
 	if c.Storage.Backend == "" {
 		c.Storage.Backend = BackendFS
@@ -217,7 +283,28 @@ func (c *Config) Normalize() {
 	if c.Storage.Backend == BackendFS && c.Storage.Path == "" {
 		c.Storage.Path = DefaultDataPath
 	}
-	c.normalizeBackings()
+	for i := range c.Storage.Backings {
+		b := &c.Storage.Backings[i]
+		b.Name = strings.TrimSpace(b.Name)
+		b.Backend = strings.ToLower(strings.TrimSpace(b.Backend))
+		if b.Backend == "" {
+			b.Backend = BackendFS
+		}
+	}
+	c.Storage.DefaultBacking = strings.TrimSpace(c.Storage.DefaultBacking)
+	c.normalizeS3Backings()
+	rp := &c.Storage.Replication
+	rp.DefaultMode = strings.ToLower(strings.TrimSpace(rp.DefaultMode))
+	rp.DefaultReplicas = trimList(rp.DefaultReplicas)
+	if rp.Workers == 0 {
+		rp.Workers = DefaultReplicationWorkers
+	}
+	if rp.HealthInterval == 0 {
+		rp.HealthInterval = DefaultHealthInterval
+	}
+	if rp.CutoverTimeout == 0 {
+		rp.CutoverTimeout = DefaultCutoverTimeout
+	}
 	if c.Server.Region == "" {
 		c.Server.Region = DefaultRegion
 	}
@@ -229,6 +316,10 @@ func (c *Config) Normalize() {
 	}
 	c.Server.Domains = trimList(c.Server.Domains)
 	c.Server.TrustedProxies = trimList(c.Server.TrustedProxies)
+	c.Server.AllowedHosts = trimList(c.Server.AllowedHosts)
+	for i, h := range c.Server.AllowedHosts {
+		c.Server.AllowedHosts[i] = strings.TrimSuffix(strings.ToLower(h), ".")
+	}
 	c.CORS.AllowedOrigins = trimList(c.CORS.AllowedOrigins)
 	c.CORS.AllowedHeaders = trimList(c.CORS.AllowedHeaders)
 	c.CORS.ExposeHeaders = trimList(c.CORS.ExposeHeaders)
@@ -236,6 +327,14 @@ func (c *Config) Normalize() {
 	c.Discovery.DNSSRV = trimList(c.Discovery.DNSSRV)
 	c.Logging.Level = strings.ToLower(strings.TrimSpace(c.Logging.Level))
 	c.Logging.Format = strings.ToLower(strings.TrimSpace(c.Logging.Format))
+	c.Compression.Mode = strings.ToLower(strings.TrimSpace(c.Compression.Mode))
+	if c.Compression.Mode == "" {
+		c.Compression.Mode = CompressionOptional
+	}
+	if c.Compression.Level == 0 {
+		c.Compression.Level = DefaultCompressionLevel
+	}
+	c.Compression.SkipContentTypes = trimList(c.Compression.SkipContentTypes)
 }
 
 func trimList(in []string) []string {
@@ -278,6 +377,18 @@ func (c Config) Validate() error {
 	if _, err := clientip.ParsePrefixes(c.Server.TrustedProxies); err != nil {
 		return fmt.Errorf("server.trusted_proxies%w", err)
 	}
+	if c.Server.TrustProxyHeaders && len(c.Server.TrustedProxies) == 0 {
+		return errors.New("server.trust_proxy_headers is on but server.trusted_proxies is empty: list the addresses " +
+			"of your reverse proxies (e.g. [\"127.0.0.1\", \"10.0.0.5\"], GOS3_TRUSTED_PROXIES); otherwise any client " +
+			"that reaches gos3 directly could choose its own aws:SourceIp and aws:SecureTransport with " +
+			"X-Forwarded-For / X-Forwarded-Proto")
+	}
+	if err := validateAllowedHosts(c.Server.AllowedHosts); err != nil {
+		return err
+	}
+	if c.Server.MaxConnections < 0 {
+		return fmt.Errorf("server.max_connections: must not be negative (0 = no limit), got %d", c.Server.MaxConnections)
+	}
 	switch c.Storage.Backend {
 	case BackendFS:
 		if c.Storage.Path == "" {
@@ -292,6 +403,12 @@ func (c Config) Validate() error {
 	}
 	if err := validateRootCredentials(c.Auth.RootAccessKey, c.Auth.RootSecretKey); err != nil {
 		return err
+	}
+	if IsDemoSecret(c.Auth.RootSecretKey) && !c.Auth.InsecureDemoCredentials {
+		return fmt.Errorf("auth.root_secret_key: %q is a published example secret: anyone can sign requests with it, "+
+			"including any website you visit (through your browser, which can reach this server). Choose your own "+
+			"(\"gos3 keygen\" prints a random pair), or set %s=true for a throwaway local demo",
+			c.Auth.RootSecretKey, EnvInsecureDemoCredentials)
 	}
 	if iv := c.Lifecycle.Interval; iv != 0 {
 		if lo, hi := MinLifecycleSeconds*time.Second, MaxLifecycleSeconds*time.Second; iv < lo || iv > hi || iv%time.Second != 0 {
@@ -312,20 +429,22 @@ func (c Config) Validate() error {
 // Config fields they are derived from (see SettingsFrom). Paths that are the
 // same in both forms (e.g. "logging.level", "discovery.seeds") are absent.
 var settingsYAMLKeys = map[string]string{
-	"name":                      "server.name",
-	"region":                    "server.region",
-	"publicUrl":                 "server.public_url",
-	"domains":                   "server.domains",
-	"cors.allowedOrigins":       "cors.allowed_origins",
-	"cors.allowedHeaders":       "cors.allowed_headers",
-	"cors.exposeHeaders":        "cors.expose_headers",
-	"cors.maxAgeSeconds":        "cors.max_age_seconds",
-	"discovery.beaconGroup":     "discovery.beacon_group",
-	"discovery.beaconInterval":  "discovery.beacon_interval",
-	"discovery.peerTtl":         "discovery.peer_ttl",
-	"discovery.dnsSrv":          "discovery.dns_srv",
-	"discovery.maxScanHosts":    "discovery.max_scan_hosts",
-	"lifecycle.intervalSeconds": "lifecycle.interval",
+	"name":                         "server.name",
+	"region":                       "server.region",
+	"publicUrl":                    "server.public_url",
+	"domains":                      "server.domains",
+	"cors.allowedOrigins":          "cors.allowed_origins",
+	"cors.allowedHeaders":          "cors.allowed_headers",
+	"cors.exposeHeaders":           "cors.expose_headers",
+	"cors.maxAgeSeconds":           "cors.max_age_seconds",
+	"discovery.beaconGroup":        "discovery.beacon_group",
+	"discovery.beaconInterval":     "discovery.beacon_interval",
+	"discovery.peerTtl":            "discovery.peer_ttl",
+	"discovery.dnsSrv":             "discovery.dns_srv",
+	"discovery.maxScanHosts":       "discovery.max_scan_hosts",
+	"lifecycle.intervalSeconds":    "lifecycle.interval",
+	"compression.minSize":          "compression.min_size",
+	"compression.skipContentTypes": "compression.skip_content_types",
 }
 
 // yamlField translates a FieldError path ("cors.allowedOrigins[2]") to the
@@ -362,6 +481,61 @@ func validateRootCredentials(ak, sk string) error {
 	return nil
 }
 
+// EnvInsecureDemoCredentials is the environment variable of
+// auth.insecure_demo_credentials.
+const EnvInsecureDemoCredentials = "GOS3_INSECURE_DEMO_CREDENTIALS"
+
+// demoSecrets are root secret keys published in gos3's own documentation
+// and demo files (README, docs, docker-compose.yml) and in those of other
+// S3 servers, compared case-insensitively.
+var demoSecrets = []string{
+	"change-me-now",    // README / docs quickstart
+	"gos3admin-secret", // docker-compose.yml demo
+	"minioadmin",       // MinIO default
+	"wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY", // AWS documentation example
+	"wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY",
+	"changeme", "change-me", "password", "secretkey", "secret-key",
+}
+
+// IsDemoSecret reports whether secret is a root secret key published in
+// documentation or demo files (auth.insecure_demo_credentials is required
+// to use one).
+func IsDemoSecret(secret string) bool {
+	for _, d := range demoSecrets {
+		if strings.EqualFold(secret, d) {
+			return true
+		}
+	}
+	return false
+}
+
+// validateAllowedHosts checks server.allowed_hosts: "*" alone, or host
+// names, "*.<domain>" wildcards and IP addresses (no scheme or port).
+func validateAllowedHosts(hosts []string) error {
+	if len(hosts) > MaxListEntries {
+		return fmt.Errorf("server.allowed_hosts: at most %d entries allowed", MaxListEntries)
+	}
+	for i, h := range hosts {
+		if h == "*" {
+			if len(hosts) > 1 {
+				return errors.New("server.allowed_hosts: \"*\" (any host) must be the only entry")
+			}
+			continue
+		}
+		ip := h
+		if strings.HasPrefix(ip, "[") && strings.HasSuffix(ip, "]") {
+			ip = ip[1 : len(ip)-1]
+		}
+		if a, err := netip.ParseAddr(ip); err == nil && a.Zone() == "" {
+			continue
+		}
+		if name := strings.TrimPrefix(h, "*."); !ValidHostname(name) {
+			return fmt.Errorf("server.allowed_hosts[%d]: %q is not a host name, \"*.<domain>\" wildcard or IP address (no scheme or port)", i, h)
+		}
+	}
+	return nil
+}
+
 // SettingsFrom derives the initial runtime Settings from a static Config,
 // substituting discovery defaults for zero values so the result passes
 // ValidateSettings whenever the config is valid.
@@ -388,6 +562,18 @@ func SettingsFrom(c Config) Settings {
 	if region == "" {
 		region = DefaultRegion
 	}
+	comp := CompressionSettings{
+		Mode:             c.Compression.Mode,
+		Level:            c.Compression.Level,
+		MinSize:          c.Compression.MinSize,
+		SkipContentTypes: c.Compression.SkipContentTypes,
+	}
+	if comp.Mode == "" {
+		comp.Mode = CompressionOptional
+	}
+	if comp.Level == 0 {
+		comp.Level = DefaultCompressionLevel
+	}
 	s := Settings{
 		Name:          c.Server.Name,
 		Region:        region,
@@ -400,6 +586,7 @@ func SettingsFrom(c Config) Settings {
 		Logging:       c.Logging,
 		Lifecycle:     LifecycleSettings{Enabled: c.Lifecycle.Enabled, IntervalSeconds: int64(interval / time.Second)},
 		MetricsPublic: c.Metrics.Public,
+		Compression:   comp,
 	}
 	return normalizeSettings(cloneSettings(s))
 }
@@ -419,6 +606,7 @@ func normalizeSettings(s Settings) Settings {
 	s.CORS.ExposeHeaders = nn(s.CORS.ExposeHeaders)
 	s.Discovery.Seeds = nn(s.Discovery.Seeds)
 	s.Discovery.DNSSRV = nn(s.Discovery.DNSSRV)
+	s.Compression.SkipContentTypes = nn(s.Compression.SkipContentTypes)
 	return s
 }
 
@@ -464,12 +652,15 @@ func (c Config) Redacted() Config {
 	}
 	c.Storage.Backings = slices.Clone(c.Storage.Backings)
 	for i := range c.Storage.Backings {
-		if c.Storage.Backings[i].SecretKey != "" {
-			c.Storage.Backings[i].SecretKey = RedactedValue
+		if s3 := c.Storage.Backings[i].S3; s3 != nil && s3.SecretKey != "" {
+			cp := *s3
+			cp.SecretKey = RedactedValue
+			c.Storage.Backings[i].S3 = &cp
 		}
 	}
 	c.Server.Domains = slices.Clone(c.Server.Domains)
 	c.Server.TrustedProxies = slices.Clone(c.Server.TrustedProxies)
+	c.Server.AllowedHosts = slices.Clone(c.Server.AllowedHosts)
 	c.CORS = cloneCORS(c.CORS)
 	c.Discovery.Seeds = slices.Clone(c.Discovery.Seeds)
 	c.Discovery.DNSSRV = slices.Clone(c.Discovery.DNSSRV)

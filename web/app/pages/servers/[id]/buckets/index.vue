@@ -1,13 +1,15 @@
 <script setup lang="ts">
 import type { DropdownMenuItem, TableColumn } from '@nuxt/ui'
-import type { BackingMode, BucketUsage } from '~/types/admin'
+import type { BucketUsage, PlacementSummary } from '~/types/admin'
 import { S3Error } from '~/utils/s3/errors'
 import { AdminError } from '~/utils/admin/client'
 import { usageAgeNote } from '~/components/browser/-bucket-usage'
+import { placementChips, placementWorthShowing } from '~/components/admin/-storage'
+import { BYPASS_GOVERNANCE_HELP, FORCE_DELETE_LOCKED_TITLE, forceDeleteBlock } from '~/components/bucket-settings/-force-delete'
 
 /**
  * Bucket list. gos3 identities with admin rights get the admin listing
- * (usage, versioning, public / object-lock flags, storage backing);
+ * (usage, versioning, public / object-lock flags, placement);
  * everybody else gets plain S3 ListBuckets.
  */
 useHead({ title: 'Buckets' })
@@ -29,23 +31,19 @@ interface BucketRow {
   objectLock?: boolean
   public?: boolean
   usage?: BucketUsage | null
-  /** Storage backing mode (admin listing on gos3). */
-  backingMode?: BackingMode
-  /** Shown for buckets on a remote backing. */
-  backingBadge?: BackingBadge | null
+  /** Storage backing / replication (gos3 with storage backings). */
+  placement?: PlacementSummary
 }
 
-interface BackingBadge {
-  label: string
-  icon: string
-  title: string
+/** Kind / mode of a backing named in a placement (WhoAmI.backings). */
+function backingInfo(name: string) {
+  const b = findBacking(name, whoami.value?.backings)
+  return b ? backingKindInfo(b) : undefined
 }
 
-/** Badge for buckets stored on a remote backing (nothing for local storage). */
-function backingBadge(backing: string | undefined, mode: BackingMode | undefined): BackingBadge | null {
-  if (!backing || backing === LOCAL_BACKING) return null
-  const info = backingModeInfo(mode)
-  return { label: backing, icon: info.icon, title: `Stored on backing “${backing}” (${info.label}). ${info.description}` }
+/** The bucket's primary copy is on a gateway backing (no versioning). */
+function onGateway(row: BucketRow): boolean {
+  return isGatewayBacking(findBacking(row.placement?.primary, whoami.value?.backings))
 }
 
 interface Listing {
@@ -73,8 +71,7 @@ async function load(): Promise<Listing> {
           objectLock: b.objectLock,
           public: b.public,
           usage: b.usage,
-          backingMode: b.backingMode,
-          backingBadge: backingBadge(b.backing, b.backingMode)
+          placement: b.placement
         }))
       }
     } catch (e) {
@@ -127,12 +124,15 @@ function sortLabel(by: SortKey, label: string): string {
 }
 
 const showUsage = computed(() => data.value?.source === 'admin')
+// Placement chips only when they tell something (not "default" on every row).
+const showPlacement = computed(() => showUsage.value && placementWorthShowing((data.value?.rows ?? []).map(r => r.placement)))
 const showRegion = computed(() => (data.value?.rows ?? []).some(r => !!r.region))
 
 const columns = computed<TableColumn<BucketRow>[]>(() => {
   const cols: TableColumn<BucketRow>[] = [{ id: 'name', header: 'Name' }]
   if (showUsage.value) {
     cols.push({ id: 'versioning', header: 'Versioning' })
+    if (showPlacement.value) cols.push({ id: 'placement', header: 'Storage' })
     cols.push({ id: 'objects', header: 'Objects', meta: { class: { th: 'text-right', td: 'text-right' } } })
     cols.push({ id: 'bytes', header: 'Size', meta: { class: { th: 'text-right', td: 'text-right' } } })
   }
@@ -148,8 +148,17 @@ const usageNote = computed(() => (data.value && showUsage.value ? usageAgeNote(d
 const totals = computed(() => {
   const list = data.value?.rows ?? []
   if (!showUsage.value) return null
-  return list.reduce((acc, r) => ({ objects: acc.objects + (r.usage?.objects ?? 0), bytes: acc.bytes + (r.usage?.bytes ?? 0) }), { objects: 0, bytes: 0 })
+  const t = list.reduce((acc, r) => ({ objects: acc.objects + (r.usage?.objects ?? 0), bytes: acc.bytes + (r.usage?.bytes ?? 0) }), { objects: 0, bytes: 0 })
+  // Stored (physical) bytes only when every usage reports them (servers with compression).
+  const usages = list.map(r => r.usage).filter(u => !!u)
+  const storedBytes = usages.length && usages.every(u => u.storedBytes !== undefined)
+    ? usages.reduce((sum, u) => sum + (u.storedBytes ?? 0), 0)
+    : undefined
+  return { ...t, storedBytes }
 })
+
+// Compression saving of all buckets ("" without compressed data or on servers without it).
+const storedNote = computed(() => (totals.value ? formatStoredNote(totals.value.bytes, totals.value.storedBytes) : ''))
 
 // ---------------------------------------------------------------------------
 // Actions
@@ -168,8 +177,8 @@ function isNotEmpty(e: unknown): boolean {
 
 const deleting = ref<string | null>(null)
 
-async function forceDelete(name: string) {
-  const ok = await confirm({
+async function forceDelete(name: string, bypassGovernanceRetention = false) {
+  const ok = bypassGovernanceRetention || await confirm({
     title: `Force delete bucket ${name}?`,
     description: 'Every object, version, delete marker, pending upload and configuration in this bucket is deleted permanently, then the bucket itself. This cannot be undone.',
     confirmLabel: 'Delete everything',
@@ -179,11 +188,25 @@ async function forceDelete(name: string) {
   if (!ok) return
   deleting.value = name
   try {
-    await requireAdmin().deleteBucket(name, { force: true })
+    await requireAdmin().deleteBucket(name, { force: true, bypassGovernanceRetention })
     toast.add({ title: `Bucket ${name} and all its contents deleted`, color: 'success', icon: 'i-lucide-circle-check' })
     await refresh()
   } catch (e) {
-    toast.add({ title: 'Could not delete bucket', description: errorMessage(e), color: 'error', icon: 'i-lucide-circle-alert' })
+    const block = forceDeleteBlock(e)
+    if (block?.governance && !bypassGovernanceRetention) {
+      // Only GOVERNANCE retention is in the way: offer to bypass it.
+      deleting.value = null
+      const again = await confirm({
+        title: 'Bypass governance retention?',
+        description: `${block.message} ${BYPASS_GOVERNANCE_HELP}`,
+        confirmLabel: 'Delete with bypass',
+        requireText: name,
+        icon: 'i-lucide-lock-open'
+      })
+      if (again) await forceDelete(name, true)
+      return
+    }
+    toast.add({ title: block ? FORCE_DELETE_LOCKED_TITLE : 'Could not delete bucket', description: errorMessage(e), color: 'error', icon: block ? 'i-lucide-lock' : 'i-lucide-circle-alert' })
   } finally {
     deleting.value = null
   }
@@ -263,7 +286,7 @@ const isAccessDenied = computed(() => {
     <CommonPageHeader
       title="Buckets"
       icon="i-lucide-database"
-      :description="data ? `${data.rows.length} bucket${data.rows.length === 1 ? '' : 's'} on ${connection?.name ?? 'this server'}${totals ? ` · ${formatNumber(totals.objects)} object${totals.objects === 1 ? '' : 's'} · ${formatBytes(totals.bytes)}${usageNote}` : ''}` : `Buckets on ${connection?.name ?? 'this server'}`"
+      :description="data ? `${data.rows.length} bucket${data.rows.length === 1 ? '' : 's'} on ${connection?.name ?? 'this server'}${totals ? ` · ${formatNumber(totals.objects)} object${totals.objects === 1 ? '' : 's'} · ${formatBytes(totals.bytes)}${storedNote ? ` · ${storedNote}` : ''}${usageNote}` : ''}` : `Buckets on ${connection?.name ?? 'this server'}`"
     >
       <template #actions>
         <UButton
@@ -402,28 +425,31 @@ const isAccessDenied = computed(() => {
             </NuxtLink>
             <UBadge v-if="row.original.public" color="warning" variant="subtle" size="sm" label="Public" icon="i-lucide-globe" />
             <UBadge v-if="row.original.objectLock" color="info" variant="subtle" size="sm" label="Object lock" icon="i-lucide-lock" />
-            <UBadge
-              v-if="row.original.backingBadge"
-              color="neutral"
-              variant="subtle"
-              size="sm"
-              :label="row.original.backingBadge.label"
-              :icon="row.original.backingBadge.icon"
-              :title="row.original.backingBadge.title"
-            />
           </div>
         </template>
         <template #versioning-cell="{ row }">
           <UBadge v-if="row.original.versioning === 'Enabled'" color="success" variant="subtle" size="sm" label="Enabled" />
           <UBadge v-else-if="row.original.versioning === 'Suspended'" color="warning" variant="subtle" size="sm" label="Suspended" />
-          <span v-else-if="!backingSupportsVersioning(row.original.backingMode)" class="text-sm text-muted" title="Gateway backings do not support versioning">n/a</span>
+          <span v-else-if="onGateway(row.original)" class="text-sm text-muted" title="Gateway backings do not support versioning">n/a</span>
           <span v-else class="text-sm text-muted">Off</span>
+        </template>
+        <template #placement-cell="{ row }">
+          <div class="flex flex-wrap items-center gap-1" data-testid="placement-chips">
+            <UTooltip v-for="chip in placementChips(row.original.placement, backingInfo)" :key="chip.label" :text="chip.title">
+              <UBadge :label="chip.label" :color="chip.color" :icon="chip.icon" variant="subtle" size="sm" />
+            </UTooltip>
+          </div>
         </template>
         <template #objects-cell="{ row }">
           <span class="tabular-nums">{{ row.original.usage ? formatNumber(row.original.usage.objects) : '—' }}</span>
         </template>
         <template #bytes-cell="{ row }">
-          <CommonByteSize v-if="row.original.usage" :bytes="row.original.usage.bytes" class="tabular-nums" />
+          <template v-if="row.original.usage">
+            <CommonByteSize :bytes="row.original.usage.bytes" class="tabular-nums" />
+            <span v-if="formatStoredNote(row.original.usage.bytes, row.original.usage.storedBytes)" class="block text-xs text-dimmed">
+              {{ formatStoredNote(row.original.usage.bytes, row.original.usage.storedBytes) }}
+            </span>
+          </template>
           <span v-else class="text-muted">—</span>
         </template>
         <template #region-cell="{ row }">

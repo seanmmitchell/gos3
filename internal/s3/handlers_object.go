@@ -10,6 +10,7 @@ import (
 	"errors"
 	"io"
 	"log/slog"
+	"maps"
 	"mime"
 	"net/http"
 	"net/url"
@@ -207,13 +208,14 @@ func (s *Server) commitError(ctx context.Context, err error, bucket, key string,
 	return s3err.ErrPreconditionFailed.With("Condition", "If-None-Match")
 }
 
-// storeObject streams src into a new version of bucket/key and commits it
+// storeObject streams src (size bytes, -1 = unknown) into a new version of
+// bucket/key, compressed as the compression policy says, and commits it
 // with meta and cond. finish runs after src reached EOF and before the
 // commit (to set ETag and checksums computed while streaming). The writer
 // is aborted on any error.
-func (s *Server) storeObject(ctx context.Context, bucket, key string, src io.Reader, meta storage.ObjectMeta,
+func (s *Server) storeObject(ctx context.Context, bucket, key string, src io.Reader, size int64, meta storage.ObjectMeta,
 	cond storage.CommitOptions, finish func(*storage.ObjectMeta) error) (storage.ObjectInfo, error) {
-	ow, err := s.backend.NewObjectWriter(ctx, bucket, key)
+	ow, err := s.newObjectWriter(ctx, bucket, key, s.objectCompression(ctx, bucket, meta, size), meta.Encryption)
 	if err != nil {
 		return storage.ObjectInfo{}, bucketError(err, bucket)
 	}
@@ -239,6 +241,26 @@ func (s *Server) storeObject(ctx context.Context, bucket, key string, src io.Rea
 	return info, nil
 }
 
+// precheckWriteConditions evaluates the conditional write headers cond of
+// a write to bucket/key before its data is received, when that data is
+// archived with restic (meta.Encryption): archiving costs a full upload
+// into the repository, which a write that is refused at commit anyway
+// should not cause. The commit evaluates the conditions again atomically.
+func (s *Server) precheckWriteConditions(ctx context.Context, bucket, key string, meta storage.ObjectMeta, cond storage.CommitOptions) error {
+	if meta.Encryption != storage.EncryptionRestic || (!cond.IfNoneMatch && cond.IfMatch == "") {
+		return nil
+	}
+	info, err := s.backend.GetObjectInfo(ctx, bucket, key, "")
+	if err != nil && !errors.Is(err, storage.ErrObjectNotFound) {
+		return bucketError(err, bucket)
+	}
+	exists := err == nil && !info.DeleteMarker
+	if (cond.IfNoneMatch && exists) || (cond.IfMatch != "" && (!exists || info.ETag != cond.IfMatch)) {
+		return s.commitError(ctx, storage.ErrPreconditionFailed, bucket, key, cond)
+	}
+	return nil
+}
+
 // newObjectPayload is newPayloadReader for object data: when the client
 // asked for no checksum, a CRC64NVME checksum is computed and stored by
 // default, as S3 does for new objects.
@@ -258,7 +280,7 @@ func (s *Server) newObjectPayload(r *http.Request, rc *reqContext, opts payloadO
 //     s3:PutObjectRetention / s3:PutObjectLegalHold permissions
 //     (o.legalHoldSet: a legal hold header or field was given);
 //   - without explicit retention, the bucket's default retention applies;
-//   - without explicit SSE, the bucket's default encryption is recorded;
+//   - without explicit SSE, the bucket's default encryption applies;
 //   - a canned ACL (o.aclSet: given explicitly) requires s3:PutObjectAcl
 //     and must be allowed by the bucket's ownership controls and public
 //     access block;
@@ -278,29 +300,9 @@ func (s *Server) prepareNewObject(ctx context.Context, r *http.Request, rc *reqC
 	if o.legalHoldSet && !bi.ObjectLockEnabled {
 		return s3err.ErrInvalidRequest.WithMessage("Bucket is missing Object Lock Configuration")
 	}
-	if meta.RetentionMode != "" {
-		if err := s.authorizeTarget(ctx, r, rc, authzTarget{Action: "s3:PutObjectRetention", Bucket: bi.Name, Key: key,
-			ObjectAttrs: o.attrs}); err != nil {
-			return err
-		}
-	}
-	if o.legalHoldSet {
-		if err := s.authorizeTarget(ctx, r, rc, authzTarget{Action: "s3:PutObjectLegalHold", Bucket: bi.Name, Key: key,
-			ObjectAttrs: o.attrs}); err != nil {
-			return err
-		}
-	}
-	if o.aclSet {
-		if err := s.authorizeTarget(ctx, r, rc, authzTarget{Action: "s3:PutObjectAcl", Bucket: bi.Name, Key: key,
-			ObjectAttrs: o.attrs}); err != nil {
-			return err
-		}
-	}
-	if o.tagsSet {
-		if err := s.authorizeTarget(ctx, r, rc, authzTarget{Action: "s3:PutObjectTagging", Bucket: bi.Name, Key: key,
-			Conditions: requestTagConditions(meta.Tags), ObjectAttrs: o.attrs}); err != nil {
-			return err
-		}
+	o.retentionSet = o.retentionSet || meta.RetentionMode != ""
+	if err := s.authorizeNewObject(ctx, r, rc, bi.Name, key, meta.Tags, o, nil); err != nil {
+		return err
 	}
 	if bi.ObjectLockEnabled && meta.RetentionMode == "" {
 		mode, until, err := s.defaultRetention(ctx, bi.Name)
@@ -312,14 +314,52 @@ func (s *Server) prepareNewObject(ctx context.Context, r *http.Request, rc *reqC
 		}
 	}
 	if meta.SSE == "" {
-		sse, kmsKey, err := s.defaultEncryption(ctx, bi.Name)
+		sse, err := s.defaultEncryption(ctx, bi.Name)
 		if err != nil {
 			return err
 		}
-		meta.SSE, meta.SSEKMSKeyID = sse, kmsKey
+		meta.SSE = sse
+	}
+	return s.prepareEncryption(ctx, bi.Name, meta, r.UserAgent())
+}
+
+// authorizeNewObject makes the authorization checks of prepareNewObject
+// for the object bucket/key with the request tags tags: the permissions
+// the explicitly given attributes of o need, and the canned ACL against
+// the bucket's ownership controls and public access block. Handlers call
+// it again, through revalidateWrite, before a long-running write commits;
+// conds (nil on the first call) then holds condition keys to evaluate
+// instead of the request's (see requestTimeConditions).
+func (s *Server) authorizeNewObject(ctx context.Context, r *http.Request, rc *reqContext, bucket, key string,
+	tags map[string]string, o newObjectOpts, conds map[string][]string) error {
+	if o.retentionSet {
+		if err := s.authorizeTarget(ctx, r, rc, authzTarget{Action: "s3:PutObjectRetention", Bucket: bucket, Key: key,
+			Conditions: conds, ObjectAttrs: o.attrs}); err != nil {
+			return err
+		}
+	}
+	if o.legalHoldSet {
+		if err := s.authorizeTarget(ctx, r, rc, authzTarget{Action: "s3:PutObjectLegalHold", Bucket: bucket, Key: key,
+			Conditions: conds, ObjectAttrs: o.attrs}); err != nil {
+			return err
+		}
 	}
 	if o.aclSet {
-		if err := s.checkObjectACLAllowed(ctx, bi.Name, o.acl); err != nil {
+		if err := s.authorizeTarget(ctx, r, rc, authzTarget{Action: "s3:PutObjectAcl", Bucket: bucket, Key: key,
+			Conditions: conds, ObjectAttrs: o.attrs}); err != nil {
+			return err
+		}
+	}
+	if o.tagsSet {
+		tc := requestTagConditions(tags)
+		maps.Copy(tc, conds)
+		if err := s.authorizeTarget(ctx, r, rc, authzTarget{Action: "s3:PutObjectTagging", Bucket: bucket, Key: key,
+			Conditions: tc, ObjectAttrs: o.attrs}); err != nil {
+			return err
+		}
+	}
+	if o.aclSet {
+		if err := s.checkObjectACLAllowed(ctx, bucket, o.acl); err != nil {
 			return err
 		}
 	}
@@ -330,6 +370,7 @@ func (s *Server) prepareNewObject(ctx context.Context, r *http.Request, rc *reqC
 // that need permissions beyond s3:PutObject (see prepareNewObject).
 type newObjectOpts struct {
 	legalHoldSet bool   // an object lock legal hold header or field was given
+	retentionSet bool   // object lock retention was given explicitly
 	acl          string // the canned ACL
 	aclSet       bool   // a canned ACL was given explicitly
 	tagsSet      bool   // tags were given or copied (they are in meta.Tags)
@@ -346,6 +387,7 @@ func headerObjectOpts(h http.Header) newObjectOpts {
 	acl := h.Get("X-Amz-Acl")
 	return newObjectOpts{
 		legalHoldSet: h.Get("X-Amz-Object-Lock-Legal-Hold") != "",
+		retentionSet: trimHeaderSpace(h.Get("X-Amz-Object-Lock-Mode")) != "",
 		acl:          acl,
 		aclSet:       acl != "",
 		tagsSet:      h.Get("X-Amz-Tagging") != "",
@@ -419,6 +461,30 @@ type lockDefaults struct {
 	days, years int
 }
 
+func parseLockDefaults(raw []byte) (*lockDefaults, error) {
+	var doc objectLockConfigDoc
+	if err := xml.Unmarshal(raw, &doc); err != nil {
+		return nil, err
+	}
+	d := &lockDefaults{}
+	if doc.Rule != nil && doc.Rule.DefaultRetention != nil {
+		dr := doc.Rule.DefaultRetention
+		mode := strings.ToUpper(strings.TrimSpace(dr.Mode))
+		if (mode == "GOVERNANCE" || mode == "COMPLIANCE") && dr.Days >= 0 && dr.Years >= 0 &&
+			dr.Days <= maxRetentionYears*366 && dr.Years <= maxRetentionYears && dr.Days+dr.Years > 0 {
+			d.mode, d.days, d.years = mode, dr.Days, dr.Years
+		}
+	}
+	return d, nil
+}
+
+func (d *lockDefaults) retentionAt(created time.Time) (string, time.Time) {
+	if d.mode == "" {
+		return "", time.Time{}
+	}
+	return d.mode, created.UTC().AddDate(d.years, 0, d.days)
+}
+
 // maxRetentionYears bounds default retention periods (as S3: 100 years).
 const maxRetentionYears = 100
 
@@ -431,32 +497,36 @@ func (s *Server) defaultRetention(ctx context.Context, bucket string) (string, t
 		return "", time.Time{}, err
 	}
 	v, err := s.configs.get(bucket, cacheKindObjectLockDefaults, raw, func(b []byte) (any, error) {
-		var doc objectLockConfigDoc
-		if err := xml.Unmarshal(b, &doc); err != nil {
-			return nil, err
-		}
-		d := &lockDefaults{}
-		if doc.Rule != nil && doc.Rule.DefaultRetention != nil {
-			dr := doc.Rule.DefaultRetention
-			mode := strings.ToUpper(strings.TrimSpace(dr.Mode))
-			if (mode == "GOVERNANCE" || mode == "COMPLIANCE") && dr.Days >= 0 && dr.Years >= 0 &&
-				dr.Days <= maxRetentionYears*366 && dr.Years <= maxRetentionYears && dr.Days+dr.Years > 0 {
-				d.mode, d.days, d.years = mode, dr.Days, dr.Years
-			}
-		}
-		return d, nil
+		return parseLockDefaults(b)
 	})
 	if err != nil {
 		s.log.LogAttrs(ctx, slog.LevelWarn, "s3: ignoring invalid stored object lock configuration",
 			slog.String("bucket", bucket), slog.String("error", err.Error()))
 		return "", time.Time{}, nil
 	}
-	d := v.(*lockDefaults)
-	if d.mode == "" {
-		return "", time.Time{}, nil
+	mode, until := v.(*lockDefaults).retentionAt(s.now())
+	return mode, until, nil
+}
+
+// publishObjectRetention uses the bucket's current default and the new
+// version's creation time. The backend calls this under its commit lock with
+// configurations from the same atomic snapshot; it must not read the backend.
+func publishObjectRetention(meta *storage.ObjectMeta, created time.Time, config func(string) []byte, explicit bool) error {
+	if explicit {
+		if !meta.RetainUntil.After(created) {
+			return s3err.ErrInvalidArgument.WithMessage("The retain until date must be in the future!")
+		}
+		return nil
 	}
-	until := s.now().UTC().AddDate(d.years, 0, d.days)
-	return d.mode, until, nil
+	meta.RetentionMode, meta.RetainUntil = "", time.Time{}
+	if raw := config(storage.ConfigObjectLock); raw != nil {
+		d, err := parseLockDefaults(raw)
+		if err != nil {
+			return s3err.ErrInternalError
+		}
+		meta.RetentionMode, meta.RetainUntil = d.retentionAt(created)
+	}
+	return nil
 }
 
 // sseConfigDoc is the stored ServerSideEncryptionConfiguration document.
@@ -464,51 +534,52 @@ type sseConfigDoc struct {
 	XMLName xml.Name `xml:"ServerSideEncryptionConfiguration"`
 	Rules   []struct {
 		Default *struct {
-			SSEAlgorithm   string `xml:"SSEAlgorithm"`
-			KMSMasterKeyID string `xml:"KMSMasterKeyID"`
+			SSEAlgorithm string `xml:"SSEAlgorithm"`
 		} `xml:"ApplyServerSideEncryptionByDefault"`
 	} `xml:"Rule"`
 }
 
-// sseDefaults is the parsed default encryption of a bucket.
-type sseDefaults struct{ algorithm, kmsKeyID string }
-
 // defaultEncryption returns the bucket's default server-side encryption
-// (from storage.ConfigEncryption) to record on new objects, or "" when no
-// default encryption is configured.
-func (s *Server) defaultEncryption(ctx context.Context, bucket string) (string, string, error) {
+// (from storage.ConfigEncryption) to record on new objects: "AES256", or ""
+// when no default encryption is configured.
+//
+// Builds before real encryption accepted and stored AWS KMS defaults. KMS
+// is not implemented, but refusing every write to such a bucket after an
+// upgrade would be an outage, so a stored KMS default applies SSE-S3
+// (AES256) instead. A warning is logged once per bucket and stored
+// document (the parse is cached); GetBucketEncryption still returns the
+// stored document, so administrators see it and can save it again.
+func (s *Server) defaultEncryption(ctx context.Context, bucket string) (string, error) {
 	raw, err := s.bucketConfig(ctx, bucket, storage.ConfigEncryption)
 	if err != nil || raw == nil {
-		return "", "", err
+		return "", err
 	}
 	v, err := s.configs.get(bucket, cacheKindSSEDefaults, raw, func(b []byte) (any, error) {
 		var doc sseConfigDoc
 		if err := xml.Unmarshal(b, &doc); err != nil {
 			return nil, err
 		}
-		d := &sseDefaults{}
 		for _, rule := range doc.Rules {
 			if rule.Default == nil {
 				continue
 			}
-			switch algo := strings.TrimSpace(rule.Default.SSEAlgorithm); algo {
-			case "AES256", "aws:kms", "aws:kms:dsse":
-				d.algorithm = algo
-				if algo != "AES256" {
-					d.kmsKeyID = strings.TrimSpace(rule.Default.KMSMasterKeyID)
-				}
-				return d, nil
+			switch algo := strings.TrimSpace(rule.Default.SSEAlgorithm); {
+			case algo == "AES256":
+				return "AES256", nil
+			case isKMS(algo):
+				s.log.LogAttrs(ctx, slog.LevelWarn, "s3: bucket default encryption uses AWS KMS, which is not implemented; new objects use SSE-S3 (AES256). Save the bucket's default encryption again to replace the setting.",
+					slog.String("bucket", bucket), slog.String("algorithm", algo))
+				return "AES256", nil
 			}
 		}
-		return d, nil
+		return "", nil
 	})
 	if err != nil {
 		s.log.LogAttrs(ctx, slog.LevelWarn, "s3: ignoring invalid stored encryption configuration",
 			slog.String("bucket", bucket), slog.String("error", err.Error()))
-		return "", "", nil
+		return "", nil
 	}
-	d := v.(*sseDefaults)
-	return d.algorithm, d.kmsKeyID, nil
+	return v.(string), nil
 }
 
 // setChecksumHeaders sets x-amz-checksum-<algo> for every checksum plus
@@ -527,14 +598,24 @@ func setChecksumHeaders(h http.Header, sums map[string]string, typ string) {
 	}
 }
 
-// setSSEHeaders reports the server-side encryption of an object.
+// setSSEHeaders reports the server-side encryption of an object. Objects
+// whose SSE an older build recorded without encrypting them (Encryption
+// "") do not report it.
 func setSSEHeaders(h http.Header, meta storage.ObjectMeta) {
-	if meta.SSE == "" {
+	if meta.SSE == "" || meta.Encryption == "" {
 		return
 	}
 	h.Set("X-Amz-Server-Side-Encryption", meta.SSE)
-	if strings.HasPrefix(meta.SSE, "aws:kms") && meta.SSEKMSKeyID != "" {
-		h.Set("X-Amz-Server-Side-Encryption-Aws-Kms-Key-Id", meta.SSEKMSKeyID)
+}
+
+// setUploadSSEHeaders reports the server-side encryption of the object a
+// multipart upload with metadata meta creates (UploadPart, UploadPartCopy,
+// CompleteMultipartUpload). Completion encrypts every upload that requested
+// SSE, including uploads created by older builds that recorded SSE (even
+// AWS KMS) without Encryption, so those report AES256 too.
+func setUploadSSEHeaders(h http.Header, meta storage.ObjectMeta) {
+	if meta.SSE != "" {
+		h.Set("X-Amz-Server-Side-Encryption", "AES256")
 	}
 }
 
@@ -559,18 +640,31 @@ func (s *Server) handlePutObject(w http.ResponseWriter, r *http.Request, rc *req
 	if err != nil {
 		return err
 	}
-	if err := s.prepareNewObject(ctx, r, rc, bi, rc.key, &meta, headerObjectOpts(h)); err != nil {
+	opts := headerObjectOpts(h)
+	if err := s.prepareNewObject(ctx, r, rc, bi, rc.key, &meta, opts); err != nil {
 		return err
+	}
+	if err := s.precheckWriteConditions(ctx, rc.bucket, rc.key, meta, cond); err != nil {
+		return err
+	}
+	cond.BeforePublish = func(m, _ *storage.ObjectMeta, created time.Time, config func(string) []byte) error {
+		return publishObjectRetention(m, created, config, opts.retentionSet)
 	}
 	p, err := s.newObjectPayload(r, rc, payloadOptions{RequireLength: true})
 	if err != nil {
 		return err
 	}
-	info, err := s.storeObject(ctx, rc.bucket, rc.key, p, meta, cond, func(m *storage.ObjectMeta) error {
+	info, err := s.storeObject(ctx, rc.bucket, rc.key, p, p.declaredSize(), meta, cond, func(m *storage.ObjectMeta) error {
 		m.ETag = p.ETag()
 		m.Checksums = p.Checksums()
 		m.ChecksumType = p.ChecksumType()
-		return nil
+		// The body may have taken long: the caller must still be allowed.
+		return s.revalidateWrite(rc, func() error {
+			if err := s.reauthorizeOp(ctx, r, rc, nil); err != nil {
+				return err
+			}
+			return s.authorizeNewObject(ctx, r, rc, rc.bucket, rc.key, m.Tags, opts, s.requestTimeConditions(r, rc, nil))
+		})
 	})
 	if err != nil {
 		return err
@@ -763,6 +857,13 @@ func (s *Server) serveObject(w http.ResponseWriter, r *http.Request, rc *reqCont
 			return err
 		}
 	}
+	// Data fetched on first use (restic) is fetched now, while a failure
+	// can still be reported with a proper status.
+	if p, ok := body.(storage.PreparingReader); ok {
+		if err := p.Prepare(); err != nil {
+			return mapStorageError(err)
+		}
+	}
 	w.WriteHeader(status)
 	n, err := copyBuffered(writerOnly{w}, io.LimitReader(body, length))
 	if err == nil && n < length {
@@ -786,21 +887,37 @@ func (s *Server) serveObject(w http.ResponseWriter, r *http.Request, rc *reqCont
 // read its stored connections and credentials. "Content-Security-Policy:
 // sandbox" gives such a document a unique opaque origin with scripts,
 // forms and plugins disabled; it does not affect images, media or
-// downloads. PDFs are exempt: browsers refuse to render them in a sandbox,
-// and their viewers never expose the page origin to the document's
-// scripts. Only a Content-Type that parses as exactly application/pdf
-// is exempt, and it is then rewritten to the bare canonical type: browsers
-// split the header on commas and use the last MIME type of the list (so
-// "application/pdf; x=y, text/html" renders as HTML), which a lenient
-// check would let through. X-Content-Type-Options: nosniff stops browsers
-// from executing objects whose stored type is not a script or style type.
+// downloads. PDFs are exempt (browsers refuse to render them in a
+// sandbox), so they are always served as downloads instead:
+// "Content-Disposition: attachment" replaces the stored disposition and any
+// response-content-disposition override (a file name given there is kept),
+// so a PDF uploaded by anyone never renders inline, with its viewer's
+// scripting and forms, on the UI's origin. Only a Content-Type that parses
+// as exactly application/pdf is exempt, and it is then rewritten to the
+// bare canonical type: browsers split the header on commas and use the
+// last MIME type of the list (so "application/pdf; x=y, text/html" renders
+// as HTML), which a lenient check would let through.
+// X-Content-Type-Options: nosniff stops browsers from executing objects
+// whose stored type is not a script or style type.
 func setActiveContentHeaders(h http.Header) {
 	h.Set("X-Content-Type-Options", "nosniff")
 	if isPlainPDF(h.Values("Content-Type")) {
 		h.Set("Content-Type", "application/pdf")
+		h.Set("Content-Disposition", attachmentDisposition(h.Get("Content-Disposition")))
 		return
 	}
 	h.Set("Content-Security-Policy", "sandbox")
+}
+
+// attachmentDisposition returns "attachment", with the file name of the
+// Content-Disposition value cd when it has a valid one.
+func attachmentDisposition(cd string) string {
+	if _, params, err := mime.ParseMediaType(cd); err == nil && params["filename"] != "" {
+		if v := mime.FormatMediaType("attachment", map[string]string{"filename": params["filename"]}); v != "" {
+			return v
+		}
+	}
+	return "attachment"
 }
 
 // isPlainPDF reports whether a Content-Type header (all its values) is a
@@ -855,15 +972,28 @@ func (s *Server) canBypassGovernance(r *http.Request, rc *reqContext, bucket, ke
 // object lock checks, atomically with the delete when the backend is a
 // storage.ConditionalDeleter (both built-in backends are); deleting a version that does not exist succeeds, as
 // in S3.
+//
+// When authorization decided from the object itself (its tags, for
+// s3:ExistingObjectTag conditions; see authzObject), the delete is tied to
+// the version that was evaluated: if the addressed version is no longer
+// that one (a protected object was written in its place, or created where
+// none was found), the delete fails with AccessDenied instead of removing
+// an object the decision never saw.
 func (s *Server) deleteObjectVersion(ctx context.Context, r *http.Request, rc *reqContext, bi storage.BucketInfo, key, vid, ifMatch string) (storage.DeleteResult, error) {
 	var res storage.DeleteResult
 	var err error
-	if ifMatch != "" || (vid != "" && bi.ObjectLockEnabled) {
+	authz, pinned := rc.authzObjects[objectRef{bi.Name, key, vid}]
+	if ifMatch != "" || (vid != "" && bi.ObjectLockEnabled) || pinned {
 		// Authorization does I/O, so it is decided before the check runs.
 		bypass := vid != "" && s.canBypassGovernance(r, rc, bi.Name, key, vid)
 		var checkErr error
 		check := func(info storage.ObjectInfo) error {
 			checkErr = nil
+			if pinned && !authorizedVersion(authz, info) {
+				rc.authzReason = "object changed after authorization"
+				checkErr = s3err.ErrAccessDenied
+				return checkErr
+			}
 			if ifMatch != "" {
 				if info.DeleteMarker {
 					checkErr = s3err.ErrNoSuchKey.With("Key", key)
@@ -876,8 +1006,26 @@ func (s *Server) deleteObjectVersion(ctx context.Context, r *http.Request, rc *r
 			}
 			return checkErr
 		}
-		if cd, ok := s.backend.(storage.ConditionalDeleter); ok {
+		cd, isCD := s.backend.(storage.ConditionalDeleter)
+		if chk, ok := s.backend.(storage.CheckedDeleter); ok && pinned && vid == "" && ifMatch == "" {
+			// A key without any version still gets its delete marker in a
+			// versioned bucket, atomically with the check that no object
+			// appeared there (the check refuses a version that is not the
+			// one authorization evaluated).
+			res, err = chk.DeleteObjectChecked(ctx, bi.Name, key, vid, func(info storage.ObjectInfo, found bool) error {
+				if !found {
+					checkErr = nil
+					return nil
+				}
+				return check(info)
+			})
+		} else if isCD {
 			res, err = cd.DeleteObjectIf(ctx, bi.Name, key, vid, check)
+			if pinned && vid == "" && ifMatch == "" && bi.Versioning != storage.VersioningUnversioned && errors.Is(err, storage.ErrObjectNotFound) {
+				// Without storage.CheckedDeleter: the key has no versions,
+				// so add the delete marker S3 creates (not atomically).
+				res, err = s.backend.DeleteObject(ctx, bi.Name, key, vid)
+			}
 		} else {
 			var info storage.ObjectInfo
 			if info, err = s.backend.GetObjectInfo(ctx, bi.Name, key, vid); err == nil {
@@ -905,6 +1053,19 @@ func (s *Server) deleteObjectVersion(ctx context.Context, r *http.Request, rc *r
 		res.VersionID = vid
 	}
 	return res, nil
+}
+
+// authorizedVersion reports whether cur, the stored version a mutation is
+// about to apply to, is the one authorization evaluated (o, see
+// authzObject): the same version with the same content and
+// authorization-relevant metadata or, when authorization found no object
+// (or a delete marker), still no object (a delete marker). It does no I/O,
+// so it can run inside a backend transaction.
+func authorizedVersion(o authzObject, cur storage.ObjectInfo) bool {
+	if !o.found || o.info.DeleteMarker {
+		return cur.DeleteMarker
+	}
+	return sameObjectVersion(o.info, cur)
 }
 
 // handleDeleteObject implements DeleteObject, including object lock

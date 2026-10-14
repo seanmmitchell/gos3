@@ -36,7 +36,7 @@ func mechNames(m map[string]*mechanism) []string {
 func TestStartStopIdempotent(t *testing.T) {
 	defer checkLeaks(t)()
 	g := &fakeGroup{}
-	cfg := DefaultConfig()
+	cfg := enabledConfig()
 	cfg.MDNS = false
 	s := New(cfg, func() Info { return testInfo("self000000000001", "self") }, testLogger(t))
 	s.openBeacon = g.opener(t)
@@ -82,7 +82,7 @@ func maps(a, b map[string]*mechanism) bool {
 func TestStartContextCancel(t *testing.T) {
 	defer checkLeaks(t)()
 	g := &fakeGroup{}
-	cfg := DefaultConfig()
+	cfg := enabledConfig()
 	cfg.MDNS = false
 	s := New(cfg, func() Info { return testInfo("self000000000001", "self") }, testLogger(t))
 	s.openBeacon = g.opener(t)
@@ -110,7 +110,7 @@ func TestStartContextCancel(t *testing.T) {
 }
 
 func TestStartInvalidConfig(t *testing.T) {
-	cfg := DefaultConfig()
+	cfg := enabledConfig()
 	cfg.BeaconGroup = "nonsense"
 	s := New(cfg, nil, testLogger(t))
 	if err := s.Start(context.Background()); !errors.Is(err, ErrInvalidConfig) {
@@ -123,7 +123,7 @@ func TestReconfigure(t *testing.T) {
 	defer checkLeaks(t)()
 	g := &fakeGroup{}
 	seed := newGos3Server(t, "seed000000000001", "seed")
-	cfg := DefaultConfig()
+	cfg := enabledConfig()
 	cfg.MDNS = false
 	s := New(cfg, func() Info { return testInfo("self000000000001", "self") }, testLogger(t))
 	s.openBeacon = g.opener(t)
@@ -347,7 +347,7 @@ func TestServiceBeaconDiscovery(t *testing.T) {
 	g := &fakeGroup{}
 	srvA := newGos3Server(t, "aaaa000000000001", "alpha")
 	srvB := newGos3Server(t, "bbbb000000000002", "bravo")
-	cfg := DefaultConfig()
+	cfg := enabledConfig()
 	cfg.MDNS = false
 	a := New(cfg, srvA.Info, testLogger(t))
 	b := New(cfg, srvB.Info, testLogger(t))
@@ -392,7 +392,7 @@ func TestBrowse(t *testing.T) {
 	defer checkLeaks(t)()
 	// Seeds only (no multicast needed).
 	seed := newGos3Server(t, "seed000000000001", "seed")
-	cfg := DefaultConfig()
+	cfg := enabledConfig()
 	cfg.MDNS, cfg.Beacon = false, false
 	cfg.Seeds = []string{seed.URL, "http://127.0.0.1:1"}
 	peers, err := Browse(context.Background(), cfg, 50*time.Millisecond)
@@ -410,14 +410,14 @@ func TestBrowse(t *testing.T) {
 	// Beacon query answered by a running server (simulated group).
 	g := &fakeGroup{}
 	srvA := newGos3Server(t, "aaaa000000000001", "alpha")
-	acfg := DefaultConfig()
+	acfg := enabledConfig()
 	acfg.MDNS = false
 	a := New(acfg, srvA.Info, testLogger(t))
 	a.openBeacon = g.opener(t)
 	if err := a.Start(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	bcfg := DefaultConfig()
+	bcfg := enabledConfig()
 	bcfg.MDNS = false
 	br := New(bcfg, nil, testLogger(t))
 	br.openBeacon = g.opener(t)
@@ -575,7 +575,7 @@ func TestFullServiceNoLeaks(t *testing.T) {
 	}
 	port := pc.LocalAddr().(*net.UDPAddr).Port
 	pc.Close()
-	cfg := DefaultConfig()
+	cfg := enabledConfig()
 	cfg.BeaconGroup = "239.255.73.83:" + strconv.Itoa(port)
 	cfg.Seeds = []string{"http://127.0.0.1:1"}
 	cfg.DNSSRV = []string{"example.invalid"}

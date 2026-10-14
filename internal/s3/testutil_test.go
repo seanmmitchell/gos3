@@ -95,6 +95,10 @@ func newTestEnv(t testing.TB, opts ...testEnvOption) *testEnv {
 		Discovery: discovery.DefaultConfig(),
 		Logging:   config.LoggingConfig{Level: "info", Format: "text", AccessLog: true},
 		Lifecycle: config.LifecycleSettings{Enabled: true, IntervalSeconds: 3600},
+		Compression: config.CompressionSettings{
+			Mode: config.CompressionOptional, Level: config.DefaultCompressionLevel,
+			MinSize: config.DefaultCompressionMinSize, SkipContentTypes: config.DefaultSkipContentTypes,
+		},
 	}}
 	for _, o := range opts {
 		o(&cfg)

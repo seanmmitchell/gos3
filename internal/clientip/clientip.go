@@ -19,8 +19,14 @@
 //     entries further left may be forged by the client. An invalid entry
 //     stops the walk; the last trusted hop (or RemoteAddr) is used then.
 //     With an empty trusted_proxies the rightmost entry is the client (a
-//     single proxy that appends to or overwrites the header).
-//   - Secure is the last X-Forwarded-Proto value equal to "https".
+//     single proxy that appends to or overwrites the header). The server
+//     configuration does not allow that combination (config.Validate):
+//     any client reaching gos3 directly could then choose its address.
+//   - Secure is the last X-Forwarded-Proto value equal to "https"; the
+//     proxy must set the header, not append to a client-sent one.
+//   - Without forwarding headers, secure follows Request.TLS; the server
+//     fills that in from the connection (an HTTP/2 client's ":scheme"
+//     does not decide it).
 package clientip
 
 import (

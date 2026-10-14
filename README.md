@@ -27,6 +27,14 @@ Run `gos3 serve`, point the AWS CLI, an SDK, `mc` or rclone at it, and open
   of current and noncurrent versions, delete markers and stale multipart uploads.
 - **Checksums**: CRC32, CRC32C, CRC64NVME, SHA-1 and SHA-256, as headers or
   trailers, full-object or composite for multipart uploads, plus MD5/ETag.
+- **Multiple backings**: spread buckets over several disks or directories,
+  move buckets between them online, and replicate a bucket to other backings
+  in active-passive or active-active mode with automatic failover. See
+  [docs/operations.md](docs/operations.md#multiple-backings-and-replication).
+- **Compression**: transparent, seekable DEFLATE compression of object data,
+  enabled per bucket, or enforced or disabled server-wide by the
+  administrator. Already-compressed media types are skipped. See
+  [docs/operations.md](docs/operations.md#compression).
 - **Remote S3 backings**: put individual buckets on AWS S3, MinIO, R2 or any
   S3 service, chosen per bucket at creation: as opaque blobs with every gos3
   feature, or as a gateway that stores native objects other tools can read.
@@ -38,7 +46,7 @@ Run `gos3 serve`, point the AWS CLI, an SDK, `mc` or rclone at it, and open
 - **Discovery**: servers announce themselves through mDNS and a UDP multicast
   beacon, and find each other through static seeds, DNS SRV records and
   on-demand network scans. The UI merges what every server sees.
-- **Simple to run**: one static binary or a ~25 MB distroless image. YAML,
+- **Simple to run**: one static binary or a distroless image. JSON, YAML,
   environment variables or flags, runtime settings without restarts,
   Prometheus metrics, health and readiness endpoints, and graceful shutdown.
 
@@ -47,50 +55,60 @@ Run `gos3 serve`, point the AWS CLI, an SDK, `mc` or rclone at it, and open
 ### Binary
 
 Download an archive from the [releases](https://github.com/seanmmitchell/gos3/releases)
-(Linux, macOS, Windows; amd64 and arm64), or build it with Go ≥ 1.25, Node.js 22
-and pnpm:
+(Linux, macOS, Windows; amd64 and arm64); from releases after 0.1.0 on,
+`gh attestation verify <archive> --repo seanmmitchell/gos3 --source-ref refs/heads/main`
+checks that it was built by the Release workflow on `main` (see
+[verifying a release](docs/releasing.md#verifying-a-release)). Or build
+it with Go 1.26.9 or newer, Node.js 22 and pnpm:
 
 ```sh
 make build                      # web UI + bin/gos3 with the UI embedded
 bin/gos3 serve --data ./data
 ```
 
-The startup banner shows the S3 endpoint, the web UI URL and the root
-credentials. Without `GOS3_ROOT_ACCESS_KEY` / `GOS3_ROOT_SECRET_KEY`, a key pair
-is generated on first start, printed once, and stored in
-`./data/.gos3/root-credentials.json`. To choose your own:
+The startup banner shows the S3 endpoint, the web UI URL and where the root
+credentials come from. Without `GOS3_ROOT_ACCESS_KEY` / `GOS3_ROOT_SECRET_KEY`,
+a key pair is generated on first start and stored in
+`./data/.gos3/root-credentials.json` (the banner shows it when it runs in a
+terminal; the secret is never logged). To choose your own:
 
 ```sh
-GOS3_ROOT_ACCESS_KEY=admin GOS3_ROOT_SECRET_KEY=change-me-now bin/gos3 serve --data ./data
+export $(bin/gos3 keygen)       # random GOS3_ROOT_ACCESS_KEY / GOS3_ROOT_SECRET_KEY
+bin/gos3 serve --data ./data
 ```
 
 ### Docker
 
 ```sh
-docker run -d --name gos3 -p 9000:9000 -v gos3-data:/data \
-  -e GOS3_ROOT_ACCESS_KEY=admin -e GOS3_ROOT_SECRET_KEY=change-me-now \
-  ghcr.io/seanmmitchell/gos3:latest
+docker run --rm ghcr.io/seanmmitchell/gos3:0.1.0 keygen > gos3.env   # your root keys
+docker run -d --name gos3 -p 127.0.0.1:9000:9000 -v gos3-data:/data --env-file gos3.env \
+  ghcr.io/seanmmitchell/gos3:0.1.0
 ```
 
-`latest` is the newest release; `X.Y.Z` and `X.Y` pin a release, and `dev`
-follows the development branch.
+This publishes the port on this machine only; use `-p 9000:9000` to serve
+the network. `X.Y.Z` and `X.Y` are releases, `latest` is the newest release,
+and `dev` follows the development branch. Releases after 0.1.0 carry signed
+build provenance:
+`gh attestation verify oci://ghcr.io/seanmmitchell/gos3:X.Y.Z --repo seanmmitchell/gos3 --source-ref refs/heads/main`.
 
 To build the image yourself, run `docker build -t gos3 .` or `make docker`.
-The image runs as a non-root user (uid 65532), keeps its data in `/data`, and
-has a health check.
+The image runs as a non-root user (uid 65532), keeps its data in `/data`, has
+a health check, and includes the restic executable that restic-encrypted
+buckets use.
 
 ### Docker Compose: two nodes with discovery
 
 ```sh
-docker compose up -d --build                # node-1 on :9001, node-2 on :9002
-docker compose --profile ui up -d --build   # + the standalone web UI on :3000
+make demo                                   # node-1 on :9001, node-2 on :9002, standalone UI on :3000
 ```
 
-Sign in at `http://localhost:9001/_gos3/ui/` with `gos3admin` /
-`gos3admin-secret` and open **Discovery**: the nodes find each other through the
-UDP beacon, with seeds as a fallback. Remove everything with
-`docker compose down -v`. Because these demo keys are public, the ports are
-published on 127.0.0.1 only; see
+`make demo` writes random root keys to `.env` on first use (or put your own
+`GOS3_ROOT_ACCESS_KEY` / `GOS3_ROOT_SECRET_KEY` there, then run
+`docker compose --profile ui up -d --build`). Sign in at
+`http://localhost:9001/_gos3/ui/` with the keys from `.env` and open
+**Discovery**: the nodes find each other through the UDP beacon, with seeds
+as a fallback. Remove everything with `docker compose --profile ui down -v`.
+The ports are published on 127.0.0.1 only; see
 [docs/deployment.md](docs/deployment.md#docker-compose) to expose the demo.
 
 ### Standalone web UI
@@ -110,11 +128,38 @@ then they only answer when the UI is opened via an IP address or `localhost`
 
 ## Configuration
 
-Settings come from defaults, then a YAML file (`--config` or `GOS3_CONFIG`), then
+Choose how the server is managed:
+
+```sh
+gos3 serve --no-admin                 # S3 only, static configuration
+gos3 serve --no-ui                    # S3 + management API for a separate UI
+gos3 serve                            # S3 + management API + embedded UI (default)
+gos3 serve --config gos3.json          # JSON or YAML configuration
+make build-headless                   # no UI assets, Node or pnpm required
+```
+
+The release and dev workflows also publish binaries and images without UI
+assets compiled in. Choose `gos3_X.Y.Z_linux_amd64-headless.tar.gz` (or the
+matching OS/architecture archive, `.zip` on Windows), and image tags
+`ghcr.io/seanmmitchell/gos3:X.Y.Z-headless`, `latest-headless` or `dev-headless`.
+These builds retain the management API; use `serve --no-admin` for S3 only.
+Build the image locally with `docker build --target headless -t gos3:headless .`.
+The ordinary archives and image tags continue to include the UI.
+
+Discovery, advertising, mDNS, beacons and scans all default to off.
+Set the discovery switches explicitly to enable them. To replace a basic
+MinIO startup command, use `gos3 server /data --address :9000 --no-admin`;
+`MINIO_ROOT_USER` and `MINIO_ROOT_PASSWORD` are accepted as credential
+aliases. See [server modes and MinIO compatibility](docs/configuration.md#server-modes)
+for JSON examples, precedence, health probes and migration limits.
+
+Settings come from defaults, then a JSON or YAML file (`--config` or `GOS3_CONFIG`), then
 `GOS3_*` environment variables, then flags. Each layer overrides the one before.
 
 ```sh
 gos3 config init -o gos3.yaml   # commented sample configuration
+gos3 config init -o gos3.json   # all settings as JSON
+gos3 config print --json        # effective JSON, secrets redacted
 gos3 config env                 # every GOS3_* variable
 gos3 config print               # effective configuration, secrets redacted
 ```
@@ -132,20 +177,25 @@ Frequently used settings:
 | Virtual-host domains | `--domain` / `GOS3_DOMAINS` | none (path-style) |
 | TLS | `--tls-cert`, `--tls-key` / `GOS3_TLS_CERT`, `GOS3_TLS_KEY` | off |
 | CORS origins | `--cors-origin` / `GOS3_CORS_ORIGINS` | `*` |
-| Discovery | `--no-discovery`, `--seed` / `GOS3_DISCOVERY_*` | on |
+| Discovery | `--no-discovery`, `--seed` / `GOS3_DISCOVERY_*` | off (opt-in) |
 
-Runtime settings (name, region, CORS, domains, discovery, logging, lifecycle,
+When management is enabled, runtime settings (name, region, CORS, domains, discovery, logging, lifecycle,
 public metrics) can also be changed from the UI or the admin API without a
 restart. They are then stored in `<data>/.gos3/settings.json` and take
 precedence over the file, environment and flags. Every key is listed in
 [docs/configuration.md](docs/configuration.md).
+
+With `--no-admin`, the server ignores saved UI settings and uses only
+defaults, the config file, environment and flags. Existing saved settings
+are preserved for a later managed startup.
 
 ## Using gos3 with S3 clients
 
 Use the server URL as the endpoint, **path-style** addressing (unless you set
 up [virtual-host domains](docs/deployment.md#virtual-hosted-style-domains)),
 and region `us-east-1` (or whatever `server.region` is). The examples use
-`http://localhost:9000` and the keys `admin` / `change-me-now`.
+`http://localhost:9000` and the stand-in keys `admin` / `change-me-now`:
+use your server's keys instead.
 
 ### AWS CLI
 
@@ -294,8 +344,9 @@ specified in [docs/discovery.md](docs/discovery.md).
 ## Security notes
 
 - **Root credentials**: set `GOS3_ROOT_ACCESS_KEY` / `GOS3_ROOT_SECRET_KEY`, or
-  save the generated pair, which is logged **once**. Use IAM users for
-  applications.
+  use the generated pair stored in `<data>/.gos3/root-credentials.json` (the
+  secret is shown in the startup banner on a terminal, never in the log).
+  Published example secrets are refused. Use IAM users for applications.
 - **Sensitive files**: `<data>/.gos3/iam.json` holds every IAM user's secret
   key, and `root-credentials.json` holds generated root keys. Both have mode
   0600. Keep the data directory private, and treat backups as secret.
@@ -306,14 +357,17 @@ specified in [docs/discovery.md](docs/discovery.md).
   other websites cannot read anonymously accessible data through a visitor's
   browser. Narrow it to your UI origins in production, and use a bucket CORS
   configuration to serve a public bucket to scripts on other sites.
-- **Discovery and scans**: servers announce their name, version and URLs on
-  the LAN. Turn this off with `discovery.advertise: false` or
-  `--no-discovery`. Network scans need `admin:ScanNetwork` and can be disabled
-  with `discovery.allow_scan: false`. The standalone UI's Node server performs
+- **Discovery and scans**: all switches default to off. Explicitly enabled
+  advertising announces the server's name, version and URLs on the LAN.
+  Network scans require `discovery.allow_scan: true` and `admin:ScanNetwork`.
+  The standalone UI's Node server performs
   local discovery only when `GOS3_UI_LOCAL_DISCOVERY=true`, and then for
   anyone who can reach it.
-- **No encryption at rest**: server-side encryption headers are accepted for
-  compatibility only. Use disk encryption.
+- **Object encryption**: SSE-S3 encrypts new object data using server-managed
+  keys. Per-bucket restic repositories provide encrypted archival on local
+  storage or remote S3 (restic is bundled in the container images; install
+  it next to a release binary). Existing objects require rewriting to
+  encrypt them; back up the protected keys and metadata. See [encryption](docs/encryption.md).
 
 More in [docs/security.md](docs/security.md).
 
@@ -335,13 +389,15 @@ More in [docs/security.md](docs/security.md).
 
 ## Development
 
-Requirements: Go ≥ 1.26, Node.js 22 with corepack (pnpm), and optionally Docker
-and Python 3 (for the compatibility suite). `go.mod` names the toolchain used
-for builds (`toolchain go1.26.9`, a supported release with current security
-fixes); with the default `GOTOOLCHAIN=auto` the go command downloads it.
+Requirements: Go 1.26.9 or newer, Node.js 22 with corepack (pnpm), and
+optionally Docker and Python 3 (for the compatibility suite). `go.mod`
+requires Go 1.26.9 (`go 1.26.9`, a supported release with current security
+fixes for the standard library gos3 links); with the default
+`GOTOOLCHAIN=auto` an older go command downloads it, and with
+`GOTOOLCHAIN=local` it refuses to build.
 
 ```sh
-make dev          # in-memory server on :9000 (keys gos3dev / gos3dev-secret, CORS for :3000)
+make dev          # in-memory server on 127.0.0.1:9000 (discovery off, random secret printed, CORS for :3000)
 cd web && pnpm dev   # UI with hot reload on http://localhost:3000
 ```
 
@@ -377,7 +433,9 @@ docs/                documentation
 
 CI (`.github/workflows/ci.yml`) runs gofmt, vet, govulncheck, the Go unit and
 e2e tests with `-race`, the web typecheck, tests and builds, the Playwright suites, the
-compatibility suite, and the Docker builds.
+compatibility suite, and the Docker builds. The Go tests run on Linux, macOS and
+Windows with a pinned restic installed (`.github/actions/setup-restic`), so the
+restic repository tests run instead of skipping.
 
 Pull requests target `dev`, the default branch; `main` only receives release
 merges from `dev`. Every push to `dev` publishes `ghcr.io/seanmmitchell/gos3:dev`,
@@ -387,11 +445,10 @@ archives and image. Branch rules, versioning and the release steps are in
 
 ## Limitations
 
-- **Single node.** No replication, erasure coding or clustering. Discovery
-  finds servers but does not combine them. Use backups (see
-  [docs/operations.md](docs/operations.md#backups)) for durability.
-  [Remote backings](docs/backings.md) can put bucket data on a durable
-  object store.
+- **Single node.** Buckets can be replicated between the backings (disks)
+  of one server, but not between servers; there is no erasure coding or
+  clustering. Discovery finds servers but does not combine them. Use backups
+  (see [docs/operations.md](docs/operations.md#backups)) for durability.
 - One account: IAM users share the bucket namespace, and there is no STS and
   no session tokens.
 - Not implemented: SigV2, SigV4A, SSE-C, ACL grants beyond canned ACLs,
@@ -399,7 +456,8 @@ archives and image. Branch rules, versioning and the release steps are in
   configurations. Lifecycle transitions, website, notification, logging and
   replication configurations are stored but not acted on. Details are in
   [docs/s3-compatibility.md](docs/s3-compatibility.md).
-- Objects are not encrypted at rest by gos3.
+- AWS KMS encryption is not implemented. Native AES256 and restic encrypt
+  new objects when requested or enabled as the bucket default.
 - TLS certificates are loaded at startup; restart after renewal.
 
 ## License

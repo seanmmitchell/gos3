@@ -71,6 +71,16 @@ export interface Capabilities {
   managePolicies: boolean
   /** admin:ForceDeleteBucket */
   manageBuckets: boolean
+  /**
+   * admin:ListBackings (server Storage page, bucket Placement tab). Absent
+   * from servers without storage backings: treated as false.
+   */
+  viewStorage?: boolean
+  /**
+   * admin:UpdateBucketPlacement (change replication, move, promote, resync).
+   * Absent from servers without storage backings: treated as false.
+   */
+  manageStorage?: boolean
   /** admin:GetDiscovery */
   discovery: boolean
   /** admin:ScanNetwork */
@@ -88,10 +98,11 @@ export interface Capabilities {
    */
   createOwnKeys?: boolean
   /**
-   * admin:ListBackings (GET /backings, with endpoints). Absent from servers
-   * that predate storage backings.
+   * admin:PutBucketCompression allowed at service level (bucket
+   * compression settings). Absent from servers without compression: use
+   * bucketCompressionAccess() (~/components/admin/-capabilities).
    */
-  listBackings?: boolean
+  manageCompression?: boolean
 }
 
 export type CapabilityName = keyof Capabilities
@@ -105,54 +116,10 @@ export interface WhoAmI {
   server: Info
   /**
    * Storage backings new buckets can be created on (every authenticated
-   * caller). Absent from servers that predate storage backings.
+   * caller; CreateBucket header x-gos3-backing). Absent from older servers;
+   * `available` is empty on servers without storage backings.
    */
-  backings?: BackingChoices
-}
-
-// ---------------------------------------------------------------------------
-// Storage backings
-// ---------------------------------------------------------------------------
-
-/**
- * Where a bucket's data lives:
- * - local:   the server's own storage
- * - blob:    opaque blobs in a remote S3 bucket (every gos3 feature works)
- * - gateway: objects stored natively in a remote S3 service (no versioning,
- *            no object lock)
- */
-export type BackingMode = 'local' | 'blob' | 'gateway'
-
-/** A backing name and its mode (WhoAmI.backings.available). */
-export interface BackingRef {
-  /** "local" for the server's own storage, else a configured backing name. */
-  name: string
-  mode: BackingMode
-}
-
-/** WhoAmI.backings: the choices for CreateBucket's x-gos3-backing header. */
-export interface BackingChoices {
-  /** Backing used when CreateBucket names none. */
-  default: string
-  /** Always contains "local" first. */
-  available: BackingRef[]
-}
-
-/** A configured backing as listed by GET /backings (no secrets). */
-export interface Backing extends BackingRef {
-  /** Remote S3 endpoint (remote modes only). */
-  endpoint?: string
-  region?: string
-  /** Remote bucket ("" for gateway mode: one remote bucket per gos3 bucket). */
-  bucket?: string
-  /** Key prefix inside the remote bucket(s). */
-  prefix?: string
-}
-
-/** GET /backings */
-export interface BackingList {
-  default: string
-  backings: Backing[] | null
+  backings?: AvailableBackings
 }
 
 // ---------------------------------------------------------------------------
@@ -216,6 +183,16 @@ export interface StorageStats {
   versionBytes: number
   deleteMarkers: number
   pendingUploads: number
+  /**
+   * Physical bytes stored for current versions (compressed data counts
+   * its compressed size); `bytes` is the logical size. Absent from servers
+   * without compression.
+   */
+  storedBytes?: number
+  /** Physical bytes stored for all versions (see storedBytes). */
+  storedVersionBytes?: number
+  /** Versions whose data is stored compressed. */
+  compressedVersions?: number
   /** Cached up to 30 s. */
   computedAt: Timestamp
 }
@@ -285,6 +262,29 @@ export interface LifecycleSettings {
   intervalSeconds: number
 }
 
+/**
+ * Server-wide compression policy set by the administrator:
+ * - optional: each bucket decides (off unless enabled for the bucket)
+ * - enforced: every bucket compresses new objects; buckets cannot opt out
+ * - disabled: nothing new is compressed and buckets cannot enable it
+ *   (objects already stored compressed stay readable)
+ */
+export type CompressionMode = 'optional' | 'enforced' | 'disabled'
+
+/** config.CompressionSettings */
+export interface CompressionSettings {
+  mode: CompressionMode | string
+  /** DEFLATE level, 1 (fastest, default) to 9 (smallest). */
+  level: number
+  /** Objects smaller than this (when the size is known up front) stay uncompressed. */
+  minSize: number
+  /**
+   * Media types stored uncompressed (already compressed): "type/subtype",
+   * "type/*" or a prefix ending in "*". Case-insensitive.
+   */
+  skipContentTypes: string[] | null
+}
+
 /** config.Settings — GET/PUT /config. PUT takes the full document. */
 export interface Settings {
   name: string
@@ -298,6 +298,8 @@ export interface Settings {
   logging: LoggingSettings
   lifecycle: LifecycleSettings
   metricsPublic: boolean
+  /** Absent from servers without compression support. */
+  compression?: CompressionSettings
 }
 
 // ---------------------------------------------------------------------------
@@ -455,8 +457,32 @@ export interface BucketUsage {
   versionBytes: number
   deleteMarkers: number
   pendingUploads: number
+  /** Physical bytes of current versions (see StorageStats.storedBytes). */
+  storedBytes?: number
+  /** Physical bytes of all versions. */
+  storedVersionBytes?: number
+  /** Versions whose data is stored compressed. */
+  compressedVersions?: number
   /** When the server computed these figures (admin BucketSummary only; cached up to 30 s). */
   computedAt?: Timestamp
+}
+
+/** The "compression" member of a BucketSummary. */
+export interface BucketCompressionSummary {
+  /** The bucket's own setting. */
+  enabled: boolean
+  /** Whether new objects are compressed under the server's policy. */
+  effective: boolean
+}
+
+/** GET/PUT /buckets/{name}/compression */
+export interface BucketCompression extends BucketCompressionSummary {
+  /** The administrator's compression.mode. */
+  serverMode: CompressionMode | string
+  /** e.g. "deflate" */
+  algorithm: string
+  level: number
+  minSize: number
 }
 
 export interface BucketSummary {
@@ -470,10 +496,165 @@ export interface BucketSummary {
   /** Bucket policy grants anonymous access or ACL public-*. */
   public: boolean
   usage: BucketUsage | null
-  /** Storage backing name ("local" = own storage). Absent from older servers. */
-  backing?: string
-  /** Mode of `backing`. Absent from older servers. */
-  backingMode?: BackingMode
+  /** Absent from servers without compression support. */
+  compression?: BucketCompressionSummary
+  /** Where the bucket is stored (servers with storage backings only). */
+  placement?: PlacementSummary
+}
+
+// ---------------------------------------------------------------------------
+// Storage backings & bucket placement
+// ---------------------------------------------------------------------------
+
+/** "fs" | "memory" | "s3" (a remote S3 service, see BackingMode) */
+export type BackingKind = 'fs' | 'memory' | 's3'
+
+/**
+ * How a kind "s3" backing stores data:
+ * - blob:    opaque blobs in a remote S3 bucket (every gos3 feature works)
+ * - gateway: objects stored natively in the remote S3 service (no
+ *            versioning, no object lock; cannot be a replica or move target)
+ */
+export type BackingMode = 'blob' | 'gateway'
+
+/** A backing new buckets can be created on (WhoAmI.backings.available). */
+export interface AvailableBacking {
+  name: string
+  kind: BackingKind | string
+  /** Kind "s3" only. */
+  mode?: BackingMode | string
+}
+
+/** WhoAmI.backings */
+export interface AvailableBackings {
+  /** Backing used when CreateBucket names none. */
+  default: string
+  available: AvailableBacking[] | null
+}
+
+/** A storage backend of the server (GET /backings). */
+export interface Backing {
+  /** "default" is the backing configured by storage.backend / storage.path. */
+  name: string
+  kind: BackingKind | string
+  /** Kind "s3" only. */
+  mode?: BackingMode | string
+  /** "" for memory. */
+  path: string
+  /** New buckets are created here. */
+  default: boolean
+  /** The last health check or operation succeeded. */
+  healthy: boolean
+  /** Last error that marked it unhealthy ("" when healthy). */
+  lastError: string
+  /** Last health check (omitted before the first). */
+  checkedAt?: Timestamp
+  /** Buckets whose primary copy is here. */
+  buckets: number
+  /** Replica copies (and move targets) of other buckets here. */
+  replicas: number
+  /** fs only, else null. */
+  disk: DiskStats | null
+}
+
+/** GET /backings */
+export interface BackingDefinition {
+  name: string
+  backend: 'fs' | 'memory'
+  path: string
+}
+
+export interface BackingConfiguration {
+  backings: BackingDefinition[]
+  defaultBacking: string
+  revision: string
+  persistent: boolean
+}
+
+export interface BackingList {
+  defaultBacking: string
+  autoFailover: boolean
+  backings: Backing[] | null
+}
+
+export type ReplicationMode = 'single' | 'active-passive' | 'active-active'
+
+export type PlacementRole = 'primary' | 'replica' | 'move-target'
+
+/**
+ * - in-sync:  receives every write synchronously, has no pending changes, or is the primary
+ * - syncing:  initial or requested full copy running
+ * - lagging:  changes are pending, copied in the background
+ * - degraded: copying failed; retried with back-off (see lastError)
+ * - offline:  the backing is unhealthy
+ */
+export type MemberState = 'in-sync' | 'syncing' | 'lagging' | 'degraded' | 'offline'
+
+/** Progress of a running full copy. */
+export interface CopyProgress {
+  keys: number
+  versions: number
+  bytes: number
+}
+
+export interface PlacementMember {
+  backing: string
+  role: PlacementRole
+  state: MemberState
+  /** The backing's health. */
+  healthy: boolean
+  /** Changed keys not yet copied to this member. */
+  pending: number
+  /** Running full copy, else null. */
+  progress: CopyProgress | null
+  /** Last completed full copy (omitted when none). */
+  lastSyncAt?: Timestamp
+  lastError: string
+}
+
+export type MovePhase = 'copying' | 'cutover'
+
+export interface PlacementMove {
+  from: string
+  to: string
+  startedAt: Timestamp
+  phase: MovePhase
+}
+
+/** GET /buckets/{name}/placement */
+export interface Placement {
+  bucket: string
+  mode: ReplicationMode
+  primary: string
+  /** Primary first, then replicas, then a move target. */
+  members: PlacementMember[] | null
+  move: PlacementMove | null
+}
+
+/** PUT /buckets/{name}/placement body. `single` needs an empty `replicas`. */
+export interface UpdatePlacementRequest {
+  mode: ReplicationMode
+  replicas: string[]
+}
+
+/** POST /buckets/{name}/placement/move body (`from` defaults to the primary). */
+export interface MoveBucketRequest {
+  to: string
+  from?: string
+}
+
+/** POST /buckets/{name}/placement/promote body. */
+export interface PromoteReplicaRequest {
+  backing: string
+  force?: boolean
+}
+
+/** Placement as summarised in BucketSummary. */
+export interface PlacementSummary {
+  mode: ReplicationMode
+  primary: string
+  replicas: string[] | null
+  moving: boolean
 }
 
 // ---------------------------------------------------------------------------
@@ -562,4 +743,47 @@ export interface AdminErrorBody {
 export interface HealthStatus {
   status: 'ok' | 'unavailable' | string
   error?: string
+}
+
+/** Implementations of SSE-S3 a gos3 bucket can use. */
+export type EncryptionProviderName = 'AES256' | 'restic'
+
+/**
+ * GET/PUT /buckets/{name}/encryption-provider: the bucket's implementation
+ * of SSE-S3 (native AES-256-GCM or restic), used for default encryption and
+ * for uploads that request AES256. Restic storage is inherited from the
+ * bucket's placement (backings).
+ */
+export interface BucketEncryptionProvider {
+  provider: EncryptionProviderName
+  /**
+   * Providers the bucket can use now (restic needs the restic executable on
+   * the server and filesystem storage for every copy). Absent when the
+   * server cannot tell: then every provider is offered.
+   */
+  available?: EncryptionProviderName[]
+  /** Backings holding the bucket (primary first). */
+  backings?: string[]
+}
+export interface BucketEncryptionProviderInput { provider: EncryptionProviderName }
+export interface ResticBacking {
+ mode: 'local' | 's3'
+ endpoint: string
+ bucket: string
+ prefix: string
+ region: string
+ credentialsConfigured: boolean
+ sessionTokenConfigured: boolean
+ locked: boolean
+}
+export interface ResticBackingInput {
+ mode: 'local' | 's3'
+ endpoint?: string
+ bucket?: string
+ prefix?: string
+ region?: string
+ accessKey?: string
+ secretKey?: string
+ sessionToken?: string
+ clearSessionToken?: boolean
 }

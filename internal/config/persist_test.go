@@ -252,9 +252,14 @@ func TestResolveRootCredentialsGeneratesAndReuses(t *testing.T) {
 			t.Errorf("credentials file mode %v, want 0600", m)
 		}
 	}
+	// The secret key is never logged (logs are collected and kept
+	// widely); the warning names the access key and the file.
 	out := buf.String()
-	if !strings.Contains(out, `"level":"WARN"`) || !strings.Contains(out, ak) || !strings.Contains(out, sk) {
-		t.Errorf("generation not logged as a warning with the keys:\n%s", out)
+	if !strings.Contains(out, `"level":"WARN"`) || !strings.Contains(out, ak) || !strings.Contains(out, RootCredentialsFileName) {
+		t.Errorf("generation not logged as a warning with the access key and file:\n%s", out)
+	}
+	if strings.Contains(out, sk) {
+		t.Errorf("generated secret key logged:\n%s", out)
 	}
 
 	// Second start: same keys, secret not logged again.
@@ -311,8 +316,11 @@ func TestResolveRootCredentialsEphemeral(t *testing.T) {
 	if c1.Auth.RootAccessKey == "" || c1.Auth.RootAccessKey == c2.Auth.RootAccessKey {
 		t.Error("ephemeral credentials not freshly generated")
 	}
-	if strings.Count(buf.String(), `"level":"WARN"`) != 2 || !strings.Contains(buf.String(), c2.Auth.RootSecretKey) {
+	if strings.Count(buf.String(), `"level":"WARN"`) != 2 || !strings.Contains(buf.String(), c2.Auth.RootAccessKey) {
 		t.Errorf("ephemeral credentials not logged on every start:\n%s", buf.String())
+	}
+	if strings.Contains(buf.String(), c1.Auth.RootSecretKey) || strings.Contains(buf.String(), c2.Auth.RootSecretKey) {
+		t.Errorf("ephemeral secret key logged:\n%s", buf.String())
 	}
 	// A nil logger falls back to slog.Default.
 	prev := slog.Default()

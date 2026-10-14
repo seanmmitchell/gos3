@@ -1,197 +1,171 @@
 package config
 
 import (
-	"encoding/json"
 	"errors"
 	"fmt"
-	"net/url"
+	"path/filepath"
 	"regexp"
+	"slices"
 	"strings"
-	"unicode/utf8"
+	"time"
 )
 
-// Backing modes (BackingConfig.Mode).
-const (
-	// BackingModeBlob stores object data as opaque blobs in a remote
-	// bucket; buckets, versions and all metadata stay in the fs backend.
-	BackingModeBlob = "blob"
-	// BackingModeGateway stores objects natively in the remote service
-	// (pass-through); only bucket configuration stays local.
-	BackingModeGateway = "gateway"
-)
+// backingNameRe matches valid backing names.
+var backingNameRe = regexp.MustCompile(`^[a-z0-9][a-z0-9_-]{0,31}$`)
 
-// BackingLocal is the reserved backing name of the server's own storage.
-const BackingLocal = "local"
-
-// Limits of BackingConfig.PartSize.
-const (
-	MinBackingPartSize = 5 << 20
-	MaxBackingPartSize = 5 << 30
-)
-
-// MaxBackings bounds the number of configured backings.
-const MaxBackings = 64
-
-var backingNameRe = regexp.MustCompile(`^[a-z0-9][a-z0-9-]{0,31}$`)
-
-// PathStyle reports whether requests to the backing use path-style
-// addressing (see BackingConfig.Addressing).
-func (b BackingConfig) PathStyle() bool {
-	switch b.Addressing {
-	case "path":
-		return true
-	case "virtual":
-		return false
+// BackingNames returns the names of every backing: DefaultBackingName
+// first, then storage.backings in order.
+func (c Config) BackingNames() []string {
+	names := []string{DefaultBackingName}
+	for _, b := range c.Storage.Backings {
+		names = append(names, b.Name)
 	}
-	u, err := url.Parse(b.Endpoint)
-	if err != nil {
-		return true
-	}
-	host := strings.ToLower(u.Hostname())
-	return host != "amazonaws.com" && !strings.HasSuffix(host, ".amazonaws.com")
+	return names
 }
 
-// Backing returns the configured backing with the given name.
-func (c StorageConfig) Backing(name string) (BackingConfig, bool) {
-	for _, b := range c.Backings {
-		if b.Name == name {
-			return b, true
-		}
-	}
-	return BackingConfig{}, false
-}
-
-// BackingCredentialEnv returns the names of the environment variables that
-// supply the credentials of a backing whose access_key / secret_key are not
-// configured: GOS3_BACKING_<NAME>_ACCESS_KEY and _SECRET_KEY.
-func BackingCredentialEnv(name string) (accessKey, secretKey string) {
-	n := strings.ToUpper(strings.ReplaceAll(name, "-", "_"))
-	return "GOS3_BACKING_" + n + "_ACCESS_KEY", "GOS3_BACKING_" + n + "_SECRET_KEY"
-}
-
-// applyBackingCredentials fills empty backing credentials from the
-// environment (see BackingCredentialEnv).
-func (c *Config) applyBackingCredentials(lookup func(string) (string, bool)) {
-	for i := range c.Storage.Backings {
-		b := &c.Storage.Backings[i]
-		ak, sk := BackingCredentialEnv(strings.ToLower(strings.TrimSpace(b.Name)))
-		if v, ok := lookup(ak); ok && b.AccessKey == "" {
-			b.AccessKey = strings.TrimSpace(v)
-		}
-		if v, ok := lookup(sk); ok && b.SecretKey == "" {
-			b.SecretKey = strings.TrimSpace(v)
-		}
-	}
-}
-
-// normalizeBackings lower-cases names and enumerations and trims values.
-func (c *Config) normalizeBackings() {
-	for i := range c.Storage.Backings {
-		b := &c.Storage.Backings[i]
-		b.Name = strings.ToLower(strings.TrimSpace(b.Name))
-		b.Mode = strings.ToLower(strings.TrimSpace(b.Mode))
-		b.Endpoint = strings.TrimRight(strings.TrimSpace(b.Endpoint), "/")
-		b.Region = strings.TrimSpace(b.Region)
-		b.Bucket = strings.TrimSpace(b.Bucket)
-		b.Addressing = strings.ToLower(strings.TrimSpace(b.Addressing))
-		if b.Addressing == "auto" {
-			b.Addressing = ""
-		}
-	}
-	c.Storage.DefaultBacking = strings.ToLower(strings.TrimSpace(c.Storage.DefaultBacking))
-	if c.Storage.DefaultBacking == BackingLocal {
-		c.Storage.DefaultBacking = ""
-	}
-}
-
-// validateBackings checks storage.backings and storage.default_backing.
+// validateBackings checks storage.backings, storage.default_backing and
+// storage.replication.
 func (c Config) validateBackings() error {
+	if err := c.Storage.ResticS3.Validate(); err != nil {
+		return fmt.Errorf("storage.restic_s3: %w", err)
+	}
+	if c.Storage.Backend == BackendMemory && c.Storage.ResticS3 != nil {
+		return errors.New("storage.restic_s3 requires an fs backing")
+	}
 	if len(c.Storage.Backings) > MaxBackings {
-		return fmt.Errorf("storage.backings: at most %d entries allowed", MaxBackings)
+		return fmt.Errorf("storage.backings: at most %d backings allowed", MaxBackings)
 	}
-	seen := make(map[string]bool)
+	paths := map[string]string{} // cleaned absolute path -> key naming it
+	if c.Storage.Path != "" {
+		if abs, err := filepath.Abs(c.Storage.Path); err == nil {
+			paths[abs] = "storage.path"
+		}
+	}
+	names := map[string]bool{DefaultBackingName: true}
 	for i, b := range c.Storage.Backings {
-		field := fmt.Sprintf("storage.backings[%d]", i)
-		if err := validateBacking(b); err != nil {
-			return fmt.Errorf("%s: %w", field, err)
+		key := fmt.Sprintf("storage.backings[%d]", i)
+		if err := b.ResticS3.Validate(); err != nil {
+			return fmt.Errorf("%s.restic_s3: %w", key, err)
 		}
-		if seen[b.Name] {
-			return fmt.Errorf("%s.name: %q is used twice", field, b.Name)
+		if b.Backend == BackendMemory && b.ResticS3 != nil {
+			return fmt.Errorf("%s.restic_s3 requires an fs backing", key)
 		}
-		seen[b.Name] = true
-		if b.Mode == BackingModeBlob && c.Storage.Backend != BackendFS {
-			return fmt.Errorf("%s.mode: blob backings need the fs storage backend (the metadata of their objects is kept there)", field)
+		switch {
+		case b.Name == DefaultBackingName:
+			return fmt.Errorf("%s.name: %q is reserved for the backing configured by storage.backend and storage.path", key, b.Name)
+		case !backingNameRe.MatchString(b.Name):
+			return fmt.Errorf("%s.name: %q must be 1-32 characters of a-z, 0-9, _ and -, starting with a letter or digit", key, b.Name)
+		case names[b.Name]:
+			return fmt.Errorf("%s.name: %q is used twice", key, b.Name)
+		}
+		names[b.Name] = true
+		if b.Backend != BackendS3 && b.S3 != nil {
+			return fmt.Errorf("%s.s3: only allowed with backend s3", key)
+		}
+		switch b.Backend {
+		case BackendFS, BackendS3:
+			if b.Backend == BackendS3 {
+				if b.S3 == nil {
+					return fmt.Errorf("%s.s3: required for an s3 backing", key)
+				}
+				if b.ResticS3 != nil {
+					return fmt.Errorf("%s.restic_s3: not supported on an s3 backing", key)
+				}
+				if err := validateS3Backing(b.Name, *b.S3); err != nil {
+					return fmt.Errorf("%s.s3.%w", key, err)
+				}
+			}
+			if b.Path == "" {
+				return fmt.Errorf("%s.path: required for an %s backing", key, b.Backend)
+			}
+			abs, err := filepath.Abs(b.Path)
+			if err != nil {
+				return fmt.Errorf("%s.path: %w", key, err)
+			}
+			if other, dup := paths[abs]; dup {
+				return fmt.Errorf("%s.path: %q is also used by %s; every backing needs its own directory", key, b.Path, other)
+			}
+			paths[abs] = key + ".path"
+		case BackendMemory:
+			if b.Path != "" {
+				return fmt.Errorf("%s.path: a memory backing has no path", key)
+			}
+		default:
+			return fmt.Errorf("%s.backend: %q is invalid (expected fs, memory or s3)", key, b.Backend)
 		}
 	}
-	if d := c.Storage.DefaultBacking; d != "" && !seen[d] {
-		return fmt.Errorf("storage.default_backing: %q is not a configured backing (expected %q or one of storage.backings)", d, BackingLocal)
+	// No backing directory may contain another one's system directory
+	// (gos3 keeps its metadata in <path>/.gos3).
+	for p, k := range paths {
+		for q, kq := range paths {
+			if p != q && (q == filepath.Join(p, SystemDirName) || strings.HasPrefix(q, filepath.Join(p, SystemDirName)+string(filepath.Separator))) {
+				return fmt.Errorf("%s: %q is inside the system directory of %s", kq, q, k)
+			}
+		}
+	}
+
+	def := c.Storage.DefaultBacking
+	if def == "" {
+		def = DefaultBackingName
+	}
+	if !names[def] {
+		return fmt.Errorf("storage.default_backing: unknown backing %q (expected one of %s)", def, strings.Join(c.BackingNames(), ", "))
+	}
+	rp := c.Storage.Replication
+	switch rp.DefaultMode {
+	case "", ReplicationSingle, ReplicationActivePassive, ReplicationActiveActive:
+	default:
+		return fmt.Errorf("storage.replication.default_mode: %q is invalid (expected single, active-passive or active-active)", rp.DefaultMode)
+	}
+	for i, r := range rp.DefaultReplicas {
+		switch {
+		case !names[r]:
+			return fmt.Errorf("storage.replication.default_replicas[%d]: unknown backing %q", i, r)
+		case r == def:
+			return fmt.Errorf("storage.replication.default_replicas[%d]: %q is the default backing, where new buckets have their primary copy", i, r)
+		case slices.Contains(rp.DefaultReplicas[:i], r):
+			return fmt.Errorf("storage.replication.default_replicas[%d]: %q is listed twice", i, r)
+		}
+	}
+	if rp.DefaultMode == ReplicationSingle && len(rp.DefaultReplicas) > 0 {
+		return errors.New("storage.replication.default_mode: single takes no default_replicas")
+	}
+	if (rp.DefaultMode == ReplicationActivePassive || rp.DefaultMode == ReplicationActiveActive) && len(rp.DefaultReplicas) == 0 {
+		return fmt.Errorf("storage.replication.default_mode: %s needs storage.replication.default_replicas", rp.DefaultMode)
+	}
+	// Zero values mean the defaults (filled in by Normalize).
+	if rp.Workers < 0 || rp.Workers > MaxReplicationWorkers {
+		return fmt.Errorf("storage.replication.workers: must be between 1 and %d (0 = default %d), got %d",
+			MaxReplicationWorkers, DefaultReplicationWorkers, rp.Workers)
+	}
+	if hi := rp.HealthInterval; hi != 0 && (hi < time.Second || hi > time.Hour) {
+		return fmt.Errorf("storage.replication.health_interval: must be between 1s and 1h, got %s", hi)
+	}
+	if ct := rp.CutoverTimeout; ct != 0 && (ct < time.Second || ct > time.Hour) {
+		return fmt.Errorf("storage.replication.cutover_timeout: must be between 1s and 1h, got %s", ct)
 	}
 	return nil
 }
 
-func validateBacking(b BackingConfig) error {
-	switch {
-	case b.Name == BackingLocal:
-		return fmt.Errorf("name: %q is reserved for the server's own storage", BackingLocal)
-	case !backingNameRe.MatchString(b.Name):
-		return fmt.Errorf("name: %q must be 1-32 lowercase letters, digits or '-', starting with a letter or digit", b.Name)
+// backingsList parses GOS3_STORAGE_BACKINGS: comma-separated entries
+// "name=/path" (an fs backing), "name=fs:/path" or "name=memory". An entry
+// without "=" names an fs backing without a path (refused by Validate).
+func backingsList(c *Config, v string) error {
+	var out []BackingConfig
+	for _, e := range SplitList(v) {
+		name, spec, _ := strings.Cut(e, "=")
+		b := BackingConfig{Name: strings.TrimSpace(name), Backend: BackendFS}
+		spec = strings.TrimSpace(spec)
+		switch {
+		case spec == BackendMemory:
+			b.Backend = BackendMemory
+		case strings.HasPrefix(spec, BackendFS+":"):
+			b.Path = strings.TrimPrefix(spec, BackendFS+":")
+		default:
+			b.Path = spec
+		}
+		out = append(out, b)
 	}
-	switch b.Mode {
-	case BackingModeBlob, BackingModeGateway:
-	default:
-		return fmt.Errorf("mode: %q is invalid (expected %s or %s)", b.Mode, BackingModeBlob, BackingModeGateway)
-	}
-	u, err := url.Parse(b.Endpoint)
-	if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" ||
-		u.Path != "" || u.RawQuery != "" || u.Fragment != "" || u.User != nil {
-		return fmt.Errorf("endpoint: %q must be an absolute http:// or https:// URL without a path", b.Endpoint)
-	}
-	if b.Region != "" && !regionRe.MatchString(b.Region) {
-		return fmt.Errorf("region: %q must be lowercase letters, digits and '-'", b.Region)
-	}
-	if b.Mode == BackingModeBlob && b.Bucket == "" {
-		return errors.New("bucket: required in blob mode")
-	}
-	if b.Bucket != "" && !remoteBucketRe.MatchString(b.Bucket) {
-		return fmt.Errorf("bucket: %q is not a valid bucket name", b.Bucket)
-	}
-	if len(b.Prefix) > 512 || !utf8.ValidString(b.Prefix) || strings.HasPrefix(b.Prefix, "/") {
-		return errors.New("prefix: must be valid UTF-8 of at most 512 bytes, not starting with '/'")
-	}
-	if b.AccessKey == "" || b.SecretKey == "" {
-		ak, sk := BackingCredentialEnv(b.Name)
-		return fmt.Errorf("access_key and secret_key are required (or set %s and %s)", ak, sk)
-	}
-	switch b.Addressing {
-	case "", "path", "virtual":
-	default:
-		return fmt.Errorf("addressing: %q is invalid (expected auto, path or virtual)", b.Addressing)
-	}
-	if b.PartSize != 0 && (b.PartSize < MinBackingPartSize || b.PartSize > MaxBackingPartSize) {
-		return fmt.Errorf("part_size: must be between %d (5 MiB) and %d (5 GiB) bytes, got %d", MinBackingPartSize, MaxBackingPartSize, b.PartSize)
-	}
-	return nil
-}
-
-var (
-	// remoteBucketRe accepts the bucket names of S3 services (stricter
-	// rules are the service's business).
-	remoteBucketRe = regexp.MustCompile(`^[a-z0-9][a-z0-9.\-_]{1,254}$`)
-)
-
-// backings is the setter of GOS3_STORAGE_BACKINGS: a JSON array of
-// BackingConfig objects (JSON field names as in BackingConfig's json tags,
-// e.g. "accessKey"); empty clears the list.
-func backings(c *Config, v string) error {
-	v = strings.TrimSpace(v)
-	if v == "" {
-		c.Storage.Backings = nil
-		return nil
-	}
-	var list []BackingConfig
-	if err := json.Unmarshal([]byte(v), &list); err != nil {
-		return fmt.Errorf("invalid JSON array of backings: %w", err)
-	}
-	c.Storage.Backings = list
+	c.Storage.Backings = out
 	return nil
 }
