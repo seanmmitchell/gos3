@@ -32,9 +32,9 @@ var restrictingKeys = map[string]bool{
 // aws:username with fixed (wildcard-free) values. ForAllValues conditions
 // never restrict (they hold when the key is missing, as it is for
 // anonymous callers). Statements restricted only by aws:SourceIp are judged
-// together: the union of their ranges over the whole policy may cover at
-// most four IPv4 /8 and four IPv6 /32 networks, so splitting a wide range
-// across statements does not hide it. Used for GetBucketPolicyStatus,
+// together: each range must be no wider than IPv4 /8 or IPv6 /32, and the
+// union over the whole policy may cover at most four such networks. Splitting
+// a wide range across statements does not hide it. Used for GetBucketPolicyStatus,
 // BlockPublicPolicy, RestrictPublicBuckets and the admin API's "public"
 // flags.
 func IsPublicPolicy(doc *PolicyDocument) bool {
@@ -126,9 +126,10 @@ func restrictingCondition(cond map[string]map[string]StringOrSlice) (restricted 
 	return false, ips
 }
 
-// Limits on the address space that aws:SourceIp conditions may cover and
-// still count as restricting: four IPv4 /8 networks and four IPv6 /32
-// networks. These are generous for real allow-lists (all RFC 1918 ranges
+// Aggregate limits on the address space that aws:SourceIp conditions may
+// cover and still count as restricting: four IPv4 /8 networks and four IPv6 /32
+// networks. Each individual range must also be no wider than /8 or /32.
+// These are generous for real allow-lists (all RFC 1918 ranges
 // together are about one /8) but keep a policy that lists many wide
 // ranges, which together admit (nearly) every client, public.
 const (
@@ -182,6 +183,12 @@ func narrowPrefixes(ps []netip.Prefix) bool {
 	var v4, v6 float64
 	var last netip.Prefix
 	for _, p := range ps {
+		// AWS classifies an individual non-private CIDR broader than /8
+		// (IPv4) or /32 (IPv6) as public. RFC 1918 ranges are all /8 or
+		// narrower, so no broader prefix can be entirely private.
+		if (p.Addr().Is4() && p.Bits() < 8) || (p.Addr().Is6() && p.Bits() < 32) {
+			return false
+		}
 		if last.IsValid() && last.Addr().BitLen() == p.Addr().BitLen() && last.Bits() <= p.Bits() && last.Contains(p.Addr()) {
 			continue
 		}

@@ -17,11 +17,6 @@ export interface BucketPolicyTemplate {
 
 const arn = (bucket: string, path?: string) => `arn:aws:s3:::${bucket}${path !== undefined ? `/${path}` : ''}`
 
-/** IAM user principal ARN as accepted by gos3 (any account id matches). */
-export function userPrincipalArn(user: string): string {
-  return `arn:aws:iam::000000000000:user/${user}`
-}
-
 export const BUCKET_POLICY_TEMPLATES: readonly BucketPolicyTemplate[] = [
   {
     id: 'public-read',
@@ -38,7 +33,7 @@ export const BUCKET_POLICY_TEMPLATES: readonly BucketPolicyTemplate[] = [
     description: 'Lets one IAM user list and download objects in this bucket.',
     needsUser: true,
     build: (bucket, { user }) => {
-      const principal = { AWS: [userPrincipalArn(user || 'USERNAME')] }
+      const principal = { AWS: [user || 'USERNAME'] }
       return [
         { Sid: `ReadOnlyList${sidSuffix(user)}`, Effect: 'Allow', Principal: principal, Action: ['s3:ListBucket', 's3:GetBucketLocation'], Resource: [arn(bucket)] },
         { Sid: `ReadOnlyGet${sidSuffix(user)}`, Effect: 'Allow', Principal: principal, Action: ['s3:GetObject', 's3:GetObjectVersion'], Resource: [arn(bucket, '*')] }

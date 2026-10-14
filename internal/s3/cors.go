@@ -22,6 +22,10 @@ const (
 	maxCORSRules      = 100
 	maxCORSConfigSize = 64 << 10
 	maxCORSRuleIDLen  = 255
+	// Preflight is unauthenticated. Bound its attacker-controlled header list
+	// before parsing it or checking it against every configured CORS rule.
+	maxCORSRequestHeadersSize  = 8 << 10
+	maxCORSRequestHeadersCount = 64
 )
 
 // corsMethods are the methods a CORSRule may allow.
@@ -359,7 +363,24 @@ func (s *Server) handlePreflight(w http.ResponseWriter, r *http.Request, rc *req
 		s.writeError(w, r, rc, s3err.ErrBadRequest.WithMessage("Invalid Access-Control-Request-Method: %s", method))
 		return
 	}
-	reqHeaders := splitHeaderList(strings.Join(r.Header.Values("Access-Control-Request-Headers"), ","))
+	headerValues := r.Header.Values("Access-Control-Request-Headers")
+	if len(headerValues) > maxCORSRequestHeadersCount {
+		s.writeError(w, r, rc, s3err.ErrBadRequest.WithMessage("Access-Control-Request-Headers contains too many headers."))
+		return
+	}
+	headerBytes := 0
+	for _, value := range headerValues {
+		headerBytes += len(value)
+		if headerBytes > maxCORSRequestHeadersSize {
+			s.writeError(w, r, rc, s3err.ErrBadRequest.WithMessage("Access-Control-Request-Headers is too large."))
+			return
+		}
+	}
+	reqHeaders := splitHeaderList(strings.Join(headerValues, ","))
+	if len(reqHeaders) > maxCORSRequestHeadersCount {
+		s.writeError(w, r, rc, s3err.ErrBadRequest.WithMessage("Access-Control-Request-Headers contains too many headers."))
+		return
+	}
 	cfg := s.corsConfigFor(r.Context(), rc.bucket, settings)
 	if cfg == nil {
 		s.writeError(w, r, rc, s3err.ErrCORSForbidden.WithMessage("CORSResponse: CORS is not enabled for this bucket."))

@@ -87,10 +87,11 @@ type StringOrSlice []string
 
 // Principal is a policy principal: "*" or {"AWS": "..."|[...]}.
 // gos3 matches AWS principals against IAM user names, access keys, "*" and
-// ARNs of the form arn:aws:iam::<anything>:user/<name> or :root (the
-// account principal, also written as a bare 12-digit account ID, which
-// never matches a user name or access key). Service and Federated
-// principals are accepted and kept but match no gos3 identity.
+// account-principal ARNs of the form arn:aws:iam::<account>:root (also
+// written as a bare 12-digit account ID, which never matches a user name
+// or access key). User ARNs are unsupported because gos3 has no account ID
+// or IAM paths. Service and Federated principals are accepted and kept but
+// match no gos3 identity.
 type Principal struct {
 	Any bool          // "*" or {"AWS":"*"}
 	AWS StringOrSlice // user names / ARNs
