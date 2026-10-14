@@ -295,15 +295,28 @@ stores. See [operations.md](operations.md#compression).
 
 | Method | Path | Action | Response |
 |---|---|---|---|
-| GET | `/buckets/{name}/encryption-provider` | GetBucketEncryption | `{"provider":"AES256"\|"restic", "backings":["default",…]}` |
-| PUT | `/buckets/{name}/encryption-provider` | PutBucketEncryption | body `{"provider":"AES256"\|"restic"}`; prepares the provider and returns its saved selection with `ready` and optional `error` |
+| GET | `/buckets/{name}/encryption-provider` | GetBucketEncryption | `{"provider":"AES256"\|"restic", "available":["AES256","restic"], "backings":["default",…]}` |
+| PUT | `/buckets/{name}/encryption-provider` | PutBucketEncryption | body `{"provider":"AES256"\|"restic"}`; prepares the provider, then saves it and returns the GET document |
 
-Provider actions use `arn:gos3:admin:::bucket/<name>`. Storage and secret fields
-are rejected: restic derives its repository from each assigned backing. GET lists
-saved settings and assigned backings, not repository health. A failed preparation
-after saving returns 200 with `ready:false` so the configuration can be retried.
-Provider selection alone does not enable S3 bucket-default encryption; use
-PutBucketEncryption with AES256 (also for restic), or an AES256 upload header.
+The provider is the bucket's implementation of SSE-S3: it applies to bucket
+default encryption and to uploads that request `AES256`. Provider actions use
+`arn:gos3:admin:::bucket/<name>`. The body is decoded strictly: storage and
+secret fields are rejected (naming the field), since restic derives its
+repositories from each assigned backing.
+
+`available` lists the providers the bucket can use now: `restic` needs the
+restic executable on the server and a filesystem backing for every copy of the
+bucket (primary, replicas and a move target). PUT refuses an unavailable
+provider with 400. Otherwise it validates the provider and prepares the
+bucket's keys or restic repository **before** saving the selection; if that
+fails it returns 400 and the previous provider stays in effect. A missing
+bucket is 404; a stored provider document that is not valid makes GET fail
+with 500 until a PUT replaces it. Changes are serialized per bucket.
+GET reports the saved selection and the assigned backings, not repository
+health. Provider selection alone does not enable S3 bucket-default encryption;
+use PutBucketEncryption with AES256 (also for restic), or an AES256 upload
+header. Force-deleting a bucket removes its encryption documents only together
+with the bucket.
 
 | Method | Path | Action | Response |
 |---|---|---|---|
@@ -311,14 +324,21 @@ PutBucketEncryption with AES256 (also for restic), or an AES256 upload header.
 | PUT | `/backings/{name}/restic` | UpdateConfig | Sets local or S3 restic storage for the backing; validates credentials before saving |
 
 Both backing actions are evaluated at service level. A memory or unknown backing
-returns 404. PUT accepts `{"mode":"local"}` or:
+returns 404. PUT (strict JSON body, serialized per backing) accepts
+`{"mode":"local"}` or:
 
 ```json
 { "mode":"s3", "endpoint":"https://s3.example.com", "bucket":"archives",
   "prefix":"gos3", "region":"us-east-1", "accessKey":"AK", "secretKey":"SK" }
 ```
 
-Optional `sessionToken` is write-only; `clearSessionToken:true` clears it.
+`endpoint` must be an `http(s)://host[:port]` base URL without credentials,
+path, query or fragment (the checks of server URLs), `bucket` an S3 bucket name,
+`prefix` free of `.`/`..` segments and control characters, and `region` empty or
+a region name (`a-z`, `0-9`, `-`). Errors name the field. An endpoint that is this
+server itself (one of its advertised URLs, or a URL whose `/_gos3/info` reports
+this server's ID) is refused: its restic writes would be archived through restic
+again. Optional `sessionToken` is write-only; `clearSessionToken:true` clears it.
 Blank credentials retain saved values. Responses contain `mode`, `endpoint`,
 `bucket`, `prefix`, `region`, `credentialsConfigured`,
 `sessionTokenConfigured`, and `locked`, never secrets. Locations are fixed

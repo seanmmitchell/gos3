@@ -172,7 +172,7 @@ export const ADMIN_RESOURCE_FORMS: readonly { type: AdminResourceType | 'service
   { type: 'service', arn: ADMIN_SERVICE_ARN, description: 'Every admin action and target' },
   { type: 'user', arn: adminArn('user', '<name>'), description: 'CreateUser, GetUser, UpdateUser, DeleteUser; CreateAccessKey (target user); UpdateAccessKey / DeleteAccessKey (the key\'s owner)' },
   { type: 'policy', arn: adminArn('policy', '<name>'), description: 'GetPolicy, PutPolicy, DeletePolicy' },
-  { type: 'bucket', arn: adminArn('bucket', '<name>'), description: 'GetBucket, ForceDeleteBucket, GetBucketCompression, PutBucketCompression' }
+  { type: 'bucket', arn: adminArn('bucket', '<name>'), description: 'GetBucket, ForceDeleteBucket, GetBucketCompression, PutBucketCompression, GetBucketEncryption, PutBucketEncryption' }
 ]
 
 /** Every admin action (IAM action "admin:<Action>"), see docs/admin-api.md. */
@@ -201,6 +201,8 @@ export const ADMIN_ACTIONS: readonly string[] = [
   'admin:ForceDeleteBucket',
   'admin:GetBucketCompression',
   'admin:PutBucketCompression',
+  'admin:GetBucketEncryption',
+  'admin:PutBucketEncryption',
   'admin:GetDiscovery',
   'admin:ProbeNetwork',
   'admin:ScanNetwork'
@@ -220,7 +222,9 @@ const ADMIN_RESOURCE_TYPES: Readonly<Record<string, AdminResourceType>> = {
   'admin:getbucket': 'bucket',
   'admin:forcedeletebucket': 'bucket',
   'admin:getbucketcompression': 'bucket',
-  'admin:putbucketcompression': 'bucket'
+  'admin:putbucketcompression': 'bucket',
+  'admin:getbucketencryption': 'bucket',
+  'admin:putbucketencryption': 'bucket'
 }
 
 /** True for admin:* actions (case-insensitive prefix). */

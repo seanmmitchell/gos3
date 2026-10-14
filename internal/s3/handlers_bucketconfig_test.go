@@ -633,37 +633,36 @@ func TestBucketEncryptionSDK(t *testing.T) {
 	c := e.client
 	_, err := c.GetBucketEncryption(bcCtx, &awss3.GetBucketEncryptionInput{Bucket: aws.String("cfg")})
 	bcSDKErr(t, err, "ServerSideEncryptionConfigurationNotFoundError")
-	for _, tc := range []struct {
-		algo   types.ServerSideEncryption
-		key    string
-		bkey   *bool
-		expect bool
-	}{
-		{types.ServerSideEncryptionAes256, "", nil, false},
-		{types.ServerSideEncryptionAwsKms, "arn:aws:kms:us-east-1:000000000000:key/abc", aws.Bool(true), true},
-		{types.ServerSideEncryptionAwsKmsDsse, "", aws.Bool(false), false},
-	} {
-		if _, err := c.PutBucketEncryption(bcCtx, &awss3.PutBucketEncryptionInput{Bucket: aws.String("cfg"),
+	// AWS KMS is not implemented: both KMS algorithms are refused, with or
+	// without a key ID and bucket key, and nothing is stored.
+	for _, algo := range []types.ServerSideEncryption{types.ServerSideEncryptionAwsKms, types.ServerSideEncryptionAwsKmsDsse} {
+		_, err := c.PutBucketEncryption(bcCtx, &awss3.PutBucketEncryptionInput{Bucket: aws.String("cfg"),
 			ServerSideEncryptionConfiguration: &types.ServerSideEncryptionConfiguration{Rules: []types.ServerSideEncryptionRule{{
-				ApplyServerSideEncryptionByDefault: &types.ServerSideEncryptionByDefault{SSEAlgorithm: tc.algo, KMSMasterKeyID: aws.String(tc.key)},
-				BucketKeyEnabled:                   tc.bkey,
-			}}}}); err != nil {
-			if tc.algo != types.ServerSideEncryptionAes256 {
-				bcSDKErr(t, err, "NotImplemented")
-				continue
-			}
-			t.Fatalf("%s: %v", tc.algo, err)
+				ApplyServerSideEncryptionByDefault: &types.ServerSideEncryptionByDefault{SSEAlgorithm: algo,
+					KMSMasterKeyID: aws.String("arn:aws:kms:us-east-1:000000000000:key/abc")},
+				BucketKeyEnabled: aws.Bool(true),
+			}}}})
+		if err == nil {
+			t.Fatalf("%s: accepted", algo)
 		}
-		out, err := c.GetBucketEncryption(bcCtx, &awss3.GetBucketEncryptionInput{Bucket: aws.String("cfg")})
-		if err != nil {
-			t.Fatal(err)
-		}
-		rules := out.ServerSideEncryptionConfiguration.Rules
-		if len(rules) != 1 || rules[0].ApplyServerSideEncryptionByDefault.SSEAlgorithm != tc.algo ||
-			aws.ToString(rules[0].ApplyServerSideEncryptionByDefault.KMSMasterKeyID) != tc.key ||
-			aws.ToBool(rules[0].BucketKeyEnabled) != tc.expect {
-			t.Fatalf("%s: %+v", tc.algo, rules)
-		}
+		bcSDKErr(t, err, "NotImplemented")
+		_, err = c.GetBucketEncryption(bcCtx, &awss3.GetBucketEncryptionInput{Bucket: aws.String("cfg")})
+		bcSDKErr(t, err, "ServerSideEncryptionConfigurationNotFoundError")
+	}
+	if _, err := c.PutBucketEncryption(bcCtx, &awss3.PutBucketEncryptionInput{Bucket: aws.String("cfg"),
+		ServerSideEncryptionConfiguration: &types.ServerSideEncryptionConfiguration{Rules: []types.ServerSideEncryptionRule{{
+			ApplyServerSideEncryptionByDefault: &types.ServerSideEncryptionByDefault{SSEAlgorithm: types.ServerSideEncryptionAes256},
+		}}}}); err != nil {
+		t.Fatal(err)
+	}
+	out, err := c.GetBucketEncryption(bcCtx, &awss3.GetBucketEncryptionInput{Bucket: aws.String("cfg")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	rules := out.ServerSideEncryptionConfiguration.Rules
+	if len(rules) != 1 || rules[0].ApplyServerSideEncryptionByDefault.SSEAlgorithm != types.ServerSideEncryptionAes256 ||
+		aws.ToString(rules[0].ApplyServerSideEncryptionByDefault.KMSMasterKeyID) != "" || aws.ToBool(rules[0].BucketKeyEnabled) {
+		t.Fatalf("AES256: %+v", rules)
 	}
 	bcNS(t, e.signed(http.MethodGet, "/cfg?encryption", nil, nil), "ServerSideEncryptionConfiguration")
 	if _, err := c.DeleteBucketEncryption(bcCtx, &awss3.DeleteBucketEncryptionInput{Bucket: aws.String("cfg")}); err != nil {
@@ -699,7 +698,8 @@ func TestBucketEncryptionValidation(t *testing.T) {
 		{"two rules", doc(rule("AES256", "") + rule("AES256", "")), 400, "MalformedXML"},
 		{"no default", doc("<Rule><BucketKeyEnabled>true</BucketKeyEnabled></Rule>"), 400, "MalformedXML"},
 		{"bad bool", doc("<Rule><ApplyServerSideEncryptionByDefault><SSEAlgorithm>AES256</SSEAlgorithm></ApplyServerSideEncryptionByDefault><BucketKeyEnabled>maybe</BucketKeyEnabled></Rule>"), 400, "MalformedXML"},
-		{"long key", doc(rule("aws:kms", strings.Repeat("k", 2049))), 400, "InvalidArgument"},
+		{"kms with key", doc(rule("aws:kms", "k")), 501, "NotImplemented"},
+		{"dsse", doc(rule("aws:kms:dsse", "")), 501, "NotImplemented"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			bcExpect(t, e.signed(http.MethodPut, "/cfg?encryption", tc.body, nil), tc.status, tc.code)

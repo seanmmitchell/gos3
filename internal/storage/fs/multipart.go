@@ -160,6 +160,12 @@ func (b *Backend) NewPartWriter(ctx context.Context, bucket, key, uploadID strin
 			return err
 		}
 		id, mode = br.ID, up.Meta.Encryption
+		// Uploads created by builds that only recorded SSE have no
+		// Encryption, but completion encrypts them: stage their new parts
+		// encrypted too.
+		if mode == "" && up.Meta.SSE != "" {
+			mode = storage.EncryptionAES256
+		}
 		return nil
 	})
 	if err != nil {

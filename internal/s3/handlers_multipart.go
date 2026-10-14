@@ -268,7 +268,7 @@ func (s *Server) handleUploadPart(w http.ResponseWriter, r *http.Request, rc *re
 	if v := part.Checksums[report]; report != "" && v != "" {
 		hdr.Set(checksumHeader(report), v)
 	}
-	setSSEHeaders(hdr, up.Meta)
+	setUploadSSEHeaders(hdr, up.Meta)
 	writeEmpty(w, http.StatusOK)
 	return nil
 }
@@ -410,7 +410,7 @@ func (s *Server) handleUploadPartCopy(w http.ResponseWriter, r *http.Request, rc
 	if srcBucket.Versioning != storage.VersioningUnversioned {
 		early.Set("X-Amz-Copy-Source-Version-Id", info.VersionID)
 	}
-	setSSEHeaders(early, up.Meta)
+	setUploadSSEHeaders(early, up.Meta)
 	bucket, key, uploadID := rc.bucket, rc.key, up.UploadID
 	return s.respondWithKeepAlive(w, r, rc, early, nil, func() longResult {
 		pw, err := s.backend.NewPartWriter(ctx, bucket, key, uploadID, partNumber)
@@ -1030,7 +1030,7 @@ func (s *Server) handleCompleteMultipartUpload(w http.ResponseWriter, r *http.Re
 
 	versioned := bi.Versioning != storage.VersioningUnversioned
 	early := http.Header{}
-	setSSEHeaders(early, plan.meta)
+	setUploadSSEHeaders(early, plan.meta)
 	var trailers []string
 	if versioned {
 		trailers = []string{"X-Amz-Version-Id"}

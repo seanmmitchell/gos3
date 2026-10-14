@@ -21,8 +21,11 @@ upload staging and multipart parts are encrypted too. The memory backend
 records AES256 for SSE responses and replication but keeps its in-process
 data as is.
 
-AWS KMS (`aws:kms` / `aws:kms:dsse`) and SSE-C return
-`501 NotImplemented`. Change legacy KMS defaults before new uploads.
+AWS KMS (`aws:kms` / `aws:kms:dsse`) and SSE-C requests return
+`501 NotImplemented`. A KMS bucket default stored by an older build is applied
+as SSE-S3 (AES256), with a logged warning, as are multipart uploads that
+requested KMS before the upgrade; save the bucket's default encryption again
+to replace it.
 
 ## Existing objects
 

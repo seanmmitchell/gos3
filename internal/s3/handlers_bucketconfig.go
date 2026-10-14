@@ -525,13 +525,11 @@ type bucketEncryptDefault struct {
 	KMSMasterKeyID string `xml:"KMSMasterKeyID,omitempty"`
 }
 
-// maxKMSKeyIDLength bounds KMSMasterKeyID values (key ARNs/aliases).
-const maxKMSKeyIDLength = 2048
-
 // validate checks the configuration: exactly one rule with
-// ApplyServerSideEncryptionByDefault (MalformedXML otherwise), SSEAlgorithm
-// AES256, aws:kms or aws:kms:dsse (MalformedXML), and a KMSMasterKeyID
-// only with the KMS algorithms (InvalidArgument).
+// ApplyServerSideEncryptionByDefault (MalformedXML otherwise) and
+// SSEAlgorithm AES256 without a KMSMasterKeyID (InvalidArgument). The KMS
+// algorithms aws:kms and aws:kms:dsse are NotImplemented, other algorithms
+// MalformedXML.
 func (c *bucketEncryptionConfig) validate() error {
 	if len(c.Rules) != 1 {
 		return s3err.ErrMalformedXML
@@ -549,10 +547,7 @@ func (c *bucketEncryptionConfig) validate() error {
 				With("ArgumentName", "ApplyServerSideEncryptionByDefault")
 		}
 	case "aws:kms", "aws:kms:dsse":
-		if len(d.KMSMasterKeyID) > maxKMSKeyIDLength {
-			return s3err.ErrInvalidArgument.WithMessage("KMS key ID is too long.")
-		}
-		return s3err.ErrNotImplemented.WithMessage("AWS KMS encryption is not implemented. Use SSE-S3 (AES256).")
+		return errKMSNotImplemented()
 	default:
 		return s3err.ErrMalformedXML
 	}
@@ -591,7 +586,7 @@ func (s *Server) handlePutBucketEncryption(w http.ResponseWriter, r *http.Reques
 		return err
 	}
 	c.XMLNS = s3Namespace
-	if err := s.prepareEncryption(ctx, rc.bucket, &storage.ObjectMeta{SSE: "AES256"}); err != nil {
+	if err := s.prepareEncryption(ctx, rc.bucket, &storage.ObjectMeta{SSE: "AES256"}, ""); err != nil {
 		return err
 	}
 	if err := s.storeBucketConfig(ctx, rc, storage.ConfigEncryption, c); err != nil {
