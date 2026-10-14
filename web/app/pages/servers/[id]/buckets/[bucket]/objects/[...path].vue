@@ -166,7 +166,9 @@ function loadMore() {
 // Declared before the listing watcher (which clears it); the getter is lazy.
 const selection = useBrowserSelection(() => visible.value.map(e => e.id))
 
-watch([s3, bucket, listPrefix, showVersions], () => {
+// Navigation can clear a search without changing listPrefix. The folder still
+// changes relative row names, placeholder visibility, and selection.
+watch([s3, bucket, prefix, listPrefix, showVersions], () => {
   selection.clear()
   void refresh()
 }, { immediate: true })

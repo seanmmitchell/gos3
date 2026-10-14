@@ -3,7 +3,7 @@
 // prefix and the server lists the matching keys (debounced while typing).
 //
 //   const { search, mode, serverQuery, listPrefix } = useBrowserSearch(prefix)
-//   watch(listPrefix, p => list(p))
+//   watch([prefix, listPrefix], ([, p]) => list(p))
 //
 // The text belongs to the folder it was typed in: opening another folder
 // clears it, so the new folder is not listed with the old query appended.
