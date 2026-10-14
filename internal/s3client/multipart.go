@@ -100,6 +100,8 @@ func (c *Client) UploadPartCopy(ctx context.Context, bucket, key, uploadID strin
 type CompleteOptions struct {
 	IfNoneMatch bool   // "If-None-Match: *"
 	IfMatch     string // "If-Match: <etag>"
+	// NoRetry sends the request once (see PutOptions.NoRetry).
+	NoRetry bool
 }
 
 // CompleteMultipartUpload assembles the parts and returns the object's ETag.
@@ -129,6 +131,7 @@ func (c *Client) CompleteMultipartUpload(ctx context.Context, bucket, key, uploa
 	resp, err := c.do(ctx, request{
 		op: "CompleteMultipartUpload", method: http.MethodPost, bucket: bucket, key: key, hasKey: true,
 		query: url.Values{"uploadId": {uploadID}}, header: h, body: bytesBody(body), bodySize: int64(len(body)),
+		noRetry: opts.NoRetry,
 	})
 	if err != nil {
 		return "", err

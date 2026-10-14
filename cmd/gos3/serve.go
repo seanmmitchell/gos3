@@ -64,8 +64,8 @@ func addConfigFlags(fs *flag.FlagSet) *configFlags {
 	}
 
 	str("address", "server.address", "listen address [host]:port (default \":9000\")")
-	str("data", "storage.path", "data directory (default \"./data\"; memory backend: none = ephemeral)")
-	str("backend", "storage.backend", "storage backend: fs or memory (default fs)")
+	str("data", "storage.path", "data directory (default \"./data\"; memory and s3 backends: system state only, none = ephemeral)")
+	str("backend", "storage.backend", "storage backend: fs, memory or s3 (default fs; s3 is configured by storage.s3 / GOS3_S3_*)")
 	str("name", "server.name", "server name shown in the UI and discovery (default: host name)")
 	str("region", "server.region", "region reported to clients (default us-east-1)")
 	str("public-url", "server.public_url", "externally reachable base URL, e.g. https://s3.example.com")
@@ -258,14 +258,7 @@ func printBanner(w io.Writer, srv *server.Server, showSecret bool, credsFile str
 		fmt.Fprintf(tw, "  Admin API\t%s/_gos3/admin/v1\n", local)
 	}
 	fmt.Fprintf(tw, "  Region\t%s\n", info.Region)
-	switch {
-	case srv.BackendName() == config.BackendFS:
-		fmt.Fprintf(tw, "  Storage\tfs at %s\n", srv.DataPath())
-	case srv.DataPath() != "":
-		fmt.Fprintf(tw, "  Storage\tmemory (ephemeral objects; system state in %s)\n", srv.DataPath())
-	default:
-		fmt.Fprintf(tw, "  Storage\tmemory (ephemeral: everything is lost on exit)\n")
-	}
+	fmt.Fprintf(tw, "  Storage\t%s\n", storageSummary(srv.BackendName(), srv.DataPath(), srv.Config().Storage.S3))
 	fmt.Fprintf(tw, "  Access key\t%s\n", ak)
 	switch srv.CredentialsSource() {
 	case config.CredentialsConfigured:
@@ -290,4 +283,29 @@ func printBanner(w io.Writer, srv *server.Server, showSecret bool, credsFile str
 	_ = tw.Flush()
 	b.WriteString("\n  Press Ctrl-C to stop.\n\n")
 	_, _ = io.WriteString(w, b.String())
+}
+
+// storageSummary describes the default backing for the banner: its
+// backend, where its data lives and where system state is kept.
+func storageSummary(backend, dataPath string, s3 *config.S3Config) string {
+	switch {
+	case backend == config.BackendFS:
+		return "fs at " + dataPath
+	case backend == config.BackendS3:
+		where := "s3"
+		if s3 != nil {
+			where = "s3 at " + s3.Endpoint + "/" + s3.Bucket + "/" + s3.Prefix
+			if s3.Gateway {
+				where += " [gateway]"
+			}
+		}
+		if dataPath != "" {
+			return where + "; system state in " + dataPath
+		}
+		return where + "; system state ephemeral (IAM users, settings, placements and live backings are lost on exit)"
+	case dataPath != "":
+		return "memory (ephemeral objects; system state in " + dataPath + ")"
+	default:
+		return "memory (ephemeral: everything is lost on exit)"
+	}
 }

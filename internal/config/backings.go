@@ -26,12 +26,6 @@ func (c Config) BackingNames() []string {
 // validateBackings checks storage.backings, storage.default_backing and
 // storage.replication.
 func (c Config) validateBackings() error {
-	if err := c.Storage.ResticS3.Validate(); err != nil {
-		return fmt.Errorf("storage.restic_s3: %w", err)
-	}
-	if c.Storage.Backend == BackendMemory && c.Storage.ResticS3 != nil {
-		return errors.New("storage.restic_s3 requires an fs backing")
-	}
 	if len(c.Storage.Backings) > MaxBackings {
 		return fmt.Errorf("storage.backings: at most %d backings allowed", MaxBackings)
 	}
@@ -42,14 +36,16 @@ func (c Config) validateBackings() error {
 		}
 	}
 	names := map[string]bool{DefaultBackingName: true}
+	var places []s3Place
+	gateways := map[string]bool{}
+	if c.Storage.Backend == BackendS3 && c.Storage.S3 != nil {
+		s := c.Storage.S3
+		places = append(places, s3Place{"storage.s3", s3Server(s.Endpoint), s.Bucket, s.Prefix})
+		gateways[DefaultBackingName] = s.Gateway
+	}
+	envNames := map[string]string{} // GOS3_BACKING_<NAME> part -> s3 backing name
 	for i, b := range c.Storage.Backings {
 		key := fmt.Sprintf("storage.backings[%d]", i)
-		if err := b.ResticS3.Validate(); err != nil {
-			return fmt.Errorf("%s.restic_s3: %w", key, err)
-		}
-		if b.Backend == BackendMemory && b.ResticS3 != nil {
-			return fmt.Errorf("%s.restic_s3 requires an fs backing", key)
-		}
 		switch {
 		case b.Name == DefaultBackingName:
 			return fmt.Errorf("%s.name: %q is reserved for the backing configured by storage.backend and storage.path", key, b.Name)
@@ -63,18 +59,24 @@ func (c Config) validateBackings() error {
 			return fmt.Errorf("%s.s3: only allowed with backend s3", key)
 		}
 		switch b.Backend {
-		case BackendFS, BackendS3:
-			if b.Backend == BackendS3 {
-				if b.S3 == nil {
-					return fmt.Errorf("%s.s3: required for an s3 backing", key)
-				}
-				if b.ResticS3 != nil {
-					return fmt.Errorf("%s.restic_s3: not supported on an s3 backing", key)
-				}
-				if err := validateS3Backing(b.Name, *b.S3); err != nil {
-					return fmt.Errorf("%s.s3.%w", key, err)
-				}
+		case BackendS3:
+			if b.Path != "" {
+				return fmt.Errorf("%s.path: an s3 backing has no path (its data and metadata live in the remote bucket)", key)
 			}
+			if b.S3 == nil {
+				return fmt.Errorf("%s.s3: required for an s3 backing", key)
+			}
+			if err := validateS3(key+".s3", b.Name, *b.S3); err != nil {
+				return err
+			}
+			if other, dup := envNames[backingEnvName(b.Name)]; dup {
+				return fmt.Errorf("%s.name: %q and %q share the environment variables %s_*; rename one",
+					key, b.Name, other, strings.TrimSuffix(BackingEnv(b.Name, ""), "_"))
+			}
+			envNames[backingEnvName(b.Name)] = b.Name
+			places = append(places, s3Place{key + ".s3", s3Server(b.S3.Endpoint), b.S3.Bucket, b.S3.Prefix})
+			gateways[b.Name] = b.S3.Gateway
+		case BackendFS:
 			if b.Path == "" {
 				return fmt.Errorf("%s.path: required for an %s backing", key, b.Backend)
 			}
@@ -93,6 +95,14 @@ func (c Config) validateBackings() error {
 		default:
 			return fmt.Errorf("%s.backend: %q is invalid (expected fs, memory or s3)", key, b.Backend)
 		}
+	}
+	if c.Storage.Backend == BackendS3 && c.Storage.S3 != nil {
+		if err := validateS3("storage.s3", DefaultBackingName, *c.Storage.S3); err != nil {
+			return err
+		}
+	}
+	if err := checkS3Overlap(places); err != nil {
+		return err
 	}
 	// No backing directory may contain another one's system directory
 	// (gos3 keeps its metadata in <path>/.gos3).
@@ -125,7 +135,13 @@ func (c Config) validateBackings() error {
 			return fmt.Errorf("storage.replication.default_replicas[%d]: %q is the default backing, where new buckets have their primary copy", i, r)
 		case slices.Contains(rp.DefaultReplicas[:i], r):
 			return fmt.Errorf("storage.replication.default_replicas[%d]: %q is listed twice", i, r)
+		case gateways[r]:
+			return fmt.Errorf("storage.replication.default_replicas[%d]: %q is an s3 gateway backing, which cannot hold replicas", i, r)
 		}
+	}
+	if gateways[def] && len(rp.DefaultReplicas) > 0 {
+		return fmt.Errorf("storage.replication.default_replicas: the default backing %q is an s3 gateway backing, whose buckets cannot be replicated; "+
+			"choose another storage.default_backing or remove the default replicas", def)
 	}
 	if rp.DefaultMode == ReplicationSingle && len(rp.DefaultReplicas) > 0 {
 		return errors.New("storage.replication.default_mode: single takes no default_replicas")
@@ -148,8 +164,10 @@ func (c Config) validateBackings() error {
 }
 
 // backingsList parses GOS3_STORAGE_BACKINGS: comma-separated entries
-// "name=/path" (an fs backing), "name=fs:/path" or "name=memory". An entry
-// without "=" names an fs backing without a path (refused by Validate).
+// "name=/path" (an fs backing), "name=fs:/path", "name=memory" or "name=s3"
+// (an s3 backing configured by its GOS3_BACKING_<NAME>_* variables, see
+// BackingEnv). An entry without "=" names an fs backing without a path
+// (refused by Validate).
 func backingsList(c *Config, v string) error {
 	var out []BackingConfig
 	for _, e := range SplitList(v) {
@@ -159,6 +177,8 @@ func backingsList(c *Config, v string) error {
 		switch {
 		case spec == BackendMemory:
 			b.Backend = BackendMemory
+		case spec == BackendS3:
+			b.Backend, b.S3 = BackendS3, &S3Config{}
 		case strings.HasPrefix(spec, BackendFS+":"):
 			b.Path = strings.TrimPrefix(spec, BackendFS+":")
 		default:

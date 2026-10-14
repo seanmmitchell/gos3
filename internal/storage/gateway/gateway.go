@@ -1,15 +1,16 @@
 // Package gateway implements the gateway (pass-through) backing: a
 // routed.DataStore that stores gos3 objects as native objects in a remote
 // S3 service, so other S3 clients can read and write them too (see
-// docs/backings.md, "Gateway mode").
+// docs/backings.md, "The gateway option").
 //
 // gos3 bucket b maps either to the remote bucket b (Options.Bucket empty;
 // created by AttachBucket when missing, adopted with its objects when it
 // exists) or to the key prefix Prefix+b+"/" of one shared remote bucket.
 // Object key k is remote key Prefix+k (per-bucket mode) or
 // Prefix+b+"/"+k (shared mode). The router (internal/storage/routed)
-// keeps bucket records and configuration documents in the primary
-// backend; this package handles objects and multipart uploads only.
+// keeps bucket records and configuration documents in its primary backend
+// (in the server, an s3store on the remote's metadata bucket); this
+// package handles objects and multipart uploads only.
 //
 // Semantics are those of an unversioned storage.Backend bucket: every
 // object is the null version. Differences that follow from storing data
@@ -30,8 +31,10 @@
 //   - Metadata changes (UpdateObjectMeta) rewrite the object onto itself
 //     with a server-side copy pinned to its ETag.
 //
-// In-progress multipart uploads are tracked locally (persistently with
-// Options.StateDir); see multipart.go for how parts are mapped to remote
+// In-progress multipart uploads are tracked in memory and written through
+// to Options.State (records and staged small parts; in the server, held in
+// the remote's metadata bucket, so nothing lives on local disk but
+// temporary spools); see multipart.go for how parts are mapped to remote
 // multipart uploads.
 package gateway
 
@@ -43,10 +46,9 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"unicode/utf8"
-
-	bolt "go.etcd.io/bbolt"
 
 	"github.com/seanmmitchell/gos3/internal/s3client"
 	"github.com/seanmmitchell/gos3/internal/storage"
@@ -68,10 +70,16 @@ type Options struct {
 	// PartSize is the upload part size and the largest object sent with a
 	// single PUT (0 = s3client.DefaultPartSize).
 	PartSize int64
-	// StateDir holds persistent local state: the multipart upload records
-	// (gateway.db) and the staged small parts (parts/). "" keeps the
-	// records in memory and stages parts in a temporary directory.
-	StateDir string
+	// State keeps the multipart upload records and the staged small parts
+	// (see StateStore). Required; MemoryState keeps them in memory.
+	State StateStore
+	// Reserved, in per-bucket mode, reports remote buckets gos3 buckets
+	// must not map to (those holding gos3's own state, e.g. the bucket of
+	// every s3 backing): AttachBucket refuses a gos3 bucket whose remote
+	// bucket it reports. It is called for every new bucket, so it can
+	// follow backings added at run time. nil reserves none (remote buckets
+	// and prefixes marked with gos3.json are refused regardless).
+	Reserved func(remoteBucket string) bool
 	// SpoolDir holds temporary files buffering uploads ("" =
 	// os.TempDir()). When set it is dedicated to this store: stale spool
 	// files in it are removed by Open.
@@ -88,13 +96,9 @@ type Store struct {
 	prefix   string
 	partSize int64
 	spoolDir string
+	reserved func(string) bool
+	state    StateStore
 	log      *slog.Logger
-
-	// stageDir holds staged parts; stageTemp marks a temporary directory
-	// removed by Close.
-	stageDir  string
-	stageTemp bool
-	db        *bolt.DB // nil without StateDir
 
 	keys keyLocks // per-object and per-part locks
 
@@ -103,7 +107,6 @@ type Store struct {
 	uploads  map[string]*upload   // upload ID -> upload
 	byBucket map[string][]*upload // bucket -> uploads in listing order
 	closed   bool
-	closeErr error
 }
 
 var _ routed.DataStore = (*Store)(nil)
@@ -111,15 +114,25 @@ var _ routed.DataStore = (*Store)(nil)
 // errClosed is returned by operations after Close.
 var errClosed = errors.New("gateway: store closed")
 
+// errRemoteUploadGone is wrapped (with storage.ErrUploadNotFound) into
+// errors caused by a remote multipart upload that no longer exists
+// (aborted by someone else, or expired by a lifecycle rule).
+var errRemoteUploadGone = errors.New("the remote multipart upload no longer exists")
+
 // errNoRemoteBucket is wrapped (with storage.ErrBackingUnavailable) into
 // errors caused by the remote bucket having vanished.
 var errNoRemoteBucket = errors.New("the remote bucket does not exist")
 
-// Open returns a store for opts, creating StateDir and SpoolDir when
-// missing and loading the multipart upload records kept in StateDir.
+// Open returns a store for opts, creating SpoolDir when missing and
+// loading the multipart upload records kept in opts.State. Besides reading
+// those records it does no remote I/O that can fail it: the removal of
+// stale state (staged parts no record refers to) is best effort.
 func Open(opts Options) (*Store, error) {
 	if opts.Client == nil {
 		return nil, errors.New("gateway: Options.Client is required")
+	}
+	if opts.State == nil {
+		return nil, errors.New("gateway: Options.State is required")
 	}
 	s := &Store{
 		name:     opts.Name,
@@ -128,6 +141,8 @@ func Open(opts Options) (*Store, error) {
 		prefix:   opts.Prefix,
 		partSize: opts.PartSize,
 		spoolDir: opts.SpoolDir,
+		reserved: opts.Reserved,
+		state:    opts.State,
 		log:      opts.Logger,
 		gens:     map[string]uint64{},
 		uploads:  map[string]*upload{},
@@ -148,42 +163,19 @@ func Open(opts Options) (*Store, error) {
 			}
 		}
 	}
-	if opts.StateDir == "" {
-		dir, err := os.MkdirTemp(s.spoolDir, "gos3-gateway-parts-*")
-		if err != nil {
-			return nil, fmt.Errorf("gateway %q: create part staging directory: %w", s.name, err)
-		}
-		s.stageDir, s.stageTemp = dir, true
-		return s, nil
-	}
-	s.stageDir = filepath.Join(opts.StateDir, "parts")
-	if err := os.MkdirAll(s.stageDir, 0o700); err != nil {
-		return nil, fmt.Errorf("gateway %q: create state directory: %w", s.name, err)
-	}
-	if err := s.openState(filepath.Join(opts.StateDir, "gateway.db")); err != nil {
+	if err := s.loadState(); err != nil {
 		return nil, err
 	}
 	return s, nil
 }
 
-// Close releases the state database (and removes the temporary part
-// staging directory of a store without StateDir). It is idempotent.
+// Close marks the store closed: uploads can no longer be created. The
+// StateStore is not closed (it belongs to the caller). It is idempotent.
 func (s *Store) Close() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.closed {
-		return s.closeErr
-	}
 	s.closed = true
-	var errs []error
-	if s.db != nil {
-		errs = append(errs, s.db.Close())
-	}
-	if s.stageTemp {
-		errs = append(errs, os.RemoveAll(s.stageDir))
-	}
-	s.closeErr = errors.Join(errs...)
-	return s.closeErr
+	return nil
 }
 
 // --- naming ---
@@ -249,6 +241,8 @@ func (s *Store) remoteErr(op, bucket, key string, err error) error {
 	switch {
 	case errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded):
 		return err
+	case s3client.IsCode(err, "NoSuchUpload"):
+		return fmt.Errorf("gateway %q: %s %s: %w: %w", s.name, op, where, errRemoteUploadGone, storage.ErrUploadNotFound)
 	case s3client.IsCode(err, "NoSuchBucket"):
 		rb, _ := s.remote(bucket)
 		return fmt.Errorf("gateway %q: %s %s: remote bucket %q: %w: %w", s.name, op, where, rb, errNoRemoteBucket, storage.ErrBackingUnavailable)
@@ -288,28 +282,71 @@ func checkVersion(bucket, key, versionID string) error {
 
 // --- buckets ---
 
+// backingMarker is the marker object at the root of the remote prefix of
+// a gos3 S3 backing (internal/storage/s3store): a remote bucket or prefix
+// holding one keeps gos3 state (journal, wrapped keys, data blobs) that
+// gos3 users must not reach through a gateway bucket.
+const backingMarker = "gos3.json"
+
 // AttachBucket prepares the remote side of a new gos3 bucket. Per-bucket
 // mode: an accessible remote bucket of the same name is adopted with its
 // objects, a missing one is created (in the client's region). Shared
 // mode: the shared remote bucket must exist.
+//
+// Remote locations holding gos3 state are refused with an error wrapping
+// storage.ErrBucketExists: in per-bucket mode the buckets Options.Reserved
+// reports and existing buckets with a gos3.json marker at their root (or
+// at Prefix); in shared mode a bucket prefix with a gos3.json marker.
 func (s *Store) AttachBucket(ctx context.Context, info storage.BucketInfo) error {
-	rb, _ := s.remote(info.Name)
+	rb, rp := s.remote(info.Name)
+	if s.bucket == "" && s.reserved != nil && s.reserved(rb) {
+		return fmt.Errorf("%w: gateway %q: the remote bucket %q holds gos3 backing state and cannot hold a gos3 bucket", storage.ErrBucketExists, s.name, rb)
+	}
 	err := s.c.HeadBucket(ctx, rb)
 	switch {
 	case err == nil:
-		return nil
+		return s.checkNoBackingState(ctx, info.Name, rb, rp)
 	case s.bucket != "" && s3client.IsNotFound(err):
 		return fmt.Errorf("gateway %q: the shared remote bucket %q does not exist: %w", s.name, rb, storage.ErrBackingUnavailable)
 	case s.bucket == "" && s3client.IsNotFound(err):
 		err = s.c.CreateBucket(ctx, rb)
-		if s3client.IsCode(err, "BucketAlreadyExists") {
+		switch {
+		case s3client.IsCode(err, "BucketAlreadyExists"):
 			return fmt.Errorf("gateway %q: the remote bucket name %q is taken by another account: %w", s.name, rb, storage.ErrBucketExists)
+		case s3client.IsCode(err, "BucketAlreadyOwnedByYou"):
+			// Created concurrently by someone else with our credentials.
+			return s.checkNoBackingState(ctx, info.Name, rb, rp)
 		}
 		return s.remoteErr("CreateBucket", info.Name, "", err)
 	case statusOf(err) == http.StatusForbidden:
 		return fmt.Errorf("gateway %q: the remote bucket %q exists but is not accessible with the backing's credentials (HTTP 403): %w", s.name, rb, storage.ErrBackingUnavailable)
 	}
 	return s.remoteErr("HeadBucket", info.Name, "", err)
+}
+
+// checkNoBackingState refuses an existing remote location that holds a
+// gos3 backing marker: at the bucket root (per-bucket mode) and at the
+// prefix the gos3 bucket's keys get (rp).
+func (s *Store) checkNoBackingState(ctx context.Context, bucket, rb, rp string) error {
+	var markers []string
+	if s.bucket == "" {
+		markers = append(markers, backingMarker)
+	}
+	if rp != "" {
+		markers = append(markers, rp+backingMarker)
+	}
+	for _, k := range markers {
+		_, err := s.c.HeadObject(ctx, rb, k)
+		switch {
+		case err == nil:
+			return fmt.Errorf("%w: gateway %q: the remote location %s/%s holds gos3 backing state (%s) and cannot hold a gos3 bucket",
+				storage.ErrBucketExists, s.name, rb, strings.TrimSuffix(k, backingMarker), backingMarker)
+		case s3client.IsNotFound(err):
+		default:
+			return s.remoteErr("HeadObject", bucket, k, err)
+		}
+	}
+	return nil
 }
 
 // CheckEmpty reports storage.ErrBucketNotEmpty when the bucket holds an
@@ -346,11 +383,14 @@ func (s *Store) DetachBucket(ctx context.Context, bucket string) error {
 		if !s.isGone(u) {
 			if rid := s.remoteUploadID(u); rid != "" {
 				rb, rk := s.remoteKey(u.bucket, u.key)
-				if err := s.c.AbortMultipartUpload(ctx, rb, rk, rid); err != nil {
+				if err := s.c.AbortMultipartUpload(ctx, rb, rk, rid); err != nil && !s3client.IsCode(err, "NoSuchUpload") {
 					errs = append(errs, s.remoteErr("AbortMultipartUpload", u.bucket, u.key, err))
 				}
 			}
-			if err := s.dropUpload(u); err != nil {
+			// The bucket is gone: forget the upload even if its records
+			// cannot be deleted (they then bring it back after a restart,
+			// where it can be aborted again if the bucket is recreated).
+			if err := s.dropUpload(ctx, u, true); err != nil {
 				errs = append(errs, err)
 			}
 		}

@@ -53,8 +53,6 @@ func (b *Backend) recover(ctx context.Context) {
 		b.log.Debug("fs: recovery interrupted by close")
 		return
 	}
-	// The remote passes run after the local summary is logged.
-	defer b.recoverRemotes(ctx, b.now())
 	attrs := []any{
 		"orphan_data_files", st.dataFiles,
 		"deleted_bucket_dirs", st.bucketDirs,

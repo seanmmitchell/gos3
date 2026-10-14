@@ -1,48 +1,42 @@
 // Package memory implements an ephemeral, in-memory storage.Backend.
 //
-// Everything lives in Go maps and per-bucket ordered skip lists guarded by
+// Everything lives in Go maps and per-bucket ordered indexes guarded by
 // read/write mutexes, so the backend is safe for concurrent use. It is meant
 // for tests, development and ephemeral deployments: all data is lost when
 // the process exits.
 //
 // Design notes:
+//   - Each bucket is an index.Bucket whose payload is the stored bytes: the
+//     index package implements the versioning semantics (version IDs and
+//     stamps, null versions, delete markers, conditional commits, imports,
+//     walks and the multipart upload order), shared with the s3store
+//     backend. This package adds locking, data handling and the
+//     storage.Backend surface.
 //   - Object data is stored as immutable byte slices; readers returned by
 //     OpenObject are snapshots over the slice of the exact version opened and
 //     are never affected by later writes or deletes.
 //   - All metadata maps and slices are deep-copied on the way in and out, so
 //     callers can never alias internal state.
-//   - Keys of a bucket are kept in a skip list, so WalkObjects/WalkVersions
-//     seek to prefix/marker in O(log n) and then step in O(1) per key.
 //   - Walk callbacks run without any lock held (the walk collects small
 //     batches under a read lock), so callbacks may call back into the backend,
 //     including mutating it.
-//   - Every version (including null versions and delete markers) is stamped
-//     with a strictly increasing 64-bit sequence (derived from the wall clock
-//     in nanoseconds) that orders versions newest-first. Generated version IDs
-//     embed this stamp: 16 lowercase hex digits of the stamp followed by 8
-//     random hex digits (24 characters, URL-safe, time-ordered, never "null").
-//   - Imported versions (storage.VersionImporter, import.go) get a fresh
-//     stamp but keep the version ID they had on their source backend, which
-//     need not embed the stamp; lookups by such IDs fall back to scanning
-//     the key's versions.
+//   - Every version is stamped by the backend's index.Clock, so stamps (and
+//     the version IDs generated from them) are unique and time-ordered
+//     across the backend's buckets.
 package memory
 
 import (
 	"bytes"
 	"context"
-	"crypto/rand"
-	"encoding/hex"
 	"errors"
 	"fmt"
-	"maps"
 	"slices"
-	"sort"
-	"strconv"
 	"sync"
 	"time"
 	"unicode/utf8"
 
 	"github.com/seanmmitchell/gos3/internal/storage"
+	"github.com/seanmmitchell/gos3/internal/storage/index"
 )
 
 // ErrClosed is returned by every operation after Close.
@@ -55,18 +49,14 @@ type Backend struct {
 	buckets map[string]*bucket
 	closed  bool
 
-	stampMu   sync.Mutex
-	lastStamp uint64
+	clock index.Clock
 
 	// now returns the current time; replaceable in tests.
 	now func() time.Time
 }
 
 var (
-	_ storage.Backend            = (*Backend)(nil)
-	_ storage.ConditionalDeleter = (*Backend)(nil)
-)
-var (
+	_ storage.Backend                = (*Backend)(nil)
 	_ storage.ConditionalDeleter     = (*Backend)(nil)
 	_ storage.UploadWalker           = (*Backend)(nil)
 	_ storage.ConditionalMetaUpdater = (*Backend)(nil)
@@ -82,194 +72,20 @@ func New() *Backend {
 	}
 }
 
-// bucket holds the state of one bucket. All fields except name are guarded
+// bucket holds the state of one bucket: its index (info, configuration
+// documents, versions with their data, uploads with their parts) guarded
 // by mu.
 type bucket struct {
-	mu      sync.RWMutex
-	info    storage.BucketInfo
-	configs map[string][]byte
-	objects *skipList[*object]
-	uploads map[string]*upload
-	// uploadOrder indexes uploads by uploadOrderKey (listing order).
-	uploadOrder *skipList[*upload]
+	mu sync.RWMutex
+	ix *index.Bucket[[]byte]
 	// deleted is set when the bucket is removed (or the backend closed) so
 	// that operations holding a stale pointer fail with ErrBucketNotFound.
 	deleted bool
 }
 
-// object is the version history of one key. versions is ordered oldest
-// first (ascending stamp), so the latest version is the last element. An
-// object with no versions is removed from the bucket.
-type object struct {
-	versions []*version
-	// imported counts the versions with a non-null imported version ID
-	// (see import.go), whose IDs do not embed their stamp.
-	imported int
-}
-
-// version is one stored object version or delete marker. data is immutable
-// once committed.
-type version struct {
-	stamp        uint64
-	id           string
-	deleteMarker bool
-	// imported is set for versions stored with a non-null version ID taken
-	// from another backend.
-	imported     bool
-	meta         storage.ObjectMeta
-	data         []byte // the content, or its compressed form (compression set)
-	lastModified time.Time
-	// compression is the algorithm data is compressed with ("" = none);
-	// size is then the size of the content.
-	compression string
-	size        int64
-}
-
-func (o *object) latest() *version { return o.versions[len(o.versions)-1] }
-
-// indexByStamp returns the index of the version with the given stamp, or -1.
-func (o *object) indexByStamp(stamp uint64) int {
-	i := sort.Search(len(o.versions), func(i int) bool { return o.versions[i].stamp >= stamp })
-	if i < len(o.versions) && o.versions[i].stamp == stamp {
-		return i
-	}
-	return -1
-}
-
-// indexByID returns the index of the version with the given ID, or -1.
-// Generated IDs are found by binary search on the stamp they embed; "null"
-// and imported IDs (which may have any shape, including that of an ID
-// generated by another memory backend, whose embedded stamp means nothing
-// here) by a linear scan, which only runs when the key has such versions.
-func (o *object) indexByID(id string) int {
-	if stamp, ok := stampFromVersionID(id); ok {
-		if i := o.indexByStamp(stamp); i >= 0 && o.versions[i].id == id {
-			return i
-		}
-	}
-	if id != storage.NullVersionID && o.imported == 0 {
-		return -1
-	}
-	for i := len(o.versions) - 1; i >= 0; i-- {
-		if o.versions[i].id == id {
-			return i
-		}
-	}
-	return -1
-}
-
-func (o *object) removeAt(i int) *version {
-	v := o.versions[i]
-	o.versions = slices.Delete(o.versions, i, i+1)
-	if v.imported {
-		o.imported--
-	}
-	return v
-}
-
-// info builds a deep-copied ObjectInfo for version v of key.
-func (v *version) info(bucketName, key string, isLatest bool) storage.ObjectInfo {
-	oi := storage.ObjectInfo{
-		Bucket:       bucketName,
-		Key:          key,
-		VersionID:    v.id,
-		IsLatest:     isLatest,
-		DeleteMarker: v.deleteMarker,
-		Size:         int64(len(v.data)),
-		LastModified: v.lastModified,
-	}
-	if !v.deleteMarker {
-		oi.ObjectMeta = cloneMeta(v.meta)
-		if v.compression != "" {
-			oi.Size, oi.Compression, oi.StoredSize = v.size, v.compression, int64(len(v.data))
-		}
-	}
-	return oi
-}
-
 // nextStamp returns a strictly increasing stamp based on the wall clock.
 func (b *Backend) nextStamp() (uint64, time.Time) {
-	now := b.now().UTC()
-	b.stampMu.Lock()
-	defer b.stampMu.Unlock()
-	s := uint64(now.UnixNano())
-	if now.UnixNano() < 0 || s <= b.lastStamp {
-		s = b.lastStamp + 1
-	}
-	b.lastStamp = s
-	return s, now
-}
-
-const (
-	stampHexLen     = 16
-	versionIDLength = stampHexLen + 8
-)
-
-// newVersionID formats a version ID embedding stamp.
-func newVersionID(stamp uint64) string {
-	var rnd [4]byte
-	_, _ = rand.Read(rnd[:]) // crypto/rand.Read never fails (Go >= 1.24)
-	buf := make([]byte, 0, versionIDLength)
-	s := strconv.AppendUint(nil, stamp, 16)
-	for i := len(s); i < stampHexLen; i++ {
-		buf = append(buf, '0')
-	}
-	buf = append(buf, s...)
-	buf = hex.AppendEncode(buf, rnd[:])
-	return string(buf)
-}
-
-// stampFromVersionID extracts the stamp from an ID generated by
-// newVersionID.
-func stampFromVersionID(id string) (uint64, bool) {
-	if len(id) != versionIDLength {
-		return 0, false
-	}
-	for i := 0; i < len(id); i++ {
-		c := id[i]
-		if !(c >= '0' && c <= '9' || c >= 'a' && c <= 'f') {
-			return 0, false
-		}
-	}
-	s, err := strconv.ParseUint(id[:stampHexLen], 16, 64)
-	if err != nil {
-		return 0, false
-	}
-	return s, true
-}
-
-// newUploadID returns a random, URL-safe upload ID.
-func newUploadID() string {
-	var rnd [24]byte
-	_, _ = rand.Read(rnd[:])
-	return hex.EncodeToString(rnd[:])
-}
-
-// --- clone helpers ---
-
-func cloneMeta(m storage.ObjectMeta) storage.ObjectMeta {
-	m.UserMeta = maps.Clone(m.UserMeta)
-	m.Tags = maps.Clone(m.Tags)
-	m.Checksums = maps.Clone(m.Checksums)
-	m.PartSizes = slices.Clone(m.PartSizes)
-	if m.PartChecksums != nil {
-		pc := make([]map[string]string, len(m.PartChecksums))
-		for i, c := range m.PartChecksums {
-			pc[i] = maps.Clone(c)
-		}
-		m.PartChecksums = pc
-	}
-	return m
-}
-
-func clonePartMeta(m storage.PartMeta) storage.PartMeta {
-	m.Checksums = maps.Clone(m.Checksums)
-	return m
-}
-
-func cloneUpload(u storage.UploadInfo) storage.UploadInfo {
-	u.Meta = cloneMeta(u.Meta)
-	return u
+	return b.clock.Next(b.now())
 }
 
 // --- lookup helpers ---
@@ -348,7 +164,7 @@ func (b *Backend) relock(ctx context.Context, bk *bucket) error {
 	}
 	bk.mu.Lock()
 	if bk.deleted {
-		name := bk.info.Name
+		name := bk.ix.Info.Name
 		bk.mu.Unlock()
 		return b.goneErr(name)
 	}
@@ -370,7 +186,7 @@ func (b *Backend) ListBuckets(ctx context.Context) ([]storage.BucketInfo, error)
 	out := make([]storage.BucketInfo, 0, len(b.buckets))
 	for _, bk := range b.buckets {
 		bk.mu.RLock()
-		out = append(out, bk.info)
+		out = append(out, bk.ix.Info)
 		bk.mu.RUnlock()
 	}
 	slices.SortFunc(out, func(a, c storage.BucketInfo) int {
@@ -408,19 +224,12 @@ func (b *Backend) CreateBucket(ctx context.Context, name string, opts storage.Cr
 		Region:            opts.Region,
 		ObjectLockEnabled: opts.ObjectLockEnabled,
 		Owner:             opts.Owner,
-		Backing:           opts.Backing,
 	}
 	if opts.ObjectLockEnabled {
 		info.Versioning = storage.VersioningEnabled
 	}
-	b.buckets[name] = &bucket{
-		info:    info,
-		configs: make(map[string][]byte),
-		objects: newSkipList[*object](),
-		uploads: make(map[string]*upload),
-
-		uploadOrder: newSkipList[*upload](),
-	}
+	ix := index.NewBucket[[]byte](info, b.nextStamp)
+	b.buckets[name] = &bucket{ix: ix}
 	return nil
 }
 
@@ -431,7 +240,7 @@ func (b *Backend) GetBucket(ctx context.Context, name string) (storage.BucketInf
 		return storage.BucketInfo{}, err
 	}
 	defer bk.mu.RUnlock()
-	return bk.info, nil
+	return bk.ix.Info, nil
 }
 
 // DeleteBucket removes an empty bucket and its configuration documents.
@@ -450,15 +259,14 @@ func (b *Backend) DeleteBucket(ctx context.Context, name string) error {
 	}
 	bk.mu.Lock()
 	defer bk.mu.Unlock()
-	if bk.objects.Len() > 0 {
+	if bk.ix.Len() > 0 {
 		return fmt.Errorf("%w: %q", storage.ErrBucketNotEmpty, name)
 	}
 	// In-progress multipart uploads do not keep a bucket alive (as on
 	// AWS); they are aborted with it.
 	bk.deleted = true
-	bk.configs = nil
-	clear(bk.uploads)
-	bk.uploadOrder = newSkipList[*upload]()
+	bk.ix.Configs = nil
+	bk.ix.ClearUploads()
 	delete(b.buckets, name)
 	return nil
 }
@@ -476,10 +284,10 @@ func (b *Backend) SetBucketVersioning(ctx context.Context, name string, status s
 		return err
 	}
 	defer bk.mu.Unlock()
-	if status == storage.VersioningUnversioned && bk.info.Versioning != storage.VersioningUnversioned {
+	if status == storage.VersioningUnversioned && bk.ix.Info.Versioning != storage.VersioningUnversioned {
 		return errors.New("memory: a versioned bucket cannot become unversioned")
 	}
-	bk.info.Versioning = status
+	bk.ix.Info.Versioning = status
 	return nil
 }
 
@@ -490,7 +298,7 @@ func (b *Backend) SetBucketObjectLock(ctx context.Context, name string, enabled 
 		return err
 	}
 	defer bk.mu.Unlock()
-	bk.info.ObjectLockEnabled = enabled
+	bk.ix.Info.ObjectLockEnabled = enabled
 	return nil
 }
 
@@ -501,7 +309,7 @@ func (b *Backend) GetBucketConfig(ctx context.Context, bucketName, key string) (
 		return nil, err
 	}
 	defer bk.mu.RUnlock()
-	data, ok := bk.configs[key]
+	data, ok := bk.ix.Configs[key]
 	if !ok {
 		return nil, fmt.Errorf("%w: %s/%s", storage.ErrConfigNotFound, bucketName, key)
 	}
@@ -516,7 +324,7 @@ func (b *Backend) ViewBucketConfig(ctx context.Context, bucketName, key string, 
 		return err
 	}
 	defer bk.mu.RUnlock()
-	data, ok := bk.configs[key]
+	data, ok := bk.ix.Configs[key]
 	if !ok {
 		return fmt.Errorf("%w: %s/%s", storage.ErrConfigNotFound, bucketName, key)
 	}
@@ -533,7 +341,7 @@ func (b *Backend) PutBucketConfig(ctx context.Context, bucketName, key string, d
 		return err
 	}
 	defer bk.mu.Unlock()
-	bk.configs[key] = append([]byte{}, data...)
+	bk.ix.Configs[key] = append([]byte{}, data...)
 	return nil
 }
 
@@ -544,7 +352,7 @@ func (b *Backend) DeleteBucketConfig(ctx context.Context, bucketName, key string
 		return err
 	}
 	defer bk.mu.Unlock()
-	delete(bk.configs, key)
+	delete(bk.ix.Configs, key)
 	return nil
 }
 

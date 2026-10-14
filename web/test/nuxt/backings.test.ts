@@ -38,7 +38,7 @@ async function createNamed(name: string) {
 
 const backings = (def: string): AvailableBackings => ({
   default: def,
-  available: [{ name: 'default', kind: 'fs' }, { name: 'aws', kind: 's3', mode: 'gateway' }, { name: 'archive', kind: 's3', mode: 'blob' }]
+  available: [{ name: 'default', kind: 'fs' }, { name: 'aws', kind: 's3', mode: 'gateway' }, { name: 'archive', kind: 's3' }]
 })
 
 describe('CreateBucketModal storage backing', () => {
@@ -59,8 +59,9 @@ describe('CreateBucketModal storage backing', () => {
     await flushPromises()
     expect(body()).toContain('Storage backing')
     expect(body()).toContain('archive (default)')
+    expect(body()).toContain('Data and metadata stored in a remote S3 bucket; all features available.')
     expect(switches().every(s => !s.disabled)).toBe(true)
-    await createNamed('blob-bucket')
+    await createNamed('remote-bucket')
     expect(created[0]![1].backing).toBe('archive')
     w.unmount()
     await nextTick()
@@ -71,6 +72,7 @@ describe('CreateBucketModal storage backing', () => {
     const w = await mountSuspended(CreateBucketModal, { props: { open: true, client, backings: backings('aws') } as never })
     await flushPromises()
     expect(body()).toContain('versioning and object lock are not available')
+    expect(body()).toContain('Objects stored natively; no versioning or object lock.')
     expect(switches()).toHaveLength(2)
     expect(switches().every(s => s.disabled)).toBe(true)
     await createNamed('gateway-bucket')

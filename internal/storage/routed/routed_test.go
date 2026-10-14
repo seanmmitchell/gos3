@@ -3,10 +3,10 @@ package routed_test
 import (
 	"context"
 	"errors"
-	"maps"
 	"slices"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/seanmmitchell/gos3/internal/storage"
 	"github.com/seanmmitchell/gos3/internal/storage/memory"
@@ -14,18 +14,18 @@ import (
 )
 
 // fakeStore records the calls the router makes. Object methods other than
-// GetObjectInfo are not used by these tests (the embedded nil interface
-// would panic).
+// GetObjectInfo and NewObjectWriter are not used by these tests (the
+// embedded nil interface would panic).
 type fakeStore struct {
 	routed.DataStore
 
 	mu        sync.Mutex
-	attached  []string
+	attached  []storage.BucketInfo
 	detached  []string
 	infoCalls []string
 	attachErr error
 	notEmpty  bool
-	closed    int
+	closed    *[]string // appended "store" on Close
 }
 
 func (f *fakeStore) AttachBucket(_ context.Context, info storage.BucketInfo) error {
@@ -34,7 +34,7 @@ func (f *fakeStore) AttachBucket(_ context.Context, info storage.BucketInfo) err
 	if f.attachErr != nil {
 		return f.attachErr
 	}
-	f.attached = append(f.attached, info.Name)
+	f.attached = append(f.attached, info)
 	return nil
 }
 
@@ -61,249 +61,287 @@ func (f *fakeStore) GetObjectInfo(_ context.Context, bucket, key, _ string) (sto
 	return storage.ObjectInfo{Bucket: bucket, Key: key, VersionID: storage.NullVersionID}, nil
 }
 
+func (f *fakeStore) NewObjectWriter(_ context.Context, bucket, key string) (storage.ObjectWriter, error) {
+	return &fakeWriter{bucket: bucket, key: key}, nil
+}
+
 func (f *fakeStore) Close() error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	f.closed++
+	*f.closed = append(*f.closed, "store")
 	return nil
 }
 
-func newRouter(t *testing.T, def string) (*routed.Backend, *memory.Backend, *fakeStore) {
-	t.Helper()
-	prim := memory.New()
-	fs := &fakeStore{}
-	b := routed.New(routed.Options{
-		Primary:         prim,
-		Stores:          map[string]routed.DataStore{"gw": fs},
-		PrimaryBackings: []string{"blob"},
-		Default:         def,
-	})
-	t.Cleanup(func() { _ = b.Close() })
-	return b, prim, fs
+// fakeWriter commits nothing; like a DataStore, it passes no configuration
+// documents to BeforePublish.
+type fakeWriter struct{ bucket, key string }
+
+func (*fakeWriter) Write(p []byte) (int, error) { return len(p), nil }
+func (*fakeWriter) Abort() error                { return nil }
+func (w *fakeWriter) Commit(_ context.Context, meta storage.ObjectMeta, opts storage.CommitOptions) (storage.ObjectInfo, error) {
+	if opts.BeforePublish != nil {
+		if err := opts.BeforePublish(&meta, nil, time.Now(), func(string) []byte { return nil }); err != nil {
+			return storage.ObjectInfo{}, err
+		}
+	}
+	return storage.ObjectInfo{ObjectMeta: meta, Bucket: w.bucket, Key: w.key, VersionID: storage.NullVersionID}, nil
 }
 
-func put(t *testing.T, b storage.Backend, bucket, key string) {
-	t.Helper()
-	w, err := b.NewObjectWriter(t.Context(), bucket, key)
-	if err != nil {
-		t.Fatalf("NewObjectWriter(%s/%s): %v", bucket, key, err)
-	}
-	if _, err := w.Commit(t.Context(), storage.ObjectMeta{}, storage.CommitOptions{}); err != nil {
-		t.Fatalf("Commit: %v", err)
-	}
+// primary is a memory backend that records Close.
+type primary struct {
+	*memory.Backend
+	closed *[]string
 }
 
-func backingOf(t *testing.T, b storage.Backend, bucket string) string {
-	t.Helper()
-	info, err := b.GetBucket(t.Context(), bucket)
-	if err != nil {
-		t.Fatalf("GetBucket(%s): %v", bucket, err)
-	}
-	return info.Backing
+func (p primary) Close() error {
+	*p.closed = append(*p.closed, "primary")
+	return p.Backend.Close()
 }
 
-func TestDefaultBackingAndLocalAlias(t *testing.T) {
+type fixture struct {
+	b      *routed.Backend
+	prim   *memory.Backend
+	fs     *fakeStore
+	closed []string
+}
+
+func newRouter(t *testing.T) *fixture {
+	t.Helper()
+	f := &fixture{prim: memory.New()}
+	f.fs = &fakeStore{closed: &f.closed}
+	f.b = routed.New(routed.Options{Primary: primary{Backend: f.prim, closed: &f.closed}, Store: f.fs})
+	t.Cleanup(func() { _ = f.b.Close() })
+	return f
+}
+
+func TestCreateBucketAttachesFirst(t *testing.T) {
 	ctx := t.Context()
-	b, prim, fs := newRouter(t, "gw")
-	for name, backing := range map[string]string{"dflt": "", "explicit": "gw", "loc": routed.BackingLocal, "blb": "blob"} {
-		if err := b.CreateBucket(ctx, name, storage.CreateBucketOptions{Backing: backing}); err != nil {
-			t.Fatalf("CreateBucket(%s, %q): %v", name, backing, err)
-		}
-	}
-	for name, want := range map[string]string{"dflt": "gw", "explicit": "gw", "loc": "", "blb": "blob"} {
-		if got := backingOf(t, b, name); got != want {
-			t.Errorf("backing of %s = %q, want %q", name, got, want)
-		}
-	}
-	if got := slices.Sorted(slices.Values(fs.attached)); !slices.Equal(got, []string{"dflt", "explicit"}) {
-		t.Errorf("attached %q, want the two gateway buckets", got)
-	}
-	// Object operations go to the bucket's backing.
-	if _, err := b.GetObjectInfo(ctx, "dflt", "k", ""); err != nil {
+	f := newRouter(t)
+	if err := f.b.CreateBucket(ctx, "b", storage.CreateBucketOptions{Region: "r1", Owner: "alice", Backing: "gw"}); err != nil {
 		t.Fatal(err)
 	}
-	if !slices.Equal(fs.infoCalls, []string{"dflt/k"}) {
-		t.Errorf("store calls %q", fs.infoCalls)
+	want := []storage.BucketInfo{{Name: "b", Region: "r1", Owner: "alice", Backing: "gw"}}
+	if !slices.Equal(f.fs.attached, want) {
+		t.Errorf("attached %+v, want %+v", f.fs.attached, want)
 	}
-	put(t, b, "loc", "k")
-	put(t, b, "blb", "k")
-	for _, bucket := range []string{"loc", "blb"} {
-		if _, err := prim.GetObjectInfo(ctx, bucket, "k", ""); err != nil {
-			t.Errorf("object of %s not in the primary: %v", bucket, err)
-		}
+	info, err := f.b.GetBucket(ctx, "b")
+	if err != nil || info.Owner != "alice" {
+		t.Errorf("GetBucket = %+v, %v", info, err)
 	}
-	if len(fs.infoCalls) != 1 {
-		t.Errorf("primary buckets reached the store: %q", fs.infoCalls)
+	if err := f.b.CreateBucket(ctx, "b", storage.CreateBucketOptions{}); !errors.Is(err, storage.ErrBucketExists) {
+		t.Errorf("second CreateBucket: %v, want ErrBucketExists", err)
 	}
-
-	// With the server's own storage as the default, "" stays local.
-	b2, _, fs2 := newRouter(t, routed.BackingLocal)
-	if err := b2.CreateBucket(ctx, "x", storage.CreateBucketOptions{}); err != nil {
-		t.Fatal(err)
-	}
-	if got := backingOf(t, b2, "x"); got != "" || len(fs2.attached) != 0 {
-		t.Errorf("default local: backing %q, attached %q", got, fs2.attached)
-	}
-}
-
-func TestInvalidBacking(t *testing.T) {
-	b, _, _ := newRouter(t, "")
-	err := b.CreateBucket(t.Context(), "b", storage.CreateBucketOptions{Backing: "nope"})
-	if !errors.Is(err, storage.ErrInvalidBacking) {
-		t.Errorf("unknown backing: %v, want ErrInvalidBacking", err)
-	}
-	if _, err := b.GetBucket(t.Context(), "b"); !errors.Is(err, storage.ErrBucketNotFound) {
-		t.Errorf("bucket created despite an invalid backing: %v", err)
-	}
-	// A default naming an unknown backing fails the same way.
-	b2, _, _ := newRouter(t, "missing")
-	if err := b2.CreateBucket(t.Context(), "b", storage.CreateBucketOptions{}); !errors.Is(err, storage.ErrInvalidBacking) {
-		t.Errorf("unknown default backing: %v", err)
+	if len(f.fs.attached) != 1 {
+		t.Errorf("an existing bucket was attached again: %+v", f.fs.attached)
 	}
 }
 
 func TestAttachFailureAbortsCreate(t *testing.T) {
-	b, _, fs := newRouter(t, "gw")
-	fs.attachErr = storage.ErrBackingUnavailable
-	if err := b.CreateBucket(t.Context(), "b", storage.CreateBucketOptions{}); !errors.Is(err, storage.ErrBackingUnavailable) {
+	f := newRouter(t)
+	f.fs.attachErr = storage.ErrBackingUnavailable
+	if err := f.b.CreateBucket(t.Context(), "b", storage.CreateBucketOptions{}); !errors.Is(err, storage.ErrBackingUnavailable) {
 		t.Errorf("CreateBucket with a failing attach: %v", err)
 	}
-	if _, err := b.GetBucket(t.Context(), "b"); !errors.Is(err, storage.ErrBucketNotFound) {
+	if _, err := f.b.GetBucket(t.Context(), "b"); !errors.Is(err, storage.ErrBucketNotFound) {
 		t.Errorf("bucket recorded although attaching failed: %v", err)
 	}
 }
 
-func TestGatewayVersioningAndObjectLock(t *testing.T) {
+func TestVersioningAndObjectLock(t *testing.T) {
 	ctx := t.Context()
-	b, _, fs := newRouter(t, "gw")
-	err := b.CreateBucket(ctx, "locked", storage.CreateBucketOptions{ObjectLockEnabled: true})
+	f := newRouter(t)
+	err := f.b.CreateBucket(ctx, "locked", storage.CreateBucketOptions{ObjectLockEnabled: true})
 	if !errors.Is(err, storage.ErrNotSupported) {
-		t.Errorf("object lock bucket on a gateway: %v, want ErrNotSupported", err)
+		t.Errorf("object lock bucket: %v, want ErrNotSupported", err)
 	}
-	if len(fs.attached) != 0 {
-		t.Errorf("attached %q for a refused bucket", fs.attached)
+	if len(f.fs.attached) != 0 {
+		t.Errorf("attached %+v for a refused bucket", f.fs.attached)
 	}
-	if err := b.CreateBucket(ctx, "gwb", storage.CreateBucketOptions{}); err != nil {
+	if err := f.b.CreateBucket(ctx, "gwb", storage.CreateBucketOptions{}); err != nil {
 		t.Fatal(err)
 	}
 	// An existing name is reported as such, whatever the options.
-	err = b.CreateBucket(ctx, "gwb", storage.CreateBucketOptions{ObjectLockEnabled: true})
+	err = f.b.CreateBucket(ctx, "gwb", storage.CreateBucketOptions{ObjectLockEnabled: true})
 	if !errors.Is(err, storage.ErrBucketExists) {
-		t.Errorf("CreateBucket of an existing gateway bucket with object lock: %v, want ErrBucketExists", err)
+		t.Errorf("CreateBucket of an existing bucket with object lock: %v, want ErrBucketExists", err)
 	}
-	if err := b.SetBucketVersioning(ctx, "gwb", storage.VersioningEnabled); !errors.Is(err, storage.ErrNotSupported) {
-		t.Errorf("versioning on a gateway bucket: %v", err)
+	for _, st := range []storage.VersioningStatus{storage.VersioningEnabled, storage.VersioningSuspended} {
+		if err := f.b.SetBucketVersioning(ctx, "gwb", st); !errors.Is(err, storage.ErrNotSupported) {
+			t.Errorf("versioning %v: %v", st, err)
+		}
 	}
-	if err := b.SetBucketObjectLock(ctx, "gwb", true); !errors.Is(err, storage.ErrNotSupported) {
-		t.Errorf("object lock on a gateway bucket: %v", err)
+	if err := f.b.SetBucketObjectLock(ctx, "gwb", true); !errors.Is(err, storage.ErrNotSupported) {
+		t.Errorf("enabling object lock: %v", err)
 	}
-	if info, _ := b.GetBucket(ctx, "gwb"); info.Versioning != storage.VersioningUnversioned || info.ObjectLockEnabled {
-		t.Errorf("gateway bucket changed: %+v", info)
+	if err := f.b.SetBucketObjectLock(ctx, "gwb", false); err != nil {
+		t.Errorf("disabling object lock: %v", err)
 	}
-	// Local buckets keep every feature.
-	if err := b.CreateBucket(ctx, "loc", storage.CreateBucketOptions{Backing: routed.BackingLocal, ObjectLockEnabled: true}); err != nil {
-		t.Fatal(err)
+	if info, _ := f.b.GetBucket(ctx, "gwb"); info.Versioning != storage.VersioningUnversioned || info.ObjectLockEnabled {
+		t.Errorf("bucket changed: %+v", info)
 	}
-	if err := b.SetBucketVersioning(ctx, "loc", storage.VersioningSuspended); err != nil {
-		t.Errorf("versioning on a local bucket: %v", err)
-	}
-	if err := b.SetBucketVersioning(ctx, "missing", storage.VersioningEnabled); !errors.Is(err, storage.ErrBucketNotFound) {
+	if err := f.b.SetBucketVersioning(ctx, "missing", storage.VersioningEnabled); !errors.Is(err, storage.ErrBucketNotFound) {
 		t.Errorf("versioning on a missing bucket: %v", err)
 	}
 }
 
 func TestDeleteBucket(t *testing.T) {
 	ctx := t.Context()
-	b, _, fs := newRouter(t, "gw")
-	if err := b.CreateBucket(ctx, "gwb", storage.CreateBucketOptions{}); err != nil {
+	f := newRouter(t)
+	if err := f.b.CreateBucket(ctx, "gwb", storage.CreateBucketOptions{}); err != nil {
 		t.Fatal(err)
 	}
-	if err := b.PutBucketConfig(ctx, "gwb", storage.ConfigPolicy, []byte("{}")); err != nil {
+	if err := f.b.PutBucketConfig(ctx, "gwb", storage.ConfigPolicy, []byte("{}")); err != nil {
 		t.Fatal(err)
 	}
-	fs.notEmpty = true
-	if err := b.DeleteBucket(ctx, "gwb"); !errors.Is(err, storage.ErrBucketNotEmpty) {
-		t.Errorf("DeleteBucket of a non-empty store bucket: %v", err)
+	// Cache the bucket's existence.
+	if _, err := f.b.GetObjectInfo(ctx, "gwb", "k", ""); err != nil {
+		t.Fatal(err)
 	}
-	if _, err := b.GetBucket(ctx, "gwb"); err != nil || len(fs.detached) != 0 {
-		t.Errorf("refused delete: GetBucket %v, detached %q", err, fs.detached)
+	f.fs.notEmpty = true
+	if err := f.b.DeleteBucket(ctx, "gwb"); !errors.Is(err, storage.ErrBucketNotEmpty) {
+		t.Errorf("DeleteBucket of a non-empty bucket: %v", err)
 	}
-	fs.notEmpty = false
-	if err := b.DeleteBucket(ctx, "gwb"); err != nil {
+	if _, err := f.b.GetBucket(ctx, "gwb"); err != nil || len(f.fs.detached) != 0 {
+		t.Errorf("refused delete: GetBucket %v, detached %q", err, f.fs.detached)
+	}
+	f.fs.notEmpty = false
+	if err := f.b.DeleteBucket(ctx, "gwb"); err != nil {
 		t.Fatalf("DeleteBucket: %v", err)
 	}
-	if !slices.Equal(fs.detached, []string{"gwb"}) {
-		t.Errorf("detached %q, want [gwb]", fs.detached)
+	if !slices.Equal(f.fs.detached, []string{"gwb"}) {
+		t.Errorf("detached %q, want [gwb]", f.fs.detached)
 	}
-	if _, err := b.GetBucket(ctx, "gwb"); !errors.Is(err, storage.ErrBucketNotFound) {
+	if _, err := f.b.GetBucket(ctx, "gwb"); !errors.Is(err, storage.ErrBucketNotFound) {
 		t.Errorf("GetBucket after delete: %v", err)
 	}
-	if _, err := b.GetBucketConfig(ctx, "gwb", storage.ConfigPolicy); !errors.Is(err, storage.ErrBucketNotFound) {
+	if _, err := f.b.GetBucketConfig(ctx, "gwb", storage.ConfigPolicy); !errors.Is(err, storage.ErrBucketNotFound) {
 		t.Errorf("config after delete: %v", err)
 	}
-	// Object operations on the deleted bucket no longer reach the store.
-	if _, err := b.GetObjectInfo(ctx, "gwb", "k", ""); !errors.Is(err, storage.ErrBucketNotFound) {
+	// Object operations on the deleted bucket no longer reach the store
+	// (the existence cache was invalidated).
+	if _, err := f.b.GetObjectInfo(ctx, "gwb", "k", ""); !errors.Is(err, storage.ErrBucketNotFound) {
 		t.Errorf("GetObjectInfo after delete: %v", err)
 	}
-	if err := b.DeleteBucket(ctx, "gwb"); !errors.Is(err, storage.ErrBucketNotFound) {
+	if len(f.fs.infoCalls) != 1 {
+		t.Errorf("store calls %q", f.fs.infoCalls)
+	}
+	if err := f.b.DeleteBucket(ctx, "gwb"); !errors.Is(err, storage.ErrBucketNotFound) {
 		t.Errorf("second delete: %v", err)
 	}
 }
 
-func TestUnconfiguredBacking(t *testing.T) {
+func TestObjectOperationsGoToStore(t *testing.T) {
 	ctx := t.Context()
-	prim := memory.New()
-	// Buckets recorded while backing "old" existed.
-	for _, name := range []string{"orphan", "orphan2"} {
-		if err := prim.CreateBucket(ctx, name, storage.CreateBucketOptions{Backing: "old"}); err != nil {
-			t.Fatal(err)
-		}
-	}
-	if err := prim.CreateBucket(ctx, "fine", storage.CreateBucketOptions{}); err != nil {
+	f := newRouter(t)
+	if err := f.b.CreateBucket(ctx, "b", storage.CreateBucketOptions{}); err != nil {
 		t.Fatal(err)
 	}
-	b := routed.New(routed.Options{Primary: prim})
-	defer b.Close()
-	if _, err := b.GetObjectInfo(ctx, "orphan", "k", ""); !errors.Is(err, storage.ErrBackingUnavailable) {
-		t.Errorf("GetObjectInfo on an unconfigured backing: %v", err)
-	}
-	if _, err := b.NewObjectWriter(ctx, "orphan", "k"); !errors.Is(err, storage.ErrBackingUnavailable) {
-		t.Errorf("NewObjectWriter on an unconfigured backing: %v", err)
-	}
-	if err := b.WalkObjects(ctx, "orphan", "", "", func(storage.ObjectInfo) error { return nil }); !errors.Is(err, storage.ErrBackingUnavailable) {
-		t.Errorf("WalkObjects on an unconfigured backing: %v", err)
-	}
-	if _, err := b.ListMultipartUploads(ctx, "orphan"); !errors.Is(err, storage.ErrBackingUnavailable) {
-		t.Errorf("ListMultipartUploads on an unconfigured backing: %v", err)
-	}
-	if err := b.SetBucketVersioning(ctx, "orphan", storage.VersioningEnabled); !errors.Is(err, storage.ErrBackingUnavailable) {
-		t.Errorf("SetBucketVersioning on an unconfigured backing: %v", err)
-	}
-	got, err := b.UnavailableBuckets(ctx)
-	if err != nil {
+	if _, err := f.b.GetObjectInfo(ctx, "b", "k", ""); err != nil {
 		t.Fatal(err)
 	}
-	if want := map[string]string{"orphan": "old", "orphan2": "old"}; !maps.Equal(got, want) {
-		t.Errorf("UnavailableBuckets = %v, want %v", got, want)
+	if _, err := f.b.GetObjectInfo(ctx, "missing", "k", ""); !errors.Is(err, storage.ErrBucketNotFound) {
+		t.Errorf("GetObjectInfo in a missing bucket: %v", err)
 	}
-	// Such buckets can still be deleted (they hold nothing locally).
-	if err := b.DeleteBucket(ctx, "orphan"); err != nil {
-		t.Errorf("DeleteBucket of an unavailable bucket: %v", err)
+	if _, err := f.b.NewObjectWriter(ctx, "missing", "k"); !errors.Is(err, storage.ErrBucketNotFound) {
+		t.Errorf("NewObjectWriter in a missing bucket: %v", err)
 	}
-	if got, _ := b.UnavailableBuckets(ctx); len(got) != 1 {
-		t.Errorf("UnavailableBuckets after delete = %v", got)
+	if !slices.Equal(f.fs.infoCalls, []string{"b/k"}) {
+		t.Errorf("store calls %q", f.fs.infoCalls)
+	}
+	// Nothing reached the primary's object space.
+	if _, err := f.prim.GetObjectInfo(ctx, "b", "k", ""); !errors.Is(err, storage.ErrObjectNotFound) {
+		t.Errorf("primary object: %v", err)
 	}
 }
 
-func TestCloseClosesStoresOnce(t *testing.T) {
-	b, _, fs := newRouter(t, "")
-	if err := b.Close(); err != nil {
+func TestBeforePublishSeesPrimaryConfigs(t *testing.T) {
+	ctx := t.Context()
+	f := newRouter(t)
+	if err := f.b.CreateBucket(ctx, "b", storage.CreateBucketOptions{}); err != nil {
 		t.Fatal(err)
 	}
-	if err := b.Close(); err != nil {
+	if err := f.b.PutBucketConfig(ctx, "b", storage.ConfigPolicy, []byte("doc")); err != nil {
 		t.Fatal(err)
 	}
-	if fs.closed != 1 {
-		t.Errorf("store closed %d times, want 1", fs.closed)
+	w, err := f.b.NewObjectWriter(ctx, "b", "k")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var seen []byte
+	_, err = w.Commit(ctx, storage.ObjectMeta{}, storage.CommitOptions{
+		BeforePublish: func(_, _ *storage.ObjectMeta, _ time.Time, config func(string) []byte) error {
+			seen = config(storage.ConfigPolicy)
+			if config("absent") != nil {
+				t.Error("absent config is not nil")
+			}
+			return nil
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(seen) != "doc" {
+		t.Errorf("BeforePublish saw %q, want the primary's document", seen)
+	}
+}
+
+func TestOptionalInterfaces(t *testing.T) {
+	ctx := t.Context()
+	f := newRouter(t)
+	if err := f.b.CreateBucket(ctx, "b", storage.CreateBucketOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := any(f.b).(storage.VersionImporter); ok {
+		t.Error("routed.Backend implements storage.VersionImporter")
+	}
+	providers, err := f.b.EncryptionProviders(ctx, "b")
+	if err != nil || providers == nil || len(providers) != 0 {
+		t.Errorf("EncryptionProviders = %q, %v; want an empty list", providers, err)
+	}
+	if _, err := f.b.EncryptionProviders(ctx, "missing"); !errors.Is(err, storage.ErrBucketNotFound) {
+		t.Errorf("EncryptionProviders of a missing bucket: %v", err)
+	}
+	for _, mode := range []string{storage.EncryptionAES256, storage.EncryptionRestic} {
+		if err := f.b.PrepareEncryption(ctx, "b", mode); !errors.Is(err, errors.ErrUnsupported) {
+			t.Errorf("PrepareEncryption(%s): %v, want ErrUnsupported", mode, err)
+		}
+		if err := f.b.ValidateEncryptionSettings(ctx, "b", storage.EncryptionSettings{Provider: mode}); !errors.Is(err, errors.ErrUnsupported) {
+			t.Errorf("ValidateEncryptionSettings(%s): %v, want ErrUnsupported", mode, err)
+		}
+	}
+	if err := f.b.PrepareEncryption(ctx, "missing", storage.EncryptionAES256); !errors.Is(err, storage.ErrBucketNotFound) {
+		t.Errorf("PrepareEncryption of a missing bucket: %v", err)
+	}
+	if err := f.b.PutBucketConfig(ctx, "b", storage.ConfigPolicy, []byte("doc")); err != nil {
+		t.Fatal(err)
+	}
+	var viewed string
+	if err := f.b.ViewBucketConfig(ctx, "b", storage.ConfigPolicy, func(d []byte) error { viewed = string(d); return nil }); err != nil || viewed != "doc" {
+		t.Errorf("ViewBucketConfig = %q, %v", viewed, err)
+	}
+	// Without a ConfigViewer primary the document is copied.
+	b2 := routed.New(routed.Options{Primary: noViewer{f.prim}, Store: &fakeStore{closed: new([]string)}})
+	viewed = ""
+	if err := b2.ViewBucketConfig(ctx, "b", storage.ConfigPolicy, func(d []byte) error { viewed = string(d); return nil }); err != nil || viewed != "doc" {
+		t.Errorf("ViewBucketConfig without a viewer = %q, %v", viewed, err)
+	}
+	if err := b2.ViewBucketConfig(ctx, "b", "absent", func([]byte) error { return nil }); !errors.Is(err, storage.ErrConfigNotFound) {
+		t.Errorf("ViewBucketConfig of an absent document: %v", err)
+	}
+}
+
+// noViewer hides the memory backend's ConfigViewer implementation.
+type noViewer struct{ storage.Backend }
+
+func TestCloseOrder(t *testing.T) {
+	f := newRouter(t)
+	if err := f.b.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.b.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if want := []string{"store", "primary"}; !slices.Equal(f.closed, want) {
+		t.Errorf("closed %q, want %q", f.closed, want)
 	}
 }

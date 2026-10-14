@@ -8,6 +8,7 @@ import (
 
 	"github.com/seanmmitchell/gos3/internal/config"
 	"github.com/seanmmitchell/gos3/internal/storage"
+	fsbackend "github.com/seanmmitchell/gos3/internal/storage/fs"
 	"github.com/seanmmitchell/gos3/internal/storage/memory"
 )
 
@@ -32,19 +33,31 @@ func (r resticVersions) WalkVersions(ctx context.Context, bucket, prefix, km, vm
 	return err
 }
 
-// ResticBackingSettings makes resticVersions a restic-capable backing.
-func (r resticVersions) ResticBackingSettings(context.Context) (*storage.ResticS3, bool, error) {
-	return nil, false, nil
+// EncryptionProviders makes resticVersions a restic-capable backing.
+func (r resticVersions) EncryptionProviders(context.Context, string) ([]string, error) {
+	return []string{storage.EncryptionAES256, storage.EncryptionRestic}, nil
 }
 
-// ConfigureResticBacking completes storage.ResticBackingBackend.
-func (r resticVersions) ConfigureResticBacking(context.Context, *storage.ResticS3) error { return nil }
+// resticFS is an fs backend that offers restic whether or not the restic
+// executable is installed (placement checks never run restic).
+type resticFS struct{ *fsbackend.Backend }
+
+func (resticFS) EncryptionProviders(context.Context, string) ([]string, error) {
+	return []string{storage.EncryptionAES256, storage.EncryptionRestic}, nil
+}
+
+// resticFSBacking is fsBacking with a resticFS backend.
+func resticFSBacking(t *testing.T, name, dir string) Backing {
+	b := fsBacking(t, name, dir)
+	b.Backend = resticFS{b.Backend.(*fsbackend.Backend)}
+	return b
+}
 
 // K8: copies of restic buckets cannot be placed on backings that cannot
 // store restic archives, in either order of configuration.
 func TestResticPlacementNeedsResticBackings(t *testing.T) {
 	ctx := context.Background()
-	bk := []Backing{fsBacking(t, "f", t.TempDir()), {Name: "m", Kind: "memory", Backend: memory.New()}, fsBacking(t, "g", t.TempDir())}
+	bk := []Backing{resticFSBacking(t, "f", t.TempDir()), {Name: "m", Kind: "memory", Backend: memory.New()}, resticFSBacking(t, "g", t.TempDir())}
 	r := openRouter(t, Options{Backings: bk})
 	for _, name := range []string{"plain", "arc"} {
 		if err := r.CreateBucket(ctx, name, storage.CreateBucketOptions{}); err != nil {
@@ -97,9 +110,9 @@ func TestResticVersionsNeedResticBackings(t *testing.T) {
 func TestResticPlacementOnLiveBackings(t *testing.T) {
 	ctx := context.Background()
 	r := openRouter(t, Options{Backings: []Backing{fsBacking(t, "default", t.TempDir())}})
-	r.EnableBackingManagement(config.StorageConfig{Backend: "fs"}, "", func(d config.BackingDefinition) (Backing, error) {
+	r.EnableBackingManagement(config.StorageConfig{Backend: "fs"}, "", BackingOpener{Open: func(d config.BackingDefinition) (Backing, error) {
 		return Backing{Name: d.Name, Kind: d.Backend, Path: d.Path, Backend: memory.New()}, nil
-	})
+	}})
 	if err := r.CreateBucket(ctx, "arc", storage.CreateBucketOptions{}); err != nil {
 		t.Fatal(err)
 	}
@@ -116,5 +129,41 @@ func TestResticPlacementOnLiveBackings(t *testing.T) {
 	}
 	if _, err := r.Move(ctx, "arc", "", "live"); !errors.Is(err, ErrInvalidPlacement) {
 		t.Fatalf("move of a restic bucket to a live memory backing: %v", err)
+	}
+}
+
+// noProviders is a backend without storage.EncryptionProvidersBackend,
+// which therefore stores no encrypted data.
+type noProviders struct{ storage.Backend }
+
+// NewVersionWriter keeps noProviders a storage.VersionImporter.
+func (n noProviders) NewVersionWriter(ctx context.Context, bucket, key string) (storage.VersionWriter, error) {
+	return n.Backend.(storage.VersionImporter).NewVersionWriter(ctx, bucket, key)
+}
+
+// A backing that offers no SSE-S3 implementation cannot receive a copy of
+// a bucket with AES256 data, but may receive one of an unencrypted bucket.
+func TestEncryptedPlacementNeedsProviders(t *testing.T) {
+	ctx := context.Background()
+	bk := []Backing{fsBacking(t, "f", t.TempDir()), {Name: "p", Kind: "memory", Backend: noProviders{memory.New()}}}
+	r := openRouter(t, Options{Backings: bk})
+	for _, name := range []string{"plain", "enc"} {
+		if err := r.CreateBucket(ctx, name, storage.CreateBucketOptions{}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	w, err := r.NewObjectWriterWith(ctx, "enc", "k", storage.WriteOptions{Encryption: storage.EncryptionAES256})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, _ = w.Write([]byte("secret"))
+	if _, err := w.Commit(ctx, storage.ObjectMeta{SSE: "AES256", Encryption: storage.EncryptionAES256}, storage.CommitOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := r.SetReplication(ctx, "enc", ModeActivePassive, []string{"p"}); !errors.Is(err, ErrInvalidPlacement) {
+		t.Fatalf("replica of AES256 data on a backing without providers: %v", err)
+	}
+	if _, err := r.SetReplication(ctx, "plain", ModeActivePassive, []string{"p"}); err != nil {
+		t.Fatalf("replica of an unencrypted bucket: %v", err)
 	}
 }

@@ -27,7 +27,8 @@ const (
 type BackingStatus struct {
 	Name      string    `json:"name"`
 	Kind      string    `json:"kind"`
-	Mode      string    `json:"mode,omitempty"` // s3 backings: "blob" or "gateway"
+	Mode      string    `json:"mode,omitempty"`     // "gateway" for an s3 gateway backing
+	Location  string    `json:"location,omitempty"` // s3 backings: e.g. "s3://bucket/prefix/"
 	Path      string    `json:"path"`
 	Default   bool      `json:"default"`
 	Healthy   bool      `json:"healthy"`
@@ -98,7 +99,7 @@ func (r *Router) Backings() []BackingStatus {
 	for _, b := range topology.order {
 		b.mu.Lock()
 		st := BackingStatus{
-			Name: b.Name, Kind: b.Kind, Mode: b.Mode, Path: b.Path, Default: b == topology.def,
+			Name: b.Name, Kind: b.Kind, Mode: b.Mode, Location: b.Location, Path: b.Path, Default: b == topology.def,
 			Healthy: b.healthy.Load(), LastError: b.lastErr, CheckedAt: b.checkedAt,
 			Buckets: primaries[b.Name], Replicas: replicas[b.Name],
 		}

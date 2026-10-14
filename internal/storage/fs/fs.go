@@ -17,33 +17,14 @@
 //	                                prepared for the bucket)
 //	keys/<bucket-id>.restic.json    a bucket's restic repository location and
 //	                                password (secret)
-//	restic/<bucket-id>/             a bucket's local restic repository (when
-//	                                the backing has no restic S3 storage)
+//	restic/<bucket-id>/             a bucket's restic repository
 //	restic-cache/                   restic's local repository cache
-//	restic-backing.json             the backing's restic S3 storage settings,
-//	                                including credentials (secret; written by
-//	                                ConfigureResticBacking)
 //
 // Keys, recovery records and repositories are kept when a bucket is
 // deleted, so that its restic archive stays recoverable.
 //
 // The schema of meta.db is documented in schema.go; encryption.go and
 // restic*.go describe encrypted and restic-archived data.
-//
-// Buckets created with a Backing that names one of Options.Remotes (blob
-// mode) keep everything above in meta.db as well, but their object and
-// part data live as opaque blobs in that remote S3 bucket instead of data/
-// and uploads/ (same IDs and names):
-//
-//	<prefix>data/<bucket-id>/<id>            object data
-//	<prefix>uploads/<upload-id>/<n>-<id>     multipart part data
-//
-// A bucket whose Backing is set but is not a configured remote (a gateway
-// backing served by another layer, or a remote removed from the
-// configuration) keeps working for metadata operations, while operations
-// that need its data fail with storage.ErrBackingUnavailable. Remote
-// failures that mean the service is unreachable or failing (transport
-// errors, 5xx) are reported wrapping storage.ErrBackingUnavailable too.
 //
 // # Write path
 //
@@ -64,22 +45,6 @@
 // races with readers of the previous part. CompleteMultipartUpload streams
 // the listed parts into a new data file and then commits like a PutObject.
 //
-// In blob mode the stored bytes are built exactly as for a local data file
-// (encrypted and/or compressed into a file in tmp/; for restic versions,
-// the snapshot reference) and the finished file is uploaded to a fresh
-// blob instead of being renamed into data/, before the same metadata
-// transaction runs; failed commits delete the blob, superseded blobs are
-// deleted after the commit. Imported versions (import.go) take the same
-// path. Parts are always uploaded as blobs, even when empty.
-// CompleteMultipartUpload composes the parts server-side (a remote
-// multipart upload of UploadPartCopy ranges, or a copy for a single part)
-// when the result is their plain concatenation (no compression or
-// encryption, plain parts) and every part but the last has at least
-// s3client.MinPartSize bytes; otherwise it streams the part blobs through
-// the local pipeline (decrypting, re-encoding) into a file that is
-// uploaded. Options.DefaultBacking puts every bucket created without a
-// backing on one remote.
-//
 // # Readers
 //
 // OpenObject returns an *os.File, or a reader decrypting or decompressing
@@ -92,16 +57,6 @@
 // cannot be deleted: unlinking a superseded data file that is still being
 // read fails, the failure is logged and the orphan is removed by the
 // recovery pass at the next start.
-//
-// In blob mode OpenObject reads the blob with lazy ranged GETs (also as an
-// io.ReaderAt below the decryption and decompression layers).
-// The same guarantee is implemented in memory: open readers are counted
-// per blob, and deleting a blob dereferenced by a transaction is deferred
-// until its last reader is closed. OpenObject registers the reader before
-// re-checking that the version still references the blob (and resolves
-// the version again if not), under the same lock as the deferred-delete
-// decision, so a concurrent overwrite can never delete a blob that a
-// reader was handed.
 //
 // # Recovery
 //
@@ -121,15 +76,6 @@
 // mount point) are left alone. Open refuses to start when meta.db is missing
 // or empty while data/ or uploads/ hold files, since a fresh database would
 // make every stored object look orphaned.
-//
-// The pass then lists the data/ and uploads/ prefixes of every remote and
-// deletes blobs that the metadata does not reference, that are neither
-// pending nor held by open readers, and whose remote LastModified is older
-// than Options.OrphanRetention (the age threshold replaces the quarantine:
-// blobs written after a backup of meta.db survive restoring it for that
-// long). Keys with names gos3 never generates are left alone. Open also
-// refuses to start with a missing or empty meta.db while a remote holds
-// blobs; a remote that cannot be reached at Open is logged, not fatal.
 //
 // # Durability
 //
@@ -169,7 +115,6 @@ var ErrClosed = errors.New("fs: backend closed")
 
 // Options configures Open.
 type Options struct {
-	ResticS3 *storage.ResticS3
 	// FsyncData fsyncs every data file (and its directory) before the
 	// metadata referencing it is committed. Slower, but committed objects
 	// survive power loss.
@@ -179,16 +124,8 @@ type Options struct {
 	Logger *slog.Logger
 	// OrphanRetention is how long the recovery pass keeps unreferenced
 	// files it moved to .gos3/orphans/ before deleting them (at a later
-	// start). Zero or negative means DefaultOrphanRetention. For remote
-	// blobs (see Remotes) it is the minimum age of an unreferenced blob
-	// before the recovery pass deletes it.
+	// start). Zero or negative means DefaultOrphanRetention.
 	OrphanRetention time.Duration
-	// Remotes are the blob backings, keyed by backing name.
-	Remotes map[string]RemoteStore
-	// DefaultBacking is the Backing recorded for buckets created with an
-	// empty CreateBucketOptions.Backing: "" (local files) or a key of
-	// Remotes (every such bucket then stores its data on that remote).
-	DefaultBacking string
 }
 
 // DefaultOrphanRetention is the default of Options.OrphanRetention.
@@ -206,21 +143,18 @@ const (
 type Backend struct {
 	// keyMu guards keys, the cache of bucket master keys by bucket ID
 	// (see bucketKey).
-	keyMu          sync.RWMutex
-	keys           map[string]*bucketKeyEntry
-	resticMu       sync.Mutex
-	resticConfigMu sync.RWMutex
-	resticS3       *storage.ResticS3
-	root           string
-	sysDir         string
-	dataDir        string
-	tmpDir         string
-	uploadDir      string
-	orphanDir      string
-	retention      time.Duration
-	fsync          bool
-	log            *slog.Logger
-	db             *bbolt.DB
+	keyMu     sync.RWMutex
+	keys      map[string]*bucketKeyEntry
+	root      string
+	sysDir    string
+	dataDir   string
+	tmpDir    string
+	uploadDir string
+	orphanDir string
+	retention time.Duration
+	fsync     bool
+	log       *slog.Logger
+	db        *bbolt.DB
 
 	closed atomic.Bool
 	cancel context.CancelFunc
@@ -231,15 +165,6 @@ type Backend struct {
 	pending pendingSet
 	commits committer
 	restic  resticState // see restic.go
-
-	// remotes are the blob backings by name; blobs tracks open readers of
-	// their data blobs.
-	remotes map[string]*remote
-	blobs   blobTracker
-	// defaultBacking is Options.DefaultBacking.
-	defaultBacking string
-	// now is the clock of the recovery pass (tests move it).
-	now func() time.Time
 
 	// commitFault, when set (tests only), replaces the result of every
 	// successful write transaction, simulating a commit that reports an
@@ -272,7 +197,6 @@ func Open(root string, opts Options) (*Backend, error) {
 		log:          opts.Logger,
 		recoveryDone: make(chan struct{}),
 		pending:      pendingSet{m: make(map[string]int)},
-		now:          time.Now,
 	}
 	if b.log == nil {
 		b.log = slog.New(slog.DiscardHandler)
@@ -285,13 +209,6 @@ func Open(root string, opts Options) (*Backend, error) {
 	if b.retention <= 0 {
 		b.retention = DefaultOrphanRetention
 	}
-	if b.remotes, err = newRemotes(opts.Remotes); err != nil {
-		return nil, err
-	}
-	if opts.DefaultBacking != "" && b.remotes[opts.DefaultBacking] == nil {
-		return nil, fmt.Errorf("fs: default backing %q is not one of the remote backings", opts.DefaultBacking)
-	}
-	b.defaultBacking = opts.DefaultBacking
 	for _, d := range []string{b.sysDir, b.dataDir, b.tmpDir, b.uploadDir} {
 		if err := os.MkdirAll(d, dirPerm); err != nil {
 			return nil, fmt.Errorf("fs: create %s: %w", d, err)
@@ -317,10 +234,6 @@ func Open(root string, opts Options) (*Backend, error) {
 		return nil, fmt.Errorf("fs: open metadata database %s: %w", dbPath, err)
 	}
 	b.db = db
-	if err := b.loadResticBacking(opts.ResticS3); err != nil {
-		_ = db.Close()
-		return nil, err
-	}
 	b.tightenPerm(dbPath)
 	if err := b.initSchema(); err != nil {
 		_ = db.Close()
@@ -374,11 +287,9 @@ func (b *Backend) tightenPerm(path string) {
 
 // checkMetadataPresent refuses to proceed when the metadata database is
 // missing or empty (bbolt would silently create a fresh one) although the
-// data or uploads directory, or the data/ or uploads/ prefix of a remote
-// blob backing, holds files gos3 wrote: the recovery pass would then
-// consider every object orphaned. A remote that cannot be reached is only
-// logged. The check runs before the database lock is taken; a database
-// that is missing or empty cannot be in use.
+// data or uploads directory holds files gos3 wrote: the recovery pass would
+// then consider every object orphaned. The check runs before the database
+// lock is taken; a database that is missing or empty cannot be in use.
 func (b *Backend) checkMetadataPresent(dbPath string) error {
 	fi, err := os.Stat(dbPath)
 	switch {
@@ -391,18 +302,12 @@ func (b *Backend) checkMetadataPresent(dbPath string) error {
 	if err != nil {
 		return fmt.Errorf("fs: inspect %s: %w", b.sysDir, err)
 	}
+	if dir == "" {
+		return nil
+	}
 	state := "missing"
 	if fi != nil {
 		state = "empty"
-	}
-	if dir == "" {
-		if where := b.remoteHoldsBlobs(); where != "" {
-			return fmt.Errorf("fs: metadata database %s is %s but remote %s still holds stored data; "+
-				"refusing to start with an empty index, which would discard it. Restore meta.db "+
-				"from a backup, or move the remote blobs aside to start with an empty store",
-				dbPath, state, where)
-		}
-		return nil
 	}
 	return fmt.Errorf("fs: metadata database %s is %s but %s still holds stored data; "+
 		"refusing to start with an empty index, which would discard it. Restore meta.db "+

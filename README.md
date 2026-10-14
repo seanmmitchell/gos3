@@ -35,10 +35,12 @@ Run `gos3 serve`, point the AWS CLI, an SDK, `mc` or rclone at it, and open
   enabled per bucket, or enforced or disabled server-wide by the
   administrator. Already-compressed media types are skipped. See
   [docs/operations.md](docs/operations.md#compression).
-- **Remote S3 backings**: put individual buckets on AWS S3, MinIO, R2 or any
-  S3 service, chosen per bucket at creation: as opaque blobs with every gos3
-  feature, or as a gateway that stores native objects other tools can read.
-  See [docs/backings.md](docs/backings.md).
+- **S3 as a storage backend**: keep a whole server, or individual buckets,
+  in a bucket of AWS S3, MinIO, R2 or another S3 service that supports
+  conditional writes, with every gos3 feature and no local data directory;
+  or use the gateway option to store native objects other tools can read.
+  S3 backings can be added and edited live from the web UI. See
+  [docs/backings.md](docs/backings.md).
 - **Web UI**: embedded in the binary or run standalone to manage many gos3
   and other S3 servers. It has an object browser with uploads, versions,
   metadata and share links, bucket settings, users and policies, server
@@ -170,7 +172,7 @@ Frequently used settings:
 |---|---|---|
 | Listen address | `--address` / `GOS3_ADDRESS` | `:9000` |
 | Data directory | `--data` / `GOS3_DATA` | `./data` |
-| Backend | `--backend fs\|memory` / `GOS3_STORAGE_BACKEND` | `fs` |
+| Backend | `--backend fs\|memory\|s3` / `GOS3_STORAGE_BACKEND` (s3: `GOS3_S3_*`) | `fs` |
 | Root keys | `GOS3_ROOT_ACCESS_KEY`, `GOS3_ROOT_SECRET_KEY` | generated |
 | Region | `--region` / `GOS3_REGION` | `us-east-1` |
 | Public URL | `--public-url` / `GOS3_PUBLIC_URL` | derived |
@@ -364,9 +366,10 @@ specified in [docs/discovery.md](docs/discovery.md).
   local discovery only when `GOS3_UI_LOCAL_DISCOVERY=true`, and then for
   anyone who can reach it.
 - **Object encryption**: SSE-S3 encrypts new object data using server-managed
-  keys. Per-bucket restic repositories provide encrypted archival on local
-  storage or remote S3 (restic is bundled in the container images; install
-  it next to a release binary). Existing objects require rewriting to
+  keys. Per-bucket restic repositories provide encrypted archival on the
+  bucket's backing, a local directory or an S3 backing's bucket (restic is
+  bundled in the container images; install it next to a release binary).
+  On S3 backings the keys are wrapped with a key-encryption key you keep. Existing objects require rewriting to
   encrypt them; back up the protected keys and metadata. See [encryption](docs/encryption.md).
 
 More in [docs/security.md](docs/security.md).
@@ -377,7 +380,8 @@ More in [docs/security.md](docs/security.md).
 |---|---|
 | [docs/configuration.md](docs/configuration.md) | every YAML key, environment variable and flag |
 | [docs/deployment.md](docs/deployment.md) | Docker, Compose, systemd, Kubernetes, reverse proxies, TLS |
-| [docs/backings.md](docs/backings.md) | storing buckets on remote S3 services (blob and gateway modes) |
+| [docs/backings.md](docs/backings.md) | storage backings: S3 as a backend (whole server or per bucket), the gateway option, live configuration |
+| [docs/encryption.md](docs/encryption.md) | native AES256 and restic encryption, keys and recovery |
 | [docs/operations.md](docs/operations.md) | health checks, metrics, logs, backups, lifecycle, upgrades |
 | [docs/security.md](docs/security.md) | authentication, stored secrets, exposure checklist |
 | [docs/s3-compatibility.md](docs/s3-compatibility.md) | supported S3 operations and differences from AWS |

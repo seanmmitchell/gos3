@@ -7,6 +7,7 @@
 package s3clienttest
 
 import (
+	"io"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
@@ -28,6 +29,22 @@ const (
 	Region    = "us-east-1"
 )
 
+// Fault is what a Remote does with the client's request after its
+// handler ran (see Remote.After).
+type Fault int
+
+const (
+	// Pass answers normally.
+	Pass Fault = iota
+	// Status500 applies the request, then answers 500 InternalError
+	// instead of the handler's answer: the client cannot tell the request
+	// succeeded.
+	Status500
+	// Reset applies the request, then closes the connection without any
+	// answer (a transport error for the client).
+	Reset
+)
+
 // Remote is a running in-process S3 service.
 type Remote struct {
 	URL     string          // endpoint, http://127.0.0.1:port
@@ -37,6 +54,16 @@ type Remote struct {
 	// Fail, when set, is consulted before every request; returning a
 	// status >= 400 answers with that status instead (fault injection).
 	Fail atomic.Pointer[func(r *http.Request) int]
+	// After, when set, is consulted before every request (after Fail) to
+	// choose a Fault applied once the handler has served the request,
+	// which then has taken effect (its body was read completely). Use it
+	// to simulate writes that succeed although the client sees a failure.
+	After atomic.Pointer[func(r *http.Request) Fault]
+	// IgnoreConditionals strips If-Match and If-None-Match from every
+	// request other than GET and HEAD, simulating a service that ignores
+	// conditional writes (they then always succeed). Reads keep their
+	// conditions.
+	IgnoreConditionals atomic.Bool
 
 	srv *httptest.Server
 }
@@ -65,7 +92,37 @@ func Start(t testing.TB) *Remote {
 				return
 			}
 		}
-		h.ServeHTTP(w, req)
+		if r.IgnoreConditionals.Load() && req.Method != http.MethodGet && req.Method != http.MethodHead {
+			// Neither header is signed by SigV4 clients, so the request
+			// still authenticates.
+			req.Header.Del("If-Match")
+			req.Header.Del("If-None-Match")
+		}
+		fault := Pass
+		if f := r.After.Load(); f != nil {
+			fault = (*f)(req)
+		}
+		if fault == Pass {
+			h.ServeHTTP(w, req)
+			return
+		}
+		// Serve into a recorder, so nothing reaches the client, and make
+		// sure the whole body was consumed before failing.
+		h.ServeHTTP(httptest.NewRecorder(), req)
+		_, _ = io.Copy(io.Discard, req.Body)
+		switch fault {
+		case Reset:
+			conn, _, err := http.NewResponseController(w).Hijack()
+			if err != nil {
+				panic("s3clienttest: hijack: " + err.Error())
+			}
+			_ = conn.Close()
+		default:
+			w.Header().Set("Content-Type", "application/xml")
+			w.WriteHeader(http.StatusInternalServerError)
+			_, _ = io.WriteString(w, `<?xml version="1.0" encoding="UTF-8"?>`+
+				`<Error><Code>InternalError</Code><Message>injected fault after the request was applied</Message></Error>`)
+		}
 	}))
 	r.URL = r.srv.URL
 	t.Cleanup(func() {

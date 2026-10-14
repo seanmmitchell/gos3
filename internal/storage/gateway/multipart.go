@@ -9,8 +9,6 @@ import (
 	"fmt"
 	"io"
 	"maps"
-	"os"
-	"path/filepath"
 	"slices"
 	"sort"
 	"strconv"
@@ -24,14 +22,14 @@ import (
 
 // Multipart uploads
 //
-// A gos3 upload has its own ID and a local record (bucket, key, metadata,
-// initiator, parts), persisted in StateDir. Its parts go to a remote
+// A gos3 upload has its own ID and a record (bucket, key, metadata,
+// initiator, parts), persisted in Options.State. Its parts go to a remote
 // multipart upload of the target key, created lazily for the first part
-// that needs it, or are staged locally:
+// that needs it, or are staged in the StateStore:
 //
 //   - A part of at least s3client.MinPartSize (5 MiB) is uploaded to the
 //     remote upload right away, under the same part number.
-//   - A smaller part is staged in a local file (StateDir/parts) and only
+//   - A smaller part is staged (StateStore.PutStaged) and only
 //     uploaded at completion. S3 rejects completions whose non-last parts
 //     are below 5 MiB, and parts of a remote upload cannot be read back,
 //     so small parts must stay readable until it is known how they are
@@ -48,8 +46,7 @@ import (
 //     ascending: a staged last part is uploaded now and the remote upload
 //     is completed with the remote parts. This is always the case for
 //     uploads the S3 layer accepts (it enforces ascending part numbers and
-//     5 MiB non-last parts), so large uploads never pass through local
-//     disk.
+//     5 MiB non-last parts), so large uploads are never staged.
 //
 // Any other combination (a small non-last part next to remote parts, or a
 // non-ascending list including remote parts) cannot be assembled from
@@ -83,15 +80,18 @@ type upload struct {
 
 	// Guarded by Store.mu.
 	remoteID string
-	parts    map[int]*part
-	gone     bool
+	// remoteSaved reports that the upload record holding remoteID was
+	// written (remote parts are only uploaded after that).
+	remoteSaved bool
+	parts       map[int]*part
+	gone        bool
 }
 
 // part is a committed part: remote (remoteETag set) or staged (file set).
 type part struct {
 	info       storage.PartInfo
 	remoteETag string
-	file       string // base name in Store.stageDir
+	file       string // staged blob name in the StateStore
 }
 
 func (u *upload) info() storage.UploadInfo {
@@ -156,6 +156,12 @@ func (s *Store) findUpload(bucket, key, id string) (*upload, error) {
 	return u, nil
 }
 
+func (s *Store) isClosed() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.closed
+}
+
 func (s *Store) isGone(u *upload) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -168,9 +174,23 @@ func (s *Store) remoteUploadID(u *upload) string {
 	return u.remoteID
 }
 
-// dropUpload forgets u and its staged parts (the remote upload, if any,
-// must have been completed or aborted). The caller holds u.op.
-func (s *Store) dropUpload(u *upload) error {
+// dropUpload deletes u's records, then forgets u and deletes its staged
+// parts (the remote upload, if any, must have been completed or aborted,
+// or be gone). The caller holds u.op exclusively.
+//
+// The records are deleted even if ctx is cancelled, upload record first:
+// once it is gone the upload cannot come back at Open, which removes the
+// leftover part records and staged parts. If deleting the records fails,
+// the staged parts are kept (a record that may still exist refers to
+// them) and the error is returned; u stays registered, so the operation
+// can be retried, unless force is set (the upload is consumed whatever
+// happens to its records).
+func (s *Store) dropUpload(ctx context.Context, u *upload, force bool) error {
+	ctx = context.WithoutCancel(ctx)
+	err := s.deleteUploadState(ctx, u.id)
+	if err != nil && !force {
+		return err
+	}
 	s.mu.Lock()
 	u.gone = true
 	s.removeUploadLocked(u)
@@ -181,10 +201,36 @@ func (s *Store) dropUpload(u *upload) error {
 		}
 	}
 	s.mu.Unlock()
-	for _, f := range files {
-		_ = os.Remove(filepath.Join(s.stageDir, f))
+	if err != nil {
+		return err
 	}
-	return s.deleteUploadState(u.id)
+	for _, f := range files {
+		s.deleteStaged(ctx, f)
+	}
+	return nil
+}
+
+// dropVanished drops u after its remote upload rid turned out to be gone
+// (errRemoteUploadGone): its remote parts are lost, so the gos3 upload
+// cannot be completed any more. The caller must not hold u.op.
+func (s *Store) dropVanished(ctx context.Context, u *upload, rid string) {
+	u.op.Lock()
+	defer u.op.Unlock()
+	s.dropVanishedLocked(ctx, u, rid)
+}
+
+// dropVanishedLocked is dropVanished with u.op held exclusively.
+func (s *Store) dropVanishedLocked(ctx context.Context, u *upload, rid string) {
+	s.mu.Lock()
+	still := !u.gone && u.remoteID == rid
+	s.mu.Unlock()
+	if !still {
+		return
+	}
+	s.log.Warn("gateway: remote multipart upload vanished; upload dropped", "backing", s.name, "bucket", u.bucket, "key", u.key, "upload", u.id)
+	if err := s.dropUpload(ctx, u, true); err != nil {
+		s.log.Warn("gateway: drop upload state", "backing", s.name, "upload", u.id, "err", err)
+	}
 }
 
 // CreateMultipartUpload starts an upload. The remote multipart upload is
@@ -205,13 +251,22 @@ func (s *Store) CreateMultipartUpload(ctx context.Context, bucket, key string, m
 		initiator: initiator,
 		parts:     map[int]*part{},
 	}
+	if s.isClosed() {
+		return storage.UploadInfo{}, errClosed
+	}
+	// The record is written without s.mu (the state store may be remote);
+	// nobody can reach u before it is registered.
+	if err := s.saveUpload(ctx, u); err != nil {
+		// The write may have landed anyway: remove the record, best
+		// effort (no staged part refers to it).
+		_ = s.state.DeleteRecords(context.WithoutCancel(ctx), uploadKey(u.id))
+		return storage.UploadInfo{}, err
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.closed {
+		_ = s.state.DeleteRecords(context.WithoutCancel(ctx), uploadKey(u.id))
 		return storage.UploadInfo{}, errClosed
-	}
-	if err := s.saveUpload(u); err != nil {
-		return storage.UploadInfo{}, err
 	}
 	s.addUploadLocked(u)
 	return u.info(), nil
@@ -302,23 +357,34 @@ func (u *upload) info0() storage.UploadInfo {
 }
 
 // ensureRemoteUpload returns the ID of u's remote multipart upload,
-// creating it (with the creation-time metadata) on first use.
+// creating it (with the creation-time metadata) on first use. It returns
+// only once the upload record holding the ID is saved, so no remote part
+// is recorded without it; a failed save is retried by the next call.
 func (s *Store) ensureRemoteUpload(ctx context.Context, u *upload) (string, error) {
 	u.createMu.Lock()
 	defer u.createMu.Unlock()
-	if id := s.remoteUploadID(u); id != "" {
-		return id, nil
-	}
-	rb, rk := s.remoteKey(u.bucket, u.key)
-	id, err := s.c.CreateMultipartUpload(ctx, rb, rk, encodeHeaders(u.meta, headerOpts{}))
-	if err != nil {
-		return "", s.remoteErr("CreateMultipartUpload", u.bucket, u.key, err)
-	}
 	s.mu.Lock()
-	u.remoteID = id
+	id, saved := u.remoteID, u.remoteSaved
 	s.mu.Unlock()
-	if err := s.saveUpload(u); err != nil {
-		return "", err
+	if id == "" {
+		rb, rk := s.remoteKey(u.bucket, u.key)
+		var err error
+		id, err = s.c.CreateMultipartUpload(ctx, rb, rk, encodeHeaders(u.meta, headerOpts{}))
+		if err != nil {
+			return "", s.remoteErr("CreateMultipartUpload", u.bucket, u.key, err)
+		}
+		s.mu.Lock()
+		u.remoteID = id
+		s.mu.Unlock()
+	}
+	if !saved {
+		// The remote upload exists: record it even if ctx is cancelled.
+		if err := s.saveUpload(context.WithoutCancel(ctx), u); err != nil {
+			return "", err
+		}
+		s.mu.Lock()
+		u.remoteSaved = true
+		s.mu.Unlock()
 	}
 	return id, nil
 }
@@ -356,8 +422,9 @@ func (w *partWriter) Write(p []byte) (int, error) {
 	return w.spool.Write(p)
 }
 
-// Commit uploads the part to the remote upload (>= 5 MiB) or stages it
-// locally, replacing an earlier part with the same number.
+// Commit uploads the part to the remote upload (>= 5 MiB) or stages it in
+// the StateStore, replacing an earlier part with the same number. When the
+// remote upload turns out to be gone, the gos3 upload is dropped.
 func (w *partWriter) Commit(ctx context.Context, meta storage.PartMeta) (storage.PartInfo, error) {
 	w.mu.Lock()
 	if w.done {
@@ -370,11 +437,21 @@ func (w *partWriter) Commit(ctx context.Context, meta storage.PartMeta) (storage
 	if err := w.spool.Finish(); err != nil {
 		return storage.PartInfo{}, err
 	}
+	info, rid, err := w.commit(ctx, meta)
+	if errors.Is(err, errRemoteUploadGone) {
+		w.s.dropVanished(ctx, w.u, rid)
+	}
+	return info, err
+}
+
+// commit does Commit's work under u.op (shared). It also returns the
+// remote upload ID it used.
+func (w *partWriter) commit(ctx context.Context, meta storage.PartMeta) (storage.PartInfo, string, error) {
 	s, u := w.s, w.u
 	u.op.RLock()
 	defer u.op.RUnlock()
 	if s.isGone(u) {
-		return storage.PartInfo{}, fmt.Errorf("%w: %q", storage.ErrUploadNotFound, u.id)
+		return storage.PartInfo{}, "", fmt.Errorf("%w: %q", storage.ErrUploadNotFound, u.id)
 	}
 	unlock := s.keys.lock("p\x00" + u.id + "\x00" + strconv.Itoa(w.number))
 	defer unlock()
@@ -386,38 +463,41 @@ func (w *partWriter) Commit(ctx context.Context, meta storage.PartMeta) (storage
 		Size:         size,
 		LastModified: time.Now().UTC().Round(0),
 	}}
+	var rid string
 	if size >= s3client.MinPartSize {
-		rid, err := s.ensureRemoteUpload(ctx, u)
+		var err error
+		rid, err = s.ensureRemoteUpload(ctx, u)
 		if err != nil {
-			return storage.PartInfo{}, err
+			return storage.PartInfo{}, "", err
 		}
 		rb, rk := s.remoteKey(u.bucket, u.key)
 		etag, err := s.c.UploadPart(ctx, rb, rk, rid, w.number, w.spool, size)
 		if err != nil {
-			return storage.PartInfo{}, s.remoteErr("UploadPart", u.bucket, u.key, err)
+			return storage.PartInfo{}, rid, s.remoteErr("UploadPart", u.bucket, u.key, err)
 		}
 		p.remoteETag = etag
 	} else {
-		file, err := s.stagePart(u.id, w.number, w.spool, size)
+		file, err := s.stagePart(ctx, u.id, w.number, w.spool, size)
 		if err != nil {
-			return storage.PartInfo{}, err
+			return storage.PartInfo{}, "", err
 		}
 		p.file = file
 	}
-	if err := s.savePart(u.id, p); err != nil {
-		if p.file != "" {
-			_ = os.Remove(filepath.Join(s.stageDir, p.file))
-		}
-		return storage.PartInfo{}, err
+	// The part is stored: record it even if ctx is cancelled. A failed
+	// write may have landed anyway, so a staged part stays (Open removes
+	// it if no record refers to it).
+	if err := s.savePart(context.WithoutCancel(ctx), u.id, p); err != nil {
+		return storage.PartInfo{}, "", err
 	}
 	s.mu.Lock()
 	old := u.parts[w.number]
 	u.parts[w.number] = p
 	s.mu.Unlock()
 	if old != nil && old.file != "" {
-		_ = os.Remove(filepath.Join(s.stageDir, old.file))
+		// No record refers to it any more.
+		s.deleteStaged(context.WithoutCancel(ctx), old.file)
 	}
-	return clonePartInfo(p.info), nil
+	return clonePartInfo(p.info), "", nil
 }
 
 func (w *partWriter) Abort() error {
@@ -430,24 +510,18 @@ func (w *partWriter) Abort() error {
 	return nil
 }
 
-// stagePart copies a small part into a staging file and returns its name.
-func (s *Store) stagePart(id string, n int, r io.ReaderAt, size int64) (string, error) {
-	f, err := os.CreateTemp(s.stageDir, fmt.Sprintf("%s-%05d-*", id, n))
-	if err != nil {
+// stagePart stores a small part as a staged blob and returns its name,
+// unique per commit so that a replaced part's blob stays readable until
+// the new part record is saved.
+func (s *Store) stagePart(ctx context.Context, id string, n int, r io.ReaderAt, size int64) (string, error) {
+	var rnd [8]byte
+	_, _ = rand.Read(rnd[:])
+	name := fmt.Sprintf("%s-%05d-%s", id, n, base64.RawURLEncoding.EncodeToString(rnd[:]))
+	if err := s.state.PutStaged(ctx, name, r, size); err != nil {
+		s.deleteStaged(context.WithoutCancel(ctx), name)
 		return "", fmt.Errorf("gateway %q: stage part: %w", s.name, err)
 	}
-	_, err = io.Copy(f, io.NewSectionReader(r, 0, size))
-	if err == nil && s.db != nil {
-		err = f.Sync() // the part record that refers to it is durable too
-	}
-	if cerr := f.Close(); err == nil {
-		err = cerr
-	}
-	if err != nil {
-		_ = os.Remove(f.Name())
-		return "", fmt.Errorf("gateway %q: stage part: %w", s.name, err)
-	}
-	return filepath.Base(f.Name()), nil
+	return name, nil
 }
 
 // --- completion ---
@@ -527,11 +601,11 @@ func (s *Store) CompleteMultipartUpload(ctx context.Context, bucket, key, upload
 		}
 		if remoteID != "" {
 			rb, rk := s.remoteKey(bucket, key)
-			if err := s.c.AbortMultipartUpload(context.WithoutCancel(ctx), rb, rk, remoteID); err != nil {
+			if err := s.c.AbortMultipartUpload(context.WithoutCancel(ctx), rb, rk, remoteID); err != nil && !s3client.IsCode(err, "NoSuchUpload") {
 				s.log.Warn("gateway: abort unused remote multipart upload", "backing", s.name, "bucket", bucket, "key", key, "err", err)
 			}
 		}
-		if err := s.dropUpload(u); err != nil {
+		if err := s.dropUpload(ctx, u, true); err != nil {
 			s.log.Warn("gateway: drop completed upload state", "backing", s.name, "upload", uploadID, "err", err)
 		}
 		info.LastModified = s.lastModifiedAfterWrite(ctx, bucket, key, etag)
@@ -542,15 +616,8 @@ func (s *Store) CompleteMultipartUpload(ctx context.Context, bucket, key, upload
 
 // completeStaged uploads the concatenation of staged parts as the object.
 func (s *Store) completeStaged(ctx context.Context, u *upload, sel []*part, total int64, meta storage.ObjectMeta, ifNoneMatch bool, ifMatch string) (string, error) {
-	mr := &multiFileReaderAt{}
+	mr := s.newStagedReader(ctx, u.id, sel)
 	defer mr.Close()
-	for _, p := range sel {
-		f, err := os.Open(filepath.Join(s.stageDir, p.file))
-		if err != nil {
-			return "", fmt.Errorf("gateway %q: open staged part %d of upload %q: %w", s.name, p.info.PartNumber, u.id, err)
-		}
-		mr.add(f, p.info.Size)
-	}
 	rb, rk := s.remoteKey(u.bucket, u.key)
 	// A multipart ETag never equals the MD5 the remote computes.
 	h := encodeHeaders(meta, headerOpts{etag: true})
@@ -573,25 +640,34 @@ func (s *Store) completeRemote(ctx context.Context, u *upload, sel []*part, info
 	for i, p := range sel {
 		etag := p.remoteETag
 		if p.file != "" { // the last part
-			f, err := os.Open(filepath.Join(s.stageDir, p.file))
+			r := s.newStagedReader(ctx, u.id, []*part{p})
+			var err error
+			etag, err = s.c.UploadPart(ctx, rb, rk, rid, p.info.PartNumber, r, p.info.Size)
+			r.Close()
 			if err != nil {
-				return storage.ObjectInfo{}, fmt.Errorf("gateway %q: open staged part %d of upload %q: %w", s.name, p.info.PartNumber, u.id, err)
-			}
-			etag, err = s.c.UploadPart(ctx, rb, rk, rid, p.info.PartNumber, f, p.info.Size)
-			_ = f.Close()
-			if err != nil {
-				return storage.ObjectInfo{}, s.remoteErr("UploadPart", u.bucket, u.key, err)
+				err = s.remoteErr("UploadPart", u.bucket, u.key, err)
+				if errors.Is(err, errRemoteUploadGone) {
+					s.dropVanishedLocked(ctx, u, rid)
+				}
+				return storage.ObjectInfo{}, err
 			}
 		}
 		parts[i] = s3client.CompletedPart{Number: p.info.PartNumber, ETag: etag}
 	}
 	etag, err := s.c.CompleteMultipartUpload(ctx, rb, rk, rid, parts, s3client.CompleteOptions{IfNoneMatch: ifNoneMatch, IfMatch: ifMatch})
 	if err != nil {
-		return storage.ObjectInfo{}, s.remoteErr("CompleteMultipartUpload", u.bucket, u.key, err)
+		// NoSuchUpload: aborted or expired remotely, or completed by an
+		// earlier attempt of this request whose answer was lost. Either
+		// way the gos3 upload cannot be completed (again).
+		err = s.remoteErr("CompleteMultipartUpload", u.bucket, u.key, err)
+		if errors.Is(err, errRemoteUploadGone) {
+			s.dropVanishedLocked(ctx, u, rid)
+		}
+		return storage.ObjectInfo{}, err
 	}
 	// The remote upload is consumed: the gos3 upload is gone whatever
 	// happens to the metadata fix-up below.
-	if err := s.dropUpload(u); err != nil {
+	if err := s.dropUpload(ctx, u, true); err != nil {
 		s.log.Warn("gateway: drop completed upload state", "backing", s.name, "upload", u.id, "err", err)
 	}
 	created := encodeHeaders(u.meta, headerOpts{})
@@ -617,8 +693,9 @@ func (s *Store) completeRemote(ctx context.Context, u *upload, sel []*part, info
 }
 
 // AbortMultipartUpload aborts the remote upload (if one was created) and
-// drops the upload. If the remote abort fails, the upload is kept so it
-// can be aborted again.
+// drops the upload. If the remote abort or the deletion of the upload's
+// records fails, the upload is kept so it can be aborted again (a remote
+// upload that is already gone counts as aborted).
 func (s *Store) AbortMultipartUpload(ctx context.Context, bucket, key, uploadID string) error {
 	u, err := s.findUpload(bucket, key, uploadID)
 	if err != nil {
@@ -631,29 +708,44 @@ func (s *Store) AbortMultipartUpload(ctx context.Context, bucket, key, uploadID 
 	}
 	if rid := s.remoteUploadID(u); rid != "" {
 		rb, rk := s.remoteKey(bucket, key)
-		if err := s.c.AbortMultipartUpload(ctx, rb, rk, rid); err != nil {
+		if err := s.c.AbortMultipartUpload(ctx, rb, rk, rid); err != nil && !s3client.IsCode(err, "NoSuchUpload") {
 			return s.remoteErr("AbortMultipartUpload", bucket, key, err)
 		}
 	}
-	return s.dropUpload(u)
+	return s.dropUpload(ctx, u, false)
 }
 
-// multiFileReaderAt is an io.ReaderAt over the concatenation of files.
-type multiFileReaderAt struct {
-	files []*os.File
+// stagedReader is an io.ReaderAt over the concatenation of staged parts.
+// Each part is opened on first use and read sequentially where possible
+// (a read at another offset seeks); a part whose read fails is reopened
+// by the next read, so retried requests can re-read it.
+type stagedReader struct {
+	ctx   context.Context
+	s     *Store
+	id    string
+	parts []*stagedFile
 	ends  []int64 // cumulative end offsets
 }
 
-func (m *multiFileReaderAt) add(f *os.File, size int64) {
-	end := size
-	if n := len(m.ends); n > 0 {
-		end += m.ends[n-1]
-	}
-	m.files = append(m.files, f)
-	m.ends = append(m.ends, end)
+type stagedFile struct {
+	p   *part
+	mu  sync.Mutex
+	rc  io.ReadSeekCloser // nil until opened
+	pos int64             // offset of rc
 }
 
-func (m *multiFileReaderAt) ReadAt(p []byte, off int64) (int, error) {
+func (s *Store) newStagedReader(ctx context.Context, id string, sel []*part) *stagedReader {
+	m := &stagedReader{ctx: ctx, s: s, id: id}
+	var end int64
+	for _, p := range sel {
+		end += p.info.Size
+		m.parts = append(m.parts, &stagedFile{p: p})
+		m.ends = append(m.ends, end)
+	}
+	return m
+}
+
+func (m *stagedReader) ReadAt(p []byte, off int64) (int, error) {
 	total := 0
 	for len(p) > 0 {
 		i := sort.Search(len(m.ends), func(i int) bool { return m.ends[i] > off })
@@ -665,22 +757,60 @@ func (m *multiFileReaderAt) ReadAt(p []byte, off int64) (int, error) {
 			start = m.ends[i-1]
 		}
 		chunk := p[:min(int64(len(p)), m.ends[i]-off)]
-		n, err := m.files[i].ReadAt(chunk, off-start)
+		n, err := m.read(m.parts[i], chunk, off-start)
 		total += n
 		off += int64(n)
 		p = p[n:]
-		if n < len(chunk) {
-			if err == nil || errors.Is(err, io.EOF) {
-				err = io.ErrUnexpectedEOF // the staged file shrank
-			}
+		if err != nil {
 			return total, err
 		}
 	}
 	return total, nil
 }
 
-func (m *multiFileReaderAt) Close() {
-	for _, f := range m.files {
-		_ = f.Close()
+// read fills chunk from offset off of staged part f.
+func (m *stagedReader) read(f *stagedFile, chunk []byte, off int64) (int, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.rc == nil {
+		rc, err := m.s.state.OpenStaged(m.ctx, f.p.file, f.p.info.Size)
+		if err != nil {
+			return 0, fmt.Errorf("gateway %q: open staged part %d of upload %q: %w", m.s.name, f.p.info.PartNumber, m.id, err)
+		}
+		f.rc, f.pos = rc, 0
+	}
+	if f.pos != off {
+		if _, err := f.rc.Seek(off, io.SeekStart); err != nil {
+			f.reset()
+			return 0, fmt.Errorf("gateway %q: read staged part %d of upload %q: %w", m.s.name, f.p.info.PartNumber, m.id, err)
+		}
+		f.pos = off
+	}
+	n, err := io.ReadFull(f.rc, chunk)
+	f.pos += int64(n)
+	if err != nil {
+		f.reset()
+		if errors.Is(err, io.EOF) {
+			err = io.ErrUnexpectedEOF // the staged part is shorter than recorded
+		}
+		return n, fmt.Errorf("gateway %q: read staged part %d of upload %q: %w", m.s.name, f.p.info.PartNumber, m.id, err)
+	}
+	return n, nil
+}
+
+// reset closes the part so the next read reopens it (f.mu held).
+func (f *stagedFile) reset() {
+	_ = f.rc.Close()
+	f.rc = nil
+}
+
+// Close closes the parts that were opened.
+func (m *stagedReader) Close() {
+	for _, f := range m.parts {
+		f.mu.Lock()
+		if f.rc != nil {
+			f.reset()
+		}
+		f.mu.Unlock()
 	}
 }

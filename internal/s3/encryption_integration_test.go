@@ -3,11 +3,8 @@ package s3
 import (
 	"bytes"
 	"context"
-	"encoding/json"
-	"io"
 	"net/http"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"testing"
 
@@ -70,79 +67,4 @@ func TestEncryptionS3RoundTrip(t *testing.T) {
 	if r.Header.Get("X-Amz-Server-Side-Encryption") != "" {
 		t.Fatal("legacy object falsely reported as encrypted")
 	}
-}
-
-func TestResticRemoteS3Integration(t *testing.T) {
-	if _, err := exec.LookPath("restic"); err != nil {
-		t.Skip("install restic >= 0.17.1 to run integration")
-	}
-	remote := newTestEnv(t)
-	remote.createBucket("repository")
-	ctx := context.Background()
-	dir := t.TempDir()
-	b, err := storagefs.Open(dir, storagefs.Options{})
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer b.Close()
-	if err = b.CreateBucket(ctx, "archive", storage.CreateBucketOptions{}); err != nil {
-		t.Fatal(err)
-	}
-	cfg := storage.ResticS3{Endpoint: remote.srv.URL, Bucket: "repository", Prefix: "archive", AccessKey: testRoot.AccessKey, SecretKey: testRoot.SecretKey, Region: "us-east-1"}
-	if err = b.ConfigureResticBacking(ctx, &cfg); err != nil {
-		t.Fatal(err)
-	}
-	raw, _ := json.Marshal(storage.EncryptionSettings{Provider: storage.EncryptionRestic})
-	if err = b.PutBucketConfig(ctx, "archive", storage.ConfigEncryptionProvider, raw); err != nil {
-		t.Fatal(err)
-	}
-	source := newTestEnv(t, withOptions(func(o *Options) { o.Backend = b }))
-	objExpect(t, source.signed("PUT", "/archive?encryption", []byte(`<ServerSideEncryptionConfiguration><Rule><ApplyServerSideEncryptionByDefault><SSEAlgorithm>AES256</SSEAlgorithm></ApplyServerSideEncryptionByDefault></Rule></ServerSideEncryptionConfiguration>`), nil), 200, "")
-	data := bytes.Repeat([]byte("remotely archived confidential data"), 1000)
-	objExpect(t, source.signed("PUT", "/archive/key", data, nil), 200, "")
-	info, err := b.GetObjectInfo(ctx, "archive", "key", "")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if info.Encryption != storage.EncryptionRestic {
-		t.Fatal("S3 default did not select restic")
-	}
-	r := source.signed("GET", "/archive/key", nil, nil)
-	if r.StatusCode != 200 || !bytes.Equal(r.Data, data) || r.Header.Get("X-Amz-Server-Side-Encryption") != "AES256" {
-		t.Fatalf("remote S3 restore failed: %d", r.StatusCode)
-	}
-	r = source.signed("GET", "/archive/key", nil, objHdr("Range", "bytes=12-51"))
-	if r.StatusCode != 206 || !bytes.Equal(r.Data, data[12:52]) {
-		t.Fatalf("remote S3 range failed: %d", r.StatusCode)
-	}
-	// The remote S3 bucket sees encrypted repository objects, not source bytes.
-	err = remote.backend.WalkObjects(ctx, "repository", "", "", func(i storage.ObjectInfo) error {
-		_, r, e := remote.backend.OpenObject(ctx, "repository", i.Key, "")
-		if e != nil {
-			return e
-		}
-		defer r.Close()
-		raw, e := io.ReadAll(r)
-		if bytes.Contains(raw, data[:32]) {
-			t.Error("plaintext reached remote S3")
-		}
-		return e
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	// Invalid credentials fail the new write; the previous snapshot survives.
-	cfg.SecretKey = "invalid-secret"
-	if err = b.ConfigureResticBacking(ctx, &cfg); err == nil {
-		t.Fatal("wrong remote credentials accepted")
-	}
-	saved, locked, err := b.ResticBackingSettings(ctx)
-	if err != nil || !locked || saved.SecretKey != testRoot.SecretKey {
-		t.Fatal("failed update replaced working backing settings")
-	}
-	r = source.signed("GET", "/archive/key", nil, nil)
-	if r.StatusCode != 200 || !bytes.Equal(r.Data, data) {
-		t.Fatal("failed update lost archive access")
-	}
-
 }

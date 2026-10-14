@@ -12,6 +12,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/seanmmitchell/gos3/internal/config"
 	"github.com/seanmmitchell/gos3/internal/server"
 )
 
@@ -66,5 +67,25 @@ func TestServeGeneratedSecretNotInOutput(t *testing.T) {
 	}
 	if _, err := os.Stat(m[1]); !errors.Is(err, fs.ErrNotExist) {
 		t.Errorf("credentials file left behind: %v", err)
+	}
+}
+
+func TestStorageSummary(t *testing.T) {
+	s3 := &config.S3Config{Endpoint: "http://minio:9000", Bucket: "bk", Prefix: "gos3/"}
+	gw := &config.S3Config{Endpoint: "https://s3.example.com", Bucket: "meta", Gateway: true}
+	for _, tc := range []struct {
+		backend, path string
+		s3            *config.S3Config
+		want          string
+	}{
+		{config.BackendFS, "/data", nil, "fs at /data"},
+		{config.BackendMemory, "/state", nil, "memory (ephemeral objects; system state in /state)"},
+		{config.BackendMemory, "", nil, "memory (ephemeral: everything is lost on exit)"},
+		{config.BackendS3, "/state", s3, "s3 at http://minio:9000/bk/gos3/; system state in /state"},
+		{config.BackendS3, "", gw, "s3 at https://s3.example.com/meta/ [gateway]; system state ephemeral (IAM users, settings, placements and live backings are lost on exit)"},
+	} {
+		if got := storageSummary(tc.backend, tc.path, tc.s3); got != tc.want {
+			t.Errorf("storageSummary(%s, %q) = %q, want %q", tc.backend, tc.path, got, tc.want)
+		}
 	}
 }

@@ -39,7 +39,7 @@ func newFixture(t *testing.T, shared bool, mod func(*gateway.Options)) *fixture 
 	t.Helper()
 	r := s3clienttest.Start(t)
 	f := &fixture{t: t, ctx: t.Context(), remote: r, c: r.Client(t)}
-	f.opts = gateway.Options{Name: "gw", Client: f.c, StateDir: t.TempDir()}
+	f.opts = gateway.Options{Name: "gw", Client: f.c, State: gateway.MemoryState()}
 	if shared {
 		r.CreateBucket(t, "shared")
 		f.opts.Bucket, f.opts.Prefix = "shared", "pfx/"
@@ -417,18 +417,18 @@ func uploadPart(t *testing.T, f *fixture, bucket, key, id string, n int, data []
 	return p
 }
 
-// stagedFiles returns the staged part files of a store with StateDir.
+// stagedFiles returns the staged parts in the store's StateStore.
 func stagedFiles(t *testing.T, f *fixture) []string {
 	t.Helper()
-	entries, err := os.ReadDir(filepath.Join(f.opts.StateDir, "parts"))
+	state := f.opts.State
+	if fs, ok := state.(*faultyState); ok {
+		state = fs.StateStore // bypass injected failures
+	}
+	names, err := state.ListStaged(f.ctx)
 	if err != nil {
 		t.Fatal(err)
 	}
-	var out []string
-	for _, e := range entries {
-		out = append(out, e.Name())
-	}
-	return out
+	return names
 }
 
 func TestMultipartRemoteParts(t *testing.T) {
@@ -684,7 +684,7 @@ func TestRemoteUnavailable(t *testing.T) {
 }
 
 func TestUploadStatePersists(t *testing.T) {
-	f := newFixture(t, false, func(o *gateway.Options) { o.SpoolDir = filepath.Join(o.StateDir, "tmp") })
+	f := newFixture(t, false, func(o *gateway.Options) { o.SpoolDir = filepath.Join(t.TempDir(), "tmp") })
 	f.attach("bkt")
 	meta := storage.ObjectMeta{ContentType: "a/b", UserMeta: map[string]string{"k": "v"}}
 	u, err := f.st.CreateMultipartUpload(f.ctx, "bkt", "obj", meta, "bob")
@@ -794,17 +794,21 @@ func TestCheckEmptyAndDetach(t *testing.T) {
 	}
 }
 
-func TestOpenCreatesDirectories(t *testing.T) {
+func TestOpenOptions(t *testing.T) {
 	r := s3clienttest.Start(t)
+	if _, err := gateway.Open(gateway.Options{Name: "gw", Client: r.Client(t)}); err == nil {
+		t.Error("Open without State succeeded")
+	}
+	if _, err := gateway.Open(gateway.Options{Name: "gw", State: gateway.MemoryState()}); err == nil {
+		t.Error("Open without Client succeeded")
+	}
 	dir := filepath.Join(t.TempDir(), "a", "b")
-	st, err := gateway.Open(gateway.Options{Name: "gw", Client: r.Client(t), StateDir: dir, SpoolDir: filepath.Join(dir, "tmp")})
+	st, err := gateway.Open(gateway.Options{Name: "gw", Client: r.Client(t), State: gateway.MemoryState(), SpoolDir: dir})
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, d := range []string{dir, filepath.Join(dir, "tmp"), filepath.Join(dir, "parts")} {
-		if fi, err := os.Stat(d); err != nil || !fi.IsDir() {
-			t.Errorf("%s: %v", d, err)
-		}
+	if fi, err := os.Stat(dir); err != nil || !fi.IsDir() {
+		t.Errorf("spool directory %s: %v", dir, err)
 	}
 	if err := st.Close(); err != nil {
 		t.Fatal(err)
@@ -812,13 +816,346 @@ func TestOpenCreatesDirectories(t *testing.T) {
 	if err := st.Close(); err != nil {
 		t.Errorf("second Close: %v", err)
 	}
-	// Without StateDir the staging directory is temporary.
-	st, err = gateway.Open(gateway.Options{Name: "gw", Client: r.Client(t), SpoolDir: t.TempDir()})
+	if _, err := st.CreateMultipartUpload(t.Context(), "bkt", "k", storage.ObjectMeta{}, ""); err == nil {
+		t.Error("CreateMultipartUpload after Close succeeded")
+	}
+}
+
+func TestReservedBucket(t *testing.T) {
+	var asked []string
+	reserved := func(rb string) bool {
+		asked = append(asked, rb)
+		return rb == "gos3-meta"
+	}
+	f := newFixture(t, false, func(o *gateway.Options) { o.Reserved = reserved })
+	err := f.st.AttachBucket(f.ctx, storage.BucketInfo{Name: "gos3-meta"})
+	if !errors.Is(err, storage.ErrBucketExists) {
+		t.Errorf("AttachBucket of a reserved bucket: %v, want ErrBucketExists", err)
+	}
+	if err := f.c.HeadBucket(f.ctx, "gos3-meta"); !s3client.IsNotFound(err) {
+		t.Errorf("reserved remote bucket: HeadBucket = %v, want it never created", err)
+	}
+	f.attach("other")
+	if !slices.Equal(asked, []string{"gos3-meta", "other"}) {
+		t.Errorf("Reserved asked about %q", asked)
+	}
+
+	// In shared mode gos3 buckets live under a prefix: no name is reserved.
+	g := newFixture(t, true, func(o *gateway.Options) { o.Reserved = reserved })
+	g.attach("gos3-meta")
+}
+
+// putRemote stores an object directly on the remote.
+func putRemote(t *testing.T, f *fixture, bucket, key string) {
+	t.Helper()
+	if _, err := f.c.PutObject(f.ctx, bucket, key, bytes.NewReader([]byte("{}")), 2, s3client.PutOptions{}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestRefuseBackingState(t *testing.T) {
+	// Per-bucket mode: an existing remote bucket with a gos3.json marker
+	// at its root (an s3 backing's bucket) is not adopted, whatever
+	// Reserved says.
+	f := newFixture(t, false, nil)
+	f.remote.CreateBucket(t, "backing-bkt")
+	putRemote(t, f, "backing-bkt", "gos3.json")
+	putRemote(t, f, "backing-bkt", "meta/lease.json")
+	err := f.st.AttachBucket(f.ctx, storage.BucketInfo{Name: "backing-bkt"})
+	if !errors.Is(err, storage.ErrBucketExists) {
+		t.Errorf("AttachBucket of a backing's bucket: %v, want ErrBucketExists", err)
+	}
+	// A marker deeper down (an s3 backing with a prefix) is not looked
+	// for: Reserved covers those buckets.
+	f.remote.CreateBucket(t, "nested")
+	putRemote(t, f, "nested", "some/prefix/gos3.json")
+	f.attach("nested")
+	// A plain existing bucket is adopted.
+	f.remote.CreateBucket(t, "plain")
+	putRemote(t, f, "plain", "data.json")
+	f.attach("plain")
+
+	// A marker at the gateway's own prefix is refused too.
+	g := newFixture(t, false, func(o *gateway.Options) { o.Prefix = "gw/" })
+	g.remote.CreateBucket(t, "pfx-bkt")
+	putRemote(t, g, "pfx-bkt", "gw/gos3.json")
+	if err := g.st.AttachBucket(g.ctx, storage.BucketInfo{Name: "pfx-bkt"}); !errors.Is(err, storage.ErrBucketExists) {
+		t.Errorf("AttachBucket with a marker at the prefix: %v, want ErrBucketExists", err)
+	}
+
+	// Shared mode: a gos3 bucket whose prefix holds a backing's marker.
+	h := newFixture(t, true, nil)
+	putRemote(t, h, "shared", "pfx/meta-b/gos3.json")
+	if err := h.st.AttachBucket(h.ctx, storage.BucketInfo{Name: "meta-b"}); !errors.Is(err, storage.ErrBucketExists) {
+		t.Errorf("shared-mode AttachBucket over a backing's prefix: %v, want ErrBucketExists", err)
+	}
+	h.attach("fine")
+}
+
+// faultyState is a persistent StateStore (it outlives the stores opened
+// on it) whose operations can be made to fail.
+type faultyState struct {
+	gateway.StateStore
+
+	mu                                 sync.Mutex
+	failRecords, failList              bool
+	failPutRecord, failPutStaged       bool
+	failDelete                         bool // DeleteRecords
+	landThenFail                       bool // PutRecord writes, then fails
+	recordsCalls, listCalls, openCalls int
+}
+
+var errInjected = errors.New("injected state failure")
+
+func (s *faultyState) fail(flag *bool, calls *int) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if calls != nil {
+		*calls++
+	}
+	if *flag {
+		return errInjected
+	}
+	return nil
+}
+
+func (s *faultyState) set(flag *bool, v bool) {
+	s.mu.Lock()
+	*flag = v
+	s.mu.Unlock()
+}
+
+func (s *faultyState) Records(ctx context.Context) (map[string][]byte, error) {
+	if err := s.fail(&s.failRecords, &s.recordsCalls); err != nil {
+		return nil, err
+	}
+	return s.StateStore.Records(ctx)
+}
+
+func (s *faultyState) PutRecord(ctx context.Context, key string, val []byte) error {
+	if err := s.fail(&s.failPutRecord, nil); err != nil {
+		return err
+	}
+	if err := s.StateStore.PutRecord(ctx, key, val); err != nil {
+		return err
+	}
+	return s.fail(&s.landThenFail, nil)
+}
+
+func (s *faultyState) DeleteRecords(ctx context.Context, prefix string) error {
+	if err := s.fail(&s.failDelete, nil); err != nil {
+		return err
+	}
+	return s.StateStore.DeleteRecords(ctx, prefix)
+}
+
+func (s *faultyState) PutStaged(ctx context.Context, name string, r io.ReaderAt, size int64) error {
+	if err := s.fail(&s.failPutStaged, nil); err != nil {
+		return err
+	}
+	return s.StateStore.PutStaged(ctx, name, r, size)
+}
+
+func (s *faultyState) OpenStaged(ctx context.Context, name string, size int64) (io.ReadSeekCloser, error) {
+	s.mu.Lock()
+	s.openCalls++
+	s.mu.Unlock()
+	return s.StateStore.OpenStaged(ctx, name, size)
+}
+
+func (s *faultyState) ListStaged(ctx context.Context) ([]string, error) {
+	if err := s.fail(&s.failList, &s.listCalls); err != nil {
+		return nil, err
+	}
+	return s.StateStore.ListStaged(ctx)
+}
+
+// stagedOf returns the staged parts of upload id.
+func stagedOf(t *testing.T, f *fixture, id string) []string {
+	t.Helper()
+	var out []string
+	for _, name := range stagedFiles(t, f) {
+		if strings.HasPrefix(name, id+"-") {
+			out = append(out, name)
+		}
+	}
+	return out
+}
+
+func TestStateStorePersistence(t *testing.T) {
+	state := &faultyState{StateStore: gateway.MemoryState()}
+	f := newFixture(t, false, func(o *gateway.Options) { o.State = state })
+	f.attach("bkt")
+	u, err := f.st.CreateMultipartUpload(f.ctx, "bkt", "obj", storage.ObjectMeta{ContentType: "a/b"}, "bob")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := st.Close(); err != nil {
+	big, small := randData(5<<20, 6), []byte("tail")
+	uploadPart(t, f, "bkt", "obj", u.UploadID, 1, big)
+	uploadPart(t, f, "bkt", "obj", u.UploadID, 2, []byte("replaced"))
+	uploadPart(t, f, "bkt", "obj", u.UploadID, 2, small)
+	if staged := stagedOf(t, f, u.UploadID); len(staged) != 1 {
+		t.Errorf("staged parts %q, want one (the replaced part's blob deleted)", staged)
+	}
+	other, err := f.st.CreateMultipartUpload(f.ctx, "bkt", "other", storage.ObjectMeta{}, "")
+	if err != nil {
 		t.Fatal(err)
+	}
+	uploadPart(t, f, "bkt", "other", other.UploadID, 1, []byte("lost"))
+	uploadPart(t, f, "bkt", "other", other.UploadID, 2, randData(5<<20, 8))
+
+	recs, err := state.Records(f.ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, k := range []string{"u/" + u.UploadID, "p/" + u.UploadID + "/00001", "p/" + u.UploadID + "/00002", "u/" + other.UploadID} {
+		if _, ok := recs[k]; !ok {
+			t.Errorf("record %q missing (have %d records)", k, len(recs))
+		}
+	}
+	if err := f.st.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	// Damage the state while the store is closed: an unreferenced staged
+	// blob, part records without an upload, a part whose blob is gone.
+	ctx := f.ctx
+	if err := state.PutStaged(ctx, "orphan", bytes.NewReader([]byte("x")), 1); err != nil {
+		t.Fatal(err)
+	}
+	if err := state.PutRecord(ctx, "p/nosuchupload/00001", []byte(`{"n":1,"size":1,"etag":"e","file":"x"}`)); err != nil {
+		t.Fatal(err)
+	}
+	lost := stagedOf(t, f, other.UploadID)
+	if len(lost) != 1 {
+		t.Fatalf("staged parts of the other upload: %q", lost)
+	}
+	if err := state.DeleteStaged(ctx, lost[0]); err != nil {
+		t.Fatal(err)
+	}
+
+	// Failing to read the records fails Open.
+	state.set(&state.failRecords, true)
+	if _, err := gateway.Open(f.opts); !errors.Is(err, errInjected) {
+		t.Errorf("Open with failing records: %v", err)
+	}
+	state.set(&state.failRecords, false)
+
+	// Failing to list staged parts does not: stale state is kept.
+	state.set(&state.failList, true)
+	f.open()
+	if !slices.Contains(stagedFiles(t, f), "orphan") {
+		t.Error("orphan blob removed although listing failed")
+	}
+	if parts, err := f.st.ListParts(ctx, "bkt", "other", other.UploadID); err != nil || len(parts) != 2 {
+		t.Errorf("parts of the other upload without a listing: %+v, %v", parts, err)
+	}
+	if err := f.st.Close(); err != nil {
+		t.Fatal(err)
+	}
+	state.set(&state.failList, false)
+
+	// A clean Open removes the stale state.
+	f.open()
+	if slices.Contains(stagedFiles(t, f), "orphan") {
+		t.Error("orphan blob kept")
+	}
+	recs, _ = state.Records(ctx)
+	if _, ok := recs["p/nosuchupload/00001"]; ok {
+		t.Error("part record without an upload kept")
+	}
+	if _, ok := recs[fmt.Sprintf("p/%s/00001", other.UploadID)]; ok {
+		t.Error("part record of a missing staged part kept")
+	}
+	parts, err := f.st.ListParts(ctx, "bkt", "other", other.UploadID)
+	if err != nil || len(parts) != 1 || parts[0].PartNumber != 2 {
+		t.Errorf("parts of the other upload: %+v, %v; want part 2 only", parts, err)
+	}
+	ups, err := f.st.ListMultipartUploads(ctx, "bkt")
+	if err != nil || len(ups) != 2 || ups[0].UploadID != u.UploadID || ups[0].Initiator != "bob" {
+		t.Fatalf("uploads after reopen: %+v, %v", ups, err)
+	}
+	if _, err := f.st.CompleteMultipartUpload(ctx, "bkt", "obj", u.UploadID, []int{1, 2}, storage.ObjectMeta{ETag: "e-2", ContentType: "a/b"}, storage.CommitOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	if _, data := f.read("bkt", "obj"); !bytes.Equal(data, slices.Concat(big, small)) {
+		t.Error("content after reopen differs")
+	}
+	if staged := stagedOf(t, f, u.UploadID); len(staged) != 0 {
+		t.Errorf("staged parts left after completion: %q", staged)
+	}
+	recs, _ = state.Records(ctx)
+	for k := range recs {
+		if strings.Contains(k, u.UploadID) {
+			t.Errorf("record %q left after completion", k)
+		}
+	}
+
+	// Write failures fail the operation and change nothing.
+	state.set(&state.failPutStaged, true)
+	w, err := f.st.NewPartWriter(ctx, "bkt", "other", other.UploadID, 3)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, _ = w.Write([]byte("small"))
+	if _, err := w.Commit(ctx, storage.PartMeta{ETag: "x"}); !errors.Is(err, errInjected) {
+		t.Errorf("part commit with failing staging: %v", err)
+	}
+	state.set(&state.failPutStaged, false)
+	state.set(&state.failPutRecord, true)
+	w, err = f.st.NewPartWriter(ctx, "bkt", "other", other.UploadID, 3)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, _ = w.Write([]byte("small"))
+	if _, err := w.Commit(ctx, storage.PartMeta{ETag: "x"}); !errors.Is(err, errInjected) {
+		t.Errorf("part commit with failing records: %v", err)
+	}
+	// The part record may have been written: its staged blob is kept
+	// (until an Open finds no record referring to it).
+	if staged := stagedOf(t, f, other.UploadID); len(staged) != 1 {
+		t.Errorf("staged blobs after a failed part record write: %q, want the new one kept", staged)
+	}
+	if _, err := f.st.CreateMultipartUpload(ctx, "bkt", "new", storage.ObjectMeta{}, ""); !errors.Is(err, errInjected) {
+		t.Errorf("CreateMultipartUpload with failing records: %v", err)
+	}
+	state.set(&state.failPutRecord, false)
+	if parts, _ := f.st.ListParts(ctx, "bkt", "other", other.UploadID); len(parts) != 1 {
+		t.Errorf("parts after failed commits: %+v", parts)
+	}
+	if ups, _ := f.st.ListMultipartUploads(ctx, "bkt"); len(ups) != 1 {
+		t.Errorf("uploads after a failed create: %+v", ups)
+	}
+}
+
+func TestStagedCompletionReadsLazily(t *testing.T) {
+	state := &faultyState{StateStore: gateway.MemoryState()}
+	f := newFixture(t, false, func(o *gateway.Options) { o.State = state })
+	f.attach("bkt")
+	u, err := f.st.CreateMultipartUpload(f.ctx, "bkt", "k", storage.ObjectMeta{}, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var want []byte
+	for n := 1; n <= 4; n++ {
+		p := randData(1<<20+n, byte(n))
+		want = append(want, p...)
+		uploadPart(t, f, "bkt", "k", u.UploadID, n, p)
+	}
+	// Complete parts 1, 3 and 4 only: part 2 is never opened.
+	if _, err := f.st.CompleteMultipartUpload(f.ctx, "bkt", "k", u.UploadID, []int{1, 3, 4}, storage.ObjectMeta{ETag: "e-3"}, storage.CommitOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	p2 := 1<<20 + 1
+	want = slices.Concat(want[:p2], want[p2+1<<20+2:])
+	if _, data := f.read("bkt", "k"); !bytes.Equal(data, want) {
+		t.Error("content differs")
+	}
+	state.mu.Lock()
+	opened := state.openCalls
+	state.mu.Unlock()
+	if opened != 3 {
+		t.Errorf("staged parts opened %d times, want 3", opened)
 	}
 }
 
@@ -936,5 +1273,150 @@ func TestConditionalRaces(t *testing.T) {
 	// Losing uploads are kept (the client may retry or abort).
 	if ups, _ := f.st.ListMultipartUploads(f.ctx, "bkt"); len(ups) != len(ids)-1 {
 		t.Errorf("%d uploads left, want %d", len(ups), len(ids)-1)
+	}
+}
+
+// TestAmbiguousStateWrites covers state writes that report an error but
+// landed: nothing they refer to may be deleted.
+func TestAmbiguousStateWrites(t *testing.T) {
+	state := &faultyState{StateStore: gateway.MemoryState()}
+	f := newFixture(t, false, func(o *gateway.Options) { o.State = state })
+	f.attach("bkt")
+	u, err := f.st.CreateMultipartUpload(f.ctx, "bkt", "k", storage.ObjectMeta{}, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	uploadPart(t, f, "bkt", "k", u.UploadID, 1, []byte("first,"))
+
+	state.set(&state.landThenFail, true)
+	if _, err := f.st.CreateMultipartUpload(f.ctx, "bkt", "ghost", storage.ObjectMeta{}, ""); !errors.Is(err, errInjected) {
+		t.Errorf("CreateMultipartUpload: %v", err)
+	}
+	w, err := f.st.NewPartWriter(f.ctx, "bkt", "k", u.UploadID, 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, _ = w.Write([]byte("second"))
+	if _, err := w.Commit(f.ctx, storage.PartMeta{ETag: "e2"}); !errors.Is(err, errInjected) {
+		t.Errorf("part commit: %v", err)
+	}
+	state.set(&state.landThenFail, false)
+	if err := f.st.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	// After a restart the landed part record is back and its staged part
+	// readable; the failed upload creation left nothing behind.
+	f.open()
+	ups, err := f.st.ListMultipartUploads(f.ctx, "bkt")
+	if err != nil || len(ups) != 1 || ups[0].UploadID != u.UploadID {
+		t.Fatalf("uploads after reopen: %+v, %v", ups, err)
+	}
+	if parts, err := f.st.ListParts(f.ctx, "bkt", "k", u.UploadID); err != nil || len(parts) != 2 {
+		t.Fatalf("parts after reopen: %+v, %v", parts, err)
+	}
+	if _, err := f.st.CompleteMultipartUpload(f.ctx, "bkt", "k", u.UploadID, []int{1, 2}, storage.ObjectMeta{ETag: "e-2"}, storage.CommitOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	if _, data := f.read("bkt", "k"); string(data) != "first,second" {
+		t.Errorf("content %q", data)
+	}
+}
+
+func TestAbortRetriesRecordDeletion(t *testing.T) {
+	state := &faultyState{StateStore: gateway.MemoryState()}
+	f := newFixture(t, false, func(o *gateway.Options) { o.State = state })
+	f.attach("bkt")
+	u, err := f.st.CreateMultipartUpload(f.ctx, "bkt", "k", storage.ObjectMeta{}, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	uploadPart(t, f, "bkt", "k", u.UploadID, 1, randData(5<<20, 1))
+	uploadPart(t, f, "bkt", "k", u.UploadID, 2, []byte("tail"))
+
+	state.set(&state.failDelete, true)
+	if err := f.st.AbortMultipartUpload(f.ctx, "bkt", "k", u.UploadID); !errors.Is(err, errInjected) {
+		t.Errorf("Abort with failing record deletion: %v", err)
+	}
+	// The upload is kept with its staged part, so the abort can be retried.
+	if _, err := f.st.GetMultipartUpload(f.ctx, "bkt", "k", u.UploadID); err != nil {
+		t.Errorf("upload after a failed abort: %v", err)
+	}
+	if staged := stagedOf(t, f, u.UploadID); len(staged) != 1 {
+		t.Errorf("staged parts after a failed abort: %q", staged)
+	}
+	state.set(&state.failDelete, false)
+	// The remote upload is already aborted: the retry still succeeds.
+	if err := f.st.AbortMultipartUpload(f.ctx, "bkt", "k", u.UploadID); err != nil {
+		t.Fatalf("retried Abort: %v", err)
+	}
+	if staged := stagedOf(t, f, u.UploadID); len(staged) != 0 {
+		t.Errorf("staged parts after abort: %q", staged)
+	}
+	if err := f.st.Close(); err != nil {
+		t.Fatal(err)
+	}
+	f.open()
+	if ups, _ := f.st.ListMultipartUploads(f.ctx, "bkt"); len(ups) != 0 {
+		t.Errorf("aborted upload came back: %+v", ups)
+	}
+}
+
+func TestVanishedRemoteUpload(t *testing.T) {
+	f := newFixture(t, false, nil)
+	f.attach("bkt")
+	abortRemote := func(key string) {
+		t.Helper()
+		ups, err := f.remote.Backend.ListMultipartUploads(f.ctx, "bkt")
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, u := range ups {
+			if u.Key == key {
+				if err := f.c.AbortMultipartUpload(f.ctx, "bkt", key, u.UploadID); err != nil {
+					t.Fatal(err)
+				}
+				return
+			}
+		}
+		t.Fatalf("no remote upload of %s", key)
+	}
+
+	// The next remote part finds the remote upload gone.
+	u, err := f.st.CreateMultipartUpload(f.ctx, "bkt", "a", storage.ObjectMeta{}, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	uploadPart(t, f, "bkt", "a", u.UploadID, 1, randData(5<<20, 1))
+	abortRemote("a")
+	w, err := f.st.NewPartWriter(f.ctx, "bkt", "a", u.UploadID, 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, _ = w.Write(randData(5<<20, 2))
+	if _, err := w.Commit(f.ctx, storage.PartMeta{ETag: "e"}); !errors.Is(err, storage.ErrUploadNotFound) {
+		t.Errorf("part commit to a vanished remote upload: %v, want ErrUploadNotFound", err)
+	}
+	if _, err := f.st.GetMultipartUpload(f.ctx, "bkt", "a", u.UploadID); !errors.Is(err, storage.ErrUploadNotFound) {
+		t.Errorf("upload after its remote upload vanished: %v", err)
+	}
+
+	// So does the completion.
+	u, err = f.st.CreateMultipartUpload(f.ctx, "bkt", "b", storage.ObjectMeta{}, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	uploadPart(t, f, "bkt", "b", u.UploadID, 1, randData(5<<20, 3))
+	uploadPart(t, f, "bkt", "b", u.UploadID, 2, []byte("tail"))
+	abortRemote("b")
+	_, err = f.st.CompleteMultipartUpload(f.ctx, "bkt", "b", u.UploadID, []int{1, 2}, storage.ObjectMeta{ETag: "e-2"}, storage.CommitOptions{})
+	if !errors.Is(err, storage.ErrUploadNotFound) {
+		t.Errorf("completion of a vanished remote upload: %v, want ErrUploadNotFound", err)
+	}
+	if ups, _ := f.st.ListMultipartUploads(f.ctx, "bkt"); len(ups) != 0 {
+		t.Errorf("uploads left: %+v", ups)
+	}
+	if staged := stagedFiles(t, f); len(staged) != 0 {
+		t.Errorf("staged parts left: %q", staged)
 	}
 }

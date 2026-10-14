@@ -57,34 +57,46 @@ server:
   max_connections: 0
 
 storage:
-  # fs (files under path) or memory (lost on exit).
+  # fs (files under path), memory (lost on exit) or s3 (a bucket of a
+  # remote S3 service, configured by the s3 block below).
   backend: fs
   # Data directory. System state lives in <path>/.gos3 (iam.json with secret
   # keys, settings.json, server-id, root-credentials.json): back it up and
-  # keep it private. With the memory backend leave it empty for a fully
-  # ephemeral server.
+  # keep it private. With the memory and s3 backends it holds system state
+  # only: leave it empty for ephemeral system state.
   path: ./data
+  # With backend: s3, the remote service holding all data and metadata
+  # (one gos3 server per bucket and prefix). Credentials and the
+  # encryption key can come from GOS3_S3_ACCESS_KEY, GOS3_S3_SECRET_KEY and
+  # GOS3_S3_ENCRYPTION_KEY instead.
+  # s3:
+  #   endpoint: https://s3.eu-central-1.amazonaws.com
+  #   region: eu-central-1
+  #   bucket: acme-gos3
+  #   prefix: gos3/
+  #   # base64 of 32 random bytes (openssl rand -base64 32): enables AES256
+  #   # and restic encryption. Back it up: without it encrypted data is lost.
+  #   encryption_key: ""
   # fsync object data before acknowledging writes (durable across power loss).
   fsync_data: true
   # Additional backings (this one is named "default"): fs directories,
-  # memory, or remote S3 services (backend: s3, mode blob = opaque blobs
-  # with every feature, gateway = native remote objects without versioning).
-  # New buckets go to default_backing unless CreateBucket names another
-  # with the x-gos3-backing header. See docs/configuration.md and
-  # docs/backings.md.
+  # memory, or buckets of remote S3 services (backend: s3, no path; with
+  # gateway: true objects are stored natively in remote buckets named like
+  # the gos3 buckets, without versioning or object lock). New buckets go to
+  # default_backing unless CreateBucket names another with the
+  # x-gos3-backing header. See docs/configuration.md and docs/backings.md.
   # backings:
   #   - name: hdd
   #     path: /mnt/hdd/gos3
   #   - name: cold
   #     backend: s3
-  #     path: /var/lib/gos3-cold     # local metadata of this backing
   #     s3:
-  #       mode: blob
   #       endpoint: https://s3.eu-central-1.amazonaws.com
   #       region: eu-central-1
-  #       bucket: acme-gos3-blobs
-  #       # credentials: access_key / secret_key, or GOS3_BACKING_COLD_ACCESS_KEY
-  #       # and GOS3_BACKING_COLD_SECRET_KEY
+  #       bucket: acme-gos3-cold
+  #       prefix: gos3/
+  #       # access_key / secret_key / encryption_key, or GOS3_BACKING_COLD_ACCESS_KEY,
+  #       # GOS3_BACKING_COLD_SECRET_KEY and GOS3_BACKING_COLD_ENCRYPTION_KEY
   backings: []
   default_backing: ""
 

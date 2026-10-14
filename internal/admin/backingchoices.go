@@ -6,7 +6,7 @@ import "github.com/seanmmitchell/gos3/internal/storage/multi"
 type backingChoice struct {
 	Name string `json:"name"`
 	Kind string `json:"kind"`           // "fs", "memory" or "s3"
-	Mode string `json:"mode,omitempty"` // s3: "blob" or "gateway"
+	Mode string `json:"mode,omitempty"` // "gateway" for an s3 gateway backing, else omitted
 }
 
 // backingChoices is the "backings" member of GET /whoami: the backings a

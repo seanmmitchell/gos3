@@ -15,7 +15,7 @@ const CHOICES: AvailableBackings = {
   available: [
     { name: 'default', kind: 'fs' },
     { name: 'gw', kind: 's3', mode: 'gateway' },
-    { name: 'cold', kind: 's3', mode: 'blob' }
+    { name: 'cold', kind: 's3' }
   ]
 }
 
@@ -46,8 +46,11 @@ describe('storage backing choices (WhoAmI.backings)', () => {
   it('describes kinds and s3 modes, with a generic fallback', () => {
     expect(backingKindInfo({ kind: 'fs' }).label).toBe('Disk')
     expect(backingKindInfo({ kind: 'memory' }).description).toMatch(/lost on restart/)
-    expect(backingKindInfo({ kind: 's3', mode: 'blob' }).description).toMatch(/all features/)
-    expect(backingKindInfo({ kind: 's3', mode: 'gateway' }).description).toMatch(/no versioning or object lock/)
+    expect(backingKindInfo({ kind: 's3' })).toEqual({ label: 'Remote S3', description: 'Data and metadata stored in a remote S3 bucket; all features available.', icon: 'i-lucide-cloud' })
+    expect(backingKindInfo({ kind: 's3', mode: '' }).label).toBe('Remote S3')
+    expect(backingKindInfo({ kind: 's3', mode: 'gateway' })).toEqual({ label: 'Remote S3 (gateway)', description: 'Objects stored natively; no versioning or object lock.', icon: 'i-lucide-cloud-cog' })
+    // The removed blob mode is no longer a known variant.
+    expect(backingKindInfo({ kind: 's3', mode: 'blob' }).label).toBe('s3 (blob)')
     expect(backingKindInfo({ kind: 's3', mode: 'tape' }).label).toBe('s3 (tape)')
     expect(backingKindInfo({ kind: 'nfs' }).label).toBe('nfs')
     expect(backingKindInfo(undefined).label).toBe('Unknown')
@@ -58,7 +61,7 @@ describe('storage backing choices (WhoAmI.backings)', () => {
     expect(items.map(i => [i.value, i.label])).toEqual([['default', 'default'], ['gw', 'gw'], ['cold', 'cold (default)']])
     expect(items[0]!.description).toMatch(/^Disk: /)
     expect(items[1]!.description).toMatch(/^Remote S3 \(gateway\): .*no versioning or object lock/)
-    expect(items[2]!.description).toMatch(/^Remote S3 \(blob\): .*all features/)
+    expect(items[2]!.description).toMatch(/^Remote S3: .*all features/)
   })
 })
 
@@ -66,7 +69,7 @@ describe('gateway backings in bucket placement', () => {
   const backing = (name: string, over: Partial<Backing> = {}): Backing => ({
     name, kind: 'fs', path: `/mnt/${name}`, default: false, healthy: true, lastError: '', buckets: 0, replicas: 0, disk: null, ...over
   })
-  const BACKINGS = [backing('default', { default: true }), backing('gw', { kind: 's3', mode: 'gateway', path: '' }), backing('cold', { kind: 's3', mode: 'blob', path: '' })]
+  const BACKINGS = [backing('default', { default: true }), backing('gw', { kind: 's3', mode: 'gateway', path: '' }), backing('cold', { kind: 's3', path: '', location: 's3://cold/gos3/' })]
   const placement: Placement = { bucket: 'b', mode: 'single', primary: 'default', members: [{ backing: 'default', role: 'primary', state: 'in-sync', healthy: true, pending: 0, progress: null, lastError: '' }], move: null }
 
   it('are neither replica choices nor selectable move targets', () => {

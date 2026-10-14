@@ -62,7 +62,7 @@ func (c *Client) Upload(ctx context.Context, bucket, key string, r io.ReaderAt, 
 	})
 	if err == nil {
 		etag, err = c.CompleteMultipartUpload(ctx, bucket, key, uploadID, parts,
-			CompleteOptions{IfNoneMatch: opts.IfNoneMatch, IfMatch: opts.IfMatch})
+			CompleteOptions{IfNoneMatch: opts.IfNoneMatch, IfMatch: opts.IfMatch, NoRetry: opts.NoRetry})
 	}
 	if err != nil {
 		// Best effort, also when the caller's context is already done.

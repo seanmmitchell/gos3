@@ -7,12 +7,12 @@ import (
 	"github.com/seanmmitchell/gos3/internal/storage"
 )
 
-// DataStore holds the objects and multipart uploads of the buckets of one
-// external backing (e.g. a gateway to a remote S3 service), while the
-// primary backend keeps the bucket records and bucket configuration
-// documents. The router calls a DataStore only for buckets that exist in
-// the primary with that backing, so implementations need not (and cannot
-// reliably) check bucket existence themselves.
+// DataStore holds the objects and multipart uploads of the buckets of a
+// gateway backing (internal/storage/gateway), while the primary backend
+// keeps the bucket records and bucket configuration documents. The router
+// calls a DataStore only for buckets that exist in the primary, so
+// implementations need not (and cannot reliably) check bucket existence
+// themselves.
 //
 // The object and multipart methods have exactly the signatures and
 // semantics of the storage.Backend methods of the same names (see
@@ -25,8 +25,8 @@ import (
 type DataStore interface {
 	// AttachBucket prepares the store for a new bucket (create or verify
 	// the remote bucket or prefix) before the primary records it. info is
-	// the bucket as it will be created (Name, Region, Owner, Backing,
-	// ObjectLockEnabled). An error aborts the bucket creation.
+	// the bucket as it will be created (Name, Region, Owner, Backing). An
+	// error aborts the bucket creation.
 	AttachBucket(ctx context.Context, info storage.BucketInfo) error
 	// CheckEmpty returns an error wrapping storage.ErrBucketNotEmpty when
 	// the bucket still holds objects (in-progress uploads do not count).
@@ -54,6 +54,6 @@ type DataStore interface {
 	CompleteMultipartUpload(ctx context.Context, bucket, key, uploadID string, partNumbers []int, meta storage.ObjectMeta, opts storage.CommitOptions) (storage.ObjectInfo, error)
 	AbortMultipartUpload(ctx context.Context, bucket, key, uploadID string) error
 
-	// Close releases resources (state databases, connections).
+	// Close releases the store's resources.
 	Close() error
 }

@@ -70,9 +70,9 @@ func (a *api) getBucketEncryption(rc *reqCtx) (int, any, error) {
 }
 
 // putBucketEncryption selects the implementation of SSE-S3, independently
-// of whether bucket default SSE is enabled. Storage settings and secrets
-// are not bucket state: restic repositories are derived from the bucket's
-// placement and the backings' settings (/backings/{name}/restic).
+// of whether bucket default SSE is enabled. Storage locations and secrets
+// are not bucket state: each backing holding a copy of the bucket keeps its
+// keys and restic repository itself.
 //
 // The new provider is stored only once it is ready: the backend validates
 // it and prepares its keys or repository first, so a failure leaves the
@@ -121,7 +121,7 @@ func (a *api) putBucketEncryption(rc *reqCtx) (int, any, error) {
 func unavailableProviderMessage(provider string) string {
 	if provider == storage.EncryptionRestic {
 		return "restic is not available for this bucket: the restic executable must be installed on the server, " +
-			"and every backing holding the bucket (primary, replicas, move target) must be a filesystem backing. " +
+			"and every backing holding the bucket (primary, replicas, move target) must be a filesystem or S3 backing. " +
 			"The provider was not changed."
 	}
 	return fmt.Sprintf("the %s provider is not available for this bucket; the provider was not changed", provider)
@@ -141,14 +141,14 @@ func (a *api) encryptionSetupError(bucket, provider, stage string, err error) er
 	a.log.Error("admin: encryption provider "+stage+" failed", "bucket", bucket, "provider", provider, "err", err)
 	if provider == storage.EncryptionRestic {
 		return badRequest("Cannot prepare the restic repository of this bucket; the provider was not changed. " +
-			"Check the server log, the restic installation and the restic storage settings of the bucket's backings.")
+			"Check the server log, the restic installation and the storage of the bucket's backings.")
 	}
 	return badRequest("Cannot prepare encryption keys for this bucket; the provider was not changed. Check the server log.")
 }
 
-// keyedMutex serializes work per key (one bucket's encryption provider,
-// one backing's restic storage) without blocking other keys: preparing a
-// remote restic repository can take long. The zero value is ready to use.
+// keyedMutex serializes work per key (one bucket's encryption provider)
+// without blocking other keys: preparing a restic repository can take
+// long. The zero value is ready to use.
 type keyedMutex struct {
 	mu sync.Mutex
 	m  map[string]*keyedEntry

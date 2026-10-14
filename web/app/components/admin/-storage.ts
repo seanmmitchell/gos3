@@ -6,6 +6,7 @@
 // The file name starts with "-" so Nuxt does not register it as a component:
 //
 //   import { placementBusy } from '~/components/admin/-storage'
+import { isGatewayBacking } from '~/utils/backings'
 import type { Backing, MemberState, Placement, PlacementMember, PlacementSummary, ReplicationMode } from '~/types/admin'
 
 /** Poll interval of the Placement tab while copies run or a move is in progress. */
@@ -84,11 +85,6 @@ export function copyMembers(p: Placement | null | undefined): PlacementMember[] 
   return (p?.members ?? []).filter(m => m.role === 'primary' || m.role === 'replica')
 }
 
-/** Gateway backings (kind "s3", mode "gateway") cannot be replicas or move targets. */
-function isGateway(b: Backing): boolean {
-  return b.kind === 's3' && b.mode === 'gateway'
-}
-
 /** Current replica backing names. */
 export function replicaNames(p: Placement | null | undefined): string[] {
   return (p?.members ?? []).filter(m => m.role === 'replica').map(m => m.backing)
@@ -112,7 +108,7 @@ export function replicaChoices(backings: readonly Backing[], p: Placement): Back
   const current = new Set(replicaNames(p))
   const list: BackingChoice[] = backings
     // Gateway backings cannot hold replicas (kept when one somehow is).
-    .filter(b => b.name !== p.primary && (!isGateway(b) || current.has(b.name)))
+    .filter(b => b.name !== p.primary && (!isGatewayBacking(b) || current.has(b.name)))
     .map(b => ({ value: b.name, label: b.name, healthy: b.healthy }))
   // Replicas on backings the listing did not return (ListBackings denied, or a backing removed from the config).
   for (const m of p.members ?? []) {
@@ -151,7 +147,7 @@ export function moveTargets(backings: readonly Backing[], p: Placement): Backing
   const members = new Set((p.members ?? []).map(m => m.backing))
   return backings
     .filter(b => !members.has(b.name))
-    .map(b => ({ value: b.name, label: b.name, healthy: b.healthy, disabledReason: isGateway(b) ? 'gateway backing' : b.healthy ? undefined : 'unhealthy' }))
+    .map(b => ({ value: b.name, label: b.name, healthy: b.healthy, disabledReason: isGatewayBacking(b) ? 'gateway backing' : b.healthy ? undefined : 'unhealthy' }))
     .sort((a, b) => a.label.localeCompare(b.label))
 }
 
