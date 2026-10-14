@@ -82,6 +82,7 @@ package s3
 // # Validation (validate.go)
 //
 //	validBucketName / validateBucketName, validateObjectKey,
+//	validateNewObjectKey (keys objects are created at: XML 1.0 characters),
 //	normalizeStorageClass, storageClassOrStandard, validateCannedACL(v, bucket),
 //	trimHeaderSpace (the only trimming of header values that become object
 //	attributes and condition keys),
