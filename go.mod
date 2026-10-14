@@ -10,7 +10,6 @@ require (
 	github.com/aws/smithy-go v1.28.2
 	github.com/miekg/dns v1.1.73
 	github.com/minio/minio-go/v7 v7.1.0
-	github.com/minio/sio v0.4.1
 	go.etcd.io/bbolt v1.5.0
 	go.yaml.in/yaml/v3 v3.0.5
 	golang.org/x/net v0.60.0
