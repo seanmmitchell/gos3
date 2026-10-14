@@ -435,9 +435,54 @@ export function validateSettingsForm(f: SettingsForm): SettingsErrors {
   return e
 }
 
-/** Which form section a field path belongs to (for error badges on section headers). */
-export function sectionOf(path: string): 'general' | 'cors' | 'discovery' | 'logging' | 'lifecycle' | 'compression' {
+/** A section of the server settings page (one chip each). */
+export type SettingsSection = 'general' | 'cors' | 'discovery' | 'logging' | 'lifecycle' | 'compression'
+
+export interface SettingsSectionDef {
+  value: SettingsSection
+  label: string
+  icon: string
+}
+
+/** Settings page sections in display order (see settingsSections). */
+export const SETTINGS_SECTIONS: readonly SettingsSectionDef[] = [
+  { value: 'general', label: 'General', icon: 'i-lucide-server' },
+  { value: 'cors', label: 'CORS', icon: 'i-lucide-globe' },
+  { value: 'discovery', label: 'Discovery', icon: 'i-lucide-radar' },
+  { value: 'logging', label: 'Logging', icon: 'i-lucide-scroll-text' },
+  { value: 'lifecycle', label: 'Lifecycle worker', icon: 'i-lucide-timer' },
+  { value: 'compression', label: 'Compression', icon: 'i-lucide-file-archive' }
+]
+
+/** The sections a form has: compression only when the server reported it. */
+export function settingsSections(f: SettingsForm | null | undefined): readonly SettingsSectionDef[] {
+  return SETTINGS_SECTIONS.filter(s => s.value !== 'compression' || !!f?.compression)
+}
+
+/** Normalises a `?tab=` query value to one of `sections` (default general). */
+export function resolveSettingsSection(v: unknown, sections: readonly SettingsSectionDef[] = SETTINGS_SECTIONS): SettingsSection {
+  const s = Array.isArray(v) ? v[0] : v
+  return sections.find(t => t.value === s)?.value ?? 'general'
+}
+
+/** Which form section a field path belongs to (for error badges on section chips). */
+export function sectionOf(path: string): SettingsSection {
   const head = path.split('.')[0]
   if (head === 'cors' || head === 'discovery' || head === 'logging' || head === 'lifecycle' || head === 'compression') return head
   return 'general'
+}
+
+/**
+ * The sections whose saved document would change, compared like
+ * isFormDirty (normalised lists), so the chips can mark unsaved sections.
+ */
+export function dirtySections(current: SettingsForm, original: SettingsForm | null | undefined): Set<SettingsSection> {
+  const out = new Set<SettingsSection>()
+  if (!original) return out
+  const a = formToSettings(current) as unknown as Record<string, unknown>
+  const b = formToSettings(original) as unknown as Record<string, unknown>
+  for (const k of new Set([...Object.keys(a), ...Object.keys(b)])) {
+    if (JSON.stringify(a[k]) !== JSON.stringify(b[k])) out.add(sectionOf(k))
+  }
+  return out
 }

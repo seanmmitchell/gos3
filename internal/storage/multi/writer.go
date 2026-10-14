@@ -7,11 +7,27 @@ import (
 	"sync"
 
 	"github.com/seanmmitchell/gos3/internal/storage"
+	"github.com/seanmmitchell/gos3/internal/storage/compress"
 )
 
 // errWriterDone is returned when using a writer that was committed or
 // aborted.
 var errWriterDone = errors.New("multi: writer already committed or aborted")
+
+// checkCompression refuses compression options that no backing accepts
+// (the rules of the memory and fs backings) before any backing sees them:
+// a backing's refusal would be taken for a failure of that backing.
+func checkCompression(c storage.Compression) error {
+	switch {
+	case !c.Enabled():
+		return nil
+	case c.Algorithm != storage.CompressionDeflate:
+		return fmt.Errorf("multi: unsupported compression algorithm %q", c.Algorithm)
+	case !compress.ValidLevel(c.Level):
+		return fmt.Errorf("multi: invalid deflate level %d", c.Level)
+	}
+	return nil
+}
 
 // objectWriter writes a new version to the bucket's primary and, in an
 // active-active bucket, streams the same bytes to every in-sync replica,
@@ -46,6 +62,9 @@ func (r *Router) NewObjectWriter(ctx context.Context, bucket, key string) (stora
 // and in an active-active bucket every in-sync replica, store the version
 // as opts asks.
 func (r *Router) NewObjectWriterWith(ctx context.Context, bucket, key string, opts storage.WriteOptions) (storage.ObjectWriter, error) {
+	if err := checkCompression(opts.Compression); err != nil {
+		return nil, err
+	}
 	rt, leave, err := r.enterWrite(ctx, bucket)
 	if err != nil {
 		return nil, err
@@ -127,15 +146,15 @@ func (w *objectWriter) Commit(ctx context.Context, meta storage.ObjectMeta, opts
 		unlock := w.r.keys.lock(w.bucket, w.key)
 		defer unlock()
 	}
-	caller := &cbTracker{}
-	info, err := w.w.Commit(ctx, meta, caller.commitOptions(opts))
+	cb := &cbTracker{}
+	info, err := w.w.Commit(ctx, meta, cb.commitOptions(opts))
 	if err != nil {
 		for _, t := range w.tees {
 			if !t.failed {
 				_ = t.w.Abort()
 			}
 		}
-		if !caller.isCaller(err) {
+		if !cb.isCaller(err) {
 			w.r.observe(w.rt.lead, err)
 		}
 		return storage.ObjectInfo{}, err

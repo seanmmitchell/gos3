@@ -30,6 +30,10 @@ the internet.
 - **Server overview and settings** (gos3 only): version, request metrics,
   storage and disk usage, and every runtime setting from
   [configuration.md](configuration.md#runtime-settings-settingsjson).
+  Server and bucket settings show one section at a time, picked with the
+  chips under the page header (kept in the URL as `?tab=`); on the server
+  settings page one Save covers every section, and the chips mark sections
+  with unsaved changes or invalid fields.
 - **Discovery** (gos3 only): peers seen by each connected server, network
   scans, local discovery from the UI host, and one-click "add server".
 - **Storage** (gos3 only): the server's storage backings, and per bucket
@@ -68,7 +72,7 @@ policies and clears that option.
   with "Bypass governance retention" (Danger zone checkbox, or the follow-up
   confirmation on the bucket list), which sends
   `bypassGovernanceRetention=true` and needs `s3:BypassGovernanceRetention`.
-- **Compression.** The server settings page has a Compression card where
+- **Compression.** The server settings page has a Compression section where
   the administrator chooses the mode (Optional, Enforced, Disabled), the
   DEFLATE level, the minimum size and the media types to skip. A bucket's
   Compression tab (gos3 servers that report the `manageCompression`
