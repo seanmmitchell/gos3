@@ -2,6 +2,7 @@
 #
 # gos3 container image: the web UI is built with pnpm, embedded into a static
 # Go binary, and shipped on distroless (non-root, no shell).
+# Select --target headless to omit UI assets and the Node/pnpm build entirely.
 #
 #   docker build -t gos3 .
 #   docker build -t gos3 --build-arg VERSION=v1.2.3 --build-arg COMMIT=$(git rev-parse --short=12 HEAD) .
@@ -132,6 +133,7 @@ CMD ["serve"]
 # docker build --target headless -t gos3:headless .
 # Management API is enabled; use --no-admin for S3-only operation.
 FROM runtime AS headless
+LABEL org.opencontainers.image.description="S3-compatible object storage server without embedded web UI assets"
 COPY --from=build-headless /out/gos3 /usr/local/bin/gos3
 COPY --from=build-headless --chown=65532:65532 /out/data /data
 

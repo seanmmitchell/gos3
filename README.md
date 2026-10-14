@@ -133,6 +133,14 @@ gos3 serve --config gos3.json          # JSON or YAML configuration
 make build-headless                   # no UI assets, Node or pnpm required
 ```
 
+The release and dev workflows also publish binaries and images without UI
+assets compiled in. Choose `gos3_X.Y.Z_linux_amd64-headless.tar.gz` (or the
+matching OS/architecture archive, `.zip` on Windows), and image tags
+`ghcr.io/seanmmitchell/gos3:X.Y.Z-headless`, `latest-headless` or `dev-headless`.
+These builds retain the management API; use `serve --no-admin` for S3 only.
+Build the image locally with `docker build --target headless -t gos3:headless .`.
+The ordinary archives and image tags continue to include the UI.
+
 Discovery, advertising, mDNS, beacons and scans all default to off.
 Set the discovery switches explicitly to enable them. To replace a basic
 MinIO startup command, use `gos3 server /data --address :9000 --no-admin`;

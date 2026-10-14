@@ -2,10 +2,10 @@ name: Build
 
 # Reusable build shared by release.yml (tagged releases from main) and
 # dev-build.yml (every push to dev): runs the Go and web tests, builds the
-# embedded web UI, cross-compiles gos3 with the UI embedded for every release
-# platform and, when image-tags is set, pushes a multi-arch image to
+# embedded web UI, cross-compiles embedded and headless binaries for every
+# release platform and, when image-tags is set, pushes both multi-arch images to
 # ghcr.io/<owner>/<repo> with a signed build provenance attestation. The
-# archives are uploaded as bin-<os>-<arch> artifacts for the caller.
+# archives are uploaded as bin-<os>-<arch>[-headless] artifacts for the caller.
 
 on:
   workflow_call:
@@ -135,7 +135,7 @@ jobs:
           retention-days: 3
 
   binaries:
-    name: gos3 ${{ matrix.goos }}/${{ matrix.goarch }}
+    name: gos3 ${{ matrix.goos }}/${{ matrix.goarch }} (${{ matrix.variant.name }})
     runs-on: ubuntu-latest
     timeout-minutes: 20
     needs: [ui, ui-test]
@@ -144,6 +144,13 @@ jobs:
       matrix:
         goos: [linux, darwin, windows]
         goarch: [amd64, arm64]
+        variant:
+          - name: embedded
+            tags: ""
+            suffix: ""
+          - name: headless
+            tags: noui
+            suffix: -headless
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
         with:
@@ -154,10 +161,12 @@ jobs:
           go-version-file: go.mod
           cache: ${{ inputs.use-cache }}
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        if: matrix.variant.name == 'embedded'
         with:
           name: ui-embed
           path: ui-embed
       - name: Embed the UI
+        if: matrix.variant.name == 'embedded'
         # Same steps as `make ui`: replace the placeholder with the build.
         run: |
           dist=internal/webui/dist
@@ -169,15 +178,21 @@ jobs:
           GOOS: ${{ matrix.goos }}
           GOARCH: ${{ matrix.goarch }}
           CGO_ENABLED: "0"
+          GO_TAGS: ${{ matrix.variant.tags }}
+          VARIANT_SUFFIX: ${{ matrix.variant.suffix }}
         run: |
           pkg=github.com/seanmmitchell/gos3/internal/version
           commit="$(git rev-parse --short=12 HEAD)"
           date="$(git log -1 --format=%cI HEAD)"
           ext=""; [ "$GOOS" = windows ] && ext=".exe"
-          name="gos3_${VERSION#v}_${GOOS}_${GOARCH}"
+          name="gos3_${VERSION#v}_${GOOS}_${GOARCH}${VARIANT_SUFFIX}"
           mkdir -p "build/$name" dist
           go mod verify
-          go build -trimpath \
+          # A headless archive must exclude even the checked-in placeholder.
+          if [ "$GO_TAGS" = noui ]; then
+            test "$(go list -tags noui -f '{{len .EmbedFiles}}' ./internal/webui)" = 0
+          fi
+          go build -tags "$GO_TAGS" -trimpath \
             -ldflags "-s -w -X $pkg.Version=$VERSION -X $pkg.Commit=$commit -X $pkg.Date=$date" \
             -o "build/$name/gos3$ext" ./cmd/gos3
           cp LICENSE THIRD_PARTY_NOTICES README.md "build/$name/"
@@ -189,17 +204,25 @@ jobs:
           ls -l dist
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: bin-${{ matrix.goos }}-${{ matrix.goarch }}
+          name: bin-${{ matrix.goos }}-${{ matrix.goarch }}${{ matrix.variant.suffix }}
           path: dist/*
           retention-days: ${{ inputs.retention-days }}
 
   image:
-    name: Container image (ghcr.io)
+    name: Container image (ghcr.io, ${{ matrix.variant.target }})
     if: inputs.image-tags != ''
     runs-on: ubuntu-latest
     timeout-minutes: 45
     # Only publish an image for a commit whose binaries built.
     needs: binaries
+    strategy:
+      fail-fast: false
+      matrix:
+        variant:
+          - target: embedded
+            suffix: ""
+          - target: headless
+            suffix: -headless
     # id-token and attestations: sign the build provenance attestation
     # (Sigstore, via the job's OIDC token) and store it with the repository.
     permissions:
@@ -230,10 +253,12 @@ jobs:
           tags: ${{ inputs.image-tags }}
           flavor: |
             latest=${{ inputs.image-latest }}
+            suffix=${{ matrix.variant.suffix }},onlatest=true
       - id: push
         uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: .
+          target: ${{ matrix.variant.target }}
           platforms: linux/amd64,linux/arm64
           push: true
           tags: ${{ steps.meta.outputs.tags }}
@@ -245,8 +270,8 @@ jobs:
           # Without use-cache (releases), nothing is read from or written to
           # the GitHub Actions cache and every layer is rebuilt.
           no-cache: ${{ !inputs.use-cache }}
-          cache-from: ${{ inputs.use-cache && format('type=gha,scope=gos3-{0}', inputs.cache-scope) || '' }}
-          cache-to: ${{ inputs.use-cache && format('type=gha,mode=max,scope=gos3-{0}', inputs.cache-scope) || '' }}
+          cache-from: ${{ inputs.use-cache && format('type=gha,scope=gos3-{0}-{1}', inputs.cache-scope, matrix.variant.target) || '' }}
+          cache-to: ${{ inputs.use-cache && format('type=gha,mode=max,scope=gos3-{0}-{1}', inputs.cache-scope, matrix.variant.target) || '' }}
           provenance: mode=max
           sbom: true
       # Verify with: gh attestation verify oci://ghcr.io/<owner>/<repo>:<tag>
