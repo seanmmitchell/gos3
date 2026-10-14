@@ -215,7 +215,7 @@ func (w *versionWriter) Commit(ctx context.Context, info storage.ObjectInfo) (st
 		if info.DeleteMarker && size > 0 {
 			return storage.ObjectInfo{}, fmt.Errorf("%w: delete marker %s/%.64s with data", storage.ErrInvalidName, w.bucket, w.key)
 		}
-		dataID, path, err = w.b.finishEncryptedData(ctx, w.t, w.bucketID, w.encryption, w.bucket, w.key)
+		dataID, path, err = w.b.finishData(w.t, w.bucketID)
 	}
 	if err != nil {
 		return storage.ObjectInfo{}, err

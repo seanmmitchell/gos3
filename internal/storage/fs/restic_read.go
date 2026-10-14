@@ -10,6 +10,7 @@ import (
 	"sync"
 
 	"github.com/seanmmitchell/gos3/internal/storage"
+	"github.com/seanmmitchell/gos3/internal/storage/crypt"
 )
 
 // openRestic returns the reader of a restic version of size bytes in the
@@ -279,7 +280,8 @@ func (b *Backend) dumpSnapshot(ctx context.Context, id, snapshot string, size in
 		return "", nil, err
 	}
 	t := b.newTemp()
-	t.key = make([]byte, 32)
+	// A fresh key: the spool is the only stream it encrypts.
+	t.key = make([]byte, crypt.KeySize)
 	_, _ = rand.Read(t.key)
 	var diag stderrTail
 	cmd.Stdout, cmd.Stderr = &boundedObjectWriter{dst: t, remaining: size}, &diag

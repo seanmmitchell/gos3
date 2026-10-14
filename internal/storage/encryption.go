@@ -8,13 +8,23 @@ import (
 	"net/url"
 	"strings"
 
-	"github.com/minio/sio"
+	"github.com/seanmmitchell/gos3/internal/storage/crypt"
 )
 
 const (
-	EncryptionAES256         = "AES256"
-	EncryptionRestic         = "restic"
-	ResticUserAgent          = "gos3-restic"
+	// EncryptionAES256 is the native SSE-S3 implementation: object data is
+	// stored in the AES-256-GCM stream format of package crypt, under a key
+	// derived for each data file (see ObjectMeta.Encryption).
+	EncryptionAES256 = "AES256"
+	// EncryptionRestic is the SSE-S3 implementation that archives object
+	// data in a per-bucket restic repository.
+	EncryptionRestic = "restic"
+	// ResticUserAgent is the HTTP User-Agent of the restic processes gos3
+	// runs; gos3 refuses restic-encrypted writes made with it, so a restic
+	// repository stored in a restic bucket of the same server cannot recurse.
+	ResticUserAgent = "gos3-restic"
+	// ConfigEncryptionProvider is the bucket configuration document (see
+	// Backend.GetBucketConfig) holding the bucket's EncryptionSettings.
 	ConfigEncryptionProvider = "encryption-provider"
 )
 
@@ -64,11 +74,20 @@ func (s *ResticS3) Validate() error {
 	return nil
 }
 
-// EncryptionBackend verifies that encrypted writes are supported and prepares
-// their keys/repository. Implementations must fail closed on setup errors.
+// EncryptionBackend is implemented by backends that can store object data
+// encrypted (WriteOptions.Encryption). Implementations must fail closed on
+// setup errors: a write that asks for encryption never stores plaintext.
 type EncryptionBackend interface {
-	PrepareEncryption(context.Context, string, string) error
-	ValidateEncryptionSettings(context.Context, string, EncryptionSettings) error
+	// PrepareEncryption makes the bucket ready for writes encrypted with
+	// mode (EncryptionAES256 or EncryptionRestic), creating its keys or
+	// repository when needed. It returns errors.ErrUnsupported (possibly
+	// wrapped) when the backend cannot store mode, and ErrBucketNotFound
+	// for a missing bucket.
+	PrepareEncryption(ctx context.Context, bucket, mode string) error
+	// ValidateEncryptionSettings checks that cfg can be used for bucket
+	// before it is stored, with the same errors as PrepareEncryption. It
+	// may create the bucket's keys (but does not switch providers).
+	ValidateEncryptionSettings(ctx context.Context, bucket string, cfg EncryptionSettings) error
 }
 
 // EncryptionProvider selects the implementation of SSE-S3 for a bucket.
@@ -94,15 +113,7 @@ func EncryptionProvider(ctx context.Context, b Backend, bucket string) (string, 
 	return doc.Provider, nil
 }
 
-// EncryptionConfig pins the authenticated streaming format and cipher suite.
-func EncryptionConfig(key []byte) sio.Config {
-	return sio.Config{Key: key, MinVersion: sio.Version20, MaxVersion: sio.Version20, CipherSuites: []byte{sio.AES_256_GCM}}
-}
-
-func EncryptedSize(n int64) int64 {
-	size, err := sio.EncryptedSize(uint64(n))
-	if err != nil {
-		return -1
-	}
-	return int64(size)
-}
+// EncryptedSize returns the size of the data stored for n bytes (of
+// content, or of its compressed form) encrypted with EncryptionAES256, or
+// -1 when n is negative or the size would overflow (see crypt.EncryptedSize).
+func EncryptedSize(n int64) int64 { return crypt.EncryptedSize(n) }

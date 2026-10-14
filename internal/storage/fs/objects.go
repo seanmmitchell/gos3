@@ -313,7 +313,7 @@ func (w *objectWriter) Commit(ctx context.Context, meta storage.ObjectMeta, opts
 		if err != nil {
 			return storage.ObjectInfo{}, err
 		}
-		dataID, path, err = w.b.finishEncryptedData(ctx, w.t, w.bucketID, w.encryption, w.bucket, w.key)
+		dataID, path, err = w.b.finishData(w.t, w.bucketID)
 	}
 	if err != nil {
 		return storage.ObjectInfo{}, err
@@ -435,41 +435,24 @@ func (b *Backend) OpenObject(ctx context.Context, bucket, key, versionID string)
 			rd, err := b.openRestic(ctx, f, bucketID, info.Size)
 			return info, rd, err
 		}
+		// data reads the stored bytes: the file, or its decrypted stream.
+		var data dataReader = &fileReader{f: f}
 		if info.Encryption == storage.EncryptionAES256 {
-			key, err := b.bucketKey(bucketID, false)
-			if err != nil {
-				_ = f.Close()
-				return storage.ObjectInfo{}, nil, err
-			}
-			size := info.Size
+			encoded := info.Size
 			if info.Compression != "" {
-				size = info.StoredSize
+				encoded = info.StoredSize
 			}
-			key, err = objectDataKey(key, dataID)
-			if err != nil {
+			if data, err = b.openEncrypted(f, bucketID, dataID, encoded); err != nil {
 				_ = f.Close()
-				return storage.ObjectInfo{}, nil, err
+				return storage.ObjectInfo{}, nil, fmt.Errorf("fs: open data of %s/%s: %w", bucket, key, err)
 			}
-			rd, err := decryptFile(f, key, size, f.Close)
-			if err != nil {
-				_ = f.Close()
-				return storage.ObjectInfo{}, nil, err
-			}
-			if info.Compression == "" {
-				return info, rd, nil
-			}
-			z, err := openCompressed(rd, info)
-			if err != nil {
-				_ = rd.Close()
-			}
-			return info, z, err
 		}
 		if info.Compression == "" {
-			return info, &fileReader{f: f}, nil
+			return info, data, nil
 		}
-		rd, err := openCompressed(f, info)
+		rd, err := openCompressed(data, info)
 		if err != nil {
-			_ = f.Close()
+			_ = data.Close()
 			return storage.ObjectInfo{}, nil, fmt.Errorf("fs: open data of %s/%s: %w", bucket, key, err)
 		}
 		return info, rd, nil
@@ -511,6 +494,13 @@ func (r *compressedReader) Close() error {
 		r.err = r.f.Close()
 	})
 	return r.err
+}
+
+// dataReader reads the stored bytes of a version: a fileReader, or a
+// cryptReader for natively encrypted data.
+type dataReader interface {
+	io.ReadSeekCloser
+	io.ReaderAt
 }
 
 // fileReader is the reader returned by OpenObject: an *os.File whose Close is

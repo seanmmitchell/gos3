@@ -8,7 +8,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"os"
 	"os/exec"
 
 	"go.etcd.io/bbolt"
@@ -179,42 +178,6 @@ func (b *Backend) checkWriteConditions(bucket, bucketID, key string, opts storag
 		}
 		return checkPreconditions(bb, key, opts)
 	})
-}
-
-// archiveTemp archives the content of the finished-for-writing temporary
-// file t (encrypted staging) as a version of bucket/key in the repository
-// of the bucket with ID id, like resticWriter.finish with check.
-func (b *Backend) archiveTemp(ctx context.Context, t *tmpFile, id, bucket, key string, check func() error) (string, string, error) {
-	defer t.discard()
-	w, err := b.newResticWriter(ctx, id, bucket, key)
-	if err != nil {
-		return "", "", err
-	}
-	defer w.abort()
-	if err := t.finish(false, false); err != nil {
-		return "", "", err
-	}
-	if t.size > 0 {
-		f, err := os.Open(t.path)
-		if err != nil {
-			return "", "", err
-		}
-		defer f.Close()
-		r, err := decryptFile(f, t.key, t.size, f.Close)
-		if err != nil {
-			return "", "", err
-		}
-		if _, err := io.Copy(w, r); err != nil {
-			return "", "", err
-		}
-	}
-	return w.finish(check)
-}
-
-// finishRestic is archiveTemp without a check (finishEncryptedData's
-// restic case; the object writers stream into a resticWriter instead).
-func (b *Backend) finishRestic(ctx context.Context, t *tmpFile, id, bucket, key string) (string, string, error) {
-	return b.archiveTemp(ctx, t, id, bucket, key, nil)
 }
 
 // snapshotOutput consumes restic's JSON progress incrementally: a long

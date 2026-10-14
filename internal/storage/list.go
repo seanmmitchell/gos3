@@ -245,8 +245,9 @@ func ListObjectVersions(ctx context.Context, b Backend, bucket string, p Version
 // BucketUsage returns the number of current objects and their total size
 // (latest versions only) and, separately, the total count/size of all versions.
 // Sizes are those of the content; the Stored* fields count the bytes the
-// backend stores for it, which is less for compressed versions (see
-// ObjectInfo.PhysicalSize).
+// backend stores for it, which is less for compressed versions and slightly
+// more for natively encrypted ones; restic versions count their content
+// size, as their repository data is shared (see ObjectInfo.PhysicalSize).
 type BucketUsage struct {
 	Objects            int64
 	Bytes              int64

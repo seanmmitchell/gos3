@@ -152,25 +152,24 @@ type ObjectInfo struct {
 	StoredSize int64
 }
 
-// PhysicalSize is the number of locally stored data bytes, including native
-// encryption overhead. Restic counts its local reference, not repository packs.
+// PhysicalSize is the number of data bytes the backend stores for the
+// version: the content's size, less when it is compressed, plus the
+// overhead of native encryption (EncryptionAES256; an empty object stores
+// nothing). Restic versions count their content size: their data lives in
+// a repository whose packs are deduplicated, compressed and shared between
+// snapshots, so it cannot be attributed to single versions (and the small
+// local snapshot reference is not counted). Usage figures therefore never
+// report restic data as compression savings. The memory backend keeps
+// AES256 data as is, so for it the encryption overhead is notional.
 func (o ObjectInfo) PhysicalSize() int64 {
-	if o.Encryption == EncryptionRestic {
-		// Local snapshot reference only. Repository packs are shared between
-		// objects/snapshots and cannot be attributed to individual versions.
-		return 64
+	n := o.Size
+	if o.Compression != "" && o.Encryption != EncryptionRestic {
+		n = o.StoredSize
 	}
-	if o.Encryption == EncryptionAES256 {
-		n := o.Size
-		if o.Compression != "" {
-			n = o.StoredSize
-		}
+	if o.Encryption == EncryptionAES256 && n > 0 {
 		return EncryptedSize(n)
 	}
-	if o.Compression != "" {
-		return o.StoredSize
-	}
-	return o.Size
+	return n
 }
 
 // CommitOptions are atomic preconditions evaluated against the current latest

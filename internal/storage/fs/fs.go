@@ -77,7 +77,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"io"
 	iofs "io/fs"
 	"log/slog"
 	"os"
@@ -87,12 +86,11 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/minio/sio"
 	"go.etcd.io/bbolt"
 	berrors "go.etcd.io/bbolt/errors"
 
-	"github.com/seanmmitchell/gos3/internal/config"
 	"github.com/seanmmitchell/gos3/internal/storage"
+	"github.com/seanmmitchell/gos3/internal/storage/crypt"
 )
 
 // ErrClosed is returned by every operation after Close.
@@ -127,8 +125,10 @@ const (
 
 // Backend is a filesystem storage.Backend. Create it with Open.
 type Backend struct {
-	keyMu          sync.Mutex
-	keys           map[string][]byte
+	// keyMu guards keys, the cache of bucket master keys by bucket ID
+	// (see bucketKey).
+	keyMu          sync.RWMutex
+	keys           map[string]*bucketKeyEntry
 	resticMu       sync.Mutex
 	resticConfigMu sync.RWMutex
 	resticS3       *storage.ResticS3
@@ -203,9 +203,7 @@ func Open(root string, opts Options) (*Backend, error) {
 		b.tightenPerm(d)
 	}
 	b.tightenPerm(b.orphanDir)
-	if err := config.RestrictDir(b.sysDir); err != nil {
-		return nil, fmt.Errorf("fs: protect encryption secrets: %w", err)
-	}
+	b.protectKeys()
 
 	dbPath := filepath.Join(b.sysDir, "meta.db")
 	if err := b.checkMetadataPresent(dbPath); err != nil {
@@ -516,9 +514,12 @@ func (p *pendingSet) has(path string) bool {
 // is created lazily, when the buffer first overflows or at finish, so empty
 // objects never touch the filesystem.
 type tmpFile struct {
+	// cryptoID and key are set for an encrypted file: its data ID and
+	// stream key (see encryptedTemp). Everything written then goes
+	// through ew into f.
 	cryptoID string
 	key      []byte
-	ew       io.WriteCloser
+	ew       *crypt.Writer
 	dir      string
 	f        *os.File
 	path     string // f.Name() once created
@@ -544,7 +545,9 @@ func (t *tmpFile) open() error {
 	}
 	t.f, t.path = f, f.Name()
 	if t.key != nil {
-		t.ew, t.err = sio.EncryptWriter(struct{ io.Writer }{f}, storage.EncryptionConfig(t.key))
+		if t.ew, t.err = crypt.NewWriter(f, t.key); t.err != nil {
+			t.err = fmt.Errorf("fs: encrypt data: %w", t.err)
+		}
 	}
 	return t.err
 }
@@ -614,7 +617,10 @@ func (t *tmpFile) finish(sync, keepEmpty bool) error {
 		err = t.flush()
 	}
 	if err == nil && t.ew != nil {
-		err = t.ew.Close()
+		// Seals the final chunk; f stays open.
+		if err = t.ew.Close(); err != nil {
+			err = fmt.Errorf("fs: write data: %w", err)
+		}
 	}
 	if err == nil && sync {
 		if serr := t.f.Sync(); serr != nil {
@@ -730,6 +736,8 @@ func newEmptyReader() emptyReader { return emptyReader{bytes.NewReader(nil)} }
 
 func (emptyReader) Close() error { return nil }
 
+// writeDisk writes p to the file, through the encryption stream when the
+// file is encrypted.
 func (t *tmpFile) writeDisk(p []byte) (int, error) {
 	if t.ew != nil {
 		return t.ew.Write(p)

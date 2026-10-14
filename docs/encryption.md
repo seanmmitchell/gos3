@@ -10,11 +10,16 @@ Each assigned backing owns its repository location and S3 credentials. A
 replica or move target uses its own backing's settings, keys, and repository;
 source backing credentials never replicate with bucket configuration.
 
-Native encryption uses authenticated AES-256-GCM streams (MinIO `sio` v2),
-with HKDF-SHA256 deriving a separate key for each immutable data file from a
-random bucket master key. Swapping objects' ciphertext fails authentication.
-Compression happens before encryption; range reads decrypt the necessary
-blocks. Filesystem upload staging and multipart parts are encrypted too.
+Native encryption uses gos3's authenticated AES-256-GCM stream format
+(`internal/storage/crypt`): 64 KiB chunks, each sealed with a nonce made of
+its index and a final-chunk flag, so reordered, truncated or extended data
+fails authentication. HKDF-SHA256 derives a separate key for each immutable
+data file from a random bucket master key, so every stream has its own key
+and swapping objects' ciphertext fails authentication. Compression happens
+before encryption; range reads decrypt only the chunks they need. Filesystem
+upload staging and multipart parts are encrypted too. The memory backend
+records AES256 for SSE responses and replication but keeps its in-process
+data as is.
 
 AWS KMS (`aws:kms` / `aws:kms:dsse`) and SSE-C return
 `501 NotImplemented`. Change legacy KMS defaults before new uploads.
@@ -31,10 +36,11 @@ Lock rules. Disabling encryption or switching provider preserves encrypted reads
 
 Install [restic](https://restic.readthedocs.io/en/stable/020_installation.html)
 **0.17.1 or newer** on each filesystem backing server's PATH. Native AES256
-needs no extra executable; memory backings do not support restic. Restic
-cannot be selected while a memory backing holds a copy of the bucket, and a
-bucket that uses restic or holds restic versions cannot be replicated or
-moved to one.
+needs no extra executable; memory backings do not support restic.
+
+Restic cannot be selected while a memory backing holds a copy of the bucket,
+and a bucket that uses restic or holds restic versions cannot be replicated
+or moved to one.
 
 On server **Storage**, open **Restic storage** for the assigned backing:
 
@@ -120,8 +126,10 @@ wait up to 30 seconds for it, and reads, which do not lock, can fail while
 it repacks. Overwrites and deletes retain snapshots; automatic pruning is not
 implemented.
 
-The per-object stored-byte metric counts the 64-byte local reference and excludes
-shared repository packs. Use restic/provider statistics to measure archive usage.
+Stored-byte usage metrics count restic versions at their content size, because
+repository packs are deduplicated, compressed, and shared between snapshots
+and cannot be attributed to single versions. Use restic/provider statistics to
+measure actual archive usage.
 
 ## Keys and recovery
 
@@ -134,8 +142,11 @@ never stored in bucket configuration. Recovery records do not duplicate S3
 credentials. Repository snapshots retain object identity but do not replace
 gos3 metadata for versions, tags, permissions, and retention.
 
-Missing native keys fail closed and are not silently regenerated. The system
-directory has private filesystem permissions and a protected Windows ACL.
+Missing native keys fail closed and are not silently regenerated. The key
+directory gets private filesystem permissions and a protected Windows ACL
+before a key is created (failing that fails key creation); at startup existing
+key and recovery files are made private again, best effort with a logged
+warning, e.g. after a restore that did not keep permissions.
 Server-managed keys allow unattended access; a party holding keys and ciphertext
 can decrypt data. This feature does not protect against a compromised gos3
 process or a full copy of its keys and data. S3 metadata itself is not encrypted.
