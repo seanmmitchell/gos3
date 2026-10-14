@@ -46,6 +46,7 @@ import (
 	"github.com/seanmmitchell/gos3/internal/storage"
 	fsbackend "github.com/seanmmitchell/gos3/internal/storage/fs"
 	"github.com/seanmmitchell/gos3/internal/storage/memory"
+	"github.com/seanmmitchell/gos3/internal/storage/routed"
 	"github.com/seanmmitchell/gos3/internal/version"
 	"github.com/seanmmitchell/gos3/internal/webui"
 )
@@ -98,7 +99,8 @@ type Server struct {
 
 	backend     storage.Backend
 	backendName string
-	dataPath    string // absolute data directory ("" when ephemeral)
+	backings    []admin.Backing // configured backings (GET /backings)
+	dataPath    string          // absolute data directory ("" when ephemeral)
 	systemDir   string
 	iam         *iam.Manager
 	verifier    *auth.Verifier
@@ -250,16 +252,18 @@ func New(cfg config.Config, logger *slog.Logger, opts ...Option) (_ *Server, err
 	})
 	s.disc = discovery.New(st.Discovery, s.Info, logger)
 	s.admin = s.instrumentAdmin(admin.NewHandler(admin.Deps{
-		Backend:     s.backend,
-		Verifier:    s.verifier,
-		IAM:         s.iam,
-		Metrics:     s.metrics,
-		Settings:    s.settings,
-		Discovery:   s.disc,
-		Info:        s.Info,
-		BackendName: s.backendName,
-		DataPath:    s.dataPath,
-		Logger:      logger,
+		Backend:        s.backend,
+		Verifier:       s.verifier,
+		IAM:            s.iam,
+		Metrics:        s.metrics,
+		Settings:       s.settings,
+		Discovery:      s.disc,
+		Info:           s.Info,
+		BackendName:    s.backendName,
+		DataPath:       s.dataPath,
+		Backings:       s.backings,
+		DefaultBacking: cfg.Storage.DefaultBacking,
+		Logger:         logger,
 
 		TrustProxyHeaders: s.clientIP,
 	}))
@@ -285,11 +289,18 @@ func New(cfg config.Config, logger *slog.Logger, opts ...Option) (_ *Server, err
 	return s, nil
 }
 
-// openBackend opens the configured storage backend.
+// openBackend opens the configured storage backend: the primary (fs or
+// memory) behind the backing router (internal/storage/routed), with the fs
+// backend's blob backings and the gateway backings of storage.backings.
 func (s *Server) openBackend() error {
+	bk, err := newBackings(s.cfg, s.log)
+	if err != nil {
+		return err
+	}
+	var primary storage.Backend
 	switch s.cfg.Storage.Backend {
 	case config.BackendMemory:
-		s.backend, s.backendName = memory.New(), config.BackendMemory
+		primary, s.backendName = memory.New(), config.BackendMemory
 		if s.cfg.Storage.Path != "" {
 			abs, err := filepath.Abs(s.cfg.Storage.Path)
 			if err != nil {
@@ -301,11 +312,31 @@ func (s *Server) openBackend() error {
 		b, err := fsbackend.Open(s.cfg.Storage.Path, fsbackend.Options{
 			FsyncData: s.cfg.Storage.FsyncData,
 			Logger:    s.log.With("component", "storage"),
+			Remotes:   bk.blobs,
 		})
 		if err != nil {
 			return fmt.Errorf("opening storage: %w", err)
 		}
-		s.backend, s.backendName, s.dataPath = b, config.BackendFS, b.Root()
+		primary, s.backendName, s.dataPath = b, config.BackendFS, b.Root()
+	}
+	// After the primary: the fs backend has locked the data directory.
+	if err := bk.openStores(); err != nil {
+		_ = primary.Close()
+		return err
+	}
+	router := routed.New(routed.Options{
+		Primary:         primary,
+		Stores:          bk.stores,
+		PrimaryBackings: bk.blobNames(),
+		Default:         s.cfg.Storage.DefaultBacking,
+		Logger:          s.log.With("component", "storage"),
+	})
+	s.backend, s.backings = router, bk.info
+	if bad, err := router.UnavailableBuckets(context.Background()); err == nil {
+		for bucket, backing := range bad {
+			s.log.Warn("bucket is on a backing that is not configured; its objects are unavailable until the backing is added back to storage.backings",
+				"bucket", bucket, "backing", backing)
+		}
 	}
 	return nil
 }

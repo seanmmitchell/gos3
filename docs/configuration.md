@@ -74,6 +74,8 @@ changed while running.
 | `storage.backend` | `GOS3_STORAGE_BACKEND` | `--backend` | `fs` | `fs` (files under `path`) or `memory` (everything is lost on exit). |
 | `storage.path` | `GOS3_DATA` | `--data` | `./data` for `fs`, empty for `memory` | Data directory. With `fs` it holds the objects and the metadata database. With either backend it holds the system state in `<path>/.gos3/` (see [operations.md](operations.md#the-data-directory)). With `memory` and no path the server is fully ephemeral, including generated root credentials and IAM users. |
 | `storage.fsync_data` | `GOS3_FSYNC` | `--fsync` | `true` | fsync object data before acknowledging a write. `--fsync=false` is faster but can lose recent writes on power loss. |
+| `storage.backings` | `GOS3_STORAGE_BACKINGS` (JSON array) | | empty | Remote S3 services that individual buckets can be stored on, in `blob` or `gateway` mode. See [backings.md](backings.md). Credentials may come from `GOS3_BACKING_<NAME>_ACCESS_KEY` / `_SECRET_KEY`. |
+| `storage.default_backing` | `GOS3_DEFAULT_BACKING` | | `local` | Backing of buckets created without the `x-gos3-backing` header: `local` (the server's own storage) or the name of a backing. |
 
 ### `auth`
 

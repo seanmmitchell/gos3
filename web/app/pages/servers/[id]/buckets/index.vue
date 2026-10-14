@@ -1,14 +1,14 @@
 <script setup lang="ts">
 import type { DropdownMenuItem, TableColumn } from '@nuxt/ui'
-import type { BucketUsage } from '~/types/admin'
+import type { BackingMode, BucketUsage } from '~/types/admin'
 import { S3Error } from '~/utils/s3/errors'
 import { AdminError } from '~/utils/admin/client'
 import { usageAgeNote } from '~/components/browser/-bucket-usage'
 
 /**
  * Bucket list. gos3 identities with admin rights get the admin listing
- * (usage, versioning, public / object-lock flags); everybody else gets plain
- * S3 ListBuckets.
+ * (usage, versioning, public / object-lock flags, storage backing);
+ * everybody else gets plain S3 ListBuckets.
  */
 useHead({ title: 'Buckets' })
 
@@ -17,7 +17,7 @@ const router = useRouter()
 const confirm = useConfirm()
 const toast = useToast()
 const { connection, isGos3, admin, s3, requireS3, requireAdmin } = useConnection()
-const { can } = useWhoAmI()
+const { can, whoami } = useWhoAmI()
 
 const serverId = computed(() => routeParam(route.params.id))
 
@@ -29,6 +29,23 @@ interface BucketRow {
   objectLock?: boolean
   public?: boolean
   usage?: BucketUsage | null
+  /** Storage backing mode (admin listing on gos3). */
+  backingMode?: BackingMode
+  /** Shown for buckets on a remote backing. */
+  backingBadge?: BackingBadge | null
+}
+
+interface BackingBadge {
+  label: string
+  icon: string
+  title: string
+}
+
+/** Badge for buckets stored on a remote backing (nothing for local storage). */
+function backingBadge(backing: string | undefined, mode: BackingMode | undefined): BackingBadge | null {
+  if (!backing || backing === LOCAL_BACKING) return null
+  const info = backingModeInfo(mode)
+  return { label: backing, icon: info.icon, title: `Stored on backing “${backing}” (${info.label}). ${info.description}` }
 }
 
 interface Listing {
@@ -55,7 +72,9 @@ async function load(): Promise<Listing> {
           versioning: b.versioning,
           objectLock: b.objectLock,
           public: b.public,
-          usage: b.usage
+          usage: b.usage,
+          backingMode: b.backingMode,
+          backingBadge: backingBadge(b.backing, b.backingMode)
         }))
       }
     } catch (e) {
@@ -383,11 +402,21 @@ const isAccessDenied = computed(() => {
             </NuxtLink>
             <UBadge v-if="row.original.public" color="warning" variant="subtle" size="sm" label="Public" icon="i-lucide-globe" />
             <UBadge v-if="row.original.objectLock" color="info" variant="subtle" size="sm" label="Object lock" icon="i-lucide-lock" />
+            <UBadge
+              v-if="row.original.backingBadge"
+              color="neutral"
+              variant="subtle"
+              size="sm"
+              :label="row.original.backingBadge.label"
+              :icon="row.original.backingBadge.icon"
+              :title="row.original.backingBadge.title"
+            />
           </div>
         </template>
         <template #versioning-cell="{ row }">
           <UBadge v-if="row.original.versioning === 'Enabled'" color="success" variant="subtle" size="sm" label="Enabled" />
           <UBadge v-else-if="row.original.versioning === 'Suspended'" color="warning" variant="subtle" size="sm" label="Suspended" />
+          <span v-else-if="!backingSupportsVersioning(row.original.backingMode)" class="text-sm text-muted" title="Gateway backings do not support versioning">n/a</span>
           <span v-else class="text-sm text-muted">Off</span>
         </template>
         <template #objects-cell="{ row }">
@@ -434,6 +463,7 @@ const isAccessDenied = computed(() => {
       :client="s3"
       :default-region="connection?.region"
       :existing-names="data?.rows.map(r => r.name)"
+      :backings="isGos3 ? whoami?.backings : null"
       @created="onCreated"
     />
   </div>

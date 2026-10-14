@@ -27,6 +27,10 @@ Run `gos3 serve`, point the AWS CLI, an SDK, `mc` or rclone at it, and open
   of current and noncurrent versions, delete markers and stale multipart uploads.
 - **Checksums**: CRC32, CRC32C, CRC64NVME, SHA-1 and SHA-256, as headers or
   trailers, full-object or composite for multipart uploads, plus MD5/ETag.
+- **Remote S3 backings**: put individual buckets on AWS S3, MinIO, R2 or any
+  S3 service, chosen per bucket at creation: as opaque blobs with every gos3
+  feature, or as a gateway that stores native objects other tools can read.
+  See [docs/backings.md](docs/backings.md).
 - **Web UI**: embedded in the binary or run standalone to manage many gos3
   and other S3 servers. It has an object browser with uploads, versions,
   metadata and share links, bucket settings, users and policies, server
@@ -319,6 +323,7 @@ More in [docs/security.md](docs/security.md).
 |---|---|
 | [docs/configuration.md](docs/configuration.md) | every YAML key, environment variable and flag |
 | [docs/deployment.md](docs/deployment.md) | Docker, Compose, systemd, Kubernetes, reverse proxies, TLS |
+| [docs/backings.md](docs/backings.md) | storing buckets on remote S3 services (blob and gateway modes) |
 | [docs/operations.md](docs/operations.md) | health checks, metrics, logs, backups, lifecycle, upgrades |
 | [docs/security.md](docs/security.md) | authentication, stored secrets, exposure checklist |
 | [docs/s3-compatibility.md](docs/s3-compatibility.md) | supported S3 operations and differences from AWS |
@@ -385,6 +390,8 @@ archives and image. Branch rules, versioning and the release steps are in
 - **Single node.** No replication, erasure coding or clustering. Discovery
   finds servers but does not combine them. Use backups (see
   [docs/operations.md](docs/operations.md#backups)) for durability.
+  [Remote backings](docs/backings.md) can put bucket data on a durable
+  object store.
 - One account: IAM users share the bucket namespace, and there is no STS and
   no session tokens.
 - Not implemented: SigV2, SigV4A, SSE-C, ACL grants beyond canned ACLs,

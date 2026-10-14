@@ -1,10 +1,15 @@
 <script setup lang="ts">
 /**
- * "Create bucket" dialog: S3 name rules with live hints, region, object lock
- * and versioning (PutBucketVersioning right after CreateBucket).
+ * "Create bucket" dialog: S3 name rules with live hints, region, storage
+ * backing (gos3 servers with several backings), object lock and versioning
+ * (PutBucketVersioning right after CreateBucket).
  *
- *   <BrowserCreateBucketModal v-model:open="open" :default-region="conn.region" @created="refresh" />
+ *   <BrowserCreateBucketModal v-model:open="open" :default-region="conn.region" :backings="whoami?.backings" @created="refresh" />
+ *
+ * Pass `backings` for gos3 connections only: the x-gos3-backing header is
+ * sent only when the selector is shown.
  */
+import type { BackingChoices } from '~/types/admin'
 import type { S3Client } from '~/utils/s3/client'
 
 const open = defineModel<boolean>('open', { required: true })
@@ -13,6 +18,8 @@ const props = defineProps<{
   client: S3Client | undefined
   defaultRegion?: string
   existingNames?: string[]
+  /** gos3 WhoAmI.backings; the selector is shown when it offers a choice. */
+  backings?: BackingChoices | null
 }>()
 
 const emit = defineEmits<{ created: [name: string] }>()
@@ -26,10 +33,26 @@ const busy = ref(false)
 const error = ref<unknown>(null)
 const warning = ref('')
 
+// Storage backing: the server default until the user picks one (whoami may
+// arrive while the dialog is open).
+const backingItems = computed(() => backingSelectItems(props.backings))
+const pickedBacking = ref<string | null>(null)
+const backing = computed<string>({
+  get: () => pickedBacking.value ?? (backingItems.value.length ? defaultBacking(props.backings) : ''),
+  set: (v) => {
+    pickedBacking.value = v
+  }
+})
+const backingMode = computed(() => backingModeOf(backing.value, props.backings))
+const backingHelp = computed(() => backingModeInfo(backingMode.value).description)
+/** Gateway backings support neither versioning nor object lock. */
+const noVersioning = computed(() => !backingSupportsVersioning(backingMode.value))
+
 watch(open, (v) => {
   if (!v) return
   name.value = ''
   region.value = props.defaultRegion ?? ''
+  pickedBacking.value = null
   objectLock.value = false
   versioning.value = false
   touched.value = false
@@ -41,6 +64,12 @@ watch(open, (v) => {
 watch(objectLock, (v) => {
   if (v) versioning.value = true
 })
+
+watch(noVersioning, (v) => {
+  if (!v) return
+  objectLock.value = false
+  versioning.value = false
+}, { immediate: true })
 
 const rules = computed(() => {
   const n = name.value
@@ -70,7 +99,11 @@ async function submit() {
   warning.value = ''
   const bucket = name.value
   try {
-    await props.client.createBucket(bucket, { region: region.value.trim() || undefined, objectLock: objectLock.value })
+    await props.client.createBucket(bucket, {
+      region: region.value.trim() || undefined,
+      objectLock: objectLock.value,
+      backing: backingItems.value.length ? backing.value : undefined
+    })
   } catch (e) {
     error.value = e
     busy.value = false
@@ -125,18 +158,27 @@ async function submit() {
           <UInput v-model.trim="region" class="w-full font-mono" placeholder="us-east-1" autocomplete="off" />
         </UFormField>
 
+        <UFormField v-if="backingItems.length" label="Storage backing" :help="backingHelp">
+          <USelect v-model="backing" :items="backingItems" value-key="value" class="w-full" />
+        </UFormField>
+
         <div class="space-y-3 rounded-lg border border-default p-3">
           <USwitch
             v-model="versioning"
             label="Versioning"
             description="Keep every version of every object; deletes create delete markers."
-            :disabled="objectLock"
+            :disabled="objectLock || noVersioning"
           />
           <USwitch
             v-model="objectLock"
             label="Object lock"
             description="Allows WORM retention and legal holds. Can only be enabled at creation and implies versioning."
+            :disabled="noVersioning"
           />
+          <p v-if="noVersioning" class="flex items-start gap-1.5 text-xs text-muted">
+            <UIcon name="i-lucide-info" class="mt-0.5 size-3.5 shrink-0" aria-hidden="true" />
+            <span>Gateway backings store objects directly in the remote S3 service, so versioning and object lock are not available.</span>
+          </p>
         </div>
 
         <CommonErrorAlert v-if="error" :error="error" title="Could not create the bucket" />

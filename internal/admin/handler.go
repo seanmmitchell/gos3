@@ -168,6 +168,7 @@ func (a *api) routes() []route {
 		{"GET", "/stats", "GetStats", service, a.stats},
 		{"GET", "/config", "GetConfig", service, a.getConfig},
 		{"PUT", "/config", "UpdateConfig", service, a.putConfig},
+		{"GET", "/backings", "ListBackings", service, a.listBackings},
 		// Users & access keys
 		{"GET", "/users", "ListUsers", service, a.listUsers},
 		{"POST", "/users", "CreateUser", inHandler, a.createUser}, // user/<body name>, admin:PolicyName

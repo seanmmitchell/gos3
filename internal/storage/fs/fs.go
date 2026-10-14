@@ -15,6 +15,21 @@
 //
 // The schema of meta.db is documented in schema.go.
 //
+// Buckets created with a Backing that names one of Options.Remotes (blob
+// mode) keep everything above in meta.db as well, but their object and
+// part data live as opaque blobs in that remote S3 bucket instead of data/
+// and uploads/ (same IDs and names):
+//
+//	<prefix>data/<bucket-id>/<id>            object data
+//	<prefix>uploads/<upload-id>/<n>-<id>     multipart part data
+//
+// A bucket whose Backing is set but is not a configured remote (a gateway
+// backing served by another layer, or a remote removed from the
+// configuration) keeps working for metadata operations, while operations
+// that need its data fail with storage.ErrBackingUnavailable. Remote
+// failures that mean the service is unreachable or failing (transport
+// errors, 5xx) are reported wrapping storage.ErrBackingUnavailable too.
+//
 // # Write path
 //
 // Object data is streamed into a fresh file in tmp/ (optionally fsync'd,
@@ -31,6 +46,15 @@
 // races with readers of the previous part. CompleteMultipartUpload streams
 // the listed parts into a new data file and then commits like a PutObject.
 //
+// In blob mode data is streamed into a spool (memory, then a file in tmp/)
+// and uploaded to a fresh blob before the same metadata transaction runs;
+// failed commits delete the blob, superseded blobs are deleted after the
+// commit. Parts are always uploaded as blobs, even when empty.
+// CompleteMultipartUpload composes the parts server-side (a remote
+// multipart upload of UploadPartCopy ranges, or a copy for a single part)
+// when every part but the last has at least s3client.MinPartSize bytes,
+// and otherwise streams the part blobs through a spool into a new blob.
+//
 // # Readers
 //
 // OpenObject returns an *os.File. Because data files are immutable and
@@ -40,6 +64,15 @@
 // cannot be deleted: unlinking a superseded data file that is still being
 // read fails, the failure is logged and the orphan is removed by the
 // recovery pass at the next start.
+//
+// In blob mode OpenObject returns a lazy ranged-GET reader over the blob.
+// The same guarantee is implemented in memory: open readers are counted
+// per blob, and deleting a blob dereferenced by a transaction is deferred
+// until its last reader is closed. OpenObject registers the reader before
+// re-checking that the version still references the blob (and resolves
+// the version again if not), under the same lock as the deferred-delete
+// decision, so a concurrent overwrite can never delete a blob that a
+// reader was handed.
 //
 // # Recovery
 //
@@ -59,6 +92,15 @@
 // mount point) are left alone. Open refuses to start when meta.db is missing
 // or empty while data/ or uploads/ hold files, since a fresh database would
 // make every stored object look orphaned.
+//
+// The pass then lists the data/ and uploads/ prefixes of every remote and
+// deletes blobs that the metadata does not reference, that are neither
+// pending nor held by open readers, and whose remote LastModified is older
+// than Options.OrphanRetention (the age threshold replaces the quarantine:
+// blobs written after a backup of meta.db survive restoring it for that
+// long). Keys with names gos3 never generates are left alone. Open also
+// refuses to start with a missing or empty meta.db while a remote holds
+// blobs; a remote that cannot be reached at Open is logged, not fatal.
 //
 // # Durability
 //
@@ -106,8 +148,12 @@ type Options struct {
 	Logger *slog.Logger
 	// OrphanRetention is how long the recovery pass keeps unreferenced
 	// files it moved to .gos3/orphans/ before deleting them (at a later
-	// start). Zero or negative means DefaultOrphanRetention.
+	// start). Zero or negative means DefaultOrphanRetention. For remote
+	// blobs (see Remotes) it is the minimum age of an unreferenced blob
+	// before the recovery pass deletes it.
 	OrphanRetention time.Duration
+	// Remotes are the blob backings, keyed by backing name.
+	Remotes map[string]RemoteStore
 }
 
 // DefaultOrphanRetention is the default of Options.OrphanRetention.
@@ -143,6 +189,13 @@ type Backend struct {
 	pending pendingSet
 	commits committer
 
+	// remotes are the blob backings by name; blobs tracks open readers of
+	// their data blobs.
+	remotes map[string]*remote
+	blobs   blobTracker
+	// now is the clock of the recovery pass (tests move it).
+	now func() time.Time
+
 	// commitFault, when set (tests only), replaces the result of every
 	// successful write transaction, simulating a commit that reports an
 	// error although it reached the disk (e.g. a failed fsync).
@@ -174,6 +227,7 @@ func Open(root string, opts Options) (*Backend, error) {
 		log:          opts.Logger,
 		recoveryDone: make(chan struct{}),
 		pending:      pendingSet{m: make(map[string]int)},
+		now:          time.Now,
 	}
 	if b.log == nil {
 		b.log = slog.New(slog.DiscardHandler)
@@ -185,6 +239,9 @@ func Open(root string, opts Options) (*Backend, error) {
 	b.retention = opts.OrphanRetention
 	if b.retention <= 0 {
 		b.retention = DefaultOrphanRetention
+	}
+	if b.remotes, err = newRemotes(opts.Remotes); err != nil {
+		return nil, err
 	}
 	for _, d := range []string{b.sysDir, b.dataDir, b.tmpDir, b.uploadDir} {
 		if err := os.MkdirAll(d, dirPerm); err != nil {
@@ -233,9 +290,11 @@ func Open(root string, opts Options) (*Backend, error) {
 
 // checkMetadataPresent refuses to proceed when the metadata database is
 // missing or empty (bbolt would silently create a fresh one) although the
-// data or uploads directory holds files gos3 wrote: the recovery pass would
-// then consider every object orphaned. The check runs before the database
-// lock is taken; a database that is missing or empty cannot be in use.
+// data or uploads directory, or the data/ or uploads/ prefix of a remote
+// blob backing, holds files gos3 wrote: the recovery pass would then
+// consider every object orphaned. A remote that cannot be reached is only
+// logged. The check runs before the database lock is taken; a database
+// that is missing or empty cannot be in use.
 func (b *Backend) checkMetadataPresent(dbPath string) error {
 	fi, err := os.Stat(dbPath)
 	switch {
@@ -248,12 +307,18 @@ func (b *Backend) checkMetadataPresent(dbPath string) error {
 	if err != nil {
 		return fmt.Errorf("fs: inspect %s: %w", b.sysDir, err)
 	}
-	if dir == "" {
-		return nil
-	}
 	state := "missing"
 	if fi != nil {
 		state = "empty"
+	}
+	if dir == "" {
+		if where := b.remoteHoldsBlobs(); where != "" {
+			return fmt.Errorf("fs: metadata database %s is %s but remote %s still holds stored data; "+
+				"refusing to start with an empty index, which would discard it. Restore meta.db "+
+				"from a backup, or move the remote blobs aside to start with an empty store",
+				dbPath, state, where)
+		}
+		return nil
 	}
 	return fmt.Errorf("fs: metadata database %s is %s but %s still holds stored data; "+
 		"refusing to start with an empty index, which would discard it. Restore meta.db "+

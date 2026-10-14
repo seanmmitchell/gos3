@@ -16,6 +16,8 @@ type whoAmI struct {
 	Policies     []string       `json:"policies"`
 	Capabilities capabilities   `json:"capabilities"`
 	Server       discovery.Info `json:"server"`
+	// Backings lets every caller pick a backing when creating a bucket.
+	Backings backingChoices `json:"backings"`
 }
 
 // capabilities are derived by evaluating admin actions for the caller at
@@ -34,12 +36,13 @@ type capabilities struct {
 	Scan           bool `json:"scan"`           // admin:ScanNetwork
 	Probe          bool `json:"probe"`          // admin:ProbeNetwork
 	CreateOwnKeys  bool `json:"createOwnKeys"`  // admin:CreateOwnAccessKey (never root)
+	ListBackings   bool `json:"listBackings"`   // admin:ListBackings
 }
 
 // adminActions are every admin:* action used by the API; "admin" in
 // capabilities is true when any of them is allowed.
 var adminActions = []string{
-	"ServerInfo", "GetStats", "GetConfig", "UpdateConfig",
+	"ServerInfo", "GetStats", "GetConfig", "UpdateConfig", "ListBackings",
 	"ListUsers", "CreateUser", "GetUser", "UpdateUser", "DeleteUser",
 	"CreateAccessKey", "UpdateAccessKey", "DeleteAccessKey",
 	"ListPolicies", "GetPolicy", "PutPolicy", "DeletePolicy", "SimulatePolicy",
@@ -86,8 +89,10 @@ func (a *api) whoami(rc *reqCtx) (int, any, error) {
 			Probe:          allowed["ProbeNetwork"],
 			// Root has no IAM keys to manage (POST /whoami/keys answers 400).
 			CreateOwnKeys: !rc.id.IsRoot && a.authorize(rc, actionCreateOwnKey, "", nil).Allowed,
+			ListBackings:  allowed["ListBackings"],
 		},
-		Server: a.info(),
+		Server:   a.info(),
+		Backings: a.backingChoices(),
 	}, nil
 }
 

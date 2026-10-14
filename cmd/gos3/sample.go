@@ -56,6 +56,22 @@ storage:
   path: ./data
   # fsync object data before acknowledging writes (durable across power loss).
   fsync_data: true
+  # Remote S3 services individual buckets can be stored on, chosen per
+  # bucket at creation (x-gos3-backing header or the web UI). mode: blob
+  # (opaque blobs, metadata stays here, every feature) or gateway (native
+  # remote objects, no versioning/object lock). See docs/backings.md.
+  # backings:
+  #   - name: cold
+  #     mode: blob
+  #     endpoint: https://s3.eu-central-1.amazonaws.com
+  #     region: eu-central-1
+  #     bucket: acme-gos3-blobs
+  #     prefix: prod/
+  #     # credentials: access_key / secret_key, or GOS3_BACKING_COLD_ACCESS_KEY
+  #     # and GOS3_BACKING_COLD_SECRET_KEY
+  backings: []
+  # Backing of buckets created without a choice: local or a backing name.
+  default_backing: ""
 
 auth:
   # Root credentials. Prefer the environment (GOS3_ROOT_ACCESS_KEY /

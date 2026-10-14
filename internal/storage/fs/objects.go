@@ -13,6 +13,7 @@ import (
 
 	"go.etcd.io/bbolt"
 
+	"github.com/seanmmitchell/gos3/internal/s3client"
 	"github.com/seanmmitchell/gos3/internal/storage"
 )
 
@@ -22,8 +23,8 @@ var errWriterDone = errors.New("fs: writer already committed or aborted")
 
 // --- commit ---
 
-// commitReq describes a new object version whose data file (if any) is
-// already in its final place.
+// commitReq describes a new object version whose data file or blob (if
+// any) is already in its final place.
 type commitReq struct {
 	bucket   string
 	bucketID string
@@ -35,13 +36,16 @@ type commitReq struct {
 	// pre runs first inside the transaction (multipart: verify and remove
 	// the upload). Its error aborts the commit.
 	pre func(tx *bbolt.Tx, bb *bbolt.Bucket) error
+	// rem is the remote holding the data blob (nil: a local data file).
+	rem *remote
 }
 
 // commitObject publishes a new version in one write transaction, evaluating
-// preconditions atomically. On failure the request's data file is removed
-// (unless the commit itself failed, in which case it may have persisted
-// anyway, see updateFiles); on success data files of replaced versions are
-// unlinked.
+// preconditions atomically. On failure the request's data file or blob is
+// removed (unless the commit itself failed, in which case it may have
+// persisted anyway, see updateFiles); on success the data of replaced
+// versions is unlinked (remote blobs: deleted, or once their last reader
+// closes).
 func (b *Backend) commitObject(req commitReq) (storage.ObjectInfo, error) {
 	var (
 		info   storage.ObjectInfo
@@ -76,16 +80,27 @@ func (b *Backend) commitObject(req commitReq) (storage.ObjectInfo, error) {
 	})
 	if err != nil {
 		if req.dataID != "" {
-			if indeterminate {
+			switch {
+			case indeterminate:
 				b.log.Warn("fs: metadata commit failed after the transaction was written; keeping its data file",
 					"bucket_id", req.bucketID, "data_id", req.dataID, "err", err)
-			} else {
+			case req.rem != nil:
+				b.removeBlob(req.rem, req.rem.dataKey(req.bucketID, req.dataID))
+			default:
 				_ = os.Remove(b.dataPath(req.bucketID, req.dataID))
 			}
 		}
 		return storage.ObjectInfo{}, err
 	}
-	b.unlinkData(req.bucketID, unlink)
+	if req.rem != nil {
+		for _, id := range unlink {
+			if validDataID(id) {
+				b.dropBlob(req.rem, req.rem.dataKey(req.bucketID, id))
+			}
+		}
+	} else {
+		b.unlinkData(req.bucketID, unlink)
+	}
 	// The returned meta must not alias anything the caller passed in.
 	return cloneInfo(info), nil
 }
@@ -120,14 +135,17 @@ type objectWriter struct {
 	bucket   string
 	bucketID string
 	key      string
+	rem      *remote // nil: local data file
 
 	mu   sync.Mutex
-	t    *tmpFile
+	t    *tmpFile        // local
+	sp   *s3client.Spool // remote
 	done bool
 }
 
 // NewObjectWriter starts writing a new version of bucket/key. Data is
-// streamed to a temporary file; nothing is visible until Commit.
+// streamed to a temporary file (or, for a bucket on a remote blob backing,
+// a spool that is uploaded at Commit); nothing is visible until Commit.
 func (b *Backend) NewObjectWriter(ctx context.Context, bucket, key string) (storage.ObjectWriter, error) {
 	if err := validKey(key); err != nil {
 		return nil, err
@@ -135,19 +153,29 @@ func (b *Backend) NewObjectWriter(ctx context.Context, bucket, key string) (stor
 	if err := b.begin(ctx); err != nil {
 		return nil, err
 	}
-	var id string
+	var id, backing string
 	err := b.view(func(tx *bbolt.Tx) error {
 		rec, _, err := loadBucket(tx, bucket)
 		if err != nil {
 			return err
 		}
-		id = rec.ID
+		id, backing = rec.ID, rec.Backing
 		return nil
 	})
 	if err != nil {
 		return nil, err
 	}
-	return &objectWriter{b: b, bucket: bucket, bucketID: id, key: key, t: b.newTemp()}, nil
+	rem, err := b.remoteFor(backing)
+	if err != nil {
+		return nil, err
+	}
+	w := &objectWriter{b: b, bucket: bucket, bucketID: id, key: key, rem: rem}
+	if rem != nil {
+		w.sp = b.newSpool()
+	} else {
+		w.t = b.newTemp()
+	}
+	return w, nil
 }
 
 func (w *objectWriter) Write(p []byte) (int, error) {
@@ -155,6 +183,9 @@ func (w *objectWriter) Write(p []byte) (int, error) {
 	defer w.mu.Unlock()
 	if w.done {
 		return 0, errWriterDone
+	}
+	if w.sp != nil {
+		return w.sp.Write(p)
 	}
 	return w.t.Write(p)
 }
@@ -166,6 +197,9 @@ func (w *objectWriter) Commit(ctx context.Context, meta storage.ObjectMeta, opts
 		return storage.ObjectInfo{}, errWriterDone
 	}
 	w.done = true
+	if w.sp != nil {
+		return w.commitRemote(ctx, meta, opts)
+	}
 	if err := w.b.begin(ctx); err != nil {
 		w.t.discard()
 		return storage.ObjectInfo{}, err
@@ -188,6 +222,40 @@ func (w *objectWriter) Commit(ctx context.Context, meta storage.ObjectMeta, opts
 	})
 }
 
+// commitRemote uploads the spooled data to a fresh blob and commits.
+func (w *objectWriter) commitRemote(ctx context.Context, meta storage.ObjectMeta, opts storage.CommitOptions) (storage.ObjectInfo, error) {
+	b := w.b
+	defer w.sp.Close()
+	if err := b.begin(ctx); err != nil {
+		return storage.ObjectInfo{}, err
+	}
+	if err := w.sp.Finish(); err != nil {
+		return storage.ObjectInfo{}, fmt.Errorf("fs: spool data: %w", err)
+	}
+	size := w.sp.Size()
+	var dataID string
+	if size > 0 {
+		dataID = randomHex(16)
+		key := w.rem.dataKey(w.bucketID, dataID)
+		id := w.rem.blobID(key)
+		b.pending.add(id)
+		defer b.pending.done(id)
+		if err := b.putBlob(ctx, w.rem, key, w.sp, size); err != nil {
+			return storage.ObjectInfo{}, err
+		}
+	}
+	return b.commitObject(commitReq{
+		bucket:   w.bucket,
+		bucketID: w.bucketID,
+		rem:      w.rem,
+		key:      w.key,
+		dataID:   dataID,
+		size:     size,
+		meta:     cloneMeta(meta),
+		opts:     opts,
+	})
+}
+
 func (w *objectWriter) Abort() error {
 	w.mu.Lock()
 	defer w.mu.Unlock()
@@ -195,20 +263,29 @@ func (w *objectWriter) Abort() error {
 		return nil
 	}
 	w.done = true
+	if w.sp != nil {
+		_ = w.sp.Close()
+		return nil
+	}
 	w.t.discard()
 	return nil
 }
 
 // --- reads ---
 
-// lookupObject returns the info of a version plus the bucket ID and data ID.
-func (b *Backend) lookupObject(ctx context.Context, bucket, key, versionID string) (storage.ObjectInfo, string, string, error) {
+// objectLoc locates the data of a version.
+type objectLoc struct {
+	bucketID, dataID, backing string
+}
+
+// lookupObject returns the info of a version plus the location of its data.
+func (b *Backend) lookupObject(ctx context.Context, bucket, key, versionID string) (storage.ObjectInfo, objectLoc, error) {
 	if err := b.begin(ctx); err != nil {
-		return storage.ObjectInfo{}, "", "", err
+		return storage.ObjectInfo{}, objectLoc{}, err
 	}
 	var (
-		info             storage.ObjectInfo
-		bucketID, dataID string
+		info storage.ObjectInfo
+		loc  objectLoc
 	)
 	err := b.view(func(tx *bbolt.Tx) error {
 		br, bb, err := loadBucket(tx, bucket)
@@ -220,17 +297,17 @@ func (b *Backend) lookupObject(ctx context.Context, bucket, key, versionID strin
 			return err
 		}
 		info = rec.info(bucket, key, latest)
-		bucketID, dataID = br.ID, rec.DataID
+		loc = objectLoc{bucketID: br.ID, dataID: rec.DataID, backing: br.Backing}
 		return nil
 	})
-	return info, bucketID, dataID, err
+	return info, loc, err
 }
 
 // GetObjectInfo returns metadata for a version ("" = latest, which may be a
 // delete marker). A missing key yields ErrObjectNotFound when versionID is
 // "" and ErrVersionNotFound otherwise.
 func (b *Backend) GetObjectInfo(ctx context.Context, bucket, key, versionID string) (storage.ObjectInfo, error) {
-	info, _, _, err := b.lookupObject(ctx, bucket, key, versionID)
+	info, _, err := b.lookupObject(ctx, bucket, key, versionID)
 	return info, err
 }
 
@@ -240,10 +317,12 @@ func (b *Backend) GetObjectInfo(ctx context.Context, bucket, key, versionID stri
 const openRetries = 8
 
 // OpenObject returns a version's info and a reader over its content (an
-// *os.File for non-empty objects). The reader is nil for delete markers.
+// *os.File for non-empty objects, or a ranged-GET reader over the blob of
+// a remote backing). The reader is nil for delete markers.
 func (b *Backend) OpenObject(ctx context.Context, bucket, key, versionID string) (storage.ObjectInfo, io.ReadSeekCloser, error) {
 	for attempt := 0; ; attempt++ {
-		info, bucketID, dataID, err := b.lookupObject(ctx, bucket, key, versionID)
+		info, loc, err := b.lookupObject(ctx, bucket, key, versionID)
+		bucketID, dataID := loc.bucketID, loc.dataID
 		if err != nil {
 			return storage.ObjectInfo{}, nil, err
 		}
@@ -258,6 +337,19 @@ func (b *Backend) OpenObject(ctx context.Context, bucket, key, versionID string)
 		}
 		if !validDataID(dataID) {
 			return storage.ObjectInfo{}, nil, fmt.Errorf("%w: invalid data ID for %s/%s", errCorrupt, bucket, key)
+		}
+		if loc.backing != "" {
+			r, retry, err := b.openRemote(ctx, bucket, loc, info.Size)
+			if err != nil {
+				return storage.ObjectInfo{}, nil, err
+			}
+			if retry {
+				if attempt < openRetries {
+					continue
+				}
+				return storage.ObjectInfo{}, nil, fmt.Errorf("fs: open data of %s/%s: too much contention", bucket, key)
+			}
+			return info, r, nil
 		}
 		f, err := openShared(b.dataPath(bucketID, dataID))
 		if err != nil {
@@ -280,6 +372,37 @@ func (b *Backend) OpenObject(ctx context.Context, bucket, key, versionID string)
 		}
 		return info, &fileReader{f: f}, nil
 	}
+}
+
+// openRemote returns a reader over the remote blob of loc (size bytes).
+// The blob is registered as open before the metadata is checked again, so
+// a concurrent overwrite or delete is either seen by the check (retry
+// reports true: resolve the version again) or sees the reader and defers
+// deleting the blob until the reader is closed.
+func (b *Backend) openRemote(ctx context.Context, bucket string, loc objectLoc, size int64) (r io.ReadSeekCloser, retry bool, err error) {
+	rem, err := b.remoteFor(loc.backing)
+	if err != nil {
+		return nil, false, err
+	}
+	key := rem.dataKey(loc.bucketID, loc.dataID)
+	b.blobs.acquire(rem.blobID(key))
+	var still bool
+	err = b.view(func(tx *bbolt.Tx) error {
+		_, bb, err := loadBucketID(tx, bucket, loc.bucketID)
+		if err != nil {
+			return err
+		}
+		still = bb.Bucket(subData).Get([]byte(loc.dataID)) != nil
+		return nil
+	})
+	if err != nil || !still {
+		b.releaseBlob(rem, key)
+		return nil, err == nil, err
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	return &blobReader{b: b, rem: rem, key: key, ctx: ctx, r: rem.client.NewReader(ctx, rem.bucket, key, size, "")}, false, nil
 }
 
 // fileReader is the reader returned by OpenObject: an *os.File whose Close is
@@ -410,9 +533,9 @@ func (b *Backend) deleteObject(ctx context.Context, bucket, key, versionID strin
 		return storage.DeleteResult{}, err
 	}
 	var (
-		res      storage.DeleteResult
-		unlink   []string
-		bucketID string
+		res               storage.DeleteResult
+		unlink            []string
+		bucketID, backing string
 	)
 	err := b.update(func(tx *bbolt.Tx) error {
 		res, unlink = storage.DeleteResult{}, nil
@@ -420,7 +543,7 @@ func (b *Backend) deleteObject(ctx context.Context, bucket, key, versionID strin
 		if err != nil {
 			return err
 		}
-		bucketID = br.ID
+		bucketID, backing = br.ID, br.Backing
 		if check != nil {
 			rec, _, latest, err := findVersion(bb, bucket, key, versionID)
 			if err != nil {
@@ -485,6 +608,6 @@ func (b *Backend) deleteObject(ctx context.Context, bucket, key, versionID strin
 	if err != nil {
 		return storage.DeleteResult{}, err
 	}
-	b.unlinkData(bucketID, unlink)
+	b.dropData(backing, bucketID, unlink)
 	return res, nil
 }

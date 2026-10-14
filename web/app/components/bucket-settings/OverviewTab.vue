@@ -1,12 +1,13 @@
 <script setup lang="ts">
-import type { BucketSummary } from '~/types/admin'
+import type { BackingMode, BucketSummary } from '~/types/admin'
 import type { VersioningStatus } from '~/types/s3'
 import type { BucketSettingsTab } from '~/components/admin/-capabilities'
 
 /**
  * Bucket overview: usage, owner, creation date, region and configured
  * sub-resources (gos3 admin API when available), plus what plain S3 can
- * tell (location, creation date, policy status).
+ * tell (location, creation date, policy status) and, on gos3, the storage
+ * backing.
  */
 const props = defineProps<{
   bucket: string
@@ -15,6 +16,9 @@ const props = defineProps<{
   summaryLoading?: boolean
   versioning: VersioningStatus | null
   objectLock: boolean
+  /** gos3 storage backing name ("local" = own storage), when known. */
+  backing?: string
+  backingMode?: BackingMode
 }>()
 
 const emit = defineEmits<{ navigate: [tab: BucketSettingsTab] }>()
@@ -52,6 +56,8 @@ const configs = computed(() => {
   ]
   return items
 })
+
+const backingInfo = computed(() => backingModeInfo(props.backingMode))
 
 const versioningLabel = computed(() => (props.versioning === 'Enabled' ? 'Enabled' : props.versioning === 'Suspended' ? 'Suspended' : 'Never enabled'))
 </script>
@@ -105,6 +111,15 @@ const versioningLabel = computed(() => (props.versioning === 'Enabled' ? 'Enable
               Owner
             </dt>
             <dd>{{ summary.owner }}</dd>
+          </template>
+          <template v-if="backing">
+            <dt class="text-muted">
+              Storage backing
+            </dt>
+            <dd class="flex flex-wrap items-center gap-1.5">
+              <span class="font-mono text-xs">{{ backing }}</span>
+              <UBadge :label="backingInfo.label" :icon="backingInfo.icon" color="neutral" variant="subtle" size="sm" :title="backingInfo.description" />
+            </dd>
           </template>
           <dt class="text-muted">
             Versioning

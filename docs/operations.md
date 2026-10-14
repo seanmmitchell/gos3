@@ -94,6 +94,7 @@ gos3 logs to stderr with Go's `log/slog`, as `text` (default) or `json`
     ├── uploads/<upload-id>/…    multipart parts in progress (fs backend)
     ├── tmp/                     files being written (cleaned at startup)
     ├── orphans/<time>-<id>/     unreferenced files moved aside at startup (fs backend)
+    ├── gateway/<backing>/       multipart upload records of gateway backings (docs/backings.md)
     ├── lock                     held by the running server
     ├── iam.json                 IAM users, keys, policies        (secret)
     ├── root-credentials.json    generated root keys, if any      (secret)
@@ -155,6 +156,16 @@ data, objects written after that backup are not destroyed: they land in
 `.gos3/orphans/` and can be recovered by hand until the retention (7 days)
 expires. Never delete `meta.db` to get past a "locked by another process"
 error: stop the other process instead.
+
+Buckets on [remote backings](backings.md) keep their bytes on the remote
+service. For **blob** backings the remote blobs are useless without
+`meta.db`: back up `meta.db` (and the rest of the directory) as above and
+protect the remote bucket with the remote service's own means (versioning,
+replication). Unreferenced blobs, such as those written after the backup a
+restored `meta.db` came from, are deleted at a later start once older than 7
+days. **Gateway** buckets hold ordinary objects that any S3 tool can back
+up; gos3 keeps only their bucket configuration and in-progress multipart
+uploads.
 
 **2. Object-level copy (portable).** Mirror buckets with any S3 tool, for
 example `rclone sync gos3:bucket backup:bucket` or

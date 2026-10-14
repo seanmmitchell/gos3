@@ -16,6 +16,7 @@ import (
 
 	"go.etcd.io/bbolt"
 
+	"github.com/seanmmitchell/gos3/internal/s3client"
 	"github.com/seanmmitchell/gos3/internal/storage"
 )
 
@@ -133,9 +134,11 @@ type partWriter struct {
 	key      string
 	uploadID string
 	number   int
+	rem      *remote // nil: local part file
 
 	mu   sync.Mutex
-	t    *tmpFile
+	t    *tmpFile        // local
+	sp   *s3client.Spool // remote
 	done bool
 }
 
@@ -148,7 +151,7 @@ func (b *Backend) NewPartWriter(ctx context.Context, bucket, key, uploadID strin
 	if err := b.begin(ctx); err != nil {
 		return nil, err
 	}
-	var id string
+	var id, backing string
 	err := b.view(func(tx *bbolt.Tx) error {
 		br, bb, err := loadBucket(tx, bucket)
 		if err != nil {
@@ -157,13 +160,23 @@ func (b *Backend) NewPartWriter(ctx context.Context, bucket, key, uploadID strin
 		if _, err := loadUpload(bb, key, uploadID); err != nil {
 			return err
 		}
-		id = br.ID
+		id, backing = br.ID, br.Backing
 		return nil
 	})
 	if err != nil {
 		return nil, err
 	}
-	return &partWriter{b: b, bucket: bucket, bucketID: id, key: key, uploadID: uploadID, number: partNumber, t: b.newTemp()}, nil
+	rem, err := b.remoteFor(backing)
+	if err != nil {
+		return nil, err
+	}
+	w := &partWriter{b: b, bucket: bucket, bucketID: id, key: key, uploadID: uploadID, number: partNumber, rem: rem}
+	if rem != nil {
+		w.sp = b.newSpool()
+	} else {
+		w.t = b.newTemp()
+	}
+	return w, nil
 }
 
 func (w *partWriter) Write(p []byte) (int, error) {
@@ -171,6 +184,9 @@ func (w *partWriter) Write(p []byte) (int, error) {
 	defer w.mu.Unlock()
 	if w.done {
 		return 0, errWriterDone
+	}
+	if w.sp != nil {
+		return w.sp.Write(p)
 	}
 	return w.t.Write(p)
 }
@@ -183,27 +199,49 @@ func (w *partWriter) Commit(ctx context.Context, meta storage.PartMeta) (storage
 	}
 	w.done = true
 	b := w.b
+	if w.sp != nil {
+		defer w.sp.Close()
+	}
 	if err := b.begin(ctx); err != nil {
-		w.t.discard()
+		if w.t != nil {
+			w.t.discard()
+		}
 		return storage.PartInfo{}, err
 	}
-	// Parts always get a file (even when empty) so completion can treat
-	// all parts alike.
-	if err := w.t.finish(b.fsync, true); err != nil {
-		return storage.PartInfo{}, err
-	}
+	// Parts always get a file or blob (even when empty) so completion can
+	// treat all parts alike.
 	file := partFileName(w.number)
-	path := b.partPath(w.uploadID, file)
-	b.pending.add(path)
-	defer b.pending.done(path)
-	if err := b.place(w.t.path, path); err != nil {
-		w.t.remove()
-		return storage.PartInfo{}, err
+	var path, blobKey string
+	var size int64
+	if w.sp != nil {
+		if err := w.sp.Finish(); err != nil {
+			return storage.PartInfo{}, fmt.Errorf("fs: spool part: %w", err)
+		}
+		size = w.sp.Size()
+		blobKey = w.rem.partKey(w.uploadID, file)
+		id := w.rem.blobID(blobKey)
+		b.pending.add(id)
+		defer b.pending.done(id)
+		if err := b.putBlob(ctx, w.rem, blobKey, w.sp, size); err != nil {
+			return storage.PartInfo{}, err
+		}
+	} else {
+		if err := w.t.finish(b.fsync, true); err != nil {
+			return storage.PartInfo{}, err
+		}
+		size = w.t.size
+		path = b.partPath(w.uploadID, file)
+		b.pending.add(path)
+		defer b.pending.done(path)
+		if err := b.place(w.t.path, path); err != nil {
+			w.t.remove()
+			return storage.PartInfo{}, err
+		}
 	}
 
 	rec := partRecord{
 		File:         file,
-		Size:         w.t.size,
+		Size:         size,
 		LastModified: time.Now().UTC(),
 		ETag:         meta.ETag,
 		Checksums:    maps.Clone(meta.Checksums),
@@ -238,6 +276,10 @@ func (w *partWriter) Commit(ctx context.Context, meta storage.PartMeta) (storage
 				"upload_id", w.uploadID, "part", w.number, "err", err)
 			return storage.PartInfo{}, err
 		}
+		if w.rem != nil {
+			b.removeBlob(w.rem, blobKey)
+			return storage.PartInfo{}, err
+		}
 		_ = os.Remove(path)
 		if errors.Is(err, storage.ErrUploadNotFound) || errors.Is(err, storage.ErrBucketNotFound) {
 			// The upload is gone; drop the directory we may have recreated.
@@ -245,7 +287,9 @@ func (w *partWriter) Commit(ctx context.Context, meta storage.PartMeta) (storage
 		}
 		return storage.PartInfo{}, err
 	}
-	if oldFile != "" && oldFile != file {
+	if oldFile != "" && oldFile != file && w.rem != nil {
+		b.removeBlob(w.rem, w.rem.partKey(w.uploadID, oldFile))
+	} else if oldFile != "" && oldFile != file {
 		if err := os.Remove(b.partPath(w.uploadID, oldFile)); err != nil && !errors.Is(err, iofs.ErrNotExist) {
 			b.log.Warn("fs: remove replaced part", "upload_id", w.uploadID, "part", w.number, "err", err)
 		}
@@ -262,6 +306,10 @@ func (w *partWriter) Abort() error {
 		return nil
 	}
 	w.done = true
+	if w.sp != nil {
+		_ = w.sp.Close()
+		return nil
+	}
 	w.t.discard()
 	return nil
 }
@@ -399,7 +447,9 @@ var errPartsChanged = errors.New("fs: multipart upload parts changed during comp
 // CompleteMultipartUpload concatenates the listed parts into a new object
 // version (committed like ObjectWriter.Commit) and removes the upload with
 // all its parts. If the commit fails (e.g. preconditions) the upload is
-// kept, so the client may retry.
+// kept, so the client may retry. On a remote blob backing the parts are
+// composed server-side where the service's multipart limits allow it (see
+// composeRemote).
 //
 // The commit transaction verifies that every listed part still refers to the
 // file that was copied; if a part was re-uploaded concurrently the
@@ -436,9 +486,9 @@ func (b *Backend) completeOnce(ctx context.Context, bucket, key, uploadID string
 	// part is still the same file, so a part replaced in between makes the
 	// next attempt see (and reject) its new ETag.
 	var (
-		bucketID string
-		files    []string
-		sizes    []int64
+		bucketID, backing string
+		files             []string
+		sizes             []int64
 	)
 	err := b.view(func(tx *bbolt.Tx) error {
 		files, sizes = files[:0], sizes[:0]
@@ -449,7 +499,7 @@ func (b *Backend) completeOnce(ctx context.Context, bucket, key, uploadID string
 		if _, err := loadUpload(bb, key, uploadID); err != nil {
 			return err
 		}
-		bucketID = br.ID
+		bucketID, backing = br.ID, br.Backing
 		parts := bb.Bucket(subParts)
 		for i, n := range partNumbers {
 			var v []byte
@@ -478,28 +528,57 @@ func (b *Backend) completeOnce(ctx context.Context, bucket, key, uploadID string
 	if err != nil {
 		return storage.ObjectInfo{}, err
 	}
-
-	t := b.newTemp()
-	for i, file := range files {
-		if err := b.appendPart(ctx, t, uploadID, file, sizes[i], partNumbers[i]); err != nil {
-			t.discard()
-			if errors.Is(err, errPartsChanged) {
-				// The part file vanished: the part was replaced (retry) or
-				// the upload was aborted or completed concurrently (report
-				// that instead).
-				if _, gerr := b.GetMultipartUpload(ctx, bucket, key, uploadID); gerr != nil {
-					return storage.ObjectInfo{}, gerr
-				}
-			}
-			return storage.ObjectInfo{}, err
-		}
-	}
-	dataID, path, err := b.finishData(t, bucketID)
+	rem, err := b.remoteFor(backing)
 	if err != nil {
 		return storage.ObjectInfo{}, err
 	}
-	if path != "" {
-		defer b.pending.done(path)
+	// partsGone handles a part that vanished while its data was copied: the
+	// part was replaced (retry) or the upload was aborted or completed
+	// concurrently (report that instead).
+	partsGone := func(err error) error {
+		if errors.Is(err, errPartsChanged) {
+			if _, gerr := b.GetMultipartUpload(ctx, bucket, key, uploadID); gerr != nil {
+				return gerr
+			}
+		}
+		return err
+	}
+
+	var (
+		dataID string
+		size   int64
+	)
+	if rem != nil {
+		for _, s := range sizes {
+			size += s
+		}
+		if size > 0 {
+			dataID = randomHex(16)
+			dst := rem.dataKey(bucketID, dataID)
+			id := rem.blobID(dst)
+			b.pending.add(id)
+			defer b.pending.done(id)
+			if err := b.composeRemote(ctx, rem, dst, uploadID, files, sizes, partNumbers); err != nil {
+				return storage.ObjectInfo{}, partsGone(err)
+			}
+		}
+	} else {
+		t := b.newTemp()
+		for i, file := range files {
+			if err := b.appendPart(ctx, t, uploadID, file, sizes[i], partNumbers[i]); err != nil {
+				t.discard()
+				return storage.ObjectInfo{}, partsGone(err)
+			}
+		}
+		var path string
+		dataID, path, err = b.finishData(t, bucketID)
+		if err != nil {
+			return storage.ObjectInfo{}, err
+		}
+		if path != "" {
+			defer b.pending.done(path)
+		}
+		size = t.size
 	}
 	if afterPartsCopied != nil {
 		afterPartsCopied(uploadID)
@@ -507,9 +586,10 @@ func (b *Backend) completeOnce(ctx context.Context, bucket, key, uploadID string
 	info, err := b.commitObject(commitReq{
 		bucket:   bucket,
 		bucketID: bucketID,
+		rem:      rem,
 		key:      key,
 		dataID:   dataID,
-		size:     t.size,
+		size:     size,
 		meta:     cloneMeta(meta),
 		opts:     opts,
 		pre: func(tx *bbolt.Tx, bb *bbolt.Bucket) error {
@@ -537,7 +617,7 @@ func (b *Backend) completeOnce(ctx context.Context, bucket, key, uploadID string
 	if err != nil {
 		return storage.ObjectInfo{}, err
 	}
-	b.removeUploadDir(uploadID)
+	b.removeUploadData(backing, uploadID)
 	return info, nil
 }
 
@@ -581,11 +661,13 @@ func (b *Backend) AbortMultipartUpload(ctx context.Context, bucket, key, uploadI
 	if err := b.begin(ctx); err != nil {
 		return err
 	}
+	var backing string
 	err := b.update(func(tx *bbolt.Tx) error {
-		_, bb, err := loadBucket(tx, bucket)
+		br, bb, err := loadBucket(tx, bucket)
 		if err != nil {
 			return err
 		}
+		backing = br.Backing
 		up, err := loadUpload(bb, key, uploadID)
 		if err != nil {
 			return err
@@ -595,6 +677,6 @@ func (b *Backend) AbortMultipartUpload(ctx context.Context, bucket, key, uploadI
 	if err != nil {
 		return err
 	}
-	b.removeUploadDir(uploadID)
+	b.removeUploadData(backing, uploadID)
 	return nil
 }

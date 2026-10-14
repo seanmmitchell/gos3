@@ -41,6 +41,8 @@ var envVars = []EnvVar{
 	{"GOS3_DATA", "storage.path", "data directory", str(func(c *Config) *string { return &c.Storage.Path })},
 	{"GOS3_STORAGE_BACKEND", "storage.backend", "fs or memory", str(func(c *Config) *string { return &c.Storage.Backend })},
 	{"GOS3_FSYNC", "storage.fsync_data", "fsync object data on commit (bool)", boolean(func(c *Config) *bool { return &c.Storage.FsyncData })},
+	{"GOS3_STORAGE_BACKINGS", "storage.backings", "remote S3 backings, a JSON array of backing objects (see docs/backings.md)", backings},
+	{"GOS3_DEFAULT_BACKING", "storage.default_backing", "backing of new buckets without an explicit choice (\"local\" = own storage)", str(func(c *Config) *string { return &c.Storage.DefaultBacking })},
 	{"GOS3_ROOT_ACCESS_KEY", "auth.root_access_key", "root access key", str(func(c *Config) *string { return &c.Auth.RootAccessKey })},
 	{"GOS3_ROOT_SECRET_KEY", "auth.root_secret_key", "root secret key", str(func(c *Config) *string { return &c.Auth.RootSecretKey })},
 	{"GOS3_STRICT_REGION", "auth.strict_region", "reject signatures for other regions (bool)", boolean(func(c *Config) *bool { return &c.Auth.StrictRegion })},

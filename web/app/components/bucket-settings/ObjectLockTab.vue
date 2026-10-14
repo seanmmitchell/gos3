@@ -1,13 +1,18 @@
 <script setup lang="ts">
 import type { ObjectLockConfiguration, ObjectLockMode, VersioningStatus } from '~/types/s3'
+import { S3Error } from '~/utils/s3/errors'
 
 /**
  * Object lock (?object-lock): status, enabling on a versioned bucket
- * (irreversible) and the default retention (mode + days or years).
+ * (irreversible) and the default retention (mode + days or years). Buckets
+ * on a gos3 gateway backing (`unsupported`) and servers answering
+ * NotImplemented get an explanation instead.
  */
 const props = defineProps<{
   bucket: string
   versioning: VersioningStatus | null
+  /** The bucket's storage cannot lock objects (gos3 gateway backing). */
+  unsupported?: boolean
 }>()
 const emit = defineEmits<{ changed: [] }>()
 
@@ -20,8 +25,18 @@ const amount = ref<number | null>(30)
 const original = ref('')
 const submitted = ref(false)
 
+/** The server answered NotImplemented for this bucket. */
+const notImplemented = ref(false)
+
 const loader = useLoader(async () => {
-  const cfg = await requireS3().getObjectLockConfiguration(props.bucket)
+  notImplemented.value = false
+  const cfg = await requireS3().getObjectLockConfiguration(props.bucket).catch((e: unknown) => {
+    if (e instanceof S3Error && (e.code === 'NotImplemented' || e.status === 501)) {
+      notImplemented.value = true
+      return null
+    }
+    throw e
+  })
   const dr = cfg?.rule?.defaultRetention
   retention.value = dr?.mode ?? 'none'
   unit.value = dr?.years !== undefined ? 'years' : 'days'
@@ -32,6 +47,7 @@ const loader = useLoader(async () => {
 }, { watch: [() => props.bucket] })
 
 const enabled = computed(() => !!loader.data.value?.enabled)
+const unavailable = computed(() => props.unsupported || notImplemented.value)
 
 function signature(): string {
   return JSON.stringify(retention.value === 'none' ? ['none'] : [retention.value, unit.value, amount.value])
@@ -111,10 +127,25 @@ async function onSave() {
             Write-once-read-many (WORM) protection for object versions.
           </p>
         </div>
-        <UBadge :label="enabled ? 'Enabled' : 'Disabled'" :color="enabled ? 'primary' : 'neutral'" variant="subtle" :icon="enabled ? 'i-lucide-shield-check' : undefined" />
+        <UBadge
+          :label="enabled ? 'Enabled' : unavailable ? 'Not supported' : 'Disabled'"
+          :color="enabled ? 'primary' : 'neutral'"
+          variant="subtle"
+          :icon="enabled ? 'i-lucide-shield-check' : undefined"
+        />
       </div>
     </template>
-    <CommonErrorAlert v-if="loader.error.value" :error="loader.error.value" title="Could not load object lock configuration" retryable @retry="loader.refresh" />
+    <UAlert
+      v-if="unavailable && !enabled"
+      color="neutral"
+      variant="subtle"
+      :icon="unsupported ? 'i-lucide-cloud-cog' : 'i-lucide-info'"
+      :title="unsupported ? 'Not available on a gateway backing' : 'Not supported'"
+      :description="unsupported
+        ? 'This bucket’s objects are stored directly in a remote S3 service, which gos3 cannot lock. Object lock cannot be enabled.'
+        : 'This server does not support object lock for this bucket.'"
+    />
+    <CommonErrorAlert v-else-if="loader.error.value" :error="loader.error.value" title="Could not load object lock configuration" retryable @retry="loader.refresh" />
     <USkeleton v-else-if="loader.loading.value && !original" class="h-32 w-full" />
     <div v-else-if="!enabled" class="space-y-4">
       <p class="text-sm text-muted">

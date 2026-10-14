@@ -24,7 +24,8 @@ export const NO_CAPS: Readonly<Capabilities> = Object.freeze({
   discovery: false,
   scan: false,
   probe: false,
-  createOwnKeys: false
+  createOwnKeys: false,
+  listBackings: false
 })
 
 /** True when the connection is gos3 and the identity has `cap`. */

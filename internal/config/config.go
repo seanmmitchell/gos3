@@ -76,6 +76,48 @@ type StorageConfig struct {
 	Path string `yaml:"path"` // default "./data" for fs, "" (ephemeral) for memory
 	// FsyncData controls fsync of object data files on commit (default true).
 	FsyncData bool `yaml:"fsync_data"`
+	// Backings are remote S3 services that can hold the data of individual
+	// buckets, chosen per bucket at creation (see docs/backings.md).
+	Backings []BackingConfig `yaml:"backings"`
+	// DefaultBacking names the backing of buckets created without an
+	// explicit choice ("" or "local" = the server's own storage).
+	DefaultBacking string `yaml:"default_backing"`
+}
+
+// BackingConfig describes one remote S3 service buckets can be stored on.
+type BackingConfig struct {
+	// Name identifies the backing in bucket records and in the
+	// x-gos3-backing header: 1-32 lowercase letters, digits and '-'
+	// ("local" is reserved for the server's own storage).
+	Name string `yaml:"name" json:"name"`
+	// Mode is BackingModeBlob (object data stored as opaque blobs; all
+	// metadata stays local, every gos3 feature works) or BackingModeGateway
+	// (objects stored natively, readable by other S3 clients; no
+	// versioning or object lock).
+	Mode string `yaml:"mode" json:"mode"`
+	// Endpoint is the service URL, http(s)://host[:port] (no path).
+	Endpoint string `yaml:"endpoint" json:"endpoint"`
+	// Region is the signing region (default us-east-1).
+	Region string `yaml:"region" json:"region"`
+	// Bucket is the remote bucket. Required in blob mode. In gateway mode
+	// it is optional: when set, every gos3 bucket is a key prefix
+	// "<prefix><bucket>/" in it; when empty, every gos3 bucket maps to the
+	// remote bucket of the same name (created when missing).
+	Bucket string `yaml:"bucket" json:"bucket"`
+	// Prefix is prepended to every remote key (e.g. "gos3/").
+	Prefix string `yaml:"prefix" json:"prefix"`
+	// AccessKey / SecretKey authenticate to the service. When empty they
+	// are read from GOS3_BACKING_<NAME>_ACCESS_KEY / _SECRET_KEY (NAME
+	// upper-cased, '-' as '_').
+	AccessKey string `yaml:"access_key" json:"accessKey"`
+	SecretKey string `yaml:"secret_key" json:"secretKey"`
+	// Addressing is "path" (<endpoint>/<bucket>/<key>), "virtual"
+	// (<bucket>.<host>/<key>) or "auto"/"" (virtual for amazonaws.com
+	// endpoints, path otherwise).
+	Addressing string `yaml:"addressing" json:"addressing"`
+	// PartSize is the multipart part size for uploads to the service and
+	// the largest object sent with one PUT (default 16 MiB, minimum 5 MiB).
+	PartSize int64 `yaml:"part_size" json:"partSize"`
 }
 
 // AuthConfig holds root credentials and signature options.

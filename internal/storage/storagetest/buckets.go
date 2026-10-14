@@ -395,7 +395,9 @@ func testBucketVersioning(e *env) {
 
 func testBucketObjectLock(e *env) {
 	e.mkVersioned("lock", storage.VersioningEnabled)
-	e.noErr("SetBucketObjectLock", e.b.SetBucketObjectLock(e.ctx, "lock", true))
+	err := e.b.SetBucketObjectLock(e.ctx, "lock", true)
+	e.skipIfNotSupported(err)
+	e.noErr("SetBucketObjectLock", err)
 	got, err := e.b.GetBucket(e.ctx, "lock")
 	e.noErr("GetBucket", err)
 	if !got.ObjectLockEnabled || got.Versioning != storage.VersioningEnabled {

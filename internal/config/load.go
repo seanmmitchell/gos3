@@ -61,7 +61,7 @@ var DefaultExposeHeaders = []string{
 	"x-amz-server-side-encryption", "x-amz-object-lock-mode",
 	"x-amz-object-lock-retain-until-date", "x-amz-object-lock-legal-hold",
 	"x-amz-expiration", "x-amz-restore", "x-amz-website-redirect-location",
-	"x-amz-abort-date", "x-amz-abort-rule-id",
+	"x-amz-abort-date", "x-amz-abort-rule-id", "x-amz-bucket-region", "x-gos3-backing",
 }
 
 // Default returns the default configuration. Name defaults to the host name
@@ -145,6 +145,7 @@ func load(path string, lookup func(string) (string, bool), overrides []Override)
 			return Config{}, fmt.Errorf("config: %w", err)
 		}
 	}
+	cfg.applyBackingCredentials(lookup)
 	cfg.Normalize()
 	return cfg, nil
 }
@@ -216,6 +217,7 @@ func (c *Config) Normalize() {
 	if c.Storage.Backend == BackendFS && c.Storage.Path == "" {
 		c.Storage.Path = DefaultDataPath
 	}
+	c.normalizeBackings()
 	if c.Server.Region == "" {
 		c.Server.Region = DefaultRegion
 	}
@@ -284,6 +286,9 @@ func (c Config) Validate() error {
 	case BackendMemory:
 	default:
 		return fmt.Errorf("storage.backend: %q is invalid (expected fs or memory)", c.Storage.Backend)
+	}
+	if err := c.validateBackings(); err != nil {
+		return err
 	}
 	if err := validateRootCredentials(c.Auth.RootAccessKey, c.Auth.RootSecretKey); err != nil {
 		return err
@@ -451,11 +456,17 @@ func (c Config) TLSEnabled() bool { return c.Server.TLSCert != "" }
 // RedactedValue is the placeholder Config.Redacted substitutes for secrets.
 const RedactedValue = "<redacted>"
 
-// Redacted returns a deep copy with secrets (the root secret key) replaced
-// by "<redacted>", for printing and logging.
+// Redacted returns a deep copy with secrets (the root and backing secret
+// keys) replaced by "<redacted>", for printing and logging.
 func (c Config) Redacted() Config {
 	if c.Auth.RootSecretKey != "" {
 		c.Auth.RootSecretKey = RedactedValue
+	}
+	c.Storage.Backings = slices.Clone(c.Storage.Backings)
+	for i := range c.Storage.Backings {
+		if c.Storage.Backings[i].SecretKey != "" {
+			c.Storage.Backings[i].SecretKey = RedactedValue
+		}
 	}
 	c.Server.Domains = slices.Clone(c.Server.Domains)
 	c.Server.TrustedProxies = slices.Clone(c.Server.TrustedProxies)

@@ -20,15 +20,20 @@ const aclPrivate = "private"
 
 // bucketSummary is the BucketSummary document of docs/admin-api.md.
 type bucketSummary struct {
-	Name       string           `json:"name"`
-	CreatedAt  time.Time        `json:"createdAt"`
-	Region     string           `json:"region"`
-	Versioning string           `json:"versioning"`
-	ObjectLock bool             `json:"objectLock"`
-	Owner      string           `json:"owner"`
-	Configs    bucketConfigs    `json:"configs"`
-	Public     bool             `json:"public"`
-	Usage      *bucketUsageJSON `json:"usage"`
+	Name       string    `json:"name"`
+	CreatedAt  time.Time `json:"createdAt"`
+	Region     string    `json:"region"`
+	Versioning string    `json:"versioning"`
+	ObjectLock bool      `json:"objectLock"`
+	Owner      string    `json:"owner"`
+	// Backing is the backing holding the bucket's data ("local" = the
+	// server's own storage) and BackingMode its mode ("local", "blob",
+	// "gateway", or "" when the backing is not configured any more).
+	Backing     string           `json:"backing"`
+	BackingMode string           `json:"backingMode"`
+	Configs     bucketConfigs    `json:"configs"`
+	Public      bool             `json:"public"`
+	Usage       *bucketUsageJSON `json:"usage"`
 }
 
 // bucketConfigs flags which configuration documents a bucket has.
@@ -115,7 +120,9 @@ func (a *api) summarize(rc *reqCtx, info storage.BucketInfo, withUsage bool) (*b
 		Versioning: string(info.Versioning),
 		ObjectLock: info.ObjectLockEnabled,
 		Owner:      info.Owner,
+		Backing:    backingName(info.Backing),
 	}
+	s.BackingMode = a.backingMode(s.Backing)
 	if s.Owner == "" {
 		s.Owner = auth.RootUser
 	}

@@ -118,6 +118,9 @@ type bucketRecord struct {
 	Versioning        storage.VersioningStatus `json:"versioning,omitempty"`
 	ObjectLockEnabled bool                     `json:"objectLock,omitempty"`
 	Owner             string                   `json:"owner,omitempty"`
+	// Backing names the backing holding the bucket's data ("" = local
+	// files; see Options.Remotes).
+	Backing string `json:"backing,omitempty"`
 }
 
 func (r *bucketRecord) info(name string) storage.BucketInfo {
@@ -128,6 +131,7 @@ func (r *bucketRecord) info(name string) storage.BucketInfo {
 		Versioning:        r.Versioning,
 		ObjectLockEnabled: r.ObjectLockEnabled,
 		Owner:             r.Owner,
+		Backing:           r.Backing,
 	}
 }
 

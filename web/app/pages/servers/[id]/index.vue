@@ -14,7 +14,7 @@ const REFRESH_MS = 10_000
 const route = useRoute()
 const id = computed(() => routeParam(route.params.id))
 const { connection, requireS3, requireAdmin, status } = useConnection()
-const { capabilities, whoami, loading: whoamiLoading } = useWhoAmI()
+const { capabilities, whoami, loading: whoamiLoading, can } = useWhoAmI()
 const { info, serverInfo, error: infoError, refresh: refreshInfo } = useServerInfo()
 
 useHead({ title: () => `${connection.value?.name ?? 'Server'} · Overview` })
@@ -119,6 +119,9 @@ const identityRows = computed(() => {
   }
   return rows
 })
+
+// Storage backings, when the server offers more than its own storage.
+const backings = computed(() => (backingChoices(whoami.value?.backings).length ? whoami.value?.backings ?? null : null))
 
 const endpoints = computed(() => {
   const e = info.value?.endpoints
@@ -234,6 +237,12 @@ const storageCards = computed(() => {
             <div class="flex flex-wrap gap-1.5">
               <UBadge v-for="f in info.features" :key="f" :label="f" color="neutral" variant="subtle" size="sm" />
             </div>
+          </div>
+          <div v-if="backings">
+            <h3 class="mb-2 text-xs font-medium uppercase tracking-wide text-muted">
+              Storage backings
+            </h3>
+            <AdminBackingsList :backings="backings" :can-list="can('listBackings')" />
           </div>
         </div>
       </div>

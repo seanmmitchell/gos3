@@ -127,6 +127,12 @@ describe('AdminClient', () => {
     expect((await admin.listPolicies())[0]!.builtin).toBe(true)
   })
 
+  it('lists storage backings (null list tolerated)', async () => {
+    const { admin, calls } = makeAdmin(() => json({ default: 'aws', backings: null }))
+    expect(await admin.listBackings()).toEqual({ default: 'aws', backings: [] })
+    expect(calls[0]!).toMatchObject({ method: 'GET', url: 'http://localhost:9000/_gos3/admin/v1/backings' })
+  })
+
   it('deletes buckets with force', async () => {
     const { admin, calls } = makeAdmin(() => new Response(null, { status: 204 }))
     await admin.deleteBucket('photos', { force: true })

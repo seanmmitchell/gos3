@@ -1,0 +1,65 @@
+package gateway_test
+
+import (
+	"maps"
+	"testing"
+
+	"github.com/seanmmitchell/gos3/internal/s3client/s3clienttest"
+	"github.com/seanmmitchell/gos3/internal/storage"
+	"github.com/seanmmitchell/gos3/internal/storage/gateway"
+	"github.com/seanmmitchell/gos3/internal/storage/memory"
+	"github.com/seanmmitchell/gos3/internal/storage/routed"
+	"github.com/seanmmitchell/gos3/internal/storage/storagetest"
+)
+
+// newRouted returns a router whose default backing "gw" is a gateway
+// store over a fresh in-process remote.
+func newRouted(t *testing.T, shared bool) storage.Backend {
+	r := s3clienttest.Start(t)
+	opts := gateway.Options{Name: "gw", Client: r.Client(t), StateDir: t.TempDir()}
+	if shared {
+		r.CreateBucket(t, "shared")
+		opts.Bucket, opts.Prefix = "shared", "pfx/"
+	}
+	st, err := gateway.Open(opts)
+	if err != nil {
+		t.Fatalf("gateway.Open: %v", err)
+	}
+	rb := routed.New(routed.Options{
+		Primary: memory.New(),
+		Stores:  map[string]routed.DataStore{"gw": st},
+		Default: "gw",
+	})
+	if shared {
+		return renamed{b: rb}
+	}
+	return renamed{b: rb, prefix: "gw-"}
+}
+
+// gatewaySkips are the conformance subtests a gateway cannot pass for
+// fundamental reasons (see the package documentation).
+var gatewaySkips = map[string]string{
+	// Walks report what ListObjectsV2 returns (key, size, remote ETag,
+	// time, storage class): user metadata, tags, checksums etc. would need
+	// a HEAD per listed object. HEAD/GET round trips of the same metadata
+	// are covered by TestMetadataRoundTrip.
+	"Objects/MetadataRoundTrip": "gateway listings carry only ListObjectsV2 metadata",
+	// Without remote versioning the replaced content is gone: the reader
+	// fails with an error once it has to issue a new request (Seek).
+	"Objects/ReaderSurvivesOverwrite/Unversioned": "a gateway reader cannot re-read content replaced on the remote",
+}
+
+func TestConformancePerBucket(t *testing.T) {
+	storagetest.RunWithOptions(t, func(t *testing.T) storage.Backend { return newRouted(t, false) },
+		storagetest.Options{Skip: gatewaySkips})
+}
+
+func TestConformanceShared(t *testing.T) {
+	skips := maps.Clone(gatewaySkips)
+	// The suite stores 1024-byte keys; in shared mode the remote key also
+	// holds the prefix and the bucket name, beyond S3's 1024-byte limit
+	// (such keys are rejected with storage.ErrInvalidName).
+	skips["Objects/Keys"] = "remote keys hold the prefix and bucket name, so gos3 keys are shorter than 1024 bytes"
+	storagetest.RunWithOptions(t, func(t *testing.T) storage.Backend { return newRouted(t, true) },
+		storagetest.Options{Skip: skips})
+}

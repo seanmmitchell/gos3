@@ -170,6 +170,23 @@ describe('S3Client requests', () => {
     expect(calls[0]!.body).toContain('<LocationConstraint>eu-west-1</LocationConstraint>')
   })
 
+  it('sends the gos3 storage backing as a signed header only when given', async () => {
+    const { client, calls } = makeClient(() => new Response(null, { status: 200 }))
+    await client.createBucket('remote', { backing: 'aws' })
+    expect(calls[0]!.headers['x-gos3-backing']).toBe('aws')
+    expect(calls[0]!.headers.authorization).toMatch(/SignedHeaders=[^,]*;x-gos3-backing[;,]/)
+    await client.createBucket('plain')
+    expect(calls[1]!.headers).not.toHaveProperty('x-gos3-backing')
+    expect(calls[1]!.headers.authorization).not.toContain('x-gos3-backing')
+  })
+
+  it('reports the bucket region and gos3 backing from HeadBucket', async () => {
+    const { client } = makeClient(() => new Response(null, { status: 200, headers: { 'x-amz-bucket-region': 'eu-west-1', 'x-gos3-backing': 'archive' } }))
+    expect(await client.headBucket('b')).toEqual({ region: 'eu-west-1', backing: 'archive' })
+    const plain = makeClient(() => new Response(null, { status: 200 }))
+    expect(await plain.client.headBucket('b')).toEqual({ region: undefined, backing: undefined })
+  })
+
   it('deleteObjects batches by 1000 with Content-MD5', async () => {
     const { client, calls } = makeClient(req => {
       const keys = [...req.body.matchAll(/<Key>(.*?)<\/Key>/g)].map(m => m[1])

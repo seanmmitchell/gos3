@@ -124,9 +124,15 @@ Non-2xx responses: `{"error": {"code": "<Code>", "message": "<text>"}}`.
     "discovery": false,       // admin:GetDiscovery
     "scan": false,            // admin:ScanNetwork
     "probe": false,           // admin:ProbeNetwork
-    "createOwnKeys": false    // admin:CreateOwnAccessKey explicitly allowed (always false for root)
+    "createOwnKeys": false,   // admin:CreateOwnAccessKey explicitly allowed (always false for root)
+    "listBackings": false     // admin:ListBackings
   },
-  "server": Info              // same as GET /_gos3/info
+  "server": Info,             // same as GET /_gos3/info
+  "backings": {               // storage backings a new bucket can be put on (x-gos3-backing),
+                              // shown to every caller; details: GET /backings
+    "default": "local",
+    "available": [ { "name": "local", "mode": "local" }, { "name": "cold", "mode": "blob" } ]
+  }
 }
 ```
 
@@ -137,6 +143,7 @@ Non-2xx responses: `{"error": {"code": "<Code>", "message": "<text>"}}`.
 | GET | `/stats` | GetStats | `Stats` |
 | GET | `/config` | GetConfig | `config.Settings` |
 | PUT | `/config` | UpdateConfig | body full `config.Settings` → updated `config.Settings` (400 `InvalidSettings` with message on validation failure) |
+| GET | `/backings` | ListBackings | `{"default": "local", "backings": Backing[]}` — the storage backings buckets can be created on, `local` first (see [backings.md](backings.md)); `Backing` = `{"name", "mode": "local"\|"blob"\|"gateway", "endpoint", "region", "bucket", "prefix"}`, never credentials |
 
 ```jsonc
 // ServerInfo = Info (see docs/discovery.md) plus:
@@ -248,6 +255,8 @@ environment and flags for these fields.
   "versioning": "Enabled" | "Suspended" | "", "objectLock": false, "owner": "alice",
   "configs": { "policy": true, "cors": false, "lifecycle": true, "tagging": false,
                "encryption": false, "website": false, "objectLock": false, "acl": "private" },
+  "backing": "local",       // backing holding the data ("local" = own storage, see backings.md)
+  "backingMode": "local",   // "local" | "blob" | "gateway" | "" (backing no longer configured)
   "public": false,          // bucket policy grants anonymous access or ACL public-*
   "usage": storage.BucketUsage | null }  // {"objects","bytes","versions","versionBytes","deleteMarkers","pendingUploads"}
 ```

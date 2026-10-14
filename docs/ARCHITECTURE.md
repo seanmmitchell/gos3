@@ -33,6 +33,9 @@ discovery of gos3 servers on the network.
 | `internal/storage/memory/` | in-memory backend | storage-memory |
 | `internal/storage/fs/` | filesystem backend (bbolt index + data files) | storage-fs |
 | `internal/storage/storagetest/` | backend conformance suite | storage-conformance |
+| `internal/storage/routed/` | backing router: places each bucket's objects on its backing (`DataStore` contract) | backings |
+| `internal/storage/gateway/` | gateway backing: objects stored natively in a remote S3 service | backings |
+| `internal/s3client/` | minimal SigV4 S3 client for remote backings (+ `s3clienttest` in-process remote) | backings |
 | `internal/auth/` | SigV4 verification, aws-chunked decoding, POST policy, client signer | auth |
 | `internal/iam/` | users, keys, policies, bucket policy parsing, authorization engine | iam |
 | `internal/s3/` | S3 HTTP layer (see file ownership below) | s3-core + s3-* |
@@ -211,6 +214,20 @@ See the doc comments in `storage.go`. Key points:
   reports an error after the transaction itself succeeded (e.g. an fsync
   error), the new data or part file is kept rather than deleted, because the
   commit may have persisted; the client still gets an error.
+- `fs` blob mode: a bucket whose `Backing` names one of `fs.Options.Remotes`
+  (`fs.RemoteStore`: client, remote bucket, prefix) keeps all its metadata
+  in `meta.db` but stores object data as `<prefix>data/<bucket-id>/<id>` and
+  parts as `<prefix>uploads/<upload-id>/<part>` blobs in the remote bucket
+  (written through an `s3client.Spool` in `tmp/`, uploaded before the
+  metadata commit). CompleteMultipartUpload composes server-side
+  (UploadPartCopy) when all parts but the last are >= 5 MiB, else streams.
+  Readers are lazy ranged GETs; open readers are refcounted per blob and the
+  delete of a superseded blob is deferred until the last one closes. Other
+  non-empty backings make data operations fail with
+  `storage.ErrBackingUnavailable` (also used for unreachable/5xx remotes).
+  Recovery deletes unreferenced remote blobs (never pending, held or
+  unrecognized keys) once older than `OrphanRetention`, and `Open` refuses
+  an empty `meta.db` while a remote holds blobs.
 - `fs` recovery (startup): cleans `tmp/`; unreferenced data files, part
   files, bucket directories and upload directories are **moved**, not
   deleted, to `<root>/.gos3/orphans/<UTC yyyymmddThhmmssZ>-<8 hex>/`
@@ -228,6 +245,21 @@ See the doc comments in `storage.go`. Key points:
   walk (both backends). The lifecycle worker skips a key whose walk reports
   more than one latest version until the next pass.
 - `memory` keeps everything in maps guarded by RW mutexes.
+- Backings ([`docs/backings.md`](backings.md)): the server always wraps the
+  primary backend (fs or memory) in `routed.Backend`. Every bucket record
+  and configuration document lives in the primary; a bucket's
+  `BucketInfo.Backing` (set at CreateBucket from the `x-gos3-backing`
+  header or `storage.default_backing`, never changed) decides where its
+  objects and uploads go: `""` (local) and the fs backend's **blob**
+  backings (`fs.Options.Remotes`: data files and parts as blobs in a remote
+  bucket, metadata in `meta.db`) are handled by the primary; **gateway**
+  backings are `routed.DataStore`s (`internal/storage/gateway`) that store
+  native remote objects and keep only multipart upload records in
+  `<data>/.gos3/gateway/<name>/`. Gateway buckets are unversioned
+  (`storage.ErrNotSupported` → 501). Unknown names at creation are
+  `storage.ErrInvalidBacking` (400); remote failures and buckets whose
+  backing was removed from the configuration are
+  `storage.ErrBackingUnavailable` (503).
 - `list.go` turns `WalkObjects`/`WalkVersions` into S3 listings (prefix,
   delimiter grouping, markers, truncation). When a common prefix `p` is found
   it restarts the walk after `p + "\xff"` (UTF-8 never contains 0xFF) so huge

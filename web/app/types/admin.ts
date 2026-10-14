@@ -87,6 +87,11 @@ export interface Capabilities {
    * explicitly denied: use canCreateOwnKeys(), which then assumes allowed.
    */
   createOwnKeys?: boolean
+  /**
+   * admin:ListBackings (GET /backings, with endpoints). Absent from servers
+   * that predate storage backings.
+   */
+  listBackings?: boolean
 }
 
 export type CapabilityName = keyof Capabilities
@@ -98,6 +103,56 @@ export interface WhoAmI {
   policies: string[]
   capabilities: Capabilities
   server: Info
+  /**
+   * Storage backings new buckets can be created on (every authenticated
+   * caller). Absent from servers that predate storage backings.
+   */
+  backings?: BackingChoices
+}
+
+// ---------------------------------------------------------------------------
+// Storage backings
+// ---------------------------------------------------------------------------
+
+/**
+ * Where a bucket's data lives:
+ * - local:   the server's own storage
+ * - blob:    opaque blobs in a remote S3 bucket (every gos3 feature works)
+ * - gateway: objects stored natively in a remote S3 service (no versioning,
+ *            no object lock)
+ */
+export type BackingMode = 'local' | 'blob' | 'gateway'
+
+/** A backing name and its mode (WhoAmI.backings.available). */
+export interface BackingRef {
+  /** "local" for the server's own storage, else a configured backing name. */
+  name: string
+  mode: BackingMode
+}
+
+/** WhoAmI.backings: the choices for CreateBucket's x-gos3-backing header. */
+export interface BackingChoices {
+  /** Backing used when CreateBucket names none. */
+  default: string
+  /** Always contains "local" first. */
+  available: BackingRef[]
+}
+
+/** A configured backing as listed by GET /backings (no secrets). */
+export interface Backing extends BackingRef {
+  /** Remote S3 endpoint (remote modes only). */
+  endpoint?: string
+  region?: string
+  /** Remote bucket ("" for gateway mode: one remote bucket per gos3 bucket). */
+  bucket?: string
+  /** Key prefix inside the remote bucket(s). */
+  prefix?: string
+}
+
+/** GET /backings */
+export interface BackingList {
+  default: string
+  backings: Backing[] | null
 }
 
 // ---------------------------------------------------------------------------
@@ -415,6 +470,10 @@ export interface BucketSummary {
   /** Bucket policy grants anonymous access or ACL public-*. */
   public: boolean
   usage: BucketUsage | null
+  /** Storage backing name ("local" = own storage). Absent from older servers. */
+  backing?: string
+  /** Mode of `backing`. Absent from older servers. */
+  backingMode?: BackingMode
 }
 
 // ---------------------------------------------------------------------------

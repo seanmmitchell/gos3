@@ -15,6 +15,7 @@ import type {
   AccessKey,
   AccessKeyStatus,
   AdminErrorCode,
+  BackingList,
   BucketSummary,
   CreateAccessKeyRequest,
   CreateUserRequest,
@@ -452,6 +453,14 @@ export class AdminClient {
   /** force=true deletes all versions, uploads and configs first. */
   deleteBucket(name: string, opts: { force?: boolean } = {}): Promise<void> {
     return this.request('DELETE', `/buckets/${enc(name)}`, { query: { force: opts.force ? 'true' : undefined }, expect: 'none' })
+  }
+
+  // Storage backings -------------------------------------------------------
+
+  /** Configured storage backings (admin:ListBackings; no secrets). */
+  async listBackings(signal?: AbortSignal): Promise<BackingList> {
+    const r = await this.request<BackingList>('GET', '/backings', { signal })
+    return { default: r.default, backings: r.backings ?? [] }
   }
 
   // Discovery --------------------------------------------------------------

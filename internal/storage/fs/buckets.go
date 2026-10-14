@@ -77,6 +77,7 @@ func (b *Backend) CreateBucket(ctx context.Context, name string, opts storage.Cr
 			Region:            opts.Region,
 			ObjectLockEnabled: opts.ObjectLockEnabled,
 			Owner:             opts.Owner,
+			Backing:           opts.Backing,
 		}
 		if opts.ObjectLockEnabled {
 			rec.Versioning = storage.VersioningEnabled
@@ -103,15 +104,15 @@ func (b *Backend) GetBucket(ctx context.Context, name string) (storage.BucketInf
 }
 
 // DeleteBucket removes an empty bucket, its configuration documents and its
-// data directory. In-progress multipart uploads do not count: they are
+// data directory (or its remaining blobs on a remote backing). In-progress multipart uploads do not count: they are
 // aborted along with the bucket and their part directories removed.
 func (b *Backend) DeleteBucket(ctx context.Context, name string) error {
 	if err := b.begin(ctx); err != nil {
 		return err
 	}
 	var (
-		id      string
-		uploads []string
+		id, backing string
+		uploads     []string
 	)
 	err := b.update(func(tx *bbolt.Tx) error {
 		uploads = nil
@@ -131,7 +132,7 @@ func (b *Backend) DeleteBucket(ctx context.Context, name string) error {
 		}); err != nil {
 			return err
 		}
-		id = rec.ID
+		id, backing = rec.ID, rec.Backing
 		if err := tx.DeleteBucket(bucketDataName(rec.ID)); err != nil {
 			return err
 		}
@@ -141,7 +142,15 @@ func (b *Backend) DeleteBucket(ctx context.Context, name string) error {
 		return err
 	}
 	for _, u := range uploads {
-		b.removeUploadDir(u)
+		b.removeUploadData(backing, u)
+	}
+	if backing != "" {
+		// Blobs left by indeterminate commits; those still held by readers
+		// of deleted versions are deleted when the readers close.
+		if r := b.remotes[backing]; r != nil {
+			b.purgeRemotePrefix(r, r.dataPrefix()+id+"/")
+		}
+		return nil
 	}
 	if err := os.RemoveAll(b.bucketDataDir(id)); err != nil {
 		b.log.Warn("fs: remove bucket data directory", "bucket", name, "bucket_id", id, "err", err)
