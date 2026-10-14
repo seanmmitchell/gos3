@@ -538,14 +538,41 @@ func (b *Backend) completeOnce(ctx context.Context, bucket, key, uploadID string
 		t.discard()
 		return storage.ObjectInfo{}, err
 	}
-	dataID, path, err := b.finishEncryptedData(ctx, t, bucketID, wopts.Encryption, bucket, key)
+	var dataID, path string
+	if wopts.Encryption == storage.EncryptionRestic {
+		// Check the parts and preconditions before the snapshot is saved,
+		// so that a retry or a refused completion archives nothing.
+		dataID, path, err = b.archiveTemp(ctx, t, bucketID, bucket, key, func() error {
+			if afterPartsCopied != nil {
+				afterPartsCopied(uploadID)
+			}
+			return b.view(func(tx *bbolt.Tx) error {
+				_, bb, err := loadBucketID(tx, bucket, bucketID)
+				if err != nil {
+					return err
+				}
+				if _, err := loadUpload(bb, key, uploadID); err != nil {
+					return err
+				}
+				for i, n := range partNumbers {
+					var rec partRecord
+					if v := bb.Bucket(subParts).Get(partKey(uploadID, n)); v == nil || decodeRecord(v, &rec) != nil || rec.File != files[i] {
+						return errPartsChanged
+					}
+				}
+				return checkPreconditions(bb, key, opts)
+			})
+		})
+	} else {
+		dataID, path, err = b.finishEncryptedData(ctx, t, bucketID, wopts.Encryption, bucket, key)
+	}
 	if err != nil {
 		return storage.ObjectInfo{}, err
 	}
 	if path != "" {
 		defer b.pending.done(path)
 	}
-	if afterPartsCopied != nil {
+	if afterPartsCopied != nil && wopts.Encryption != storage.EncryptionRestic {
 		afterPartsCopied(uploadID)
 	}
 	meta.Encryption = wopts.Encryption

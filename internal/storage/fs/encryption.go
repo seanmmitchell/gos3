@@ -46,7 +46,7 @@ func (b *Backend) bucketKey(bucketID string, create bool) ([]byte, error) {
 			return nil, e
 		}
 		if used {
-			return nil, errors.New("encryption key is missing; restore the key from backup")
+			return nil, fmt.Errorf("%w: encryption key is missing; restore the key from backup", storage.ErrEncryptionUnavailable)
 		}
 		if err = os.MkdirAll(dir, dirPerm); err != nil {
 			return nil, err
@@ -60,6 +60,9 @@ func (b *Backend) bucketKey(bucketID string, create bool) ([]byte, error) {
 			return nil, err
 		}
 
+	}
+	if errors.Is(err, os.ErrNotExist) {
+		return nil, fmt.Errorf("%w: encryption key is missing: %w", storage.ErrEncryptionUnavailable, err)
 	}
 	if err != nil {
 		return nil, fmt.Errorf("fs: read encryption key: %w", err)

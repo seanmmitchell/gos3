@@ -26,7 +26,7 @@ func TestResticBackingLocationAndPersistence(t *testing.T) {
 	if err := os.MkdirAll(filepath.Join(b.sysDir, "keys"), dirPerm); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(filepath.Join(b.sysDir, "keys", "bucket-id.restic.json"), []byte(`{"repository":"s3:https://s3.example.test/archives/one/bucket-id","password":"derived"}`), filePerm); err != nil {
+	if err := os.WriteFile(filepath.Join(b.sysDir, "keys", "bucket-id.restic.json"), []byte(`{"initialized":true,"repository":"s3:https://s3.example.test/archives/one/bucket-id","password":"derived"}`), filePerm); err != nil {
 		t.Fatal(err)
 	}
 	if err := b.checkResticLocation(remote); err != nil {

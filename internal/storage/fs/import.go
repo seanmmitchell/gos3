@@ -106,9 +106,11 @@ type versionWriter struct {
 
 	mu sync.Mutex
 	t  *tmpFile
-	// cw compresses into t when the version is stored compressed; w is
-	// where written data goes (cw or t).
+	// cw compresses into t when the version is stored compressed; rw
+	// archives restic versions instead of t; w is where written data goes
+	// (cw, rw or t).
 	cw          *compress.Writer
+	rw          *resticWriter
 	w           io.Writer
 	compression string
 	encryption  string
@@ -123,7 +125,8 @@ func (b *Backend) NewVersionWriter(ctx context.Context, bucket, key string) (sto
 }
 
 // NewVersionWriterWith is NewVersionWriter with write options (see
-// storage.CompressingImporter).
+// storage.CompressingImporter). Restic versions are archived as in
+// NewObjectWriterWith.
 func (b *Backend) NewVersionWriterWith(ctx context.Context, bucket, key string, opts storage.WriteOptions) (storage.VersionWriter, error) {
 	if err := checkCompression(opts.Compression); err != nil {
 		return nil, err
@@ -131,29 +134,22 @@ func (b *Backend) NewVersionWriterWith(ctx context.Context, bucket, key string, 
 	if err := validKey(key); err != nil {
 		return nil, err
 	}
-	if err := b.begin(ctx); err != nil {
-		return nil, err
-	}
-	var id string
-	err := b.view(func(tx *bbolt.Tx) error {
-		rec, _, err := loadBucket(tx, bucket)
-		if err != nil {
-			return err
-		}
-		id = rec.ID
-		return nil
-	})
+	id, err := b.encryptionBucketID(ctx, bucket)
 	if err != nil {
 		return nil, err
 	}
-	t, err := b.encryptedTemp(id, opts.Encryption)
-	if err != nil {
-		return nil, err
-	}
+	w := &versionWriter{b: b, bucket: bucket, bucketID: id, key: key, encryption: opts.Encryption}
 	if opts.Encryption == storage.EncryptionRestic {
-		opts.Compression = storage.Compression{}
+		if w.rw, err = b.newResticWriter(ctx, id, bucket, key); err != nil {
+			return nil, err
+		}
+		w.t, w.w = b.newTemp(), w.rw
+		return w, nil
 	}
-	w := &versionWriter{b: b, bucket: bucket, bucketID: id, key: key, t: t, compression: opts.Compression.Algorithm, encryption: opts.Encryption}
+	if w.t, err = b.encryptedTemp(id, opts.Encryption); err != nil {
+		return nil, err
+	}
+	w.compression = opts.Compression.Algorithm
 	if w.cw, err = newCompressor(w.t, opts.Compression); err != nil {
 		return nil, err
 	}
@@ -168,6 +164,9 @@ func (b *Backend) NewVersionWriterWith(ctx context.Context, bucket, key string, 
 func (w *versionWriter) discard() {
 	if w.cw != nil {
 		w.cw.Abandon()
+	}
+	if w.rw != nil {
+		w.rw.abort()
 	}
 	w.t.discard()
 }
@@ -190,25 +189,34 @@ func (w *versionWriter) Commit(ctx context.Context, info storage.ObjectInfo) (st
 		return storage.ObjectInfo{}, errWriterDone
 	}
 	w.done = true
-	defer w.t.discard()
+	defer w.discard()
 	if !storage.ValidImportedVersionID(info.VersionID) {
-		w.discard()
 		return storage.ObjectInfo{}, fmt.Errorf("%w: version ID %.80q", storage.ErrInvalidName, info.VersionID)
 	}
 	if err := w.b.begin(ctx); err != nil {
-		w.discard()
 		return storage.ObjectInfo{}, err
 	}
-	size, compression, stored, err := sealData(w.t, w.cw, w.compression)
-	if err != nil {
-		w.t.discard()
-		return storage.ObjectInfo{}, err
+	var (
+		size, stored int64
+		compression  string
+		dataID, path string
+		err          error
+	)
+	if w.rw != nil {
+		size = w.rw.size
+		if info.DeleteMarker && size > 0 {
+			return storage.ObjectInfo{}, fmt.Errorf("%w: delete marker %s/%.64s with data", storage.ErrInvalidName, w.bucket, w.key)
+		}
+		dataID, path, err = w.rw.finish(nil)
+	} else {
+		if size, compression, stored, err = sealData(w.t, w.cw, w.compression); err != nil {
+			return storage.ObjectInfo{}, err
+		}
+		if info.DeleteMarker && size > 0 {
+			return storage.ObjectInfo{}, fmt.Errorf("%w: delete marker %s/%.64s with data", storage.ErrInvalidName, w.bucket, w.key)
+		}
+		dataID, path, err = w.b.finishEncryptedData(ctx, w.t, w.bucketID, w.encryption, w.bucket, w.key)
 	}
-	if info.DeleteMarker && size > 0 {
-		w.t.discard()
-		return storage.ObjectInfo{}, fmt.Errorf("%w: delete marker %s/%.64s with data", storage.ErrInvalidName, w.bucket, w.key)
-	}
-	dataID, path, err := w.b.finishEncryptedData(ctx, w.t, w.bucketID, w.encryption, w.bucket, w.key)
 	if err != nil {
 		return storage.ObjectInfo{}, err
 	}
@@ -218,8 +226,6 @@ func (w *versionWriter) Commit(ctx context.Context, info storage.ObjectInfo) (st
 	var meta storage.ObjectMeta
 	if !info.DeleteMarker {
 		meta = cloneMeta(info.ObjectMeta)
-	}
-	if !info.DeleteMarker {
 		meta.Encryption = w.encryption
 	}
 	return w.b.commitObject(commitReq{
