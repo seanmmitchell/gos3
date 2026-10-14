@@ -127,14 +127,17 @@ func (w *objectWriter) Commit(ctx context.Context, meta storage.ObjectMeta, opts
 		unlock := w.r.keys.lock(w.bucket, w.key)
 		defer unlock()
 	}
-	info, err := w.w.Commit(ctx, meta, opts)
+	caller := &cbTracker{}
+	info, err := w.w.Commit(ctx, meta, caller.commitOptions(opts))
 	if err != nil {
 		for _, t := range w.tees {
 			if !t.failed {
 				_ = t.w.Abort()
 			}
 		}
-		w.r.observe(w.rt.lead, err)
+		if !caller.isCaller(err) {
+			w.r.observe(w.rt.lead, err)
+		}
 		return storage.ObjectInfo{}, err
 	}
 	committed := map[*memberState]bool{}

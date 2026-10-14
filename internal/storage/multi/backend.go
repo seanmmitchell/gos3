@@ -239,6 +239,17 @@ func (t *cbTracker) isCaller(err error) bool {
 	return t.err != nil && errors.Is(err, t.err)
 }
 
+// commitOptions tracks publication checks separately from backing failures:
+// a policy rejection must not mark the primary unhealthy or trigger failover.
+func (t *cbTracker) commitOptions(opts storage.CommitOptions) storage.CommitOptions {
+	if check := opts.BeforePublish; check != nil {
+		opts.BeforePublish = func(meta, current *storage.ObjectMeta, created time.Time, config func(string) []byte) error {
+			return t.note(check(meta, current, created, config))
+		}
+	}
+	return opts
+}
+
 // --- buckets ---
 
 // ListBuckets returns every bucket, as its first reachable copy describes
@@ -737,7 +748,9 @@ func (r *Router) CompleteMultipartUpload(ctx context.Context, bucket, key, uploa
 func (r *Router) CompleteMultipartUploadWith(ctx context.Context, bucket, key, uploadID string, partNumbers []int,
 	meta storage.ObjectMeta, opts storage.CommitOptions, wopts storage.WriteOptions) (storage.ObjectInfo, error) {
 	var info storage.ObjectInfo
-	err := r.objectWrite(ctx, bucket, key, nil, func(b storage.Backend) error {
+	caller := &cbTracker{}
+	opts = caller.commitOptions(opts)
+	err := r.objectWrite(ctx, bucket, key, caller, func(b storage.Backend) error {
 		var err error
 		if !wopts.Compression.Enabled() {
 			info, err = b.CompleteMultipartUpload(ctx, bucket, key, uploadID, partNumbers, meta, opts)
