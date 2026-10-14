@@ -10,9 +10,9 @@ Each assigned backing owns its repository location and S3 credentials. A
 replica or move target uses its own backing's settings, keys, and repository;
 source backing credentials never replicate with bucket configuration.
 
-Native encryption uses authenticated AES-256-GCM streams, with HKDF-SHA256
-deriving a separate key for each immutable data file from a random bucket
-master key. Swapping objects' ciphertext fails authentication.
+Native encryption uses authenticated AES-256-GCM streams (MinIO `sio` v2),
+with HKDF-SHA256 deriving a separate key for each immutable data file from a
+random bucket master key. Swapping objects' ciphertext fails authentication.
 Compression happens before encryption; range reads decrypt the necessary
 blocks. Filesystem upload staging and multipart parts are encrypted too.
 
