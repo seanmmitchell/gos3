@@ -352,7 +352,10 @@ adopted where they are found at startup.
 
 System state lives in `<data>/.gos3/`: `lock` (an exclusive lock held by the
 running server, whatever the backend; a no-op on platforms without
-`flock`/Windows sharing), `iam.json`, `placements.json` (bucket placements), `settings.json` (written on
+`flock`/Windows sharing), `iam.json`, `placements.json` (bucket placements),
+`backings.json` (backings configured live through the admin API; it
+overrides `storage.backings` and `storage.default_backing` at the next
+start while management is enabled), `settings.json` (written on
 the first runtime settings update, then it wins over file/env/flags for the
 Settings fields), `server-id`, and `root-credentials.json` (only when root
 keys were generated). With the memory backend this needs `storage.path`;

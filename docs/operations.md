@@ -112,6 +112,7 @@ gos3 logs to stderr with Go's `log/slog`, as `text` (default) or `json`
     ├── root-credentials.json    generated root keys, if any      (secret)
     ├── settings.json            runtime settings, after the first change
     ├── placements.json          which backings hold which buckets
+    ├── backings.json            backings configured in the web UI, after the first change
     └── server-id                this server's discovery ID
 ```
 
