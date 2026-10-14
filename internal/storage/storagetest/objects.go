@@ -262,6 +262,8 @@ var testKeys = []string{
 	"back\\slash",
 	"star*brackets[]{}",
 	"tab\tand\nnewline",
+	"nul\x00byte",
+	"nul\x00",
 	"quote\"'<>",
 	strings.Repeat("k", 1024),
 	strings.Repeat("é", 512), // 1024 bytes of 2-byte runes

@@ -50,6 +50,15 @@ type opSpec struct {
 	ObjectRead bool
 	// NoBucketLookup: the bucket need not exist (CreateBucket).
 	NoBucketLookup bool
+	// RequiresObjectRead: besides Action, the caller must be allowed to
+	// read the object itself (s3:GetObject, s3:GetObjectVersion with a
+	// versionId; with the object-ACL fallback), as AWS requires for
+	// GetObjectAttributes, whose response reveals the content's ETag and
+	// checksums.
+	RequiresObjectRead bool
+	// NewKey: the operation creates an object at the request's key, which
+	// must therefore pass validateNewObjectKey (not only validateObjectKey).
+	NewKey bool
 
 	handler handlerFunc
 }
@@ -134,8 +143,8 @@ var opTable = []*opSpec{
 	{Name: "PutBucketRequestPayment", Action: "s3:PutBucketRequestPayment", Kind: resBucket, handler: (*Server).handlePutBucketRequestPayment},
 
 	// --- Objects ---
-	{Name: "PutObject", Action: "s3:PutObject", Kind: resObject, handler: (*Server).handlePutObject},
-	{Name: "CopyObject", Action: "s3:PutObject", Kind: resObject, handler: (*Server).handleCopyObject},
+	{Name: "PutObject", Action: "s3:PutObject", Kind: resObject, NewKey: true, handler: (*Server).handlePutObject},
+	{Name: "CopyObject", Action: "s3:PutObject", Kind: resObject, NewKey: true, handler: (*Server).handleCopyObject},
 	{Name: "GetObject", Action: "s3:GetObject", VersionAction: "s3:GetObjectVersion", Kind: resObject, ObjectRead: true, handler: (*Server).handleGetObject},
 	{Name: "HeadObject", Action: "s3:GetObject", VersionAction: "s3:GetObjectVersion", Kind: resObject, ObjectRead: true, handler: (*Server).handleHeadObject},
 	{Name: "DeleteObject", Action: "s3:DeleteObject", VersionAction: "s3:DeleteObjectVersion", Kind: resObject, handler: (*Server).handleDeleteObject},
@@ -148,15 +157,15 @@ var opTable = []*opSpec{
 	{Name: "PutObjectRetention", Action: "s3:PutObjectRetention", Kind: resObject, AuthzByHandler: true, handler: (*Server).handlePutObjectRetention},
 	{Name: "GetObjectLegalHold", Action: "s3:GetObjectLegalHold", Kind: resObject, handler: (*Server).handleGetObjectLegalHold},
 	{Name: "PutObjectLegalHold", Action: "s3:PutObjectLegalHold", Kind: resObject, AuthzByHandler: true, handler: (*Server).handlePutObjectLegalHold},
-	{Name: "GetObjectAttributes", Action: "s3:GetObjectAttributes", VersionAction: "s3:GetObjectVersionAttributes", Kind: resObject, handler: (*Server).handleGetObjectAttributes},
+	{Name: "GetObjectAttributes", Action: "s3:GetObjectAttributes", VersionAction: "s3:GetObjectVersionAttributes", Kind: resObject, RequiresObjectRead: true, handler: (*Server).handleGetObjectAttributes},
 	{Name: "RestoreObject", Action: "s3:RestoreObject", Kind: resObject, handler: (*Server).handleRestoreObject},
 	{Name: "SelectObjectContent", Action: "s3:GetObject", Kind: resObject, handler: (*Server).handleSelectObjectContent},
 
 	// --- Multipart ---
-	{Name: "CreateMultipartUpload", Action: "s3:PutObject", Kind: resObject, handler: (*Server).handleCreateMultipartUpload},
+	{Name: "CreateMultipartUpload", Action: "s3:PutObject", Kind: resObject, NewKey: true, handler: (*Server).handleCreateMultipartUpload},
 	{Name: "UploadPart", Action: "s3:PutObject", Kind: resObject, handler: (*Server).handleUploadPart},
 	{Name: "UploadPartCopy", Action: "s3:PutObject", Kind: resObject, handler: (*Server).handleUploadPartCopy},
-	{Name: "CompleteMultipartUpload", Action: "s3:PutObject", Kind: resObject, handler: (*Server).handleCompleteMultipartUpload},
+	{Name: "CompleteMultipartUpload", Action: "s3:PutObject", Kind: resObject, NewKey: true, handler: (*Server).handleCompleteMultipartUpload},
 	{Name: "AbortMultipartUpload", Action: "s3:AbortMultipartUpload", Kind: resObject, handler: (*Server).handleAbortMultipartUpload},
 	{Name: "ListParts", Action: "s3:ListMultipartUploadParts", Kind: resObject, handler: (*Server).handleListParts},
 }

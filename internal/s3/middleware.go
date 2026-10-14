@@ -191,7 +191,11 @@ func (s *Server) serve(w *responseWriter, r *http.Request, rc *reqContext) {
 		s.applyCORSHeaders(w, r, rc, settings)
 	}
 	if rc.key != "" {
-		if err := validateObjectKey(rc.key); err != nil {
+		validate := validateObjectKey
+		if op.NewKey {
+			validate = validateNewObjectKey
+		}
+		if err := validate(rc.key); err != nil {
 			s.writeError(w, r, rc, err)
 			return
 		}

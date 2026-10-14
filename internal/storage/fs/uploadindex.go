@@ -54,10 +54,39 @@ func deleteUploadIndex(bb *bbolt.Bucket, uploadID string, rec *uploadRecord) err
 	return bb.Bucket(subUploadOrder).Delete(uploadOrderKey(rec.Key, rec.Initiated, uploadID))
 }
 
+// uploadIndexValid reports whether idx holds exactly the "upk" entries of
+// the upload records in upl. It streams over the index once: every entry
+// must name an existing upload whose record yields that very entry key.
+// Since the key ends in the upload ID, no two entries can match the same
+// record, so with equal counts the entries and records correspond one to
+// one. An undecodable record makes the index invalid (the rebuild then
+// reports it).
+func uploadIndexValid(idx, upl *bbolt.Bucket) bool {
+	if idx.Stats().KeyN != upl.Stats().KeyN {
+		return false
+	}
+	c := idx.Cursor()
+	for k, id := c.First(); k != nil; k, id = c.Next() {
+		raw := upl.Get(id)
+		if raw == nil {
+			return false
+		}
+		var rec uploadRecord
+		if err := decodeRecord(raw, &rec); err != nil {
+			return false
+		}
+		if !bytes.Equal(k, uploadOrderKey(rec.Key, rec.Initiated, string(id))) {
+			return false
+		}
+	}
+	return true
+}
+
 // ensureUploadIndexes creates the "upk" index of every bucket that lacks
-// one (databases written before it existed) and rebuilds indexes whose
-// entry count differs from the number of upload records (e.g. after an
-// older gos3 version ran on the database). Runs once at Open.
+// one (databases written before it existed) and rebuilds indexes that do
+// not match the upload records (e.g. after an older gos3 version that did
+// not maintain the index created and aborted uploads, which can leave the
+// entry count unchanged). Runs once at Open.
 func ensureUploadIndexes(tx *bbolt.Tx) error {
 	return tx.Bucket(topBuckets).ForEach(func(name, v []byte) error {
 		var br bucketRecord
@@ -69,7 +98,7 @@ func ensureUploadIndexes(tx *bbolt.Tx) error {
 			return nil
 		}
 		if idx := bb.Bucket(subUploadOrder); idx != nil {
-			if idx.Stats().KeyN == bb.Bucket(subUploads).Stats().KeyN {
+			if uploadIndexValid(idx, bb.Bucket(subUploads)) {
 				return nil
 			}
 			if err := bb.DeleteBucket(subUploadOrder); err != nil {

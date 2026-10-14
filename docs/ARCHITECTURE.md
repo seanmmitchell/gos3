@@ -63,8 +63,8 @@ metrics, or are refused outright when the list is set; see
 docs/security.md#dns-rebinding-and-the-host-header):
 
 1. Virtual-hosted-style request (Host is `<bucket>.<domain>` for a configured
-   domain) → **S3 handler**, always (even if the path starts with `/_gos3/`;
-   that is then an object key).
+   domain, and is not itself a configured domain) → **S3 handler**, always
+   (even if the path starts with `/_gos3/`; that is then an object key).
 2. Path starts with `/_gos3/`:
    - `/_gos3/admin/v1/...` → admin API (404 when `admin.enabled` is false)
    - `/_gos3/ui/...` → embedded web UI (SPA, `index.html`/`200.html` fallback)
@@ -135,7 +135,8 @@ Unknown subresources → `NotImplemented`. Unsupported method for a resource →
   HTTP `Last-Modified` is RFC1123 GMT.
 - `x-amz-version-id` header is sent only when the bucket's versioning status is
   not Unversioned (then `null` versions are reported as `null`).
-- Limits: key ≤ 1024 bytes UTF-8; user metadata ≤ 2 KiB; ≤ 10 object tags
+- Limits: key ≤ 1024 bytes UTF-8 (keys objects are created at: XML 1.0
+  characters only, see `validateNewObjectKey`); user metadata ≤ 2 KiB; ≤ 10 object tags
   (key ≤ 128, value ≤ 256 chars); ≤ 50 bucket tags; single PUT ≤ 5 GiB
   (configurable); parts 1..10000, each ≥ 5 MiB except the last; max-keys ≤ 1000;
   DeleteObjects ≤ 1000 keys.
