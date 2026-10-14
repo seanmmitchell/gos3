@@ -200,8 +200,8 @@ ListObjectsV2, ListParts and GetObjectAttributes.
   operators on them evaluate to false, so `Allow` statements using them
   never grant and `Deny` statements using them never apply (use
   `…IfExists` or `Null` deliberately). gos3 has no account ID, so restrict
-  principals with the `Principal` / `NotPrincipal` element (which accepts
-  `arn:aws:iam::<any account>:user/<name>`) rather than with
+  principals with local user names in the `Principal` / `NotPrincipal`
+  element rather than with
   `aws:PrincipalArn` or `aws:PrincipalAccount` conditions.
 - **Where the object-attribute keys come from**, per operation:
   - PutObject, CreateMultipartUpload and CopyObject: the request headers.
@@ -247,9 +247,8 @@ ListObjectsV2, ListParts and GetObjectAttributes.
   as `s3:RequestObjectTag/<key>` keys. Untagged sources, and `REPLACE`
   without tags, need only `s3:GetObject` plus `s3:PutObject`.
 - **Principals** in bucket policies: `"*"`, `AWS` (user names, access key
-  IDs, `arn:<partition>:iam::<account>:user/[path/]<name>`, the account
-  principal) and `CanonicalUser` (matched like `AWS`). `Service` and
-  `Federated` principals are accepted and stored but match no gos3
+  IDs and the account principal) and `CanonicalUser` (matched like `AWS`).
+  `Service` and `Federated` principals are accepted and stored but match no gos3
   identity: a statement with only them never applies, and a `NotPrincipal`
   naming only them applies to everyone. Other principal types (for example
   OIDC) are rejected with `MalformedPolicy`.
@@ -261,8 +260,12 @@ ListObjectsV2, ListParts and GetObjectAttributes.
   Conflict` from the admin API). Keys in an `iam.json` written by an
   earlier version that break this rule are refused at authentication
   (`InvalidAccessKeyId`, with a warning in the log); delete them and create
-  new ones. The ARN form `arn:<partition>:iam::<account>:user/<name>`
-  always names a user.
+  new ones. User ARNs are not supported: gos3 has no account ID or IAM
+  path to compare with one. Replace any `Principal` or `NotPrincipal` user
+  ARN with the intended local user name before upgrading. After upgrading,
+  a stored policy containing one fails closed for non-root requests until
+  root replaces it; new policies containing one are rejected as
+  `MalformedPolicy`.
 - The **account principal** (`arn:<partition>:iam::<account>:root` or a
   12-digit account ID; the account number is not checked, because gos3 has
   one account; a bare 12-digit entry is never compared with user names or
@@ -274,7 +277,7 @@ ListObjectsV2, ListParts and GetObjectAttributes.
   - `Allow` with `NotPrincipal` account: only anonymous callers get the
     grant (the policy counts as public).
   - `Deny` with `NotPrincipal` account: does not exempt IAM users; list the
-    user's ARN or name as well.
+    user's local name as well.
 - IAM actions follow AWS (for example `s3:GetObjectVersion` when `versionId` is
   given, and `s3:ListBucket` for HeadBucket). Admin API actions are
   `admin:<Action>` on resource `arn:gos3:admin:::*` (see
@@ -318,6 +321,10 @@ ListObjectsV2, ListParts and GetObjectAttributes.
   bucket, and `BucketAlreadyOwnedByYou` is returned to the bucket's creator
   and to root, while other users get `BucketAlreadyExists`.
 - **Storage classes** are accepted and reported but have no effect.
+- **Compression** (a gos3 feature, see [operations.md](operations.md#compression))
+  is invisible to S3 clients: objects stored compressed return the same
+  bytes, ETag, checksums, sizes and ranges. It is configured through the
+  admin API and the web UI, not through an S3 API.
 - **No replication between gos3 servers.** Every server stores its own data.
   Discovery only finds servers; it does not cluster them.
 - With slow CopyObject and CompleteMultipartUpload calls (over about 5 s),

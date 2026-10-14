@@ -56,6 +56,7 @@ func TestHostPolicyKnown(t *testing.T) {
 // or public metrics; signed requests and the public probes still work.
 func TestDNSRebinding(t *testing.T) {
 	cfg := testConfig()
+	cfg.UI.Enabled = true
 	cfg.Metrics.Public = true
 	srv := start(t, cfg, WithUIFS(fakeUI()))
 	u := srv.url

@@ -21,7 +21,8 @@ the internet.
 
 - **Dashboard** of all configured servers with status, version and usage.
 - **Buckets**: create and delete; versioning, policy editor with templates,
-  CORS, lifecycle, tags, object lock, default encryption and ACL settings.
+  CORS, lifecycle, tags, object lock, default encryption and ACL settings,
+  and (gos3 only) compression.
 - **Object browser**: folders, drag-and-drop uploads (multipart with parallel
   parts and progress), downloads, delete, rename and copy, metadata and tag
   editors, versions, and presigned share links.
@@ -29,8 +30,15 @@ the internet.
 - **Server overview and settings** (gos3 only): version, request metrics,
   storage and disk usage, and every runtime setting from
   [configuration.md](configuration.md#runtime-settings-settingsjson).
+  Server and bucket settings show one section at a time, picked with the
+  chips under the page header (kept in the URL as `?tab=`); on the server
+  settings page one Save covers every section, and the chips mark sections
+  with unsaved changes or invalid fields.
 - **Discovery** (gos3 only): peers seen by each connected server, network
   scans, local discovery from the UI host, and one-click "add server".
+- **Storage** (gos3 only): the server's storage backings, and per bucket
+  its placement, replication, moves and promotions (see
+  [Storage backings and placement](#storage-backings-and-placement)).
 
 Pages are shown according to the signed-in identity's permissions (from
 `GET /_gos3/admin/v1/whoami`). For example, Users appears only with
@@ -64,6 +72,20 @@ policies and clears that option.
   with "Bypass governance retention" (Danger zone checkbox, or the follow-up
   confirmation on the bucket list), which sends
   `bypassGovernanceRetention=true` and needs `s3:BypassGovernanceRetention`.
+- **Compression.** The server settings page has a Compression section where
+  the administrator chooses the mode (Optional, Enforced, Disabled), the
+  DEFLATE level, the minimum size and the media types to skip. A bucket's
+  Compression tab (gos3 servers that report the `manageCompression`
+  capability) shows whether new objects are compressed, the bucket's own
+  setting and the server mode; while the administrator enforces or disables
+  compression the switch is locked in the direction the server would refuse
+  (409), and "Reset to server default" removes the bucket's setting. The tab
+  is shown to everyone on such servers, since a grant of
+  `admin:PutBucketCompression` scoped to some buckets does not show in the
+  capabilities; a refused change shows the server's 403. Bucket lists, the
+  bucket overview and the server overview show the stored size and the
+  saving next to the size when compression saves space. See
+  [operations.md](operations.md#compression).
 - **Policy editor and simulator.** Admin actions are evaluated against
   `arn:gos3:admin:::user/<name>`, `arn:gos3:admin:::policy/<name>` and
   `arn:gos3:admin:::bucket/<name>` (see [admin-api.md](admin-api.md));
@@ -75,6 +97,36 @@ policies and clears that option.
   (it lists all users; actions on users outside the pattern are refused by
   the server and shown as errors). For an admin action the simulator asks for an admin
   resource instead of a bucket and key (empty = service level).
+
+### Storage backings and placement
+
+On servers with several storage backings (see
+[admin-api.md](admin-api.md#storage-backings-and-bucket-placement)):
+
+- **Storage** (sidebar, needs `admin:ListBackings`, whoami capability
+  `viewStorage`) shows every backing with its kind, path, health (the last
+  error of an unhealthy one), last check, bucket and replica counts and disk
+  usage. It refreshes every 10 seconds.
+- **Bucket settings → Placement** (also `viewStorage`) shows the replication
+  mode and each member (primary, replicas, a move target) with its state
+  (`in sync`, `syncing`, `lagging`, `degraded`, `offline`), pending changes,
+  copy progress, last full sync and last error, and a banner while the
+  bucket moves. The tab polls every 3 seconds while a copy runs, changes are
+  pending or a move is in progress.
+- With `admin:UpdateBucketPlacement` (capability `manageStorage`) the tab
+  changes the mode (single, active-passive, active-active) and the replica
+  backings (removing a replica asks first, because its copy is deleted),
+  moves the bucket (or one replica) to a backing without a copy, cancels a
+  move while it is copying, promotes a replica to primary and resyncs one or
+  all replicas. "Force promote" is offered when the replica is not in sync
+  or the primary is offline; it asks you to type the backing name, because
+  changes not yet copied to the replica are lost. Without the capability the
+  tab is read-only.
+- The bucket list shows the primary backing, the mode with the number of
+  copies (for example `AP ×2`) and `moving`, when the server reports
+  placement and the buckets are not all on one backing.
+- Servers that do not report `viewStorage` (older versions) show neither the
+  page nor the tab.
 
 ### Object browser notes
 

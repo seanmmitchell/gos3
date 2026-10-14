@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
 
@@ -234,6 +235,31 @@ func TestAuthzRestrictPublicBuckets(t *testing.T) {
 	}
 }
 
+func TestBroadSourceIPPolicyBlocked(t *testing.T) {
+	e := newAuthzEnv(t)
+	e.createBucket("pub")
+	e.putObject("pub", "k", []byte("x"), storage.ObjectMeta{})
+	policy := `{"Statement":[{"Effect":"Allow","Principal":"*","Action":"s3:GetObject","Resource":"arn:aws:s3:::pub/*","Condition":{"IpAddress":{"aws:SourceIp":"124.0.0.0/6"}}}]}`
+	e.putBucketConfig("pub", storage.ConfigPolicy, policy)
+	read := func() int {
+		req := httptest.NewRequest(http.MethodGet, "http://example.com/pub/k", nil)
+		req.RemoteAddr = "124.0.0.1:1234"
+		w := httptest.NewRecorder()
+		e.server.ServeHTTP(w, req)
+		return w.Code
+	}
+	if got := read(); got != http.StatusOK {
+		t.Fatalf("before RestrictPublicBuckets: got %d, want 200", got)
+	}
+	e.putBucketConfig("pub", storage.ConfigPublicAccessBlock, `<PublicAccessBlockConfiguration><RestrictPublicBuckets>true</RestrictPublicBuckets><BlockPublicPolicy>true</BlockPublicPolicy></PublicAccessBlockConfiguration>`)
+	if got := read(); got != http.StatusForbidden {
+		t.Fatalf("after RestrictPublicBuckets: got %d, want 403", got)
+	}
+	if resp := e.signed(http.MethodPut, "/pub?policy", []byte(policy), nil); resp.StatusCode != http.StatusForbidden || resp.code() != "AccessDenied" {
+		t.Fatalf("BlockPublicPolicy: %d %s", resp.StatusCode, resp.Data)
+	}
+}
+
 func TestAuthorizeHelperSecondaryResource(t *testing.T) {
 	e := newAuthzEnv(t)
 	e.createBucket("src")
@@ -277,6 +303,25 @@ func TestAuthzStoredPolicyCorruptFailsClosed(t *testing.T) {
 	}
 	if resp := e.signed("GET", "/bad/k", nil, nil); resp.StatusCode != 200 {
 		t.Fatalf("root unaffected: %d", resp.StatusCode)
+	}
+}
+
+func TestAuthzStoredPolicyUserARNFailsClosed(t *testing.T) {
+	e := newAuthzEnv(t)
+	e.createBucket("bad")
+	e.putBucketConfig("bad", storage.ConfigPolicy, `{"Statement":[{"Effect":"Allow","Principal":{"AWS":"arn:aws:iam::123456789012:user/team/alice"},"Action":"s3:GetObject","Resource":"arn:aws:s3:::bad/*"}]}`)
+	if resp := e.anon("GET", "/bad/k", nil, nil); resp.StatusCode != http.StatusInternalServerError {
+		t.Fatalf("stored user ARN policy did not fail closed: %d %s", resp.StatusCode, resp.Data)
+	}
+	if resp := e.signed("GET", "/bad/k", nil, nil); resp.StatusCode != http.StatusOK {
+		t.Fatalf("root read blocked by policy: %d %s", resp.StatusCode, resp.Data)
+	}
+	fixed := `{"Statement":[{"Effect":"Allow","Principal":"*","Action":"s3:GetObject","Resource":"arn:aws:s3:::bad/*"}]}`
+	if resp := e.signed("PUT", "/bad?policy", []byte(fixed), nil); resp.StatusCode != http.StatusNoContent {
+		t.Fatalf("root cannot replace policy: %d %s", resp.StatusCode, resp.Data)
+	}
+	if resp := e.anon("GET", "/bad/k", nil, nil); resp.StatusCode != http.StatusOK {
+		t.Fatalf("repaired policy not applied: %d %s", resp.StatusCode, resp.Data)
 	}
 }
 

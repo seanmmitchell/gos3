@@ -124,6 +124,13 @@ namespaces are kept apart: a key ID cannot equal a user name, `root`,
 a 12-digit account ID, and a bare 12-digit principal only ever names the
 account. Keys in an older `iam.json` that break this rule are refused at
 authentication and logged at startup and on first use; replace them.
+
+Bucket policies must name local users by bare name, not by an AWS IAM user
+ARN: gos3 cannot verify an ARN's account or path. Before upgrading, replace
+user ARNs in `Principal` and `NotPrincipal` with the intended local names.
+Existing policies that still contain user ARNs fail closed for non-root
+requests until root updates them.
+
 Choosing a key's ID (`"accessKey"` in `POST /users/{name}/keys`) needs
 `admin:CreateAccessKey` at service level, so a delegated administrator can
 only create keys with generated IDs. Principals, `arn:gos3:admin:::user/…`
@@ -170,8 +177,9 @@ per-target resources (see
 [admin-api.md](admin-api.md#resources-and-condition-keys)):
 `arn:gos3:admin:::user/<name>` for user and key actions (a key is evaluated
 as its owner), `arn:gos3:admin:::policy/<name>` for policy actions and
-`arn:gos3:admin:::bucket/<name>` for `admin:GetBucket` and
-`admin:ForceDeleteBucket`, with wildcards, and limit which policies may be
+`arn:gos3:admin:::bucket/<name>` for `admin:GetBucket`,
+`admin:ForceDeleteBucket`, `admin:GetBucketCompression` and
+`admin:PutBucketCompression`, with wildcards, and limit which policies may be
 attached with the multi-valued condition key `admin:PolicyName`. For
 example, this help-desk policy manages only `team-*` users, which cannot
 include the help-desk user itself, and may attach only `readonly`:
@@ -278,6 +286,17 @@ such as `C:\ProgramData` with default permissions. Object data outside
 `x-amz-server-side-encryption` headers are accepted and reported for client
 compatibility only. Use full-disk or file system encryption if you need
 encryption at rest. SSE-C is rejected (`NotImplemented`).
+
+Compressed objects (see [operations.md](operations.md#compression)) are
+compressed, not protected: anyone who can read the data files can inflate
+them. The stored size of a compressed object depends on its content, so it
+can leak how well data that an attacker partly controls compresses together
+with a secret in the same object (the idea behind CRIME/BREACH). Stored sizes
+are only reported by the admin API's bucket usage and stats
+(`admin:GetBucket`, `admin:ListBuckets`, `admin:GetStats`), as totals per
+bucket; if your buckets mix untrusted input with secrets in single objects,
+keep compression off for them or do not grant those actions to the parties
+supplying the input.
 
 Only one gos3 process can use a data directory at a time: every backend,
 including the memory backend with a data path, takes an exclusive lock on
@@ -435,6 +454,9 @@ already has a secret key. Under the global `*` rule:
 - Preflights are approved only when `Access-Control-Request-Headers`
   includes `authorization` or the URL is presigned; otherwise the answer is
   `403 AccessForbidden`.
+- A preflight's `Access-Control-Request-Headers` is limited to 8 KiB and 64
+  requested headers before matching bucket CORS rules; larger lists get
+  `400 BadRequest`.
 - Browser POST-policy uploads (PostObject) never count as signed, even when
   they come with an `Authorization` header or `X-Amz-*` query parameters:
   PostObject authenticates from its form fields and accepts forms without a
@@ -515,9 +537,10 @@ and `ForAllValues:` conditions never count as restricting; `ForAllValues:`
 conditions hold when the key is missing, as it is for anonymous callers.
 
 Allow statements for everyone that are restricted only by `aws:SourceIp`
-are judged together: the union of their ranges across the whole policy may
-cover at most four IPv4 /8 networks and four IPv6 /32 networks, so splitting
-a wide range across statements does not hide it. Overlapping or repeated
+are judged together: each IPv4 range must be /8 or narrower and each IPv6
+range /32 or narrower. The union across the whole policy may cover at most
+four IPv4 /8 networks and four IPv6 /32 networks, so splitting a wide range
+across statements does not hide it. Overlapping or repeated
 ranges are merged, not counted twice, and `::ffff:a.b.c.d/96+n` counts as
 the IPv4 /n. Wider allow-lists, such as `fd00::/8` or many large ranges,
 count as public. Statements that also carry another restricting key

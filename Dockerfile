@@ -2,6 +2,7 @@
 #
 # gos3 container image: the web UI is built with pnpm, embedded into a static
 # Go binary, and shipped on distroless (non-root, no shell).
+# Select --target headless to omit UI assets and the Node/pnpm build entirely.
 #
 #   docker build -t gos3 .
 #   docker build -t gos3 --build-arg VERSION=v1.2.3 --build-arg COMMIT=$(git rev-parse --short=12 HEAD) .
@@ -46,7 +47,7 @@ RUN --mount=type=cache,id=gos3-pnpm,target=/pnpm/store \
 # ---------------------------------------------------------------------------
 # Go binary with the UI embedded (internal/webui/dist)
 # ---------------------------------------------------------------------------
-FROM --platform=$BUILDPLATFORM golang:1.26-bookworm@sha256:d9c68c2c51161e12fd77e4c6320687c9cd86e1af1e3ad6e6cd63ff970641453c AS build
+FROM --platform=$BUILDPLATFORM golang:1.26-bookworm@sha256:d9c68c2c51161e12fd77e4c6320687c9cd86e1af1e3ad6e6cd63ff970641453c AS go-base
 ARG TARGETOS
 ARG TARGETARCH
 ARG VERSION=dev
@@ -68,6 +69,21 @@ RUN want="$(tr -d '\r' <go.mod | sed -n 's/^go //p')"; \
 RUN --mount=type=cache,target=/go/pkg/mod go mod download
 COPY cmd/ cmd/
 COPY internal/ internal/
+
+# This target has no dependency on the Node/pnpm stage or UI assets.
+FROM go-base AS build-headless
+RUN --mount=type=cache,target=/go/pkg/mod \
+    --mount=type=cache,target=/root/.cache/go-build \
+    CGO_ENABLED=0 GOOS=$TARGETOS GOARCH=$TARGETARCH \
+    go build -tags noui -trimpath \
+      -ldflags "-s -w \
+        -X github.com/seanmmitchell/gos3/internal/version.Version=${VERSION} \
+        -X github.com/seanmmitchell/gos3/internal/version.Commit=${COMMIT} \
+        -X github.com/seanmmitchell/gos3/internal/version.Date=${DATE}" \
+      -o /out/gos3 ./cmd/gos3 && \
+    mkdir -p /out/data
+
+FROM go-base AS build
 # Same steps as `make ui`: replace the placeholder with the UI build and make
 # sure index.html exists (the SPA build may only produce 200.html).
 COPY --from=ui /src/web/.output/public/ /tmp/ui/
@@ -88,15 +104,13 @@ RUN --mount=type=cache,target=/go/pkg/mod \
 # ---------------------------------------------------------------------------
 # Runtime: distroless static, uid/gid 65532 (nonroot)
 # ---------------------------------------------------------------------------
-FROM gcr.io/distroless/static-debian12:nonroot@sha256:afa5c872c891853ca7fcf1f12c3edb23f7eeef36189728842dd51042ff57f7ab
+FROM gcr.io/distroless/static-debian12:nonroot@sha256:afa5c872c891853ca7fcf1f12c3edb23f7eeef36189728842dd51042ff57f7ab AS runtime
 ARG VERSION=dev
 LABEL org.opencontainers.image.title="gos3" \
       org.opencontainers.image.description="S3-compatible object storage server with an embedded web UI" \
       org.opencontainers.image.licenses="MIT" \
       org.opencontainers.image.version="${VERSION}" \
       org.opencontainers.image.source="https://github.com/seanmmitchell/gos3"
-COPY --from=build /out/gos3 /usr/local/bin/gos3
-COPY --from=build --chown=65532:65532 /out/data /data
 COPY LICENSE THIRD_PARTY_NOTICES /usr/share/doc/gos3/
 # Every config key has a GOS3_* variable (`gos3 config env`). Root keys:
 # set GOS3_ROOT_ACCESS_KEY / GOS3_ROOT_SECRET_KEY, or let gos3 generate a
@@ -115,3 +129,15 @@ HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
     CMD ["/usr/local/bin/gos3", "healthcheck"]
 ENTRYPOINT ["/usr/local/bin/gos3"]
 CMD ["serve"]
+
+# docker build --target headless -t gos3:headless .
+# Management API is enabled; use --no-admin for S3-only operation.
+FROM runtime AS headless
+LABEL org.opencontainers.image.description="S3-compatible object storage server without embedded web UI assets"
+COPY --from=build-headless /out/gos3 /usr/local/bin/gos3
+COPY --from=build-headless --chown=65532:65532 /out/data /data
+
+# The default image continues to include and enable the embedded UI.
+FROM runtime AS embedded
+COPY --from=build /out/gos3 /usr/local/bin/gos3
+COPY --from=build --chown=65532:65532 /out/data /data

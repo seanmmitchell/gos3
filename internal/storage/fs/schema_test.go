@@ -164,12 +164,19 @@ func fullVersionRecord() versionRecord {
 }
 
 func TestRecordEncoding(t *testing.T) {
-	for _, rec := range []versionRecord{fullVersionRecord(), {VersionID: "null", DeleteMarker: true}, {}} {
+	compressed := fullVersionRecord()
+	compressed.Compression, compressed.StoredSize = storage.CompressionDeflate, 12345
+	for _, rec := range []versionRecord{fullVersionRecord(), {VersionID: "null", DeleteMarker: true}, {}, compressed} {
 		data, err := encodeRecord(&rec)
 		if err != nil {
 			t.Fatal(err)
 		}
-		eq(t, "format", data[0], recordFormatVersionV1)
+		// Only compressed versions need the newer format.
+		wantFormat := recordFormatVersionV1
+		if rec.Compression != "" {
+			wantFormat = recordFormatVersionV2
+		}
+		eq(t, "format", data[0], wantFormat)
 		var got versionRecord
 		if err := decodeRecord(data, &got); err != nil {
 			t.Fatal(err)
@@ -225,17 +232,20 @@ func TestRecordEncoding(t *testing.T) {
 
 func FuzzDecodeVersionRecord(f *testing.F) {
 	full := fullVersionRecord()
-	f.Add(encodeVersionRecord(&full)[1:])
-	f.Add([]byte{})
-	f.Add([]byte{0, 0, 0xff, 0xff, 0xff, 0xff, 0x0f})
-	f.Fuzz(func(t *testing.T, data []byte) {
+	f.Add(encodeVersionRecord(&full)[1:], false)
+	full.Compression, full.StoredSize = storage.CompressionDeflate, 99
+	f.Add(encodeVersionRecord(&full)[1:], true)
+	f.Add([]byte{}, false)
+	f.Add([]byte{0, 0, 0xff, 0xff, 0xff, 0xff, 0x0f}, true)
+	f.Fuzz(func(t *testing.T, data []byte, v2 bool) {
 		var r versionRecord
-		if err := decodeVersionRecord(data, &r); err != nil {
+		if err := decodeVersionRecord(data, &r, v2); err != nil {
 			return
 		}
 		// Whatever decodes must re-encode to an equivalent record.
 		var r2 versionRecord
-		if err := decodeVersionRecord(encodeVersionRecord(&r)[1:], &r2); err != nil {
+		enc := encodeVersionRecord(&r)
+		if err := decodeVersionRecord(enc[1:], &r2, enc[0] == recordFormatVersionV2); err != nil {
 			t.Fatalf("re-decode: %v", err)
 		}
 		if !reflect.DeepEqual(r, r2) {

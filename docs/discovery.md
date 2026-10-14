@@ -1,5 +1,14 @@
 # gos3 discovery protocol
 
+Discovery is opt-in. `enabled`, `advertise`, `mdns`, `beacon`, and
+`allow_scan` all default to false; seeds and DNS SRV lists default to empty.
+For beacon discovery, explicitly enable `discovery.enabled`,
+`discovery.beacon`, and (to announce this server) `discovery.advertise`.
+For seed-only discovery, enable `discovery.enabled` and populate `seeds`.
+Existing explicit configuration and saved settings in managed mode retain
+their values. The `gos3 discover` command explicitly requests a one-shot
+search and still browses mDNS and beacons unless its disable flags are set.
+
 gos3 servers find each other — and the web UI finds servers — through five
 mechanisms. Every mechanism only produces *candidates*; a candidate becomes a
 verified peer once `GET <base>/_gos3/info` returns a valid `Info` document

@@ -3,7 +3,7 @@
 gos3 is configured from four layers. Each layer overrides the one before it:
 
 1. built-in defaults
-2. a YAML file (`--config FILE`, or `GOS3_CONFIG=FILE`)
+2. a JSON or YAML file (`--config FILE`, or `GOS3_CONFIG=FILE`)
 3. `GOS3_*` environment variables
 4. command-line flags of `gos3 serve`
 
@@ -11,20 +11,27 @@ There is also a fifth, **runtime** layer. The settings marked *runtime* below ca
 be changed while the server runs, through the web UI (**Settings**) or the admin
 API (`PUT /_gos3/admin/v1/config`, see [admin-api.md](admin-api.md)). gos3
 writes them to `<data>/.gos3/settings.json`, and from then on that file wins
-over the YAML file, the environment and the flags for those keys (see
+over the configuration file, the environment and the flags for those keys (see
 [Runtime settings](#runtime-settings-settingsjson)).
+
+This fifth layer applies only when `admin.enabled` is true. S3-only servers
+(`admin.enabled: false` or `--no-admin`) use the four static layers and
+neither read nor overwrite an existing `settings.json`. IAM and object state
+continue to load normally.
 
 Useful commands:
 
 ```sh
 gos3 config init -o gos3.yaml   # commented sample file; its values are the defaults
+gos3 config init -o gos3.json   # complete JSON configuration with default values
+gos3 config print --json        # effective JSON, secrets redacted
 gos3 config print [serve flags] # effective configuration (secrets redacted); exit 1 if invalid
 gos3 config env                 # table of every GOS3_* variable
 gos3 serve -h                   # flags
 ```
 
-`gos3 config print` takes the same flags as `gos3 serve`, so you can check what
-a command line would produce. When `<data>/.gos3/settings.json` exists, it
+`gos3 config print` takes the configuration flags of `gos3 serve`, so you can check what
+a command line would produce. When management is enabled and `<data>/.gos3/settings.json` exists, it
 lays that file over the result (defaults < file < env < flags <
 settings.json), as the server does, and lists the configured values it
 overrides. Unknown YAML keys are an error, reported with
@@ -33,6 +40,71 @@ Validation errors name the YAML key, for example
 `cors.allowed_origins[1]: must not contain a path...`.
 
 ## Value syntax
+
+JSON uses exactly the same snake_case keys and nested objects as the reference
+below, including `storage.backings` and `storage.replication`. Use native
+booleans, integer byte sizes, arrays, and string durations such as `"30s"`.
+A `.json` file must contain one JSON object; comments, trailing commas, nulls,
+duplicate keys, unknown fields and incorrect types are rejected. Omitted
+fields retain defaults. Static configuration JSON differs from the runtime
+admin API's camelCase fields and nanosecond durations.
+
+`gos3 config init --json` emits JSON to stdout; `-o file.json` also selects
+JSON automatically. `config print --json` prints a plain JSON object with the
+same effective settings as YAML output and exits unsuccessfully if invalid.
+
+## Server modes
+
+| Mode | Configuration | CLI |
+|---|---|---|
+| Embedded UI (default) | `admin.enabled: true`, `ui.enabled: true` | `gos3 serve` |
+| Separate UI / management API | `admin.enabled: true`, `ui.enabled: false` | `gos3 serve --no-ui` |
+| S3 only | `admin.enabled: false` (also disables UI) | `gos3 serve --no-admin` |
+
+Disabled UI and management endpoints return 404 and are not advertised.
+Mode switches require a restart and cannot be changed through the admin API.
+Health/readiness, optional metrics and the identity endpoint remain available.
+Discovery and all of its switches default to off in every mode.
+
+Examples: [S3 only](../deploy/config/s3-only.json),
+[separate UI](../deploy/config/managed.json), and
+[embedded UI](../deploy/config/embedded.json). Run
+`gos3 serve --config deploy/config/s3-only.json`; supply root keys through
+the environment or let gos3 generate them.
+
+`make build-headless` or `go build -tags noui ./cmd/gos3` excludes all UI
+assets and requires no Node/pnpm. These binaries default to UI disabled and
+management enabled; add `--no-admin` for S3 only. Explicitly enabling UI in a
+headless binary fails with an actionable error. For containers use
+`docker build --target headless -t gos3:headless .`.
+
+### MinIO startup compatibility
+
+`gos3 server /data --address :9000 --no-admin` accepts the MinIO-style
+`server` command, one local data directory, and flags before or after it.
+Do not combine the positional directory with `--data`.
+
+- `MINIO_ROOT_USER` / `MINIO_ROOT_PASSWORD` alias the root credential variables.
+- `MINIO_ADDRESS`, `MINIO_SITE_REGION`, and `MINIO_BROWSER` alias
+  `GOS3_ADDRESS`, `GOS3_REGION`, and `GOS3_UI_ENABLED`.
+- Native `GOS3_*` variables win over their aliases, even when explicitly empty.
+  Aliases override the file; flags override both environment forms.
+- `--json` selects JSON logs; `--quiet` suppresses the startup banner;
+  `--certs-dir DIR` uses `DIR/public.crt` and `DIR/private.key`.
+- Anonymous GET/HEAD `/minio/health/live` and `/minio/health/ready` are
+  probe aliases. Signed, presigned and virtual-host requests still route to
+  S3 objects, including a bucket named `minio`. The two anonymous path-style
+  URLs are reserved for probes.
+
+The UI shares the S3 listener at `/_gos3/ui/`; `--console-address` reports
+an error explaining how to use that URL or disable UI. Distributed MinIO
+volume syntax and multiple positional directories are rejected. Use gos3's
+storage configuration for additional backings. MinIO admin APIs and on-disk
+data layouts are not compatible; migrate objects through S3 into a new gos3
+data directory. JSON configures server settings; provision buckets and IAM
+resources through their APIs.
+
+### Environment and flag values
 
 These rules apply to environment variables and flags. YAML uses its native
 types for the same keys.
@@ -75,7 +147,44 @@ changed while running.
 |---|---|---|---|---|
 | `storage.backend` | `GOS3_STORAGE_BACKEND` | `--backend` | `fs` | `fs` (files under `path`) or `memory` (everything is lost on exit). |
 | `storage.path` | `GOS3_DATA` | `--data` | `./data` for `fs`, empty for `memory` | Data directory. With `fs` it holds the objects and the metadata database. With either backend it holds the system state in `<path>/.gos3/` (see [operations.md](operations.md#the-data-directory)). With `memory` and no path the server is fully ephemeral, including generated root credentials and IAM users. |
-| `storage.fsync_data` | `GOS3_FSYNC` | `--fsync` | `true` | fsync object data before acknowledging a write. `--fsync=false` is faster but can lose recent writes on power loss. |
+| `storage.fsync_data` | `GOS3_FSYNC` | `--fsync` | `true` | fsync object data before acknowledging a write (every fs backing). `--fsync=false` is faster but can lose recent writes on power loss. |
+| `storage.backings` | `GOS3_STORAGE_BACKINGS` | | none | Additional storage backings, see [below](#storage-backings). Env syntax: comma-separated `name=/path` (fs), `name=fs:/path` or `name=memory`. |
+| `storage.default_backing` | `GOS3_DEFAULT_BACKING` | | `default` | Backing new buckets are created on. |
+| `storage.replication.default_mode` | `GOS3_REPLICATION_MODE` | | `single` | Replication of new buckets: `single`, `active-passive` or `active-active` (`active-passive` when only `default_replicas` is set). |
+| `storage.replication.default_replicas` | `GOS3_REPLICATION_REPLICAS` | | none | Backings new buckets are replicated to (comma-separated in env). Must not include the default backing. |
+| `storage.replication.auto_failover` | `GOS3_AUTO_FAILOVER` | | `false` | Promote a synced replica of an **active-passive** bucket when its primary backing fails. Changes not yet copied to the replica are lost. Active-active buckets always fail over. |
+| `storage.replication.workers` | `GOS3_REPLICATION_WORKERS` | | `2` | Bucket copies (to replicas and move targets) running concurrently, 1-64. |
+| `storage.replication.health_interval` | `GOS3_HEALTH_INTERVAL` | | `10s` | How often every backing is checked (1s-1h). |
+| `storage.replication.cutover_timeout` | `GOS3_CUTOVER_TIMEOUT` | | `60s` | How long the cutover of a move or promotion waits for writes in flight on the bucket (1s-1h); new writes to the bucket wait meanwhile. |
+
+#### Storage backings
+
+A server can spread its buckets over several **backings**, for example one
+fs directory per disk. The backing configured by `storage.backend` and
+`storage.path` is named `default` and also holds the system state; each entry
+of `storage.backings` adds one more:
+
+```yaml
+storage:
+  path: /var/lib/gos3              # the "default" backing + system state
+  backings:
+    - name: nvme                   # 1-32 of [a-z0-9_-]
+      path: /mnt/nvme/gos3         # backend: fs (default) needs its own directory
+    - name: archive
+      path: /mnt/hdd/gos3
+    - name: scratch
+      backend: memory              # lost on restart
+  default_backing: nvme            # new buckets go here
+  replication:
+    default_mode: active-passive   # new buckets get a replica...
+    default_replicas: [archive]    # ...on archive
+```
+
+Every bucket has a primary backing and optionally replicas; buckets can be
+moved between backings online. Placements are changed with the admin API or
+the web UI and saved in `<data>/.gos3/placements.json`. Existing buckets stay
+where they are when backings are added. See
+[operations.md](operations.md#multiple-backings-and-replication).
 
 ### `auth`
 
@@ -99,6 +208,12 @@ without a terminal they are written to a private temporary file (named in
 the banner and the log) that is deleted on exit. `gos3 keygen` prints a
 random pair you can use instead. See
 [security.md](security.md#root-credentials).
+
+### `admin`
+
+| Key | Env | Flag | Default | Description |
+|---|---|---|---|---|
+| `admin.enabled` | `GOS3_ADMIN_ENABLED` | `--no-admin` (sets false) | `true` | Enable the management API and persisted runtime settings. False also disables embedded UI. Restart required. |
 
 ### `ui`
 
@@ -150,16 +265,16 @@ API). [discovery.md](discovery.md) describes the protocol.
 
 | YAML key | Env | Flag | Default | Description |
 |---|---|---|---|---|
-| `discovery.enabled` | `GOS3_DISCOVERY_ENABLED` | `--no-discovery` (sets false) | `true` | Run discovery (mDNS, beacon, seeds, DNS SRV). |
-| `discovery.advertise` | `GOS3_DISCOVERY_ADVERTISE` | | `true` | Announce this server via mDNS and the beacon. |
-| `discovery.mdns` | `GOS3_DISCOVERY_MDNS` | | `true` | Use mDNS / DNS-SD (`_gos3._tcp.local.`). |
-| `discovery.beacon` | `GOS3_DISCOVERY_BEACON` | | `true` | Use the UDP multicast beacon. |
+| `discovery.enabled` | `GOS3_DISCOVERY_ENABLED` | `--no-discovery` (sets false) | `false` | Run discovery (mDNS, beacon, seeds, DNS SRV). |
+| `discovery.advertise` | `GOS3_DISCOVERY_ADVERTISE` | | `false` | Announce this server via mDNS and the beacon. |
+| `discovery.mdns` | `GOS3_DISCOVERY_MDNS` | | `false` | Use mDNS / DNS-SD (`_gos3._tcp.local.`). |
+| `discovery.beacon` | `GOS3_DISCOVERY_BEACON` | | `false` | Use the UDP multicast beacon. |
 | `discovery.beacon_group` | `GOS3_DISCOVERY_BEACON_GROUP` | | `239.255.73.83:7373` | IPv4 multicast group and port. |
 | `discovery.beacon_interval` | `GOS3_DISCOVERY_BEACON_INTERVAL` | | `10s` | Announce interval (±10 % jitter), 1s–1h. |
 | `discovery.seeds` | `GOS3_DISCOVERY_SEEDS` | `--seed` | `[]` | Base URLs (or bare `host[:port]`, meaning `http://`) of servers to probe on start and every 30 s. At most 256. |
 | `discovery.dns_srv` | `GOS3_DISCOVERY_DNS_SRV` | | `[]` | Domains whose `_gos3._tcp.<domain>` SRV records list servers (queried every 60 s). At most 64. |
 | `discovery.peer_ttl` | `GOS3_DISCOVERY_PEER_TTL` | | `60s` | Peers not seen for this long are dropped, 30s–7d. |
-| `discovery.allow_scan` | `GOS3_DISCOVERY_ALLOW_SCAN` | | `true` | Allow network scans through the admin API (users also need `admin:ScanNetwork`). |
+| `discovery.allow_scan` | `GOS3_DISCOVERY_ALLOW_SCAN` | | `false` | Allow network scans through the admin API (users also need `admin:ScanNetwork`). |
 | `discovery.max_scan_hosts` | `GOS3_DISCOVERY_MAX_SCAN_HOSTS` | | `1024` | Host limit per scan, 1–65536. |
 
 ### `logging`
@@ -183,6 +298,18 @@ API). [discovery.md](discovery.md) describes the protocol.
 |---|---|---|---|---|
 | `metrics.enabled` | `GOS3_METRICS_ENABLED` | `true` | | Serve Prometheus metrics at `/_gos3/metrics` (404 when disabled). |
 | `metrics.public` | `GOS3_METRICS_PUBLIC` | `false` | `metricsPublic` | Serve metrics without authentication. Otherwise a signed request with `admin:GetStats` is required. |
+
+### `compression`
+
+The server-wide compression policy. Compression is transparent to clients;
+see [operations.md](operations.md#compression).
+
+| YAML key | Env | Default | Runtime | Description |
+|---|---|---|---|---|
+| `compression.mode` | `GOS3_COMPRESSION_MODE` | `optional` | `compression.mode` | `optional`: each bucket's setting decides (off unless enabled through the admin API or the web UI). `enforced`: every bucket compresses new objects and cannot opt out. `disabled`: nothing new is compressed and buckets cannot enable it. Stored objects stay readable whatever the mode. |
+| `compression.level` | `GOS3_COMPRESSION_LEVEL` | `1` | `compression.level` | DEFLATE level, 1 (fastest) to 9 (smallest). |
+| `compression.min_size` | `GOS3_COMPRESSION_MIN_SIZE` | `4096` | `compression.minSize` | Objects smaller than this (when the size is known before the upload, i.e. not for chunked uploads without a length) are stored uncompressed. Bytes or `4KiB`-style. |
+| `compression.skip_content_types` | `GOS3_COMPRESSION_SKIP_CONTENT_TYPES` | compressed images, `video/*`, `audio/*`, `font/woff*`, archives, zip-based document formats (see `gos3 config print`) | `compression.skipContentTypes` | Media types stored uncompressed because they are compressed already: `type/subtype`, `type/*` or a prefix ending in `*` (case-insensitive, parameters ignored), at most 256. `[]` compresses every type. Objects with a compressing `Content-Encoding` (`gzip`, `br`, `zstd`, …) are never compressed again. |
 
 ### Other
 
@@ -231,6 +358,7 @@ The runtime subset is the `Settings` document of the admin API:
 | `logging.*` | `logging.*` |
 | `lifecycle.enabled`, `lifecycle.intervalSeconds` | `lifecycle.enabled`, `lifecycle.interval` |
 | `metricsPublic` | `metrics.public` |
+| `compression.*` | `compression.*` (`minSize` = `min_size`, `skipContentTypes` = `skip_content_types`) |
 
 How it behaves:
 
@@ -239,7 +367,7 @@ How it behaves:
   laid over them and **wins** for every runtime field.
 - The file is written atomically (mode 0600) the first time settings are saved
   through the UI or `PUT /config`, not at first start. Until then, changes to
-  YAML, environment or flags take effect on the next restart as usual.
+  JSON, YAML, environment or flags take effect on the next restart as usual.
 - After the first save, changing one of these keys in YAML, the environment or
   a flag has no effect. Change it in the UI or the admin API, or stop the
   server and delete `settings.json` to go back to the static configuration.
@@ -248,7 +376,8 @@ How it behaves:
   `gos3 config print` lists them.
 - Changes apply immediately and need no restart: log level and format, the
   access log, CORS, domains, region, discovery (only the mechanisms whose
-  settings changed are restarted) and the lifecycle worker. With
+  settings changed are restarted), the lifecycle worker and the compression
+  policy (from the next write on). With
   `auth.strict_region`, signature checks follow a region change immediately.
 - A corrupt or invalid `settings.json` stops the server at startup with an
   error that names the file.

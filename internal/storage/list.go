@@ -244,13 +244,20 @@ func ListObjectVersions(ctx context.Context, b Backend, bucket string, p Version
 
 // BucketUsage returns the number of current objects and their total size
 // (latest versions only) and, separately, the total count/size of all versions.
+// Sizes are those of the content; the Stored* fields count the bytes the
+// backend stores for it, which is less for compressed versions (see
+// ObjectInfo.PhysicalSize).
 type BucketUsage struct {
-	Objects        int64
-	Bytes          int64
-	Versions       int64 // all versions incl. noncurrent (excluding delete markers)
-	VersionBytes   int64
-	DeleteMarkers  int64
-	PendingUploads int64
+	Objects            int64
+	Bytes              int64
+	StoredBytes        int64
+	Versions           int64 // all versions incl. noncurrent (excluding delete markers)
+	VersionBytes       int64
+	StoredVersionBytes int64
+	// CompressedVersions counts the versions stored compressed.
+	CompressedVersions int64
+	DeleteMarkers      int64
+	PendingUploads     int64
 }
 
 // ComputeBucketUsage walks a bucket to compute usage statistics. It is
@@ -264,9 +271,14 @@ func ComputeBucketUsage(ctx context.Context, b Backend, bucket string) (BucketUs
 		}
 		u.Versions++
 		u.VersionBytes += v.Size
+		u.StoredVersionBytes += v.PhysicalSize()
+		if v.Compression != "" {
+			u.CompressedVersions++
+		}
 		if v.IsLatest {
 			u.Objects++
 			u.Bytes += v.Size
+			u.StoredBytes += v.PhysicalSize()
 		}
 		return nil
 	})

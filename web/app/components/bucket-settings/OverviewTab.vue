@@ -37,6 +37,13 @@ const created = computed(() => props.summary?.createdAt || s3Info.data.value?.cr
 const isPublic = computed<boolean | null>(() => props.summary?.public ?? s3Info.data.value?.isPublic ?? null)
 
 const usage = computed(() => props.summary?.usage ?? null)
+/** "… incl. versions", after the compression saving of the current versions when there is one. */
+const sizeHint = computed(() => {
+  const u = usage.value
+  if (!u) return undefined
+  const note = formatStoredNote(u.bytes, u.storedBytes)
+  return `${note ? `${note} · ` : ''}${formatBytes(u.versionBytes)} incl. versions`
+})
 
 const configs = computed(() => {
   const c = props.summary?.configs
@@ -50,6 +57,12 @@ const configs = computed(() => {
     { label: 'Object lock', on: c.objectLock, tab: 'object-lock' },
     { label: 'ACL', on: !!c.acl && c.acl !== 'private', tab: 'access', detail: c.acl || 'private' }
   ]
+  const comp = props.summary?.compression
+  if (comp) {
+    // The bucket's own setting may differ from what happens (server mode).
+    const detail = comp.effective ? (comp.enabled ? 'Enabled' : 'Enforced') : (comp.enabled ? 'Off (server disabled)' : 'Not set')
+    items.splice(5, 0, { label: 'Compression', on: comp.effective, tab: 'compression', detail })
+  }
   return items
 })
 
@@ -61,7 +74,7 @@ const versioningLabel = computed(() => (props.versioning === 'Enabled' ? 'Enable
     <div class="grid grid-cols-2 gap-3 xl:grid-cols-4">
       <template v-if="usage">
         <AdminStatCard label="Objects" :value="formatNumber(usage.objects)" icon="i-lucide-files" :hint="`${formatNumber(usage.versions)} versions`" />
-        <AdminStatCard label="Size" :value="formatBytes(usage.bytes)" icon="i-lucide-hard-drive" :hint="`${formatBytes(usage.versionBytes)} incl. versions`" />
+        <AdminStatCard label="Size" :value="formatBytes(usage.bytes)" icon="i-lucide-hard-drive" :hint="sizeHint" />
         <AdminStatCard label="Delete markers" :value="formatNumber(usage.deleteMarkers)" icon="i-lucide-eraser" />
         <AdminStatCard label="Pending uploads" :value="formatNumber(usage.pendingUploads)" icon="i-lucide-upload" :color="usage.pendingUploads ? 'warning' : 'default'" />
       </template>

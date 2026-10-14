@@ -33,7 +33,23 @@ const INFO = {
 }
 
 // Root: createOwnKeys is always false (root has no IAM keys).
-const ALL_CAPS = { admin: true, viewInfo: true, viewStats: true, manageConfig: true, manageUsers: true, managePolicies: true, manageBuckets: true, discovery: true, scan: true, probe: true, createOwnKeys: false }
+const ALL_CAPS = { admin: true, viewInfo: true, viewStats: true, manageConfig: true, manageUsers: true, managePolicies: true, manageBuckets: true, viewStorage: true, manageStorage: true, discovery: true, scan: true, probe: true, createOwnKeys: false }
+
+interface MockMember { backing: string, role: string, state: string, healthy: boolean, pending: number, progress: { keys: number, versions: number, bytes: number } | null, lastSyncAt?: string, lastError: string }
+interface MockPlacement { bucket: string, mode: string, primary: string, members: MockMember[], move: { from: string, to: string, startedAt: string, phase: string } | null }
+
+const BACKINGS = [
+  { name: 'default', kind: 'fs', path: '/data', default: true, healthy: true, lastError: '', checkedAt: new Date(now - 5000).toISOString(), buckets: 1, replicas: 0, disk: { path: '/data', totalBytes: 100_000_000_000, freeBytes: 60_000_000_000, usedBytes: 40_000_000_000 } },
+  { name: 'fast', kind: 'fs', path: '/mnt/nvme', default: false, healthy: true, lastError: '', checkedAt: new Date(now - 5000).toISOString(), buckets: 0, replicas: 0, disk: { path: '/mnt/nvme', totalBytes: 1_000_000_000_000, freeBytes: 900_000_000_000, usedBytes: 100_000_000_000 } },
+  { name: 'archive', kind: 'fs', path: '/mnt/archive', default: false, healthy: true, lastError: '', checkedAt: new Date(now - 5000).toISOString(), buckets: 0, replicas: 0, disk: null },
+  { name: 'usb', kind: 'fs', path: '/mnt/usb', default: false, healthy: false, lastError: 'stat /mnt/usb: no such file or directory', checkedAt: new Date(now - 5000).toISOString(), buckets: 0, replicas: 0, disk: null }
+]
+
+const member = (backing: string, role: string, over: Partial<MockMember> = {}): MockMember => ({ backing, role, state: 'in-sync', healthy: true, pending: 0, progress: null, lastError: '', ...over })
+
+function placementSummary(p: MockPlacement) {
+  return { mode: p.mode, primary: p.primary, replicas: p.members.filter(m => m.role === 'replica').map(m => m.backing), moving: !!p.move }
+}
 
 interface MockState {
   log: string[]
@@ -45,6 +61,7 @@ interface MockState {
   settings: Record<string, unknown>
   lifecycle: string | null
   cors: string | null
+  placement: MockPlacement
 }
 
 function initialState(): MockState {
@@ -76,10 +93,12 @@ function initialState(): MockState {
       discovery: { enabled: true, advertise: true, mdns: true, beacon: true, beaconGroup: '239.255.73.83:7373', beaconInterval: 10_000_000_000, seeds: null, dnsSrv: null, peerTtl: 60_000_000_000, allowScan: true, maxScanHosts: 1024 },
       logging: { level: 'info', format: 'text', accessLog: true },
       lifecycle: { enabled: true, intervalSeconds: 3600 },
-      metricsPublic: false
+      metricsPublic: false,
+      compression: { mode: 'optional', level: 1, minSize: 4096, skipContentTypes: ['image/jpeg', 'video/*'] }
     },
     lifecycle: null,
-    cors: null
+    cors: null,
+    placement: { bucket: 'photos', mode: 'single', primary: 'default', members: [member('default', 'primary')], move: null }
   }
 }
 
@@ -192,12 +211,51 @@ async function mockGos3(page: Page): Promise<MockState> {
         const r = JSON.parse(body) as { action: string }
         return json(200, { Allowed: r.action === 's3:GetObject', ExplicitDeny: false, Reason: r.action === 's3:GetObject' ? 'allowed by policy readwrite' : 'no statement allows the action' })
       }
+      if (p === '/backings') return json(200, { defaultBacking: 'default', autoFailover: false, backings: BACKINGS })
+      if (p === '/buckets' && method === 'GET') {
+        return json(200, { buckets: [{
+          name: 'photos', createdAt: '2026-01-01T00:00:00Z', region: 'eu-test-1', versioning: 'Enabled', objectLock: false, owner: 'root',
+          configs: { policy: false, cors: false, lifecycle: false, tagging: false, encryption: false, website: false, objectLock: false, acl: 'private' },
+          public: false,
+          usage: { objects: 42, bytes: 4096, versions: 50, versionBytes: 5000, deleteMarkers: 1, pendingUploads: 0 },
+          placement: placementSummary(st.placement)
+        }] })
+      }
+      if (p === '/buckets/photos/placement' && method === 'GET') {
+        const res = JSON.parse(JSON.stringify(st.placement)) as MockPlacement
+        // A running replica copy finishes once it has been seen (the UI polls meanwhile).
+        for (const m of st.placement.members) {
+          if (m.state === 'syncing' && m.role === 'replica') Object.assign(m, { state: 'in-sync', progress: null, lastSyncAt: new Date().toISOString() })
+        }
+        return json(200, res)
+      }
+      if (p === '/buckets/photos/placement' && method === 'PUT') {
+        const r = JSON.parse(body) as { mode: string, replicas: string[] }
+        const keep = st.placement.members.filter(m => m.role === 'primary' || r.replicas.includes(m.backing))
+        const added = r.replicas.filter(b => !keep.some(m => m.backing === b)).map(b => member(b, 'replica', { state: 'syncing', progress: { keys: 10, versions: 12, bytes: 2048 } }))
+        st.placement = { ...st.placement, mode: r.mode, members: [...keep, ...added] }
+        return json(200, st.placement)
+      }
+      if (p === '/buckets/photos/placement/move' && method === 'POST') {
+        const r = JSON.parse(body) as { to: string }
+        st.placement = {
+          ...st.placement,
+          members: [...st.placement.members, member(r.to, 'move-target', { state: 'syncing', progress: { keys: 1, versions: 1, bytes: 1 } })],
+          move: { from: st.placement.primary, to: r.to, startedAt: new Date().toISOString(), phase: 'copying' }
+        }
+        return json(202, st.placement)
+      }
+      if (p === '/buckets/photos/placement/move' && method === 'DELETE') {
+        st.placement = { ...st.placement, members: st.placement.members.filter(m => m.role !== 'move-target'), move: null }
+        return json(200, st.placement)
+      }
       if (p === '/buckets/photos') {
         return json(200, {
           name: 'photos', createdAt: '2026-01-01T00:00:00Z', region: 'eu-test-1', versioning: 'Enabled', objectLock: false, owner: 'root',
           configs: { policy: false, cors: !!st.cors, lifecycle: !!st.lifecycle, tagging: false, encryption: false, website: false, objectLock: false, acl: 'private' },
           public: false,
-          usage: { objects: 42, bytes: 4096, versions: 50, versionBytes: 5000, deleteMarkers: 1, pendingUploads: 0 }
+          usage: { objects: 42, bytes: 4096, versions: 50, versionBytes: 5000, deleteMarkers: 1, pendingUploads: 0 },
+          placement: placementSummary(st.placement)
         })
       }
       return json(404, { error: { code: 'NotFound', message: `unmocked ${method} ${p}` } })
@@ -381,11 +439,21 @@ test.describe('admin pages', () => {
   test('settings: edits durations in seconds and saves nanoseconds', async ({ page }) => {
     const st = await mockGos3(page)
     await page.goto(`/_gos3/ui/servers/${CONN_ID}/settings`)
+    // One section at a time: the chips under the header switch (?tab=).
+    const chips = page.getByRole('tablist', { name: 'Settings sections' })
+    await expect(chips.getByRole('tab', { name: 'General' })).toHaveAttribute('aria-selected', 'true')
+    await expect(page.getByLabel('Beacon interval (seconds)')).toBeHidden()
+    const discovery = chips.getByRole('tab', { name: /^Discovery/ })
+    await discovery.click()
+    await expect(page).toHaveURL(/[?&]tab=discovery/)
+    await expect(page.getByRole('tabpanel', { name: 'Discovery' })).toBeVisible()
+    await expect(page.getByLabel('Server name')).toBeHidden()
     const interval = page.getByLabel('Beacon interval (seconds)')
     await expect(interval).toHaveValue('10')
     await interval.fill('5')
     await interval.blur()
     await expect(page.getByText('You have unsaved changes.')).toBeVisible()
+    await expect(discovery).toContainText('unsaved changes')
     await page.getByRole('button', { name: 'Save settings' }).click()
     await expect(page.getByText('All changes saved.')).toBeVisible()
     const put = JSON.parse(st.bodies['PUT /_gos3/admin/v1/config']!) as { discovery: { beaconInterval: number, peerTtl: number } }
@@ -416,5 +484,44 @@ test.describe('admin pages', () => {
     await expect.poll(() => st.cors).toContain('<AllowedMethod>GET</AllowedMethod>')
     await page.getByRole('tab', { name: 'XML' }).click()
     await expect(page.getByText(/<CORSConfiguration/)).toBeVisible()
+  })
+  test('storage: backings page, replication and a canceled move in bucket settings', async ({ page }) => {
+    const st = await mockGos3(page)
+    await page.goto(`/_gos3/ui/servers/${CONN_ID}/storage`)
+    await expect(page.getByRole('heading', { name: 'Storage', level: 1 })).toBeVisible()
+    for (const name of ['default', 'fast', 'archive', 'usb']) await expect(page.getByRole('heading', { name, level: 2, exact: true })).toBeVisible()
+    await expect(page.getByRole('meter', { name: 'Disk usage of default' })).toHaveAttribute('aria-valuenow', '40')
+    await expect(page.getByTestId('unhealthy-backings')).toContainText('usb')
+    await expect(page.getByText('stat /mnt/usb: no such file or directory')).toBeVisible()
+    await expect(page.getByRole('navigation', { name: 'Server navigation' }).getByRole('link', { name: 'Storage' })).toBeVisible()
+
+    await page.goto(`/_gos3/ui/servers/${CONN_ID}/buckets/photos/settings?tab=placement`)
+    await expect(page.getByRole('tab', { name: 'Placement' })).toHaveAttribute('aria-selected', 'true')
+    await expect(page.getByTestId('placement-mode')).toHaveText('Single copy')
+
+    // Replicate to "fast": the new replica syncs, then (polled) is in sync.
+    await page.getByRole('radio', { name: /Active-passive/ }).click()
+    await page.getByRole('checkbox', { name: 'fast' }).click()
+    await page.getByRole('button', { name: 'Save replication' }).click()
+    await expect(page.getByTestId('placement-mode')).toHaveText('Active-passive')
+    expect(JSON.parse(st.bodies['PUT /_gos3/admin/v1/buckets/photos/placement']!)).toEqual({ mode: 'active-passive', replicas: ['fast'] })
+    await expect(page.getByTestId('member-fast')).toContainText('Replica')
+    await expect(page.getByTestId('member-fast')).toContainText('In sync', { timeout: 10_000 })
+
+    // Move the primary to "archive", then cancel while copying.
+    await page.getByRole('combobox', { name: 'Target backing' }).click()
+    await page.getByRole('option', { name: 'archive' }).click()
+    await page.getByRole('button', { name: 'Move', exact: true }).click()
+    await page.getByRole('dialog').getByRole('button', { name: 'Start move' }).click()
+    await expect(page.getByTestId('move-banner')).toContainText('Moving from default to archive')
+    expect(JSON.parse(st.bodies['POST /_gos3/admin/v1/buckets/photos/placement/move']!)).toEqual({ to: 'archive' })
+    await page.getByTestId('move-banner').getByRole('button', { name: 'Cancel move' }).click()
+    await page.getByRole('dialog').getByRole('button', { name: 'Cancel move' }).click()
+    await expect(page.getByTestId('move-banner')).toBeHidden()
+    expect(st.log).toContain('DELETE /_gos3/admin/v1/buckets/photos/placement/move')
+
+    // The bucket list shows the replication chip.
+    await page.goto(`/_gos3/ui/servers/${CONN_ID}/buckets`)
+    await expect(page.getByTestId('placement-chips')).toContainText('AP ×2')
   })
 })

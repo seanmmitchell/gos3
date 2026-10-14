@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/seanmmitchell/gos3/internal/storage"
+	"github.com/seanmmitchell/gos3/internal/storage/compress"
 )
 
 // MaxPartNumber is the largest part number accepted (S3 allows 1..10000).
@@ -258,6 +259,18 @@ func (b *Backend) WalkMultipartUploads(ctx context.Context, bucketName, prefix s
 // all its parts. If the commit preconditions fail the upload is kept, so the
 // client may retry.
 func (b *Backend) CompleteMultipartUpload(ctx context.Context, bucketName, key, uploadID string, partNumbers []int, meta storage.ObjectMeta, opts storage.CommitOptions) (storage.ObjectInfo, error) {
+	return b.CompleteMultipartUploadWith(ctx, bucketName, key, uploadID, partNumbers, meta, opts, storage.WriteOptions{})
+}
+
+// CompleteMultipartUploadWith is CompleteMultipartUpload with write
+// options: with wopts.Compression the concatenated parts are stored
+// compressed (see storage.CompressingBackend). The compression runs with
+// the bucket locked, like the concatenation.
+func (b *Backend) CompleteMultipartUploadWith(ctx context.Context, bucketName, key, uploadID string, partNumbers []int,
+	meta storage.ObjectMeta, opts storage.CommitOptions, wopts storage.WriteOptions) (storage.ObjectInfo, error) {
+	if err := checkCompression(wopts.Compression); err != nil {
+		return storage.ObjectInfo{}, err
+	}
 	bk, err := b.lockBucket(ctx, bucketName)
 	if err != nil {
 		return storage.ObjectInfo{}, err
@@ -288,11 +301,29 @@ func (b *Backend) CompleteMultipartUpload(ctx context.Context, bucketName, key, 
 	if err := checkPreconditions(obj, opts); err != nil {
 		return storage.ObjectInfo{}, err
 	}
-	data := make([]byte, 0, total)
-	for _, p := range parts {
-		data = append(data, p.data...)
+	var (
+		data []byte
+		enc  stored
+	)
+	if c := wopts.Compression; c.Enabled() && total > 0 {
+		zw, err := compress.NewWriter((*appendWriter)(&data), c.Level)
+		if err != nil {
+			return storage.ObjectInfo{}, err
+		}
+		for _, p := range parts {
+			_, _ = zw.Write(p.data) // appending to a slice cannot fail
+		}
+		if err := zw.Close(); err != nil {
+			return storage.ObjectInfo{}, err
+		}
+		enc = stored{compression: c.Algorithm, size: total}
+	} else {
+		data = make([]byte, 0, total)
+		for _, p := range parts {
+			data = append(data, p.data...)
+		}
 	}
-	info, err := b.commitLocked(bk, key, data, meta, opts)
+	info, err := b.commitLocked(bk, key, data, enc, meta, opts)
 	if err != nil {
 		return storage.ObjectInfo{}, err
 	}

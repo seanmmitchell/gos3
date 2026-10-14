@@ -11,7 +11,6 @@ package webui
 import (
 	"bytes"
 	"crypto/sha256"
-	"embed"
 	"encoding/base64"
 	"io"
 	"io/fs"
@@ -30,18 +29,6 @@ const Prefix = "/_gos3/ui/"
 
 // placeholderMarker identifies the committed placeholder index.html.
 const placeholderMarker = `name="gos3-ui-placeholder"`
-
-//go:embed all:dist
-var embedded embed.FS
-
-// FS returns the embedded UI files (the contents of dist/).
-func FS() fs.FS {
-	sub, err := fs.Sub(embedded, "dist")
-	if err != nil { // cannot happen: dist is embedded
-		panic(err)
-	}
-	return sub
-}
 
 // Built reports whether the embedded files are a real UI build rather than
 // the placeholder.
@@ -65,7 +52,12 @@ func IsBuilt(fsys fs.FS) bool {
 }
 
 // Handler returns the handler for the embedded UI (see NewHandler).
-func Handler() http.Handler { return NewHandler(FS()) }
+func Handler() http.Handler {
+	if FS() == nil {
+		return http.NotFoundHandler()
+	}
+	return NewHandler(FS())
+}
 
 // NewHandler serves the static UI in fsys under Prefix:
 //

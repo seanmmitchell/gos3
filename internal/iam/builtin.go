@@ -78,7 +78,7 @@ var builtinPolicies = map[string]*NamedPolicy{
 			Statement: []Statement{{
 				Sid:      "Diagnostics",
 				Effect:   "Allow",
-				Action:   StringOrSlice{"admin:ServerInfo", "admin:GetStats", "admin:GetDiscovery"},
+				Action:   StringOrSlice{"admin:ServerInfo", "admin:GetStats", "admin:GetDiscovery", "admin:ListBackings", "admin:GetBucketPlacement"},
 				Resource: StringOrSlice{AdminResourceARN},
 			}},
 		},

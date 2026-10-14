@@ -106,17 +106,18 @@ type Config struct {
 	MaxScanHosts int `json:"maxScanHosts" yaml:"max_scan_hosts"`
 }
 
-// DefaultConfig returns the default discovery configuration.
+// DefaultConfig returns an opt-in discovery configuration. All network
+// mechanisms, advertising and scans are disabled until explicitly enabled.
 func DefaultConfig() Config {
 	return Config{
-		Enabled:        true,
-		Advertise:      true,
-		MDNS:           true,
-		Beacon:         true,
+		Enabled:        false,
+		Advertise:      false,
+		MDNS:           false,
+		Beacon:         false,
 		BeaconGroup:    DefaultBeaconGroup,
 		BeaconInterval: DefaultBeaconInterval,
 		PeerTTL:        60 * time.Second,
-		AllowScan:      true,
+		AllowScan:      false,
 		MaxScanHosts:   1024,
 	}
 }

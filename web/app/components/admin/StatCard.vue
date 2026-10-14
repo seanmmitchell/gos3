@@ -33,7 +33,7 @@ const VALUE_CLASS = {
           <USkeleton v-if="loading" class="h-7 w-20" />
           <span v-else class="text-2xl font-semibold tabular-nums" :class="VALUE_CLASS[color]">{{ value }}</span>
         </dd>
-        <dd v-if="hint" class="mt-0.5 truncate text-xs text-dimmed">
+        <dd v-if="hint" class="mt-0.5 truncate text-xs text-dimmed" :title="hint">
           {{ hint }}
         </dd>
       </dl>

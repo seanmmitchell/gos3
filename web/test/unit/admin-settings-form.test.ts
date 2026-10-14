@@ -1,16 +1,20 @@
 import { describe, expect, it } from 'vitest'
 import type { Settings } from '~/types/admin'
 import {
+  dirtySections,
   formatList,
   formToSettings,
   isFormDirty,
   normalizeList,
   parseList,
+  resolveSettingsSection,
   sectionOf,
+  settingsSections,
   settingsToForm,
   validateBeaconGroup,
   validateDomain,
   validateExposeHeader,
+  validateMediaTypePattern,
   validateOrigin,
   validateSeed,
   validateSettingsForm,
@@ -97,6 +101,92 @@ describe('settings form conversions', () => {
     const f = settingsToForm(sample())
     f.publicUrl = 'https://s3.example.com/'
     expect(formToSettings(f).publicUrl).toBe('https://s3.example.com')
+  })
+})
+
+describe('compression settings', () => {
+  // A server with compression (sample() is a server without it).
+  function withCompression(): Settings {
+    return { ...sample(), compression: { mode: 'enforced', level: 6, minSize: 4096, skipContentTypes: ['image/jpeg', 'video/*', 'application/vnd.oasis.opendocument.*'] } }
+  }
+
+  it('round-trips the compression section', () => {
+    const base = withCompression()
+    const f = settingsToForm(base)
+    expect(f.compression).toEqual({ mode: 'enforced', level: 6, minSize: 4096, skipContentTypes: ['image/jpeg', 'video/*', 'application/vnd.oasis.opendocument.*'] })
+    expect(formToSettings(f, base)).toEqual({ ...base, discovery: { ...base.discovery, seeds: [], dnsSrv: [] } })
+    expect(validateSettingsForm(f)).toEqual({})
+  })
+
+  it('saves edited fields with normalised lists', () => {
+    const f = settingsToForm(withCompression())
+    f.compression!.mode = 'disabled'
+    f.compression!.level = 9
+    f.compression!.minSize = 0
+    f.compression!.skipContentTypes = [' audio/* ', '', 'audio/*', 'font/woff2']
+    expect(formToSettings(f, withCompression()).compression).toEqual({ mode: 'disabled', level: 9, minSize: 0, skipContentTypes: ['audio/*', 'font/woff2'] })
+  })
+
+  it('treats a null skip list as empty and keeps unknown compression fields', () => {
+    const base = { ...sample(), compression: { mode: 'optional', level: 1, minSize: 4096, skipContentTypes: null, future: true } } as unknown as Settings
+    const f = settingsToForm(base)
+    expect(f.compression!.skipContentTypes).toEqual([])
+    const out = formToSettings(f, base).compression as unknown as Record<string, unknown>
+    expect(out.skipContentTypes).toEqual([])
+    expect(out.future).toBe(true)
+  })
+
+  it('sends no compression section to a server that has none', () => {
+    const base = sample()
+    const f = settingsToForm(base)
+    expect(f.compression).toBeNull()
+    const out = formToSettings(f, base)
+    expect('compression' in out).toBe(false)
+    expect(out).toEqual({ ...base, discovery: { ...base.discovery, seeds: [], dnsSrv: [] } })
+    expect(validateSettingsForm(f)).toEqual({})
+    expect(formToSettings(f)).not.toHaveProperty('compression')
+  })
+
+  it('detects compression changes as dirty', () => {
+    const orig = settingsToForm(withCompression())
+    const cur = settingsToForm(withCompression())
+    cur.compression!.skipContentTypes = [...cur.compression!.skipContentTypes, ' video/* ']
+    expect(isFormDirty(cur, orig)).toBe(false)
+    cur.compression!.level = 1
+    expect(isFormDirty(cur, orig)).toBe(true)
+  })
+
+  it('validates mode, level, minimum size and media type patterns like the server', () => {
+    const f = settingsToForm(withCompression())
+    f.compression!.mode = 'sometimes'
+    f.compression!.level = 10
+    f.compression!.minSize = -1
+    f.compression!.skipContentTypes = ['image/jpeg', 'text/plain; charset=utf-8']
+    expect(validateSettingsForm(f)).toEqual({
+      'compression.mode': 'Unknown compression mode',
+      'compression.level': 'Must be a whole number between 1 and 9',
+      'compression.minSize': expect.stringMatching(/between 0 and/),
+      'compression.skipContentTypes': expect.stringMatching(/text\/plain; charset=utf-8/)
+    })
+    f.compression!.mode = 'optional'
+    f.compression!.level = 1.5
+    f.compression!.minSize = 5 * 1024 ** 4 + 1
+    f.compression!.skipContentTypes = Array.from({ length: 257 }, (_, i) => `x/t${i}`)
+    expect(Object.keys(validateSettingsForm(f)).sort()).toEqual(['compression.level', 'compression.minSize', 'compression.skipContentTypes'])
+    f.compression!.level = 1
+    f.compression!.minSize = 5 * 1024 ** 4
+    f.compression!.skipContentTypes = ['video/*']
+    expect(validateSettingsForm(f)).toEqual({})
+    expect(sectionOf('compression.level')).toBe('compression')
+  })
+
+  it('accepts the media type pattern forms', () => {
+    for (const t of ['image/jpeg', 'video/*', 'application/vnd.oasis.opendocument.*', 'application/epub+zip', 'Image/JPEG', 'application/x-7z-compressed']) {
+      expect(validateMediaTypePattern(t)).toBeUndefined()
+    }
+    for (const t of ['*', 'image', '*/*', 'image/', '/jpeg', 'image/jp*eg', 'image/**', 'text/plain;charset=utf-8', 'image /jpeg']) {
+      expect(validateMediaTypePattern(t)).toBeDefined()
+    }
   })
 })
 
@@ -250,5 +340,44 @@ describe('settings validation', () => {
     expect(sectionOf('name')).toBe('general')
     expect(sectionOf('cors.maxAgeSeconds')).toBe('cors')
     expect(sectionOf('discovery.seeds')).toBe('discovery')
+  })
+})
+
+describe('settings sections', () => {
+  it('offers compression only when the server reported it', () => {
+    expect(settingsSections(settingsToForm(sample())).map(s => s.value)).toEqual(['general', 'cors', 'discovery', 'logging', 'lifecycle'])
+    const withCompression = settingsToForm({ ...sample(), compression: { mode: 'optional', level: 1, minSize: 0, skipContentTypes: [] } })
+    expect(settingsSections(withCompression).map(s => s.value)).toContain('compression')
+    expect(settingsSections(null).map(s => s.value)).not.toContain('compression')
+  })
+
+  it('resolves ?tab= to a known section (default general)', () => {
+    const sections = settingsSections(settingsToForm(sample()))
+    expect(resolveSettingsSection('discovery', sections)).toBe('discovery')
+    expect(resolveSettingsSection(['logging', 'cors'], sections)).toBe('logging')
+    expect(resolveSettingsSection('compression', sections)).toBe('general')
+    expect(resolveSettingsSection(undefined, sections)).toBe('general')
+    expect(resolveSettingsSection('bogus')).toBe('general')
+  })
+
+  it('reports the sections with unsaved changes', () => {
+    const original = settingsToForm(sample())
+    const f = settingsToForm(sample())
+    expect(dirtySections(f, original).size).toBe(0)
+    expect(dirtySections(f, null).size).toBe(0)
+    f.name = 'renamed'
+    f.discovery.beaconIntervalSeconds = 5
+    expect([...dirtySections(f, original)].sort()).toEqual(['discovery', 'general'])
+    // Normalised like the saved document: whitespace and duplicates are no change.
+    const g = settingsToForm(sample())
+    g.cors.allowedOrigins = [' * ', '*']
+    g.region = ' us-east-1 '
+    expect(dirtySections(g, original).size).toBe(0)
+  })
+
+  it('maps every section field path to its section', () => {
+    expect(sectionOf('logging.level')).toBe('logging')
+    expect(sectionOf('lifecycle.intervalSeconds')).toBe('lifecycle')
+    expect(sectionOf('publicUrl')).toBe('general')
   })
 })

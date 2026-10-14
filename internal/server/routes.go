@@ -63,6 +63,22 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		s.s3.ServeHTTP(w, r)
 		return
 	}
+	// MinIO health aliases are anonymous probes only. Signed requests and
+	// virtual-host requests still address objects in a bucket named minio.
+	if r.Header.Get("Authorization") == "" && r.URL.RawQuery == "" &&
+		(r.URL.Path == "/minio/health/live" || r.URL.Path == "/minio/health/ready") {
+		w, r, done := s.guardBody(w, r)
+		defer done()
+		if !allowGet(w, r) {
+			return
+		}
+		if r.URL.Path == "/minio/health/ready" {
+			s.serveReady(w, r)
+		} else {
+			w.WriteHeader(http.StatusOK)
+		}
+		return
+	}
 	// 2. gos3's own endpoints.
 	if p := r.URL.Path; p == "/_gos3" || strings.HasPrefix(p, SystemPrefix) {
 		w, r, done := s.guardBody(w, r)
@@ -99,6 +115,11 @@ func (s *Server) serveSystem(w http.ResponseWriter, r *http.Request, st *config.
 	p := r.URL.Path
 	switch {
 	case p == admin.Prefix || strings.HasPrefix(p, admin.Prefix+"/"):
+		if s.admin == nil {
+			s.logSystem(r, http.StatusNotFound)
+			writeJSONError(w, http.StatusNotFound, "NotFound", "the management API is disabled on this server")
+			return
+		}
 		s.admin.ServeHTTP(w, r)
 	case p+"/" == webui.Prefix || strings.HasPrefix(p, webui.Prefix):
 		if s.ui == nil {

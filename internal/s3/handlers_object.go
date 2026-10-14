@@ -208,13 +208,14 @@ func (s *Server) commitError(ctx context.Context, err error, bucket, key string,
 	return s3err.ErrPreconditionFailed.With("Condition", "If-None-Match")
 }
 
-// storeObject streams src into a new version of bucket/key and commits it
+// storeObject streams src (size bytes, -1 = unknown) into a new version of
+// bucket/key, compressed as the compression policy says, and commits it
 // with meta and cond. finish runs after src reached EOF and before the
 // commit (to set ETag and checksums computed while streaming). The writer
 // is aborted on any error.
-func (s *Server) storeObject(ctx context.Context, bucket, key string, src io.Reader, meta storage.ObjectMeta,
+func (s *Server) storeObject(ctx context.Context, bucket, key string, src io.Reader, size int64, meta storage.ObjectMeta,
 	cond storage.CommitOptions, finish func(*storage.ObjectMeta) error) (storage.ObjectInfo, error) {
-	ow, err := s.backend.NewObjectWriter(ctx, bucket, key)
+	ow, err := s.newObjectWriter(ctx, bucket, key, s.objectCompression(ctx, bucket, meta, size))
 	if err != nil {
 		return storage.ObjectInfo{}, bucketError(err, bucket)
 	}
@@ -440,6 +441,30 @@ type lockDefaults struct {
 	days, years int
 }
 
+func parseLockDefaults(raw []byte) (*lockDefaults, error) {
+	var doc objectLockConfigDoc
+	if err := xml.Unmarshal(raw, &doc); err != nil {
+		return nil, err
+	}
+	d := &lockDefaults{}
+	if doc.Rule != nil && doc.Rule.DefaultRetention != nil {
+		dr := doc.Rule.DefaultRetention
+		mode := strings.ToUpper(strings.TrimSpace(dr.Mode))
+		if (mode == "GOVERNANCE" || mode == "COMPLIANCE") && dr.Days >= 0 && dr.Years >= 0 &&
+			dr.Days <= maxRetentionYears*366 && dr.Years <= maxRetentionYears && dr.Days+dr.Years > 0 {
+			d.mode, d.days, d.years = mode, dr.Days, dr.Years
+		}
+	}
+	return d, nil
+}
+
+func (d *lockDefaults) retentionAt(created time.Time) (string, time.Time) {
+	if d.mode == "" {
+		return "", time.Time{}
+	}
+	return d.mode, created.UTC().AddDate(d.years, 0, d.days)
+}
+
 // maxRetentionYears bounds default retention periods (as S3: 100 years).
 const maxRetentionYears = 100
 
@@ -452,32 +477,36 @@ func (s *Server) defaultRetention(ctx context.Context, bucket string) (string, t
 		return "", time.Time{}, err
 	}
 	v, err := s.configs.get(bucket, cacheKindObjectLockDefaults, raw, func(b []byte) (any, error) {
-		var doc objectLockConfigDoc
-		if err := xml.Unmarshal(b, &doc); err != nil {
-			return nil, err
-		}
-		d := &lockDefaults{}
-		if doc.Rule != nil && doc.Rule.DefaultRetention != nil {
-			dr := doc.Rule.DefaultRetention
-			mode := strings.ToUpper(strings.TrimSpace(dr.Mode))
-			if (mode == "GOVERNANCE" || mode == "COMPLIANCE") && dr.Days >= 0 && dr.Years >= 0 &&
-				dr.Days <= maxRetentionYears*366 && dr.Years <= maxRetentionYears && dr.Days+dr.Years > 0 {
-				d.mode, d.days, d.years = mode, dr.Days, dr.Years
-			}
-		}
-		return d, nil
+		return parseLockDefaults(b)
 	})
 	if err != nil {
 		s.log.LogAttrs(ctx, slog.LevelWarn, "s3: ignoring invalid stored object lock configuration",
 			slog.String("bucket", bucket), slog.String("error", err.Error()))
 		return "", time.Time{}, nil
 	}
-	d := v.(*lockDefaults)
-	if d.mode == "" {
-		return "", time.Time{}, nil
+	mode, until := v.(*lockDefaults).retentionAt(s.now())
+	return mode, until, nil
+}
+
+// publishObjectRetention uses the bucket's current default and the new
+// version's creation time. The backend calls this under its commit lock with
+// configurations from the same atomic snapshot; it must not read the backend.
+func publishObjectRetention(meta *storage.ObjectMeta, created time.Time, config func(string) []byte, explicit bool) error {
+	if explicit {
+		if !meta.RetainUntil.After(created) {
+			return s3err.ErrInvalidArgument.WithMessage("The retain until date must be in the future!")
+		}
+		return nil
 	}
-	until := s.now().UTC().AddDate(d.years, 0, d.days)
-	return d.mode, until, nil
+	meta.RetentionMode, meta.RetainUntil = "", time.Time{}
+	if raw := config(storage.ConfigObjectLock); raw != nil {
+		d, err := parseLockDefaults(raw)
+		if err != nil {
+			return s3err.ErrInternalError
+		}
+		meta.RetentionMode, meta.RetainUntil = d.retentionAt(created)
+	}
+	return nil
 }
 
 // sseConfigDoc is the stored ServerSideEncryptionConfiguration document.
@@ -584,11 +613,14 @@ func (s *Server) handlePutObject(w http.ResponseWriter, r *http.Request, rc *req
 	if err := s.prepareNewObject(ctx, r, rc, bi, rc.key, &meta, opts); err != nil {
 		return err
 	}
+	cond.BeforePublish = func(m, _ *storage.ObjectMeta, created time.Time, config func(string) []byte) error {
+		return publishObjectRetention(m, created, config, opts.retentionSet)
+	}
 	p, err := s.newObjectPayload(r, rc, payloadOptions{RequireLength: true})
 	if err != nil {
 		return err
 	}
-	info, err := s.storeObject(ctx, rc.bucket, rc.key, p, meta, cond, func(m *storage.ObjectMeta) error {
+	info, err := s.storeObject(ctx, rc.bucket, rc.key, p, p.declaredSize(), meta, cond, func(m *storage.ObjectMeta) error {
 		m.ETag = p.ETag()
 		m.Checksums = p.Checksums()
 		m.ChecksumType = p.ChecksumType()

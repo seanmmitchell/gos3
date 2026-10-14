@@ -70,6 +70,9 @@ const (
 	ConfigReplication       = "replication"
 	ConfigAccelerate        = "accelerate"
 	ConfigRequestPayment    = "request-payment"
+	// ConfigCompression is the gos3 bucket compression setting (JSON, see
+	// the admin API), not an S3 configuration.
+	ConfigCompression = "compression"
 )
 
 // BucketInfo describes a bucket.
@@ -119,6 +122,11 @@ type ObjectMeta struct {
 	RetainUntil     time.Time // zero = none
 	LegalHold       bool
 	WebsiteRedirect string // x-amz-website-redirect-location
+	// MultipartRetentionSource is set only on an in-progress upload. "default"
+	// means its retention must be calculated when the version is published;
+	// "explicit" means the caller supplied the retention headers. It is
+	// cleared before the completed object's metadata is stored.
+	MultipartRetentionSource string
 }
 
 // ObjectInfo describes one object version (or delete marker).
@@ -131,6 +139,23 @@ type ObjectInfo struct {
 	DeleteMarker bool
 	Size         int64
 	LastModified time.Time
+	// Compression is the algorithm the backend stored the data with (see
+	// CompressingBackend; "" = stored as is). It is set by the backend
+	// and transparent to readers: Size and OpenObject are always about
+	// the uncompressed content.
+	Compression string
+	// StoredSize is the number of bytes the backend stores for the data
+	// when Compression is set (0 otherwise; see PhysicalSize).
+	StoredSize int64
+}
+
+// PhysicalSize is the number of bytes stored for the object's data: Size,
+// or StoredSize for compressed data.
+func (o ObjectInfo) PhysicalSize() int64 {
+	if o.Compression != "" {
+		return o.StoredSize
+	}
+	return o.Size
 }
 
 // CommitOptions are atomic preconditions evaluated against the current latest
@@ -148,6 +173,12 @@ type CommitOptions struct {
 	// part was replaced after the caller validated it. The check is atomic
 	// with the commit.
 	PartETags []string
+	// BeforePublish runs after any data copy, under the backend's atomic
+	// bucket commit lock/transaction, with the current object's metadata (nil
+	// if absent or a delete marker), the new version's actual creation time,
+	// and current bucket configurations. It may update meta or refuse the
+	// commit. The callback must not call the same backend.
+	BeforePublish func(meta, current *ObjectMeta, created time.Time, config func(key string) []byte) error
 }
 
 // ObjectWriter streams the data of a new object version. Nothing becomes

@@ -9,7 +9,7 @@ import (
 	"time"
 )
 
-// EnvConfig names the YAML configuration file (overridden by --config).
+// EnvConfig names the JSON or YAML configuration file (overridden by --config).
 const EnvConfig = "GOS3_CONFIG"
 
 // EnvVar documents one GOS3_* environment variable.
@@ -25,7 +25,8 @@ type EnvVar struct {
 // booleans accept 1/0, true/false, t/f, yes/no and on/off; durations use Go
 // syntax ("30s", "1h"); sizes accept unit suffixes ("5GiB", see ParseSize).
 var envVars = []EnvVar{
-	{EnvConfig, "", "path of the YAML config file", nil},
+	{EnvConfig, "", "path of the JSON or YAML config file", nil},
+	{"GOS3_ADMIN_ENABLED", "admin.enabled", "enable management API and saved UI settings (bool); false also disables UI", boolean(func(c *Config) *bool { return &c.Admin.Enabled })},
 	{"GOS3_ADDRESS", "server.address", "listen address, [host]:port", str(func(c *Config) *string { return &c.Server.Address })},
 	{"GOS3_NAME", "server.name", "server name (default: host name)", str(func(c *Config) *string { return &c.Server.Name })},
 	{"GOS3_REGION", "server.region", "region reported to clients", str(func(c *Config) *string { return &c.Server.Region })},
@@ -43,6 +44,14 @@ var envVars = []EnvVar{
 	{"GOS3_DATA", "storage.path", "data directory", str(func(c *Config) *string { return &c.Storage.Path })},
 	{"GOS3_STORAGE_BACKEND", "storage.backend", "fs or memory", str(func(c *Config) *string { return &c.Storage.Backend })},
 	{"GOS3_FSYNC", "storage.fsync_data", "fsync object data on commit (bool)", boolean(func(c *Config) *bool { return &c.Storage.FsyncData })},
+	{"GOS3_STORAGE_BACKINGS", "storage.backings", "extra backings, comma-separated name=/path (fs) or name=memory", backingsList},
+	{"GOS3_DEFAULT_BACKING", "storage.default_backing", "backing new buckets are created on", str(func(c *Config) *string { return &c.Storage.DefaultBacking })},
+	{"GOS3_REPLICATION_MODE", "storage.replication.default_mode", "replication of new buckets: single, active-passive or active-active", str(func(c *Config) *string { return &c.Storage.Replication.DefaultMode })},
+	{"GOS3_REPLICATION_REPLICAS", "storage.replication.default_replicas", "backings new buckets are replicated to, comma-separated", list(func(c *Config) *[]string { return &c.Storage.Replication.DefaultReplicas })},
+	{"GOS3_AUTO_FAILOVER", "storage.replication.auto_failover", "promote a replica of an active-passive bucket when its primary fails (bool)", boolean(func(c *Config) *bool { return &c.Storage.Replication.AutoFailover })},
+	{"GOS3_REPLICATION_WORKERS", "storage.replication.workers", "buckets copied concurrently", integer(func(c *Config) *int { return &c.Storage.Replication.Workers })},
+	{"GOS3_HEALTH_INTERVAL", "storage.replication.health_interval", "backing health check interval (duration)", duration(func(c *Config) *time.Duration { return &c.Storage.Replication.HealthInterval })},
+	{"GOS3_CUTOVER_TIMEOUT", "storage.replication.cutover_timeout", "how long a cutover waits for writes in flight (duration)", duration(func(c *Config) *time.Duration { return &c.Storage.Replication.CutoverTimeout })},
 	{"GOS3_ROOT_ACCESS_KEY", "auth.root_access_key", "root access key", str(func(c *Config) *string { return &c.Auth.RootAccessKey })},
 	{"GOS3_ROOT_SECRET_KEY", "auth.root_secret_key", "root secret key", str(func(c *Config) *string { return &c.Auth.RootSecretKey })},
 	{"GOS3_STRICT_REGION", "auth.strict_region", "reject signatures for other regions (bool)", boolean(func(c *Config) *bool { return &c.Auth.StrictRegion })},
@@ -71,6 +80,10 @@ var envVars = []EnvVar{
 	{"GOS3_LIFECYCLE_INTERVAL", "lifecycle.interval", "lifecycle pass interval (duration)", duration(func(c *Config) *time.Duration { return &c.Lifecycle.Interval })},
 	{"GOS3_METRICS_ENABLED", "metrics.enabled", "serve /_gos3/metrics (bool)", boolean(func(c *Config) *bool { return &c.Metrics.Enabled })},
 	{"GOS3_METRICS_PUBLIC", "metrics.public", "serve metrics without auth (bool)", boolean(func(c *Config) *bool { return &c.Metrics.Public })},
+	{"GOS3_COMPRESSION_MODE", "compression.mode", "optional (buckets decide), enforced or disabled", str(func(c *Config) *string { return &c.Compression.Mode })},
+	{"GOS3_COMPRESSION_LEVEL", "compression.level", "DEFLATE level, 1 (fastest) to 9 (smallest)", integer(func(c *Config) *int { return &c.Compression.Level })},
+	{"GOS3_COMPRESSION_MIN_SIZE", "compression.min_size", "store smaller objects uncompressed, bytes or 4KiB-style", size(func(c *Config) *int64 { return &c.Compression.MinSize })},
+	{"GOS3_COMPRESSION_SKIP_CONTENT_TYPES", "compression.skip_content_types", "media types stored uncompressed (\"video/*\" wildcards), comma-separated", list(func(c *Config) *[]string { return &c.Compression.SkipContentTypes })},
 }
 
 // EnvVars returns the documented GOS3_* environment variables.
@@ -123,6 +136,24 @@ func WriteEnvTable(w io.Writer) error {
 // applyEnv applies every set GOS3_* variable to c. Empty values are applied
 // too (e.g. GOS3_DOMAINS= clears the list), except for GOS3_CONFIG.
 func applyEnv(c *Config, lookup func(string) (string, bool)) error {
+	// MinIO names are aliases at the environment layer. Native names win,
+	// including explicitly empty values.
+	for _, alias := range [][2]string{
+		{"MINIO_ROOT_USER", "GOS3_ROOT_ACCESS_KEY"},
+		{"MINIO_ROOT_PASSWORD", "GOS3_ROOT_SECRET_KEY"},
+		{"MINIO_ADDRESS", "GOS3_ADDRESS"},
+		{"MINIO_SITE_REGION", "GOS3_REGION"},
+		{"MINIO_BROWSER", "GOS3_UI_ENABLED"},
+	} {
+		if _, native := lookup(alias[1]); native {
+			continue
+		}
+		if value, ok := lookup(alias[0]); ok {
+			if err := c.Set(alias[1], value); err != nil {
+				return fmt.Errorf("%s: %w", alias[0], err)
+			}
+		}
+	}
 	for _, e := range envVars {
 		if e.set == nil {
 			continue

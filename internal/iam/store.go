@@ -156,7 +156,7 @@ func (m *Manager) warnAmbiguousNames() {
 		switch {
 		case isAccountID(name):
 			m.warnOnce("load:user:"+name, "iam: user name is a 12-digit account ID: a bare 12-digit bucket-policy "+
-				"principal names the account, not this user; name it as arn:aws:iam::<account>:user/<name>", "user", name)
+				"principal names the account, not this user; recreate the user with a nonnumeric name before using it as a principal", "user", name)
 		case name == m.opts.RootAccessKey:
 			m.warnOnce("load:user:"+name, "iam: user name equals the root access key: a bare bucket-policy "+
 				"principal with this value also names the user; re-create it under another name", "user", name)

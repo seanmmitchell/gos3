@@ -639,7 +639,8 @@ func testListBucketUsage(e *env) {
 
 	u, err = storage.ComputeBucketUsage(e.ctx, e.b, "b")
 	e.noErr("ComputeBucketUsage", err)
-	want := storage.BucketUsage{Objects: 2, Bytes: 7, Versions: 4, VersionBytes: 15, DeleteMarkers: 2, PendingUploads: 2}
+	want := storage.BucketUsage{Objects: 2, Bytes: 7, StoredBytes: 7, Versions: 4, VersionBytes: 15, StoredVersionBytes: 15,
+		DeleteMarkers: 2, PendingUploads: 2}
 	if u != want {
 		e.t.Errorf("ComputeBucketUsage = %+v, want %+v", u, want)
 	}
