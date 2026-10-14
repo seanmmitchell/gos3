@@ -150,6 +150,14 @@ move `data/` and `uploads/` aside to start with an empty store.
 
 ## Multiple backings and replication
 
+Use **Storage → Configure backings** to add storage and choose the default
+for new buckets without restarting. You can edit or remove additional
+backings once their buckets and replicas have been moved or removed and
+background cleanup has finished. Backing definitions persist in
+`backings.json` in the system directory; the UI indicates when the server
+has no persistent settings directory. The system backing named `default`
+is fixed at startup.
+
 A server can store buckets on several backings (see
 [configuration.md](configuration.md#storage-backings)), typically one fs
 directory per disk. Each backing directory has its own `.gos3/` with its own

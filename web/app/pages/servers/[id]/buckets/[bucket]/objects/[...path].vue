@@ -77,19 +77,8 @@ const versioned = computed(() => versioning.value === 'Enabled' || versioning.va
 // ---------------------------------------------------------------------------
 
 const showVersions = ref(false)
-const search = ref('')
-const searchMode = ref<'filter' | 'prefix'>('filter')
-const serverQuery = ref('')
-let searchTimer: ReturnType<typeof setTimeout> | undefined
-watch([search, searchMode], () => {
-  clearTimeout(searchTimer)
-  if (searchMode.value !== 'prefix') {
-    serverQuery.value = ''
-    return
-  }
-  searchTimer = setTimeout(() => (serverQuery.value = search.value), 350)
-})
-const listPrefix = computed(() => prefix.value + serverQuery.value)
+// Search text is cleared when another folder is opened (useBrowserSearch).
+const { search, mode: searchMode, serverQuery, listPrefix } = useBrowserSearch(prefix)
 
 const entries = shallowRef<BrowserEntry[]>([])
 const listing = reactive({
@@ -177,14 +166,15 @@ function loadMore() {
 // Declared before the listing watcher (which clears it); the getter is lazy.
 const selection = useBrowserSelection(() => visible.value.map(e => e.id))
 
-watch([s3, bucket, listPrefix, showVersions], () => {
+// Navigation can clear a search without changing listPrefix. The folder still
+// changes relative row names, placeholder visibility, and selection.
+watch([s3, bucket, prefix, listPrefix, showVersions], () => {
   selection.clear()
   void refresh()
 }, { immediate: true })
 
 onBeforeUnmount(() => {
   listAbort?.abort()
-  clearTimeout(searchTimer)
 })
 
 // Sorting + client-side filter.

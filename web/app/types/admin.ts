@@ -527,6 +527,19 @@ export interface Backing {
 }
 
 /** GET /backings */
+export interface BackingDefinition {
+  name: string
+  backend: 'fs' | 'memory'
+  path: string
+}
+
+export interface BackingConfiguration {
+  backings: BackingDefinition[]
+  defaultBacking: string
+  revision: string
+  persistent: boolean
+}
+
 export interface BackingList {
   defaultBacking: string
   autoFailover: boolean

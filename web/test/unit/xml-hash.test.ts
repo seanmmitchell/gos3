@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest'
 import { bytesToHex, crc32, crc32Base64, md5Base64, md5Hex } from '~/utils/s3/hash'
-import { bool, child, children, escapeXml, num, parseXml, t, text, texts, unquoteETag, x, xmlDocument, XmlParseError } from '~/utils/s3/xml'
+import { bool, child, children, escapeXml, hasXmlIllegalChars, num, parseXml, t, text, texts, unquoteETag, x, xmlDocument, XmlParseError } from '~/utils/s3/xml'
 
 describe('xml helpers', () => {
   it('parses namespaced and non-namespaced documents alike', () => {
@@ -31,6 +31,21 @@ describe('xml helpers', () => {
     // round trip through the parser
     const weird = '<&>"\' ünï 🚀'
     expect(text(parseXml(xmlDocument('R', t('V', weird))), 'V')).toBe(weird)
+  })
+
+  it('writes tab, LF and CR as character references so they survive parsing', () => {
+    expect(escapeXml('a\tb\nc\rd')).toBe('a&#9;b&#10;c&#13;d')
+    const ws = ' a\r\nb\rc\td \n'
+    expect(text(parseXml(xmlDocument('R', t('V', ws))), 'V')).toBe(ws)
+  })
+
+  it('detects characters XML 1.0 cannot carry', () => {
+    for (const ok of ['', 'plain/key.txt', 'tab\tlf\ncr\r', 'ünï 🚀', '퟿�', '\u{10FFFF}']) {
+      expect(hasXmlIllegalChars(ok)).toBe(false)
+    }
+    for (const bad of ['a\u0001b', '\u0000', 'x\u001F', '\u000B', '￾', '￿', 'lone \uD800 surrogate', '\uDC00']) {
+      expect(hasXmlIllegalChars(bad)).toBe(true)
+    }
   })
 
   it('unquotes ETags', () => {

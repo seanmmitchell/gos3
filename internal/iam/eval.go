@@ -117,12 +117,12 @@ func hasPrefixFold(s, prefix string) bool {
 	return len(s) >= len(prefix) && strings.EqualFold(s[:len(prefix)], prefix)
 }
 
-// lookup returns the values of a condition key (exact match first, then
-// case-insensitive). present is false when the key is missing or empty.
+// lookup returns the values of a condition key, case-insensitively. This
+// includes tag-qualified keys: stored tags preserve case, but IAM condition
+// key names do not. Always use the folded index so an exact spelling cannot
+// hide values from another tag whose key differs only in case.
+// present is false when the key is missing or empty.
 func (c *evalCtx) lookup(key string) ([]string, bool) {
-	if v, ok := c.raw[key]; ok && len(v) > 0 {
-		return v, true
-	}
 	if c.lower == nil {
 		c.buildLower()
 	}

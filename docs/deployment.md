@@ -443,7 +443,10 @@ self-hosted setups use. For virtual-hosted style
    path-style for those.
 
 Requests to the bare domain stay path-style, and `/_gos3/*` on the bare domain
-reaches the admin API and UI. On a bucket host, every path is an object key.
+reaches the admin API and UI. This holds for every configured domain, even
+one that is a subdomain of another (with `example.com` and `s3.example.com`
+both configured, `s3.example.com` is path-style, not bucket `s3`). On a bucket
+host, every path is an object key.
 
 ## TLS
 
