@@ -26,6 +26,35 @@ type backingJSON struct {
 	Disk *diskStats `json:"disk"`
 }
 
+func (a *api) getBackingConfig(rc *reqCtx) (int, any, error) {
+	r, err := a.router()
+	if err != nil {
+		return 0, nil, err
+	}
+	out, err := r.BackingConfiguration()
+	if err != nil {
+		return 0, nil, notFound("backing configuration is not available on this server")
+	}
+	return http.StatusOK, out, nil
+}
+
+func (a *api) putBackingConfig(rc *reqCtx) (int, any, error) {
+	r, err := a.router()
+	if err != nil {
+		return 0, nil, err
+	}
+	var in multi.BackingConfiguration
+	if err := rc.decodeBody(&in, false); err != nil {
+		return 0, nil, err
+	}
+	out, err := r.ConfigureBackings(rc.ctx, in)
+	if err != nil {
+		return 0, nil, err
+	}
+	a.log.Info("admin: backing configuration updated", "user", rc.id.User)
+	return http.StatusOK, out, nil
+}
+
 func (a *api) listBackings(rc *reqCtx) (int, any, error) {
 	r, err := a.router()
 	if err != nil {

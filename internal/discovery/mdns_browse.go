@@ -39,7 +39,7 @@ type mdnsEntry struct {
 	name   string // instance FQDN as received
 	host   string // lower-cased SRV target
 	port   int
-	txt    []string
+	txt    []string // raw TXT strings (unescaped)
 	hasSRV bool
 	hasTXT bool
 	zone   string // IPv6 zone of the sender (for link-local addresses)
@@ -152,7 +152,11 @@ func (b *mdnsBrowser) handle(data []byte, src netip.AddrPort) []dns.Question {
 		case *dns.TXT:
 			if instanceOf(rr.Hdr.Name) {
 				if e := entry(rr.Hdr.Name); e != nil {
-					e.txt = append([]string(nil), rr.Txt[:min(len(rr.Txt), mdnsMaxTXTFields)]...)
+					// rr.Txt is in presentation format (see txtUnescape).
+					e.txt = make([]string, 0, min(len(rr.Txt), mdnsMaxTXTFields))
+					for _, t := range rr.Txt[:min(len(rr.Txt), mdnsMaxTXTFields)] {
+						e.txt = append(e.txt, txtUnescape(t))
+					}
 					e.hasTXT = true
 					touched = append(touched, e)
 				}

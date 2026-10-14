@@ -187,6 +187,59 @@ describe('S3Client requests', () => {
     expect(r.errors).toHaveLength(0)
   })
 
+  it('deleteObjects deletes keys XML cannot carry one by one (key in the URL)', async () => {
+    const { client, calls } = makeClient((req) => {
+      const u = new URL(req.url)
+      if (req.method === 'POST') {
+        const keys = [...req.body.matchAll(/<Key>(.*?)<\/Key>/g)].map(m => m[1])
+        return xml(`<DeleteResult ${NS}>${keys.map(k => `<Deleted><Key>${k}</Key></Deleted>`).join('')}</DeleteResult>`)
+      }
+      if (u.pathname === '/b/denied%01') return xml('<Error><Code>AccessDenied</Code><Message>Access Denied</Message></Error>', 403)
+      if (u.searchParams.get('versionId') === 'v1') return new Response(null, { status: 204, headers: { 'x-amz-version-id': 'v1' } })
+      return new Response(null, { status: 204, headers: { 'x-amz-version-id': 'dm1', 'x-amz-delete-marker': 'true' } })
+    })
+    const objects = [
+      ...Array.from({ length: 1000 }, (_, i) => ({ key: `k${i}` })),
+      { key: 'a\u0001b' },
+      { key: 'old\u001F', versionId: 'v1' },
+      { key: 'denied\u0001' },
+      { key: 'tab\tline\nbreak' }
+    ]
+    const r = await client.deleteObjects('b', objects)
+
+    const singles = calls.filter(c => c.method === 'DELETE')
+    expect(singles.map(c => c.url)).toEqual([
+      'http://localhost:9000/b/a%01b',
+      'http://localhost:9000/b/old%1F?versionId=v1',
+      'http://localhost:9000/b/denied%01'
+    ])
+    // The remaining 1001 keys (tab/LF are fine as character references) go in two batches.
+    const batches = calls.filter(c => c.method === 'POST')
+    expect(batches).toHaveLength(2)
+    expect(batches.some(c => /[\u0000-\u0008\u000B\u000C\u000E-\u001F]/.test(c.body))).toBe(false)
+    expect(batches[1]!.body).toContain('<Key>tab&#9;line&#10;break</Key>')
+
+    expect(r.deleted).toHaveLength(1000 + 1 + 2)
+    expect(r.deleted).toContainEqual({ key: 'a\u0001b', versionId: undefined, deleteMarker: true, deleteMarkerVersionId: 'dm1' })
+    expect(r.deleted).toContainEqual({ key: 'old\u001F', versionId: 'v1', deleteMarker: undefined, deleteMarkerVersionId: undefined })
+    expect(r.errors).toEqual([{ key: 'denied\u0001', versionId: undefined, code: 'AccessDenied', message: 'Access Denied' }])
+  })
+
+  it('deleteObjects still fails as a whole when a single delete cannot reach the server', async () => {
+    const { client, calls } = makeClient(() => {
+      throw new TypeError('Failed to fetch')
+    })
+    await expect(client.deleteObjects('b', [{ key: 'a\u0001' }, { key: 'b' }])).rejects.toMatchObject({ code: 'NetworkError' })
+    expect(calls).toHaveLength(1)
+  })
+
+  it('deleteObjects reports keys that fit neither a URL nor XML as per-key errors', async () => {
+    const { client, calls } = makeClient(() => new Response(null, { status: 204 }))
+    const r = await client.deleteObjects('b', [{ key: 'x/../\u0001' }])
+    expect(calls).toHaveLength(0)
+    expect(r.errors).toMatchObject([{ key: 'x/../\u0001', code: 'UnaddressableKey' }])
+  })
+
   it('returns null / [] for missing configurations but rethrows other 404s', async () => {
     let body = '<Error><Code>NoSuchBucketPolicy</Code><Message>none</Message></Error>'
     const { client } = makeClient(() => xml(body, 404))

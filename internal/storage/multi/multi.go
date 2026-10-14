@@ -141,11 +141,10 @@ func (b *backing) setUp(at time.Time) bool {
 
 // Router is the multi-backing storage.Backend. Create it with Open.
 type Router struct {
-	log      *slog.Logger
-	opts     Options
-	backings map[string]*backing
-	order    []*backing // configuration order
-	def      *backing
+	log        *slog.Logger
+	opts       Options
+	topology   atomic.Pointer[backingTopology]
+	management *backingManagement
 
 	// adminMu serializes bucket creation and deletion and placement
 	// changes (the slow, rare operations), so that each sees a stable
@@ -216,12 +215,13 @@ func Open(ctx context.Context, opts Options) (_ *Router, err error) {
 		opts.CutoverTimeout = DefaultCutoverTimeout
 	}
 	r := &Router{
-		log:      opts.Logger,
-		opts:     opts,
-		backings: map[string]*backing{},
-		buckets:  map[string]*bucketState{},
-		purges:   map[purgeRecord]*purgeJob{},
+		log:     opts.Logger,
+		opts:    opts,
+		buckets: map[string]*bucketState{},
+		purges:  map[purgeRecord]*purgeJob{},
 	}
+	topology := &backingTopology{backings: map[string]*backing{}}
+	r.topology.Store(topology) // Close also owns partially opened backings on failure.
 	r.ctx, r.cancel = context.WithCancel(context.Background())
 	defer func() {
 		if err != nil {
@@ -235,20 +235,20 @@ func Open(ctx context.Context, opts Options) (_ *Router, err error) {
 		}
 		b := &backing{Backing: cfg}
 		b.setUp(now)
-		r.order = append(r.order, b) // closed by Close, also on failure
+		topology.order = append(topology.order, b) // closed by Close, also on failure
 	}
-	for _, b := range r.order {
+	for _, b := range topology.order {
 		if b.Name == "" {
 			return nil, errors.New("multi: a backing needs a name")
 		}
-		if _, dup := r.backings[b.Name]; dup {
+		if _, dup := topology.backings[b.Name]; dup {
 			return nil, fmt.Errorf("multi: duplicate backing %q", b.Name)
 		}
-		r.backings[b.Name] = b
+		topology.backings[b.Name] = b
 	}
-	r.def = r.order[0]
+	topology.def = topology.order[0]
 	if opts.Default != "" {
-		if r.def = r.backings[opts.Default]; r.def == nil {
+		if topology.def = topology.backings[opts.Default]; topology.def == nil {
 			return nil, fmt.Errorf("%w: default backing %q", ErrUnknownBacking, opts.Default)
 		}
 	}
@@ -262,10 +262,10 @@ func Open(ctx context.Context, opts Options) (_ *Router, err error) {
 		return nil, fmt.Errorf("%w: new bucket mode %q with replicas %v", ErrInvalidPlacement, opts.NewBucketMode, opts.NewBucketReplicas)
 	}
 	for i, name := range opts.NewBucketReplicas {
-		if r.backings[name] == nil {
+		if topology.backings[name] == nil {
 			return nil, fmt.Errorf("%w: new bucket replica %q", ErrUnknownBacking, name)
 		}
-		if name == r.def.Name || slices.Contains(opts.NewBucketReplicas[:i], name) {
+		if name == topology.def.Name || slices.Contains(opts.NewBucketReplicas[:i], name) {
 			return nil, fmt.Errorf("%w: new bucket replica %q is the default backing or listed twice", ErrInvalidPlacement, name)
 		}
 	}
@@ -313,7 +313,7 @@ func Open(ctx context.Context, opts Options) (_ *Router, err error) {
 // against the buckets the backings hold.
 func (r *Router) reconcile(ctx context.Context, st *stateFile) error {
 	present := map[string]map[string]bool{} // backing -> bucket set
-	for _, b := range r.order {
+	for _, b := range r.topology.Load().order {
 		infos, err := b.Backend.ListBuckets(ctx)
 		if err != nil {
 			return fmt.Errorf("listing the buckets of backing %q: %w", b.Name, err)
@@ -327,7 +327,7 @@ func (r *Router) reconcile(ctx context.Context, st *stateFile) error {
 	has := func(backing, bucket string) bool { return present[backing][bucket] }
 
 	for _, p := range st.Purges {
-		if r.backings[p.Backing] == nil {
+		if r.topology.Load().backings[p.Backing] == nil {
 			r.log.Warn("dropping the deletion of a bucket copy on a backing that is no longer configured",
 				"bucket", p.Bucket, "backing", p.Backing)
 			continue
@@ -340,7 +340,7 @@ func (r *Router) reconcile(ctx context.Context, st *stateFile) error {
 		// Forget members on backings that are no longer configured.
 		var kept []memberRecord
 		for _, m := range rec.Members {
-			if r.backings[m.Backing] == nil {
+			if r.topology.Load().backings[m.Backing] == nil {
 				r.log.Warn("bucket copy on a backing that is no longer configured is forgotten",
 					"bucket", name, "backing", m.Backing)
 				continue
@@ -386,9 +386,9 @@ func (r *Router) reconcile(ctx context.Context, st *stateFile) error {
 			rec.Mode = ModeActivePassive
 		}
 		if mv := rec.Move; mv != nil {
-			if r.backings[mv.To] == nil || rec.member(mv.From) < 0 || rec.member(mv.To) >= 0 {
+			if r.topology.Load().backings[mv.To] == nil || rec.member(mv.From) < 0 || rec.member(mv.To) >= 0 {
 				r.log.Warn("dropping a bucket move that no longer applies", "bucket", name, "from", mv.From, "to", mv.To)
-				if r.backings[mv.To] != nil && rec.member(mv.To) < 0 && has(mv.To, name) {
+				if r.topology.Load().backings[mv.To] != nil && rec.member(mv.To) < 0 && has(mv.To, name) {
 					r.addPurgeLocked(name, mv.To)
 				}
 				rec.Move = nil
@@ -399,7 +399,7 @@ func (r *Router) reconcile(ctx context.Context, st *stateFile) error {
 
 	// Adopt buckets without a placement: the default backing first, then
 	// the configuration order.
-	adoptOrder := append([]*backing{r.def}, r.order...)
+	adoptOrder := append([]*backing{r.topology.Load().def}, r.topology.Load().order...)
 	for _, b := range adoptOrder {
 		for name := range present[b.Name] {
 			if bs := r.buckets[name]; bs != nil {
@@ -502,8 +502,10 @@ func (r *Router) Close() error {
 			r.jobs.close()
 		}
 		r.wg.Wait()
+		r.adminMu.Lock()
+		defer r.adminMu.Unlock()
 		var errs []error
-		for _, b := range r.order {
+		for _, b := range r.topology.Load().order {
 			if err := b.Backend.Close(); err != nil {
 				errs = append(errs, fmt.Errorf("closing backing %q: %w", b.Name, err))
 			}
@@ -514,7 +516,7 @@ func (r *Router) Close() error {
 }
 
 // DefaultBacking returns the name of the backing new buckets are created on.
-func (r *Router) DefaultBacking() string { return r.def.Name }
+func (r *Router) DefaultBacking() string { return r.topology.Load().def.Name }
 
 // AutoFailover reports whether active-passive buckets fail over
 // automatically.
@@ -574,7 +576,7 @@ func (r *Router) healthLoop() {
 			return
 		case <-t.C:
 		}
-		for _, b := range r.order {
+		for _, b := range r.topology.Load().order {
 			r.probe(b)
 		}
 	}
@@ -618,7 +620,7 @@ func (r *Router) onBackingDown(b *backing) {
 	r.mu.Lock()
 	for _, bs := range r.buckets {
 		ms := bs.members[b.Name]
-		if ms == nil {
+		if ms == nil || ms.backing != b {
 			continue
 		}
 		if bs.rec.primary() == b.Name {

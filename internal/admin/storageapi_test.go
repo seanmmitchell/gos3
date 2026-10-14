@@ -5,6 +5,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/seanmmitchell/gos3/internal/config"
 	"github.com/seanmmitchell/gos3/internal/iam"
 	"github.com/seanmmitchell/gos3/internal/storage"
 	"github.com/seanmmitchell/gos3/internal/storage/memory"
@@ -114,6 +115,25 @@ func TestStorageEndpointsAuthorization(t *testing.T) {
 	// Without the router the endpoints are absent.
 	plain := newEnv(t)
 	plain.root("GET", "/backings", nil).expectError(t, 404, codeNotFound)
+}
+
+func TestBackingConfigurationPermissionsAndValidation(t *testing.T) {
+	e, r := newRouterEnv(t)
+	r.EnableBackingManagement(config.StorageConfig{Backend: "memory", Backings: []config.BackingConfig{{Name: "fast", Backend: "memory"}}}, "", func(d config.BackingDefinition) (multi.Backing, error) {
+		return multi.Backing{Name: d.Name, Kind: d.Backend, Backend: memory.New()}, nil
+	})
+	var in multi.BackingConfiguration
+	e.root("GET", "/backings/config", nil).json(t, &in)
+	diag := e.addUser("storage-diag", iam.PolicyDiagnostics)
+	e.do(&diag, "GET", Prefix+"/backings/config", nil).expectError(t, 403, codeAccessDenied)
+	e.do(&diag, "PUT", Prefix+"/backings/config", in).expectError(t, 403, codeAccessDenied)
+	in.Backings = append(in.Backings, config.BackingDefinition{Name: "default", Backend: "memory"})
+	e.root("PUT", "/backings/config", in).expectError(t, 400, codeInvalidRequest)
+	in.Backings = in.Backings[:1]
+	in.DefaultBacking = "fast"
+	e.root("PUT", "/backings/config", in).expectStatus(t, 200)
+	e.root("PUT", "/backings/config", in).expectError(t, 409, codeConflict)
+	e.root("PUT", "/backings/config", map[string]any{"bogus": true}).expectError(t, 400, codeInvalidRequest)
 }
 
 func waitFor(t *testing.T, cond func() bool) {

@@ -103,7 +103,7 @@ type mdnsZone struct {
 	HostName string       // "host.local."
 	Port     int          // listener port
 	IPs      []netip.Addr // advertised addresses
-	TXT      []string
+	TXT      []string     // TXT strings as raw bytes ("name=Seán"), unescaped
 
 	// Lower-cased owner names, for matching questions.
 	serviceName, instanceName, hostName string
@@ -141,7 +141,11 @@ func newMDNSZone(instance, host string, port int, ips []netip.Addr, txt []string
 	z.enum = &dns.PTR{Hdr: rrHeader(mdnsEnumName, dns.TypePTR), Ptr: mdnsServiceName}
 	z.ptr = &dns.PTR{Hdr: rrHeader(mdnsServiceName, dns.TypePTR), Ptr: instanceFQDN}
 	z.srv = &dns.SRV{Hdr: rrHeader(instanceFQDN, dns.TypeSRV), Priority: 10, Weight: 1, Port: uint16(port), Target: host}
-	z.txt = &dns.TXT{Hdr: rrHeader(instanceFQDN, dns.TypeTXT), Txt: z.TXT}
+	esc := make([]string, len(txt))
+	for i, t := range txt {
+		esc[i] = txtEscape(t)
+	}
+	z.txt = &dns.TXT{Hdr: rrHeader(instanceFQDN, dns.TypeTXT), Txt: esc}
 	for _, ip := range ips {
 		ip = ip.Unmap().WithZone("")
 		if len(z.IPs) >= mdnsMaxAddrs || !ip.IsValid() || slices.Contains(z.IPs, ip) {
@@ -156,6 +160,62 @@ func newMDNSZone(instance, host string, port int, ips []netip.Addr, txt []string
 	}
 	return z, nil
 }
+
+// txtEscape returns the raw TXT string s in the presentation format that
+// miekg/dns expects in dns.TXT.Txt: packing reads `\X` as X and `\DDD` as
+// the byte DDD, so a backslash in a server name would be lost and a literal
+// "\195" turned into one byte. Backslash and double quote are escaped with a
+// backslash and bytes outside printable ASCII as \DDD, as miekg/dns itself
+// prints them.
+func txtEscape(s string) string {
+	var b strings.Builder
+	b.Grow(len(s))
+	for i := 0; i < len(s); i++ {
+		switch c := s[i]; {
+		case c == '"' || c == '\\':
+			b.WriteByte('\\')
+			b.WriteByte(c)
+		case c < ' ' || c > '~':
+			fmt.Fprintf(&b, "\\%03d", c)
+		default:
+			b.WriteByte(c)
+		}
+	}
+	return b.String()
+}
+
+// txtUnescape returns the raw bytes of a dns.TXT.Txt string unpacked by
+// miekg/dns, which escapes backslash and double quote as `\X` and bytes
+// outside printable ASCII as `\DDD`. The result may be invalid UTF-8 (it
+// is whatever the sender put on the wire); callers clean it (cleanField).
+func txtUnescape(s string) string {
+	if !strings.Contains(s, `\`) {
+		return s
+	}
+	var b strings.Builder
+	b.Grow(len(s))
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if c != '\\' {
+			b.WriteByte(c)
+			continue
+		}
+		switch rest := s[i+1:]; {
+		case len(rest) >= 3 && isDecimal(rest[0]) && isDecimal(rest[1]) && isDecimal(rest[2]):
+			// Values above 255 cannot come from miekg/dns; they wrap
+			// like its own dddToByte.
+			b.WriteByte((rest[0]-'0')*100 + (rest[1]-'0')*10 + (rest[2] - '0'))
+			i += 3
+		case len(rest) >= 1:
+			b.WriteByte(rest[0])
+			i++
+		}
+		// A dangling backslash is dropped.
+	}
+	return b.String()
+}
+
+func isDecimal(c byte) bool { return '0' <= c && c <= '9' }
 
 // records returns the answer and additional records for question q (RFC
 // 6763 §12: a PTR answer comes with the SRV, TXT and address records, an

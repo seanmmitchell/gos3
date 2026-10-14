@@ -763,7 +763,8 @@ func TestWalkVersionsMarkers(t *testing.T) {
 		{"version marker mid", "", "a", a2.VersionID, all[2:]},
 		{"version marker last", "", "a", a1.VersionID, all[3:]},
 		{"null marker", "", "b", "null", all[4:]},
-		{"missing null marker", "", "a", "null", all[3:]},
+		// "null" has no position: every version of the key is listed.
+		{"missing null marker", "", "a", "null", all},
 		{"garbage marker", "", "a", "garbage", all[3:]},
 		{"marker before prefix", "c", "a", "", all[5:]},
 		{"marker after prefix", "a", "b", "", nil},

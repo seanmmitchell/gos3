@@ -44,6 +44,8 @@ func TestParseTarget(t *testing.T) {
 		{name: "vhost double slash key", host: "b.s3.local", uri: "//x", bucket: "b", key: "/x", vhost: true},
 		{name: "vhost trailing dot", host: "b.example.com.", uri: "/x", bucket: "b", key: "x", vhost: true},
 		{name: "domain itself is path style", host: "s3.local:9000", uri: "/b/k", bucket: "b", key: "k"},
+		{name: "nested domain itself is path style", host: "deep.s3.local", uri: "/b/k", bucket: "b", key: "k"},
+		{name: "nested domain itself, port and case", host: "Deep.S3.Local.:9000", uri: "/", bucket: ""},
 		{name: "unrelated suffix", host: "xs3.local", uri: "/b/k", bucket: "b", key: "k"},
 		{name: "vhost domain with scheme", host: "b.web.test", uri: "/k", bucket: "b", key: "k", vhost: true},
 		{name: "ipv6 host", host: "[::1]:9000", uri: "/b/k", bucket: "b", key: "k"},

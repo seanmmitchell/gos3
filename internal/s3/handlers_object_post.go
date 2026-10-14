@@ -223,7 +223,7 @@ func (s *Server) handlePostObject(w http.ResponseWriter, r *http.Request, rc *re
 			With("ArgumentName", "key")
 	}
 	key = strings.ReplaceAll(key, "${filename}", form.filename)
-	if err := validateObjectKey(key); err != nil {
+	if err := validateNewObjectKey(key); err != nil {
 		return err
 	}
 	fields["key"] = key
