@@ -29,6 +29,27 @@ func checkCompression(c storage.Compression) error {
 	return nil
 }
 
+// withOptions reports whether a write needs the write-options variant of a
+// backing's methods (storage.CompressingBackend, CompressingImporter):
+// only then, so that backings without them still take plain writes.
+func withOptions(o storage.WriteOptions) bool {
+	return o.Compression.Enabled() || o.Encryption != ""
+}
+
+// errNoWriteOptions is the error for the backing name ("" for the
+// bucket's primary) that cannot store data as the write options o ask.
+func errNoWriteOptions(name string, o storage.WriteOptions) error {
+	what := "compressed"
+	if o.Encryption != "" {
+		what = "encrypted (" + o.Encryption + ")"
+	}
+	who := "the primary backing"
+	if name != "" {
+		who = fmt.Sprintf("backing %q", name)
+	}
+	return fmt.Errorf("%s cannot store data %s: %w", who, what, errors.ErrUnsupported)
+}
+
 // objectWriter writes a new version to the bucket's primary and, in an
 // active-active bucket, streams the same bytes to every in-sync replica,
 // which stores the version under the ID the primary assigned at commit.
@@ -70,11 +91,11 @@ func (r *Router) NewObjectWriterWith(ctx context.Context, bucket, key string, op
 		return nil, err
 	}
 	var w storage.ObjectWriter
-	if opts.Compression.Enabled() || opts.Encryption != "" {
+	if withOptions(opts) {
 		cb, ok := rt.lead.Backend.(storage.CompressingBackend)
 		if !ok {
 			leave()
-			return nil, fmt.Errorf("backing %q cannot store data compressed: %w", rt.lead.Name, errors.ErrUnsupported)
+			return nil, errNoWriteOptions(rt.lead.Name, opts)
 		}
 		w, err = cb.NewObjectWriterWith(ctx, bucket, key, opts)
 	} else {

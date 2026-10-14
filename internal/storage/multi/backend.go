@@ -756,13 +756,13 @@ func (r *Router) CompleteMultipartUploadWith(ctx context.Context, bucket, key, u
 	opts = cb.commitOptions(opts)
 	err := r.objectWrite(ctx, bucket, key, cb, func(b storage.Backend) error {
 		var err error
-		if !wopts.Compression.Enabled() && wopts.Encryption == "" {
+		if !withOptions(wopts) {
 			info, err = b.CompleteMultipartUpload(ctx, bucket, key, uploadID, partNumbers, meta, opts)
 			return err
 		}
 		cb, ok := b.(storage.CompressingBackend)
 		if !ok {
-			return fmt.Errorf("the primary backing cannot store data compressed: %w", errors.ErrUnsupported)
+			return errNoWriteOptions("", wopts)
 		}
 		info, err = cb.CompleteMultipartUploadWith(ctx, bucket, key, uploadID, partNumbers, meta, opts, wopts)
 		return err
