@@ -60,37 +60,57 @@ func (s *Server) objectCompression(ctx context.Context, bucket string, meta stor
 	})
 }
 
-// newObjectWriter starts a new version of bucket/key, compressed as c
-// says when the backend supports it.
-func (s *Server) newObjectWriter(ctx context.Context, bucket, key string, c storage.Compression, encryption string) (storage.ObjectWriter, error) {
-	if cb, ok := s.backend.(storage.CompressingBackend); ok && (c.Enabled() || encryption != "") {
-		return cb.NewObjectWriterWith(ctx, bucket, key, storage.WriteOptions{Compression: c, Encryption: encryption})
+// withOptions returns the backend's write-options interface when opts ask
+// for anything (compression or encryption), nil when the plain Backend
+// methods suffice. A backend that cannot encrypt fails with
+// errors.ErrUnsupported: encryption is never dropped. (Compression is only
+// requested from CompressingBackends: see objectCompression.)
+func (s *Server) withOptions(opts storage.WriteOptions) (storage.CompressingBackend, error) {
+	if opts == (storage.WriteOptions{}) {
+		return nil, nil
 	}
-	if encryption != "" {
+	cb, ok := s.backend.(storage.CompressingBackend)
+	if !ok && opts.Encryption != "" {
 		return nil, errors.ErrUnsupported
+	}
+	return cb, nil
+}
+
+// newObjectWriter starts a new version of bucket/key, compressed as c says
+// and encrypted with the provider encryption ("" = unencrypted; see
+// prepareEncryption).
+func (s *Server) newObjectWriter(ctx context.Context, bucket, key string, c storage.Compression, encryption string) (storage.ObjectWriter, error) {
+	opts := storage.WriteOptions{Compression: c, Encryption: encryption}
+	cb, err := s.withOptions(opts)
+	if err != nil {
+		return nil, err
+	}
+	if cb != nil {
+		return cb.NewObjectWriterWith(ctx, bucket, key, opts)
 	}
 	return s.backend.NewObjectWriter(ctx, bucket, key)
 }
 
 // completeMultipartUpload is Backend.CompleteMultipartUpload storing the
-// object as the compression policy says.
+// object as the compression policy says, encrypted when the upload
+// requested SSE (prepareEncryption decides the provider; uploads created
+// by older builds are encrypted too).
 func (s *Server) completeMultipartUpload(ctx context.Context, bucket, key, uploadID string, partNumbers []int,
 	meta storage.ObjectMeta, cond storage.CommitOptions) (storage.ObjectInfo, error) {
-	if err := s.prepareEncryption(ctx, bucket, &meta); err != nil {
+	if err := s.prepareEncryption(ctx, bucket, &meta, ""); err != nil {
 		return storage.ObjectInfo{}, err
 	}
 	var size int64
 	for _, n := range meta.PartSizes {
 		size += n
 	}
-	if cb, ok := s.backend.(storage.CompressingBackend); ok {
-		if c := s.objectCompression(ctx, bucket, meta, size); c.Enabled() || meta.Encryption != "" {
-			return cb.CompleteMultipartUploadWith(ctx, bucket, key, uploadID, partNumbers, meta, cond,
-				storage.WriteOptions{Compression: c, Encryption: meta.Encryption})
-		}
+	opts := storage.WriteOptions{Compression: s.objectCompression(ctx, bucket, meta, size), Encryption: meta.Encryption}
+	cb, err := s.withOptions(opts)
+	if err != nil {
+		return storage.ObjectInfo{}, err
 	}
-	if meta.Encryption != "" {
-		return storage.ObjectInfo{}, errors.ErrUnsupported
+	if cb != nil {
+		return cb.CompleteMultipartUploadWith(ctx, bucket, key, uploadID, partNumbers, meta, cond, opts)
 	}
 	return s.backend.CompleteMultipartUpload(ctx, bucket, key, uploadID, partNumbers, meta, cond)
 }
