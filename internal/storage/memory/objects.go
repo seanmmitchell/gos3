@@ -210,6 +210,7 @@ func (b *Backend) commitLocked(bk *bucket, key string, data []byte, enc stored, 
 	}
 	stamp, created := b.nextStamp()
 	if opts.BeforePublish != nil {
+		encryption := meta.Encryption
 		var current *storage.ObjectMeta
 		if obj != nil && len(obj.versions) > 0 {
 			latest := obj.versions[len(obj.versions)-1]
@@ -223,15 +224,14 @@ func (b *Backend) commitLocked(bk *bucket, key string, data []byte, enc stored, 
 		}); err != nil {
 			return storage.ObjectInfo{}, err
 		}
+		// The encoding is the backend's choice, never the hook's.
+		meta.Encryption = encryption
 	}
 	if data == nil {
 		data = []byte{}
 	}
 	v := &version{meta: cloneMeta(meta), data: data, stamp: stamp, lastModified: created,
 		compression: enc.compression, size: enc.size}
-	if err := encryptVersion(v); err != nil {
-		return storage.ObjectInfo{}, err
-	}
 	b.addVersionLocked(bk, key, obj, v)
 	return v.info(bk.info.Name, key, true), nil
 }
@@ -367,18 +367,14 @@ func (b *Backend) OpenObject(ctx context.Context, bucketName, key, versionID str
 	if v.deleteMarker {
 		return info, nil, nil
 	}
-	data, err := decryptedData(v)
-	if err != nil {
-		return storage.ObjectInfo{}, nil, err
-	}
 	if v.compression != "" {
-		z, err := compress.NewReader(bytes.NewReader(data), int64(len(data)))
+		z, err := compress.NewReader(bytes.NewReader(v.data), int64(len(v.data)))
 		if err != nil {
 			return storage.ObjectInfo{}, nil, fmt.Errorf("memory: open %s/%s: %w", bucketName, key, err)
 		}
 		return info, z, nil
 	}
-	return info, newObjectReader(data), nil
+	return info, newObjectReader(v.data), nil
 }
 
 // UpdateObjectMeta atomically mutates the metadata of an existing version.

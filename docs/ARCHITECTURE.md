@@ -35,6 +35,7 @@ discovery of gos3 servers on the network.
 | `internal/storage/multi/` | multi-backing router: bucket placement, replication (active-passive / active-active), online moves, backing health | storage-multi |
 | `internal/storage/storagetest/` | backend conformance suite | storage-conformance |
 | `internal/storage/compress/` | seekable block-compressed data format used by both backends | storage-compression |
+| `internal/storage/crypt/` | authenticated AES-256-GCM chunked stream format for natively encrypted (SSE-S3) data | storage-encryption |
 | `internal/compression/` | compression policy: bucket setting document, server mode, per-object decision | storage-compression |
 | `internal/auth/` | SigV4 verification, aws-chunked decoding, POST policy, client signer | auth |
 | `internal/iam/` | users, keys, policies, bucket policy parsing, authorization engine | iam |

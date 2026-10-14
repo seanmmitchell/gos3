@@ -1,8 +1,10 @@
 package multi
 
 import (
+	"bytes"
 	"context"
 	"errors"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"strings"
@@ -72,9 +74,12 @@ func TestReplicasKeepEncryption(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if info.Encryption != storage.EncryptionAES256 || info.PhysicalSize() <= info.Size {
+		if info.Encryption != storage.EncryptionAES256 {
 			t.Fatalf("%s lost encryption: %+v", backing.Name, info)
 		}
+		// PhysicalSize is derived from the metadata: check the bytes the
+		// replica actually stores.
+		assertCiphertextOnDisk(t, backing, []byte(data))
 		if got := read(t, backing.Backend, "encrypted", "k", ""); got != data {
 			t.Fatalf("%s content mismatch", backing.Name)
 		}
@@ -115,5 +120,29 @@ func TestReplicationEncryptionChangedBeforeRead(t *testing.T) {
 	}
 	if _, err = bk[1].Backend.GetObjectInfo(ctx, "source", "k", ""); !errors.Is(err, storage.ErrObjectNotFound) {
 		t.Fatalf("published inconsistent copy: %v", err)
+	}
+}
+
+// assertCiphertextOnDisk checks that the fs backing holds exactly one data
+// file, of the encrypted size of data and without its plaintext.
+func assertCiphertextOnDisk(t *testing.T, backing Backing, data []byte) {
+	t.Helper()
+	var files []string
+	root := filepath.Join(backing.Path, ".gos3", "data")
+	err := filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
+		if err == nil && !d.IsDir() {
+			files = append(files, path)
+		}
+		return err
+	})
+	if err != nil || len(files) != 1 {
+		t.Fatalf("%s: data files %v (%v)", backing.Name, files, err)
+	}
+	raw, err := os.ReadFile(files[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	if int64(len(raw)) != storage.EncryptedSize(int64(len(data))) || bytes.Contains(raw, data[:32]) {
+		t.Fatalf("%s stores %d bytes that are not the ciphertext of %d bytes", backing.Name, len(raw), len(data))
 	}
 }

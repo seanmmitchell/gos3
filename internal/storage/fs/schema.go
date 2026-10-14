@@ -163,14 +163,6 @@ type versionRecord struct {
 	StoredSize  int64  `json:"ssize,omitempty"`
 }
 
-// fileSize returns the expected size of the version's data file.
-func (r *versionRecord) fileSize() int64 {
-	if r.Compression != "" {
-		return r.StoredSize
-	}
-	return r.Size
-}
-
 func (r *versionRecord) info(bucket, key string, latest bool) storage.ObjectInfo {
 	oi := storage.ObjectInfo{
 		Bucket:       bucket,
@@ -209,14 +201,18 @@ func (r *uploadRecord) info(bucket, uploadID string) storage.UploadInfo {
 
 // partRecord is the persisted form of an uploaded part.
 type partRecord struct {
+	// KeyID is the data ID the part file's stream key is derived from (see
+	// objectDataKey) when the part is stored encrypted, "" otherwise.
 	KeyID        string            `json:"keyID,omitempty"`
-	Encrypted    bool              `json:"encrypted,omitempty"`
 	File         string            `json:"file"` // file name inside the upload directory
 	Size         int64             `json:"size"`
 	LastModified time.Time         `json:"mtime"`
 	ETag         string            `json:"etag"`
 	Checksums    map[string]string `json:"checksums,omitempty"`
 }
+
+// encrypted reports whether the part file is stored encrypted.
+func (r *partRecord) encrypted() bool { return r.KeyID != "" }
 
 func (r *partRecord) info(number int) storage.PartInfo {
 	return storage.PartInfo{

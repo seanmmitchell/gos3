@@ -208,7 +208,6 @@ func (w *partWriter) Commit(ctx context.Context, meta storage.PartMeta) (storage
 	}
 
 	rec := partRecord{
-		Encrypted:    w.t.key != nil,
 		KeyID:        w.t.cryptoID,
 		File:         file,
 		Size:         w.t.size,
@@ -456,14 +455,11 @@ func (b *Backend) completeOnce(ctx context.Context, bucket, key, uploadID string
 	// part is still the same file, so a part replaced in between makes the
 	// next attempt see (and reject) its new ETag.
 	var (
-		bucketID  string
-		files     []string
-		sizes     []int64
-		encrypted []bool
-		keyIDs    []string
+		bucketID string
+		parts    []partRecord // in partNumbers order
 	)
 	err := b.view(func(tx *bbolt.Tx) error {
-		files, sizes, encrypted, keyIDs = files[:0], sizes[:0], encrypted[:0], keyIDs[:0]
+		parts = parts[:0]
 		br, bb, err := loadBucket(tx, bucket)
 		if err != nil {
 			return err
@@ -472,11 +468,11 @@ func (b *Backend) completeOnce(ctx context.Context, bucket, key, uploadID string
 			return err
 		}
 		bucketID = br.ID
-		parts := bb.Bucket(subParts)
+		pb := bb.Bucket(subParts)
 		for i, n := range partNumbers {
 			var v []byte
 			if n >= 1 && n <= maxPartNumber {
-				v = parts.Get(partKey(uploadID, n))
+				v = pb.Get(partKey(uploadID, n))
 			}
 			if v == nil {
 				return fmt.Errorf("%w: part %d of upload %q", storage.ErrPartNotFound, n, uploadID)
@@ -492,10 +488,7 @@ func (b *Backend) completeOnce(ctx context.Context, bucket, key, uploadID string
 				return fmt.Errorf("%w: part %d of upload %q was replaced (ETag %q, want %q)",
 					storage.ErrPartNotFound, n, uploadID, rec.ETag, opts.PartETags[i])
 			}
-			files = append(files, rec.File)
-			sizes = append(sizes, rec.Size)
-			encrypted = append(encrypted, rec.Encrypted)
-			keyIDs = append(keyIDs, rec.KeyID)
+			parts = append(parts, rec)
 		}
 		return checkPreconditions(bb, key, opts)
 	})
@@ -516,8 +509,8 @@ func (b *Backend) completeOnce(ctx context.Context, bucket, key, uploadID string
 	if err != nil {
 		return storage.ObjectInfo{}, err
 	}
-	for i, file := range files {
-		if err := b.appendPart(ctx, t, cw, uploadID, file, sizes[i], partNumbers[i], bucketID, encrypted[i], keyIDs[i]); err != nil {
+	for i, part := range parts {
+		if err := b.appendPart(ctx, t, cw, bucketID, uploadID, partNumbers[i], part); err != nil {
 			if cw != nil {
 				cw.Abandon()
 			}
@@ -564,9 +557,9 @@ func (b *Backend) completeOnce(ctx context.Context, bucket, key, uploadID string
 			if err != nil {
 				return err
 			}
-			parts := bb.Bucket(subParts)
+			pb := bb.Bucket(subParts)
 			for i, n := range partNumbers {
-				v := parts.Get(partKey(uploadID, n))
+				v := pb.Get(partKey(uploadID, n))
 				if v == nil {
 					return fmt.Errorf("%w: part %d of upload %q", storage.ErrPartNotFound, n, uploadID)
 				}
@@ -574,7 +567,7 @@ func (b *Backend) completeOnce(ctx context.Context, bucket, key, uploadID string
 				if err := decodeRecord(v, &rec); err != nil {
 					return err
 				}
-				if rec.File != files[i] {
+				if rec.File != parts[i].File {
 					return errPartsChanged
 				}
 			}
@@ -588,15 +581,16 @@ func (b *Backend) completeOnce(ctx context.Context, bucket, key, uploadID string
 	return info, nil
 }
 
-// appendPart copies one part file into t, or through the compressor cw
-// into t when cw is not nil, verifying its size. An uncompressed copy goes
-// file to file (copy_file_range on Linux). The context is checked between
-// parts.
-func (b *Backend) appendPart(ctx context.Context, t *tmpFile, cw *compress.Writer, uploadID, file string, size int64, n int, bucketID string, encrypted bool, keyID string) error {
+// appendPart copies part number n of the upload into t, or through the
+// compressor cw into t when cw is not nil, decrypting an encrypted part
+// file and verifying its size. An uncompressed copy of a plain part into a
+// plain t goes file to file (copy_file_range on Linux). The context is
+// checked between parts.
+func (b *Backend) appendPart(ctx context.Context, t *tmpFile, cw *compress.Writer, bucketID, uploadID string, n int, part partRecord) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	f, err := openShared(b.partPath(uploadID, file))
+	f, err := openShared(b.partPath(uploadID, part.File))
 	if err != nil {
 		if errors.Is(err, iofs.ErrNotExist) || openRaced(err) {
 			// Replaced, aborted or completed concurrently.
@@ -606,42 +600,25 @@ func (b *Backend) appendPart(ctx context.Context, t *tmpFile, cw *compress.Write
 	}
 	defer f.Close()
 	var src io.Reader = f
-	if encrypted {
-		key, err := b.bucketKey(bucketID, false)
+	if part.encrypted() {
+		r, err := b.openEncrypted(f, bucketID, part.KeyID, part.Size)
 		if err != nil {
-			return err
+			return fmt.Errorf("fs: open part %d: %w", n, err)
 		}
-		st, err := f.Stat()
-		if err != nil {
-			return err
-		}
-		if st.Size() != storage.EncryptedSize(size) {
-			return fmt.Errorf("%w: encrypted part size", errCorrupt)
-		}
-		if !validDataID(keyID) {
-			return fmt.Errorf("%w: invalid part encryption identity", errCorrupt)
-		}
-		key, err = objectDataKey(key, keyID)
-		if err != nil {
-			return err
-		}
-		src, err = decryptFile(f, key, size, f.Close)
-		if err != nil {
-			return err
-		}
+		src = r
 	}
 	if cw != nil {
-		copied, err := io.Copy(cw, io.LimitReader(src, size+1))
+		copied, err := io.Copy(cw, io.LimitReader(src, part.Size+1))
 		if err != nil {
 			return fmt.Errorf("fs: copy part %d: %w", n, err)
 		}
-		if copied != size {
-			return fmt.Errorf("%w: part %d of upload %q has %d bytes, expected %d", errCorrupt, n, uploadID, copied, size)
+		if copied != part.Size {
+			return fmt.Errorf("%w: part %d of upload %q has %d bytes, expected %d", errCorrupt, n, uploadID, copied, part.Size)
 		}
 		return nil
 	}
 	var copied int64
-	if t.key == nil && !encrypted {
+	if t.key == nil && !part.encrypted() {
 		// Preserve direct file copying for ordinary unencrypted uploads.
 		if err := t.open(); err != nil {
 			return err
@@ -649,17 +626,17 @@ func (b *Backend) appendPart(ctx context.Context, t *tmpFile, cw *compress.Write
 		if err := t.flush(); err != nil {
 			return err
 		}
-		copied, err = io.Copy(t.f, io.LimitReader(f, size+1))
+		copied, err = io.Copy(t.f, io.LimitReader(f, part.Size+1))
 		t.size += copied
 	} else {
-		copied, err = io.Copy(t, io.LimitReader(src, size+1))
+		copied, err = io.Copy(t, io.LimitReader(src, part.Size+1))
 	}
 	if err != nil {
 		t.err = err
 		return fmt.Errorf("fs: copy part %d: %w", n, err)
 	}
-	if copied != size {
-		return fmt.Errorf("%w: part %d of upload %q has %d bytes, expected %d", errCorrupt, n, uploadID, copied, size)
+	if copied != part.Size {
+		return fmt.Errorf("%w: part %d of upload %q has %d bytes, expected %d", errCorrupt, n, uploadID, copied, part.Size)
 	}
 	return nil
 }

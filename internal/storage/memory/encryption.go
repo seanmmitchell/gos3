@@ -1,15 +1,23 @@
 package memory
 
 import (
-	"bytes"
 	"context"
-	"crypto/rand"
 	"errors"
 
-	"github.com/minio/sio"
 	"github.com/seanmmitchell/gos3/internal/storage"
 )
 
+// The optional storage interface implemented by PrepareEncryption and
+// ValidateEncryptionSettings.
+var _ storage.EncryptionBackend = (*Backend)(nil)
+
+// PrepareEncryption implements storage.EncryptionBackend. The memory
+// backend accepts storage.EncryptionAES256 and records it on the versions
+// written with it (ObjectMeta.Encryption), so SSE responses and replication
+// behave as on the fs backend, but keeps their bytes as they are: its data
+// never leaves the process, where any key would have to sit next to the
+// data it protects. storage.EncryptionRestic and other modes return
+// errors.ErrUnsupported.
 func (b *Backend) PrepareEncryption(ctx context.Context, bucket, mode string) error {
 	if _, err := b.GetBucket(ctx, bucket); err != nil {
 		return err
@@ -20,32 +28,8 @@ func (b *Backend) PrepareEncryption(ctx context.Context, bucket, mode string) er
 	return nil
 }
 
+// ValidateEncryptionSettings implements storage.EncryptionBackend: it
+// accepts the settings PrepareEncryption accepts for their provider.
 func (b *Backend) ValidateEncryptionSettings(ctx context.Context, bucket string, cfg storage.EncryptionSettings) error {
 	return b.PrepareEncryption(ctx, bucket, cfg.Provider)
-}
-
-func encryptVersion(v *version) error {
-	if v.meta.Encryption == "" {
-		return nil
-	}
-	if v.meta.Encryption != storage.EncryptionAES256 {
-		return errors.ErrUnsupported
-	}
-	v.dataKey = make([]byte, 32)
-	_, _ = rand.Read(v.dataKey)
-	var out bytes.Buffer
-	if _, err := sio.Encrypt(&out, bytes.NewReader(v.data), storage.EncryptionConfig(v.dataKey)); err != nil {
-		return err
-	}
-	v.data = out.Bytes()
-	return nil
-}
-
-func decryptedData(v *version) ([]byte, error) {
-	if v.meta.Encryption == "" {
-		return v.data, nil
-	}
-	var out bytes.Buffer
-	_, err := sio.Decrypt(&out, bytes.NewReader(v.data), storage.EncryptionConfig(v.dataKey))
-	return out.Bytes(), err
 }
