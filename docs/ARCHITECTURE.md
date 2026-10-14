@@ -194,8 +194,9 @@ See the doc comments in `storage.go`. Key points:
   and listing order.
 - Version IDs for versioned writes must be unique, URL-safe, ≤ 64 chars and
   never `null`.
-- Optional Backend extensions (`optional.go`), discovered by type
-  assertion; both built-in backends implement all of them:
+- Optional Backend extensions (`optional.go`, `encryption.go`), discovered
+  by type assertion; both built-in backends implement all of them except
+  where noted:
   - `ConditionalDeleter.DeleteObjectIf` looks up the addressed version and
     deletes it only if a check on it passes, atomically (same transaction or
     lock). The S3 DeleteObject/DeleteObjects `If-Match`, object lock and
@@ -220,7 +221,19 @@ See the doc comments in `storage.go`. Key points:
     all of a bucket's uploads.
   - `CompressingBackend.NewObjectWriterWith` / `CompleteMultipartUploadWith`
     store a version's data compressed (`WriteOptions.Compression`), see
-    [Compression](#compression).
+    [Compression](#compression), and encrypted (`WriteOptions.Encryption`:
+    `AES256` or `restic`; an unsupported provider fails, never falls back to
+    plaintext). `ObjectMeta.Encryption` of the result records how the data
+    is actually stored.
+  - In `encryption.go`: `EncryptionBackend.PrepareEncryption` prepares a
+    bucket for encrypted writes (the fs backend creates its key and, for
+    restic, initializes its repository; `errors.ErrUnsupported` for a
+    provider the backend cannot store), and
+    `ValidateEncryptionSettings` checks a provider before the admin API
+    saves it; `ResticBackingBackend` reads and changes a backing's restic S3
+    storage. The memory backend implements `EncryptionBackend` for `AES256`
+    only and not `ResticBackingBackend`. See
+    [encryption.md](encryption.md).
   `storage.ListObjects`, `ListObjectVersions` and `ListUploads` return
   entries trimmed to the fields a listing reports (`storage.ListingInfo`).
   `uploads.go` builds on them: `storage.ListUploads` (S3
@@ -247,7 +260,17 @@ See the doc comments in `storage.go`. Key points:
   transaction commits (open readers keep working on POSIX). If the commit
   reports an error after the transaction itself succeeded (e.g. an fsync
   error), the new data or part file is kept rather than deleted, because the
-  commit may have persisted; the client still gets an error.
+  commit may have persisted; the client still gets an error. Encryption
+  (see [encryption.md](encryption.md)) adds `<root>/.gos3/keys/<bucket-id>`
+  (the bucket's master key; data, staging and part files are encrypted
+  with keys derived from it or fresh ones) and
+  `<root>/.gos3/keys/<bucket-id>.restic.json` (restic repository location
+  and password), local restic repositories in
+  `<root>/.gos3/restic/<bucket-id>/`, restic's cache in
+  `<root>/.gos3/restic-cache/` and the backing's restic S3 settings in
+  `<root>/.gos3/restic-backing.json` (secret, like the keys). Keys,
+  recovery records and repositories stay after a bucket is deleted. The
+  data file of a restic-archived version holds only its snapshot ID.
 - `fs` recovery (startup): cleans `tmp/`; unreferenced data files, part
   files, bucket directories and upload directories are **moved**, not
   deleted, to `<root>/.gos3/orphans/<UTC yyyymmddThhmmssZ>-<8 hex>/`
@@ -270,7 +293,10 @@ See the doc comments in `storage.go`. Key points:
 - Compression: see [Compression](#compression). A compressed fs version
   record uses record format 4 (format 3 plus the algorithm and the stored
   size); uncompressed records stay format 3, so databases without
-  compressed objects remain readable by older builds.
+  compressed objects remain readable by older builds. An encrypted version
+  record uses record format 5 (format 4 plus `ObjectMeta.Encryption`,
+  compressed or not), which builds before object encryption cannot read
+  (rollback: [operations.md](operations.md#upgrades)).
 - `list.go` turns `WalkObjects`/`WalkVersions` into S3 listings (prefix,
   delimiter grouping, markers, truncation). When a common prefix `p` is found
   it restarts the walk after `p + "\xff"` (UTF-8 never contains 0xFF) so huge
@@ -311,6 +337,12 @@ adopted where they are found at startup.
   forwarding to the primary; active-active replicas receive the same write
   options, and background copies of a compressed version are stored
   compressed too (`storage.CompressingImporter`, at the default level).
+- Encryption: `PrepareEncryption` / `ValidateEncryptionSettings` go to the
+  bucket's primary, and `Router.ResticBacking(name)` gives the admin API a
+  backing's restic S3 settings. Copies of an encrypted version are
+  encrypted on the receiving backing with that backing's own key and
+  repository (`WriteOptions.Encryption`); a backing that cannot store the
+  provider fails the copy instead of storing plaintext.
 
 System state lives in `<data>/.gos3/`: `lock` (an exclusive lock held by the
 running server, whatever the backend; a no-op on platforms without

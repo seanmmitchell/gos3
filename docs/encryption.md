@@ -10,14 +10,18 @@ Each assigned backing owns its repository location and S3 credentials. A
 replica or move target uses its own backing's settings, keys, and repository;
 source backing credentials never replicate with bucket configuration.
 
-Native encryption uses authenticated AES-256-GCM streams (MinIO `sio` v2),
-with HKDF-SHA256 deriving a separate key for each immutable data file from a
-random bucket master key. Swapping objects' ciphertext fails authentication.
+Native encryption uses authenticated AES-256-GCM streams, with HKDF-SHA256
+deriving a separate key for each immutable data file from a random bucket
+master key. Swapping objects' ciphertext fails authentication.
 Compression happens before encryption; range reads decrypt the necessary
 blocks. Filesystem upload staging and multipart parts are encrypted too.
 
 AWS KMS (`aws:kms` / `aws:kms:dsse`) and SSE-C return
 `501 NotImplemented`. Change legacy KMS defaults before new uploads.
+
+Encrypted versions use a newer metadata record format that gos3 versions
+without object encryption cannot read; see
+[operations.md](operations.md#upgrades) before rolling back.
 
 ## Existing objects
 
@@ -29,8 +33,11 @@ Lock rules. Disabling encryption or switching provider preserves encrypted reads
 
 ## Backing storage for restic
 
-Install [restic](https://restic.readthedocs.io/en/stable/020_installation.html)
-**0.17.1 or newer** on each filesystem backing server's PATH. Native AES256
+Restic needs the [restic](https://restic.readthedocs.io/en/stable/020_installation.html)
+executable, **0.17.1 or newer**, on the gos3 server's PATH. The gos3
+container images include a pinned, checksum-verified restic at
+`/usr/local/bin/restic` ([deployment.md](deployment.md#docker)); for the
+release archives and the systemd unit, install it yourself. Native AES256
 needs no extra executable; memory backings do not support restic.
 
 On server **Storage**, open **Restic storage** for the assigned backing:
@@ -40,7 +47,9 @@ On server **Storage**, open **Restic storage** for the assigned backing:
 - **S3 storage**: configure the endpoint (`https://s3.example.com`), destination
   S3 bucket, repository prefix, region, access key, secret key, and optional
   session token. Each bucket copy derives its repository as
-  `s3:<endpoint>/<destination-bucket>/<prefix>/<bucket-id>`.
+  `s3:<endpoint>/<destination-bucket>/<prefix>/<bucket-id>`. Saving the
+  settings runs restic to check access to the destination (and to every
+  repository the backing already has), so restic must be installed first.
 
 Each physical bucket copy has its own ID and key, including replicas. Passwords
 are derived from that key and managed by the server. Bucket encryption has no
@@ -77,8 +86,10 @@ Once repository preparation begins, its location is fixed, including after
 objects or buckets are deleted. Configure another backing and use **Placement**
 to move the bucket when changing storage. Existing archives stay with their
 original backing. Credentials and region can be updated at the same location.
-Use an S3 destination without restic default encryption; recursive destinations
-are rejected. HTTPS protects transport; HTTP supports trusted local endpoints.
+The destination may be a bucket on another gos3 server, but not one whose
+provider is restic: gos3 rejects restic's own uploads (recognized by its
+`gos3-restic` user agent) to a bucket that would archive them through restic
+again. HTTPS protects transport; HTTP supports trusted local endpoints.
 
 Reading backing settings uses `admin:ListBackings`; updates require
 `admin:UpdateConfig` at service level. Bucket provider selection uses scoped
@@ -105,9 +116,12 @@ shared repository packs. Use restic/provider statistics to measure archive usage
 
 ## Keys and recovery
 
-Back up metadata, keys, backing settings, and data/repositories together.
-Native keys are `.gos3/keys/<bucket-id>`. Restic repository/password recovery
-records are `.gos3/keys/<bucket-id>.restic.json` and remain after deletion.
+Back up metadata, keys, backing settings, and data/repositories together:
+a file-level backup of a backing's data directory includes all but remote S3
+repositories ([operations.md](operations.md#backups)). Native keys are
+`.gos3/keys/<bucket-id>`. Restic repository/password recovery records are
+`.gos3/keys/<bucket-id>.restic.json`. Keys, recovery records and local
+repositories (`.gos3/restic/<bucket-id>`) remain after the bucket is deleted.
 S3 settings and credentials live in the backing's protected
 `.gos3/restic-backing.json`, or its protected startup configuration; they are
 never stored in bucket configuration. Recovery records do not duplicate S3
