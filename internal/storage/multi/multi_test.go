@@ -197,6 +197,83 @@ func TestActiveActiveFailover(t *testing.T) {
 	waitSame(t, "ha", fa.Backend, r.backings["b"].Backend)
 }
 
+// A publication refused by the caller's BeforePublish, or invalid
+// compression options, say nothing about the backing: they must not mark
+// the primary unhealthy (and so fail the bucket over), whether a single
+// PUT or a multipart completion is refused.
+func TestRefusedPublicationKeepsPrimaryHealthy(t *testing.T) {
+	// No health probes: a probe would hide a wrong setDown by clearing it.
+	r := openRouter(t, Options{
+		Backings: memBackings(3), NewBucketMode: ModeActiveActive, NewBucketReplicas: []string{"b", "c"},
+		HealthInterval: time.Hour,
+	})
+	ctx := context.Background()
+	if err := r.CreateBucket(ctx, "ha", storage.CreateBucketOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	waitState(t, r, "ha", StateInSync)
+	denied := errors.New("publication refused")
+	refuse := storage.CommitOptions{BeforePublish: func(_, _ *storage.ObjectMeta, _ time.Time, _ func(string) []byte) error {
+		return denied
+	}}
+	wantHealthy := func(after string) {
+		t.Helper()
+		for _, b := range r.Backings() {
+			if !b.Healthy || b.LastError != "" {
+				t.Fatalf("after %s: backing %s healthy=%v lastError=%q", after, b.Name, b.Healthy, b.LastError)
+			}
+		}
+		if st, err := r.Placement("ha"); err != nil || st.Primary != "a" {
+			t.Fatalf("after %s: placement %+v, %v", after, st, err)
+		}
+	}
+
+	w, err := r.NewObjectWriter(ctx, "ha", "put")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := w.Write([]byte("data")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := w.Commit(ctx, storage.ObjectMeta{ETag: "e"}, refuse); !errors.Is(err, denied) {
+		t.Fatalf("refused Commit = %v, want %v", err, denied)
+	}
+	wantHealthy("a refused PUT")
+
+	up, err := r.CreateMultipartUpload(ctx, "ha", "mp", storage.ObjectMeta{}, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	pw, err := r.NewPartWriter(ctx, "ha", "mp", up.UploadID, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pw.Write([]byte("part")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pw.Commit(ctx, storage.PartMeta{ETag: "p1"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := r.CompleteMultipartUpload(ctx, "ha", "mp", up.UploadID, []int{1}, storage.ObjectMeta{ETag: "mp-1"}, refuse); !errors.Is(err, denied) {
+		t.Fatalf("refused CompleteMultipartUpload = %v, want %v", err, denied)
+	}
+	wantHealthy("a refused multipart completion")
+
+	// Invalid compression options are the caller's mistake too.
+	bad := storage.WriteOptions{Compression: storage.Compression{Algorithm: storage.CompressionDeflate, Level: 10}}
+	if w, err := r.NewObjectWriterWith(ctx, "ha", "put", bad); err == nil {
+		_ = w.Abort()
+		t.Fatal("NewObjectWriterWith accepted deflate level 10")
+	}
+	if _, err := r.CompleteMultipartUploadWith(ctx, "ha", "mp", up.UploadID, []int{1}, storage.ObjectMeta{ETag: "mp-1"}, storage.CommitOptions{}, bad); err == nil {
+		t.Fatal("CompleteMultipartUploadWith accepted deflate level 10")
+	}
+	wantHealthy("invalid compression options")
+	if _, err := r.GetMultipartUpload(ctx, "ha", "mp", up.UploadID); err != nil {
+		t.Fatalf("upload lost after refused completions: %v", err)
+	}
+}
+
 func TestActivePassiveReadFallbackAndAutoFailover(t *testing.T) {
 	fa := &faulty{Backend: memory.New()}
 	r := openRouter(t, Options{

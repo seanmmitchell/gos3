@@ -81,9 +81,17 @@ func TestStorageEndpoints(t *testing.T) {
 	e.root("POST", "/buckets/photos/placement/resync", nil).expectStatus(t, 202)
 	e.root("PUT", "/buckets/photos/placement", map[string]any{"mode": "single", "replicas": []string{}}).json(t, &st)
 
-	// Move and cancel.
-	waitPurged(t, r, "photos")
-	e.root("POST", "/buckets/photos/placement/move", map[string]any{"to": "default"}).expectStatus(t, 202)
+	// Move and cancel. The copy on "default" left by the switch to single
+	// is deleted in the background; until then a move back there is
+	// refused with a 409. (Probing with a move and a cancel instead races:
+	// a move of the empty bucket can finish before the cancel.)
+	waitFor(t, func() bool {
+		res := e.root("POST", "/buckets/photos/placement/move", map[string]any{"to": "default"})
+		if res.status != 202 && res.status != 409 {
+			t.Fatalf("POST move: status %d: %s", res.status, res.body)
+		}
+		return res.status == 202
+	})
 	e.root("POST", "/buckets/photos/placement/move", map[string]any{"to": "default"}).expectError(t, 409, codeConflict)
 	e.root("POST", "/buckets/photos/placement/move", map[string]any{}).expectError(t, 400, codeInvalidRequest)
 	waitFor(t, func() bool {
@@ -133,32 +141,4 @@ func waitInSync(t *testing.T, r *multi.Router, bucket string) {
 		}
 		return true
 	})
-}
-
-func waitPurged(t *testing.T, r *multi.Router, bucket string) {
-	t.Helper()
-	waitFor(t, func() bool {
-		for _, b := range r.Backings() {
-			if b.Replicas != 0 {
-				return false
-			}
-		}
-		return true
-	})
-	// The copy on "default" is deleted in the background; a move back
-	// there is refused until then.
-	waitFor(t, func() bool {
-		_, err := r.Move(context.Background(), bucket, "", "default")
-		if err == nil {
-			_, _ = r.CancelMove(context.Background(), bucket)
-			return true
-		}
-		return false
-	})
-	waitFor(t, func() bool {
-		st, _ := r.Placement(bucket)
-		return st.Move == nil
-	})
-	// And the canceled target is deleted again.
-	time.Sleep(200 * time.Millisecond)
 }
