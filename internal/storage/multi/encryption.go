@@ -53,9 +53,22 @@ func (r *Router) ValidateEncryptionSettings(ctx context.Context, bucket string, 
 // ResticBacking returns the restic settings interface of the backing
 // name: errors.ErrUnsupported when it cannot store restic archives.
 func (r *Router) ResticBacking(name string) (storage.ResticBackingBackend, error) {
-	r.mu.RLock()
-	b := r.backings[name]
-	r.mu.RUnlock()
+	r.adminMu.Lock()
+	defer r.adminMu.Unlock()
+	if _, err := r.resticBackend(name); err != nil {
+		return nil, err
+	}
+	return routerResticBacking{r: r, name: name}, nil
+}
+
+// resticBackend returns the restic settings interface of the backing name.
+// Resolve under adminMu so live reconfiguration cannot close a backing while
+// its restic settings are being inspected or credentials are being validated.
+func (r *Router) resticBackend(name string) (storage.ResticBackingBackend, error) {
+	if r.closed.Load() {
+		return nil, ErrClosed
+	}
+	b := r.topology.Load().backings[name]
 	if b == nil {
 		return nil, ErrUnknownBacking
 	}
@@ -64,6 +77,36 @@ func (r *Router) ResticBacking(name string) (storage.ResticBackingBackend, error
 		return nil, errors.ErrUnsupported
 	}
 	return e, nil
+}
+
+// routerResticBacking is the storage.ResticBackingBackend of one named
+// backing. Every call resolves the backing again under adminMu, so it acts
+// on the backing currently configured under that name.
+type routerResticBacking struct {
+	r    *Router
+	name string
+}
+
+// ResticBackingSettings implements storage.ResticBackingBackend.
+func (b routerResticBacking) ResticBackingSettings(ctx context.Context) (*storage.ResticS3, bool, error) {
+	b.r.adminMu.Lock()
+	defer b.r.adminMu.Unlock()
+	e, err := b.r.resticBackend(b.name)
+	if err != nil {
+		return nil, false, err
+	}
+	return e.ResticBackingSettings(ctx)
+}
+
+// ConfigureResticBacking implements storage.ResticBackingBackend.
+func (b routerResticBacking) ConfigureResticBacking(ctx context.Context, cfg *storage.ResticS3) error {
+	b.r.adminMu.Lock()
+	defer b.r.adminMu.Unlock()
+	e, err := b.r.resticBackend(b.name)
+	if err != nil {
+		return err
+	}
+	return e.ConfigureResticBacking(ctx, cfg)
 }
 
 // storesRestic reports whether backing b can store restic archives (it has
@@ -81,14 +124,22 @@ func (r *Router) placementBackings(bucket string) ([]*backing, error) {
 		return nil, err
 	}
 	r.mu.RLock()
-	defer r.mu.RUnlock()
 	rec := bs.rec
-	out := make([]*backing, 0, len(rec.Members)+1)
-	for _, m := range rec.Members {
-		out = append(out, r.backings[m.Backing])
-	}
+	r.mu.RUnlock()
+	// Live backing configuration never replaces or removes a backing that
+	// holds or receives a copy, so the members resolve in any topology.
+	topology := r.topology.Load()
+	names := memberNames(rec.Members)
 	if rec.Move != nil {
-		out = append(out, r.backings[rec.Move.To])
+		names = append(names, rec.Move.To)
+	}
+	out := make([]*backing, 0, len(names))
+	for _, name := range names {
+		b := topology.backings[name]
+		if b == nil {
+			return nil, fmt.Errorf("%w %q of bucket %q", ErrUnknownBacking, name, bucket)
+		}
+		out = append(out, b)
 	}
 	return out, nil
 }
@@ -132,13 +183,25 @@ func (r *Router) checkResticTarget(ctx context.Context, bucket string, primary, 
 func (r *Router) checkNewMembers(ctx context.Context, bucket string, bs *bucketState, names []string) error {
 	r.mu.RLock()
 	rec := bs.rec
-	primary := r.backings[rec.primary()]
 	r.mu.RUnlock()
+	// The caller holds adminMu, which also serializes live backing
+	// configuration, so this topology stays current during the checks.
+	topology := r.topology.Load()
+	primary := topology.backings[rec.primary()]
+	if primary == nil {
+		return fmt.Errorf("%w %q of bucket %q", ErrUnknownBacking, rec.primary(), bucket)
+	}
 	for _, name := range names {
 		if rec.member(name) >= 0 {
 			continue
 		}
-		if err := r.checkResticTarget(ctx, bucket, primary, r.backings[name]); err != nil {
+		// Re-resolved here: the backing may have been reconfigured since
+		// the caller validated the name.
+		b := topology.backings[name]
+		if b == nil {
+			return fmt.Errorf("%w %q", ErrUnknownBacking, name)
+		}
+		if err := r.checkResticTarget(ctx, bucket, primary, b); err != nil {
 			return err
 		}
 	}

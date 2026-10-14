@@ -10,8 +10,42 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/seanmmitchell/gos3/internal/config"
 	"github.com/seanmmitchell/gos3/internal/storage"
+	storagefs "github.com/seanmmitchell/gos3/internal/storage/fs"
+	"github.com/seanmmitchell/gos3/internal/storage/memory"
 )
+
+func TestResticBackingUsesLiveConfiguration(t *testing.T) {
+	ctx := context.Background()
+	oldDir, newDir := t.TempDir(), t.TempDir()
+	r := openRouter(t, Options{Backings: []Backing{{Name: "default", Kind: "memory", Backend: memory.New()}, fsBacking(t, "extra", oldDir)}})
+	r.EnableBackingManagement(config.StorageConfig{Backend: config.BackendMemory, Backings: []config.BackingConfig{{Name: "extra", Backend: config.BackendFS, Path: oldDir}}}, "", func(d config.BackingDefinition) (Backing, error) {
+		b, err := storagefs.Open(d.Path, storagefs.Options{})
+		return Backing{Name: d.Name, Kind: d.Backend, Path: d.Path, Backend: b}, err
+	})
+	handle, err := r.ResticBacking("extra")
+	if err != nil {
+		t.Fatal(err)
+	}
+	in, err := r.BackingConfiguration()
+	if err != nil {
+		t.Fatal(err)
+	}
+	in.Backings[0].Path = newDir
+	if _, err := r.ConfigureBackings(ctx, in); err != nil {
+		t.Fatal(err)
+	}
+	if err := handle.ConfigureResticBacking(ctx, nil); err != nil {
+		t.Fatalf("restic operation retained a replaced backend: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(newDir, ".gos3", "restic-backing.json")); err != nil {
+		t.Fatal("settings did not reach the current backing")
+	}
+	if _, err := os.Stat(filepath.Join(oldDir, ".gos3", "restic-backing.json")); !os.IsNotExist(err) {
+		t.Fatal("settings were written to a removed backing")
+	}
+}
 
 func TestReplicasKeepEncryption(t *testing.T) {
 	bk := []Backing{fsBacking(t, "a", t.TempDir()), fsBacking(t, "b", t.TempDir()), fsBacking(t, "c", t.TempDir())}
@@ -80,7 +114,8 @@ func TestReplicationEncryptionChangedBeforeRead(t *testing.T) {
 	}
 	// A listing saw plaintext, but opening that null version now sees a new
 	// encrypted object. Abort before sending any bytes to the plaintext writer.
-	if _, err = r.importVersion(ctx, r.backings["a"], r.backings["b"], "source", "k", old); !errors.Is(err, errSourceChanged) {
+	topology := r.topology.Load()
+	if _, err = r.importVersion(ctx, topology.backings["a"], topology.backings["b"], "source", "k", old); !errors.Is(err, errSourceChanged) {
 		t.Fatalf("expected retry after encryption changed: %v", err)
 	}
 	if _, err = bk[1].Backend.GetObjectInfo(ctx, "source", "k", ""); !errors.Is(err, storage.ErrObjectNotFound) {

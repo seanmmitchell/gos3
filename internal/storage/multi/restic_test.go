@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"testing"
 
+	"github.com/seanmmitchell/gos3/internal/config"
 	"github.com/seanmmitchell/gos3/internal/storage"
 	"github.com/seanmmitchell/gos3/internal/storage/memory"
 )
@@ -88,5 +89,32 @@ func TestResticVersionsNeedResticBackings(t *testing.T) {
 	}
 	if _, err := r.SetReplication(ctx, "arc", ModeActivePassive, []string{"m"}); !errors.Is(err, ErrInvalidPlacement) {
 		t.Fatalf("memory replica of a bucket with restic versions: %v", err)
+	}
+}
+
+// K8 with live backing configuration: a memory backing added at runtime
+// cannot receive a copy of a restic bucket either.
+func TestResticPlacementOnLiveBackings(t *testing.T) {
+	ctx := context.Background()
+	r := openRouter(t, Options{Backings: []Backing{fsBacking(t, "default", t.TempDir())}})
+	r.EnableBackingManagement(config.StorageConfig{Backend: "fs"}, "", func(d config.BackingDefinition) (Backing, error) {
+		return Backing{Name: d.Name, Kind: d.Backend, Path: d.Path, Backend: memory.New()}, nil
+	})
+	if err := r.CreateBucket(ctx, "arc", storage.CreateBucketOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.PutBucketConfig(ctx, "arc", storage.ConfigEncryptionProvider, []byte(`{"provider":"restic"}`)); err != nil {
+		t.Fatal(err)
+	}
+	in, _ := r.BackingConfiguration()
+	in.Backings = append(in.Backings, config.BackingDefinition{Name: "live", Backend: "memory"})
+	if _, err := r.ConfigureBackings(ctx, in); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := r.SetReplication(ctx, "arc", ModeActivePassive, []string{"live"}); !errors.Is(err, ErrInvalidPlacement) {
+		t.Fatalf("live memory replica of a restic bucket: %v", err)
+	}
+	if _, err := r.Move(ctx, "arc", "", "live"); !errors.Is(err, ErrInvalidPlacement) {
+		t.Fatalf("move of a restic bucket to a live memory backing: %v", err)
 	}
 }

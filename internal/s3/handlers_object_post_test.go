@@ -190,6 +190,7 @@ func TestObjectPostErrors(t *testing.T) {
 		{"user without PutObject", objSignedPostFields(t, weak, exp, base, objPostField{"key", "up/k"}), "f", file[:3], 403, "AccessDenied"},
 		{"anonymous", []objPostField{{"key", "up/k"}}, "f", file[:3], 403, "AccessDenied"},
 		{"missing key", signed(), "f", file[:3], 400, "InvalidArgument"},
+		{"key not representable in XML", signed(objPostField{"key", "up/k\x01"}), "f", file[:3], 400, "InvalidArgument"},
 		{"missing file", signed(objPostField{"key", "up/k"}), "", nil, 400, "InvalidArgument"},
 		{"fields too large", append(signed(objPostField{"key", "up/k"}), bigField), "f", file[:3], 400, "MaxPostPreDataLengthExceededError"},
 		{"duplicate field", append(signed(objPostField{"key", "up/k"}), objPostField{"KEY", "up/j"}), "f", file[:3], 400, "InvalidArgument"},

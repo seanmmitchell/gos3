@@ -312,7 +312,8 @@ func onThisHost(addr string, isLocal func(netip.Addr) bool) bool {
 // the same ID is known at other addresses, those are re-probed first. If
 // one still answers with the ID, the verified record is kept and the claim
 // is recorded as a conflict (ok=false); only when none does is the peer
-// moved to addr.
+// moved to addr. When ctx ends before the re-probes are decided, nothing
+// changes (ok=false): the claim is neither recorded nor accepted.
 func (s *Service) record(ctx context.Context, info Info, addr string, src Source) (Peer, bool) {
 	selfID := s.selfID()
 	p, res := s.table.observeInfo(info, addr, src, s.now(), selfID)
@@ -322,7 +323,15 @@ func (s *Service) record(ctx context.Context, info Info, addr string, src Source
 	case observeRejected:
 		return Peer{}, false
 	}
-	if s.knownStillAnswer(ctx, info.ID) {
+	switch s.knownStillAnswer(ctx, info.ID) {
+	case knownUndecided:
+		// Not knowing is not evidence either way: a re-probe cut short
+		// by ctx (e.g. the admin probe's deadline while a known address
+		// times out) must not report a conflict, nor move the peer.
+		s.logger.Debug("server ID seen at another address; known addresses not re-checked in time",
+			"id", info.ID, "known", p.Addresses, "address", addr)
+		return Peer{}, false
+	case knownAnswered:
 		if s.table.conflict(info, addr, s.now()) {
 			s.logger.Warn("server ID claimed by another address; keeping the verified peer",
 				"id", info.ID, "name", p.Name, "known", p.Addresses, "claimedBy", addr)
@@ -339,29 +348,54 @@ func (s *Service) record(ctx context.Context, info Info, addr string, src Source
 	return moved, ok
 }
 
+// knownState is the outcome of knownStillAnswer.
+type knownState int
+
+const (
+	knownGone      knownState = iota // no known address answered with the ID
+	knownAnswered                    // a known address answered with the ID
+	knownUndecided                   // ctx ended before every address was checked
+)
+
 // knownStillAnswer reports whether verified peer id answers with its ID at
 // one of its known addresses (re-probing them unless it answered very
-// recently). A cancelled ctx counts as "still answers": nothing moves on
-// an undecided check.
-func (s *Service) knownStillAnswer(ctx context.Context, id string) bool {
+// recently). When ctx ends before an answer and before every known address
+// has failed on its own, the result is knownUndecided: an address cut off
+// by ctx (rather than by its own probe timeout) is neither alive nor gone.
+func (s *Service) knownStillAnswer(ctx context.Context, id string) knownState {
 	urls, alive := s.table.knownTargets(id, s.now(), conflictFresh)
 	if alive {
-		return true
+		return knownAnswered
 	}
 	selfID := s.selfID()
 	for _, u := range urls {
+		if ctxEnded(ctx) {
+			return knownUndecided
+		}
 		pctx, cancel := context.WithTimeout(ctx, candidateProbeTimeout)
 		info, err := s.prober.fetch(pctx, u)
 		cancel()
-		if ctx.Err() != nil {
-			return true
-		}
 		if err == nil && info.ID == id {
 			s.table.observeInfo(info, u, "", s.now(), selfID)
-			return true
+			return knownAnswered
+		}
+		if ctxEnded(ctx) {
+			// This probe may have failed only because ctx ended.
+			return knownUndecided
 		}
 	}
-	return false
+	return knownGone
+}
+
+// ctxEnded reports whether ctx is done or past its deadline. The deadline
+// check covers a probe context whose own timer fired at the same instant
+// as ctx's, before ctx itself is marked done.
+func ctxEnded(ctx context.Context) bool {
+	if ctx.Err() != nil {
+		return true
+	}
+	dl, ok := ctx.Deadline()
+	return ok && !time.Now().Before(dl)
 }
 
 // verifyAll verifies candidates with bounded concurrency and waits.

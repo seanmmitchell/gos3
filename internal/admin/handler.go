@@ -204,6 +204,8 @@ func (a *api) routes() []route {
 		{"GET", "/backings", "ListBackings", service, a.listBackings},
 		{"GET", "/backings/{name}/restic", "ListBackings", service, a.getBackingRestic},
 		{"PUT", "/backings/{name}/restic", "UpdateConfig", service, a.putBackingRestic},
+		{"GET", "/backings/config", "GetConfig", service, a.getBackingConfig},
+		{"PUT", "/backings/config", "UpdateConfig", service, a.putBackingConfig},
 		{"GET", "/buckets/{name}/placement", "GetBucketPlacement", bucket, a.getPlacement},
 		{"PUT", "/buckets/{name}/placement", "UpdateBucketPlacement", bucket, a.putPlacement},
 		{"POST", "/buckets/{name}/placement/move", "UpdateBucketPlacement", bucket, a.startMove},

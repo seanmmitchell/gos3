@@ -26,7 +26,7 @@ const walkBatchKeys = 256
 // the key's lock. prog, when non-nil, counts the work.
 func (r *Router) syncMemberKey(ctx context.Context, ms *memberState, key string, prog *Progress) error {
 	r.mu.RLock()
-	src := r.backings[ms.bucket.rec.primary()]
+	src := ms.bucket.members[ms.bucket.rec.primary()].backing
 	removed := ms.bucket.removed
 	r.mu.RUnlock()
 	if removed || ms.isCanceled() {
@@ -313,7 +313,7 @@ func walkKeys(ctx context.Context, b storage.Backend, bucket string, fn func(key
 func (r *Router) fullSync(ctx context.Context, ms *memberState) error {
 	bs := ms.bucket
 	r.mu.RLock()
-	src := r.backings[bs.rec.primary()]
+	src := bs.members[bs.rec.primary()].backing
 	r.mu.RUnlock()
 	if src == ms.backing {
 		return nil
@@ -533,7 +533,7 @@ func (r *Router) startPurge(j *purgeJob) {
 // purge deletes every version, upload and configuration document of the
 // bucket on the backing, then the bucket itself.
 func (r *Router) purge(ctx context.Context, p purgeRecord) error {
-	b := r.backings[p.Backing]
+	b := r.topology.Load().backings[p.Backing]
 	if b == nil {
 		return nil
 	}

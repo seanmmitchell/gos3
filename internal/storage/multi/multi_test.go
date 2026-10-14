@@ -194,7 +194,7 @@ func TestActiveActiveFailover(t *testing.T) {
 	if st.Primary != "b" || st.Members[1].Backing != "a" {
 		t.Fatalf("placement after recovery: %+v", st)
 	}
-	waitSame(t, "ha", fa.Backend, r.backings["b"].Backend)
+	waitSame(t, "ha", fa.Backend, r.topology.Load().backings["b"].Backend)
 }
 
 // A publication refused by the caller's BeforePublish, or invalid
@@ -298,7 +298,7 @@ func TestActivePassiveReadFallbackAndAutoFailover(t *testing.T) {
 	put(t, r, "ap", "k2", "new", storage.ObjectMeta{})
 	fa.down.Store(false)
 	waitState(t, r, "ap", StateInSync)
-	waitSame(t, "ap", fa.Backend, r.backings["b"].Backend)
+	waitSame(t, "ap", fa.Backend, r.topology.Load().backings["b"].Backend)
 }
 
 func TestActivePassiveNoAutoFailover(t *testing.T) {
@@ -331,7 +331,7 @@ func TestActivePassiveNoAutoFailover(t *testing.T) {
 	put(t, r, "ap", "k", "new", storage.ObjectMeta{})
 	fa.down.Store(false)
 	waitState(t, r, "ap", StateInSync)
-	waitSame(t, "ap", fa.Backend, r.backings["b"].Backend)
+	waitSame(t, "ap", fa.Backend, r.topology.Load().backings["b"].Backend)
 }
 
 func TestGracefulPromote(t *testing.T) {

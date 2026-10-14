@@ -675,3 +675,82 @@ func TestMDNSAdvertiserSockets(t *testing.T) {
 		t.Errorf("answer to 200 questions: id %d, %d answers, %d questions", m.Id, len(m.Answer), len(m.Question))
 	}
 }
+
+// TestMDNSTXTRoundTrip: TXT values go on the wire byte for byte and come
+// back unchanged through a packed and unpacked dns.Msg, although miekg/dns
+// keeps dns.TXT.Txt in presentation format (it reads `\X` and `\DDD` when
+// packing and writes them when unpacking).
+func TestMDNSTXTRoundTrip(t *testing.T) {
+	names := []string{
+		"nas",
+		"Seán",
+		`a\b`,
+		`say "hi"`,
+		`\195`,      // a literal backslash-digits sequence, not a byte escape
+		`trailing\`, // a dangling backslash
+		`\\"\"\`,    // runs of escapes
+		"日本語 NAS",
+		"tab\there",   // a control byte (cleanField drops it later)
+		"\xff\xferaw", // invalid UTF-8 (cleanField replaces it later)
+	}
+	for _, name := range names {
+		txt := []string{"id=b3f1c2d4e5f60718", "name=" + name, "v=1", "scheme=http"}
+		z, err := newMDNSZone("nas-b3f1c2", "host.local.", 9000, []netip.Addr{netip.MustParseAddr("10.0.0.7")}, txt)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !slices.Equal(z.TXT, txt) {
+			t.Errorf("%q: zone TXT = %q", name, z.TXT)
+		}
+		r, _ := testResponder(t)
+		r.setZone(z)
+		w := &fakeWriter{}
+		r.handle(mdnsPacket{data: query(t, 1, q(mdnsServiceName, dns.TypePTR)), src: src("10.0.0.7:40000")}, w)
+		if len(w.uni) != 1 {
+			t.Fatalf("%q: %d responses", name, len(w.uni))
+		}
+		// On the wire: a length byte, then the raw bytes.
+		raw := "name=" + name
+		if !strings.Contains(string(w.uni[0]), string(rune(len(raw)))+raw) {
+			t.Errorf("%q: TXT string not on the wire verbatim", name)
+		}
+		b := newMDNSBrowser("self", testNets())
+		b.handle(w.uni[0], src("10.0.0.7:5353"))
+		cs := b.candidates()
+		if len(cs) != 1 || cs[0].id != "b3f1c2d4e5f60718" || cs[0].name != name || cs[0].version != "1" {
+			t.Errorf("%q: candidates = %+v", name, cs)
+		}
+	}
+
+	// A TXT record written by another implementation (here parsed from
+	// presentation format) is read as the bytes it carries.
+	b := newMDNSBrowser("self", testNets())
+	fq := "nas." + mdnsServiceName
+	b.handle(response(t, mdnsServiceName+" 120 IN PTR "+fq, fq+" 120 IN SRV 10 1 9000 nas.local.",
+		fq+` 120 IN TXT "id=id0000000000000c" "name=Se\195\161n \"q\" \\"`, "nas.local. 120 IN A 10.0.0.7"), src("10.0.0.7:5353"))
+	if cs := b.candidates(); len(cs) != 1 || cs[0].name != `Seán "q" \` {
+		t.Errorf("candidates = %+v", cs)
+	}
+}
+
+func TestTXTEscape(t *testing.T) {
+	for _, tc := range []struct{ raw, esc string }{
+		{"plain=1", "plain=1"},
+		{"Seán", `Se\195\161n`},
+		{`a"b\c`, `a\"b\\c`},
+		{"\x00\x1f\x7f", `\000\031\127`},
+	} {
+		if got := txtEscape(tc.raw); got != tc.esc {
+			t.Errorf("txtEscape(%q) = %q, want %q", tc.raw, got, tc.esc)
+		}
+		if got := txtUnescape(tc.esc); got != tc.raw {
+			t.Errorf("txtUnescape(%q) = %q, want %q", tc.esc, got, tc.raw)
+		}
+	}
+	// Forms miekg/dns never produces still decode sensibly.
+	for in, want := range map[string]string{`a\`: "a", `\x`: "x", `\12`: "12", `\0651`: "A1"} {
+		if got := txtUnescape(in); got != want {
+			t.Errorf("txtUnescape(%q) = %q, want %q", in, got, want)
+		}
+	}
+}
