@@ -233,6 +233,9 @@ func (r *Router) SetReplication(ctx context.Context, bucket string, mode Mode, r
 	if err != nil {
 		return PlacementStatus{}, err
 	}
+	if err := r.checkNewMembers(ctx, bucket, bs, replicas); err != nil {
+		return PlacementStatus{}, err
+	}
 
 	r.mu.Lock()
 	rec := bs.rec
@@ -318,6 +321,9 @@ func (r *Router) Move(ctx context.Context, bucket, from, to string) (PlacementSt
 	}
 	bs, err := r.lookup(bucket)
 	if err != nil {
+		return PlacementStatus{}, err
+	}
+	if err := r.checkNewMembers(ctx, bucket, bs, []string{to}); err != nil {
 		return PlacementStatus{}, err
 	}
 	r.mu.Lock()

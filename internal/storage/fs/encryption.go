@@ -127,7 +127,7 @@ func (b *Backend) loadBucketKey(bucketID string, create bool) ([]byte, error) {
 			return nil, err
 		}
 		if used {
-			return nil, fmt.Errorf("fs: encryption key %s is missing; restore it from backup", path)
+			return nil, fmt.Errorf("%w: encryption key %s is missing; restore it from backup", storage.ErrEncryptionUnavailable, path)
 		}
 		if err := os.MkdirAll(dir, dirPerm); err != nil {
 			return nil, fmt.Errorf("fs: create key directory: %w", err)
@@ -140,6 +140,9 @@ func (b *Backend) loadBucketKey(bucketID string, create bool) ([]byte, error) {
 		if err := config.WriteFileAtomic(path, key, filePerm); err != nil {
 			return nil, fmt.Errorf("fs: write encryption key: %w", err)
 		}
+	case errors.Is(err, os.ErrNotExist):
+		// A per-bucket condition, not a failure of the backend.
+		return nil, fmt.Errorf("%w: encryption key %s is missing: %w", storage.ErrEncryptionUnavailable, path, err)
 	default:
 		return nil, fmt.Errorf("fs: read encryption key: %w", err)
 	}
@@ -294,16 +297,6 @@ func (b *Backend) openEncrypted(f *os.File, bucketID, id string, size int64) (*c
 		return nil, err
 	}
 	return decryptFile(f, objectDataKey(master, id), size, f.Close)
-}
-
-// finishEncryptedData completes the temporary file t holding a new
-// version's data: restic archives it, every other mode moves it into place
-// (see finishData).
-func (b *Backend) finishEncryptedData(ctx context.Context, t *tmpFile, bucketID, mode, bucket, key string) (string, string, error) {
-	if mode == storage.EncryptionRestic {
-		return b.finishRestic(ctx, t, bucketID, bucket, key)
-	}
-	return b.finishData(t, bucketID)
 }
 
 // resticPassword derives the password of a bucket's restic repository from

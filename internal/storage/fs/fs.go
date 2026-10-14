@@ -151,6 +151,7 @@ type Backend struct {
 
 	pending pendingSet
 	commits committer
+	restic  resticState // see restic.go
 
 	// commitFault, when set (tests only), replaces the result of every
 	// successful write transaction, simulating a commit that reports an

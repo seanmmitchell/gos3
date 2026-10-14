@@ -187,6 +187,9 @@ func (s *Server) handleCopyObject(w http.ResponseWriter, r *http.Request, rc *re
 	if err := s.prepareNewObject(ctx, r, rc, bi, rc.key, &meta, opts); err != nil {
 		return err
 	}
+	if err := s.precheckWriteConditions(ctx, rc.bucket, rc.key, meta, cond); err != nil {
+		return err
+	}
 	cond.BeforePublish = func(m, current *storage.ObjectMeta, created time.Time, config func(string) []byte) error {
 		if err := s.checkCredentialsCurrent(rc); err != nil {
 			return err

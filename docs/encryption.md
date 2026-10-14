@@ -41,6 +41,10 @@ Install [restic](https://restic.readthedocs.io/en/stable/020_installation.html)
 **0.17.1 or newer** on each filesystem backing server's PATH. Native AES256
 needs no extra executable; memory backings do not support restic.
 
+Restic cannot be selected while a memory backing holds a copy of the bucket,
+and a bucket that uses restic or holds restic versions cannot be replicated
+or moved to one.
+
 On server **Storage**, open **Restic storage** for the assigned backing:
 
 - **Local backing storage** (default): each bucket copy uses
@@ -81,7 +85,7 @@ saved values; an expired session token can be explicitly cleared. Invalid
 credential updates leave working settings intact. Persisted settings override
 startup settings for that backing.
 
-Once repository preparation begins, its location is fixed, including after
+Once a repository is initialized, its location is fixed, including after
 objects or buckets are deleted. Configure another backing and use **Placement**
 to move the bucket when changing storage. Existing archives stay with their
 original backing. Credentials and region can be updated at the same location.
@@ -95,18 +99,35 @@ permissions separately govern enabling or disabling bucket-default encryption.
 
 ## Archive behavior
 
-Each object becomes a restic snapshot containing `/object`, published only
-after backup succeeds. Encrypted snapshot tags `gos3-bucket:<base64url>` and
-`gos3-key:<base64url>` retain the source identity using unpadded URL-safe
-base64. Restic handles compression and deduplication; gos3 compression is not
-applied to restic objects. Failed commits can leave unreferenced snapshots.
+Each non-empty object becomes a restic snapshot containing `/object`,
+published only after backup succeeds; empty objects need no snapshot.
+Uploads stream into `restic backup` while they are received, and the
+snapshot is saved only after the write's `If-None-Match`/`If-Match`
+conditions (and, for multipart completion, its parts) are checked again, so
+aborted or refused writes leave no snapshot. A write refused later in the
+commit, or racing another write, can still leave an unreferenced snapshot.
+Encrypted snapshot tags `gos3-bucket:<base64url>` and `gos3-key:<base64url>`
+retain the source identity using unpadded URL-safe base64. Restic handles
+compression and deduplication; gos3 compression is not applied to restic
+objects. Restic 0.17.1 or newer is checked on first use.
 
-GET retrieves and verifies the whole object into an encrypted temporary cache
-before serving it, including range requests. The cache is removed on close and
-crash leftovers are cleared at startup. This requires disk space for the whole
-object and adds repository latency. Errors fail the request without plaintext
-fallback. Overwrites and deletes retain snapshots; automatic pruning is not
-implemented. Do not forget snapshots still referenced by live gos3 metadata.
+GET restores the whole object into an encrypted temporary file on the first
+read, then serves it, including range requests; requests that send no data
+(HEAD, `304`, `412`, `416`) restore nothing, and concurrent readers of the
+same version share one restore. The file is removed with its last reader
+and crash leftovers are cleared at startup. This requires disk space for the
+whole object and adds repository latency. Errors fail the request without
+plaintext fallback; they concern the bucket only and do not mark its backing
+unhealthy. Restic's diagnostics appear (redacted) in the server log.
+
+Restic keeps a cache in `.gos3/restic-cache/` (one subdirectory per
+repository, managed by restic; safe to delete). Every object adds a snapshot
+and an index file, so run `restic prune` on each repository periodically to
+consolidate its index (it forgets nothing; never run `restic forget` on
+snapshots still referenced by gos3). Prune takes an exclusive lock: writes
+wait up to 30 seconds for it, and reads, which do not lock, can fail while
+it repacks. Overwrites and deletes retain snapshots; automatic pruning is not
+implemented.
 
 Stored-byte usage metrics count restic versions at their content size, because
 repository packs are deduplicated, compressed, and shared between snapshots

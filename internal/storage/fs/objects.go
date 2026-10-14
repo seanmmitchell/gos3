@@ -210,9 +210,11 @@ type objectWriter struct {
 
 	mu sync.Mutex
 	t  *tmpFile
-	// cw compresses into t when the version is stored compressed; w is
-	// where written data goes (cw or t).
+	// cw compresses into t when the version is stored compressed; rw
+	// archives restic versions instead of t; w is where written data goes
+	// (cw, rw or t).
 	cw          *compress.Writer
+	rw          *resticWriter
 	w           io.Writer
 	compression string
 	encryption  string
@@ -227,7 +229,9 @@ func (b *Backend) NewObjectWriter(ctx context.Context, bucket, key string) (stor
 
 // NewObjectWriterWith is NewObjectWriter with write options: with
 // opts.Compression the data file is written in the compress package's
-// format (see storage.CompressingBackend).
+// format (see storage.CompressingBackend). With opts.Encryption restic the
+// data streams into restic as it is written (see resticWriter) and is not
+// compressed by gos3.
 func (b *Backend) NewObjectWriterWith(ctx context.Context, bucket, key string, opts storage.WriteOptions) (storage.ObjectWriter, error) {
 	if err := checkCompression(opts.Compression); err != nil {
 		return nil, err
@@ -235,29 +239,22 @@ func (b *Backend) NewObjectWriterWith(ctx context.Context, bucket, key string, o
 	if err := validKey(key); err != nil {
 		return nil, err
 	}
-	if err := b.begin(ctx); err != nil {
-		return nil, err
-	}
-	var id string
-	err := b.view(func(tx *bbolt.Tx) error {
-		rec, _, err := loadBucket(tx, bucket)
-		if err != nil {
-			return err
-		}
-		id = rec.ID
-		return nil
-	})
+	id, err := b.encryptionBucketID(ctx, bucket)
 	if err != nil {
 		return nil, err
 	}
-	t, err := b.encryptedTemp(id, opts.Encryption)
-	if err != nil {
-		return nil, err
-	}
+	w := &objectWriter{b: b, bucket: bucket, bucketID: id, key: key, encryption: opts.Encryption}
 	if opts.Encryption == storage.EncryptionRestic {
-		opts.Compression = storage.Compression{}
+		if w.rw, err = b.newResticWriter(ctx, id, bucket, key); err != nil {
+			return nil, err
+		}
+		w.t, w.w = b.newTemp(), w.rw
+		return w, nil
 	}
-	w := &objectWriter{b: b, bucket: bucket, bucketID: id, key: key, t: t, compression: opts.Compression.Algorithm, encryption: opts.Encryption}
+	if w.t, err = b.encryptedTemp(id, opts.Encryption); err != nil {
+		return nil, err
+	}
+	w.compression = opts.Compression.Algorithm
 	if w.cw, err = newCompressor(w.t, opts.Compression); err != nil {
 		return nil, err
 	}
@@ -282,6 +279,9 @@ func (w *objectWriter) discard() {
 	if w.cw != nil {
 		w.cw.Abandon()
 	}
+	if w.rw != nil {
+		w.rw.abort()
+	}
 	w.t.discard()
 }
 
@@ -292,17 +292,29 @@ func (w *objectWriter) Commit(ctx context.Context, meta storage.ObjectMeta, opts
 		return storage.ObjectInfo{}, errWriterDone
 	}
 	w.done = true
-	defer w.t.discard()
+	defer w.discard()
 	if err := w.b.begin(ctx); err != nil {
-		w.discard()
 		return storage.ObjectInfo{}, err
 	}
-	size, compression, stored, err := sealData(w.t, w.cw, w.compression)
-	if err != nil {
-		w.t.discard()
-		return storage.ObjectInfo{}, err
+	var (
+		size, stored int64
+		compression  string
+		dataID, path string
+		err          error
+	)
+	if w.rw != nil {
+		// A write refused by its preconditions must not leave a snapshot.
+		size = w.rw.size
+		dataID, path, err = w.rw.finish(func() error {
+			return w.b.checkWriteConditions(w.bucket, w.bucketID, w.key, opts)
+		})
+	} else {
+		size, compression, stored, err = sealData(w.t, w.cw, w.compression)
+		if err != nil {
+			return storage.ObjectInfo{}, err
+		}
+		dataID, path, err = w.b.finishData(w.t, w.bucketID)
 	}
-	dataID, path, err := w.b.finishEncryptedData(ctx, w.t, w.bucketID, w.encryption, w.bucket, w.key)
 	if err != nil {
 		return storage.ObjectInfo{}, err
 	}
@@ -411,7 +423,9 @@ func (b *Backend) OpenObject(ctx context.Context, bucket, key, versionID string)
 		}
 		want := info.PhysicalSize()
 		if info.Encryption == storage.EncryptionRestic {
-			want = 64
+			// The data file is the snapshot reference, whatever the
+			// version's size accounting says.
+			want = snapshotRefSize
 		}
 		if st.Size() != want {
 			_ = f.Close()

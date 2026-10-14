@@ -191,12 +191,12 @@ func (r *Router) importVersion(ctx context.Context, src, dst *backing, bucket, k
 // when b can compress (else as is). errors.ErrUnsupported when b cannot
 // import versions at all.
 func newVersionWriter(ctx context.Context, b *backing, bucket, key string, opts storage.WriteOptions) (storage.VersionWriter, error) {
-	if opts.Compression.Enabled() || opts.Encryption != "" {
+	if withOptions(opts) {
 		if ci, ok := b.Backend.(storage.CompressingImporter); ok {
 			return ci.NewVersionWriterWith(ctx, bucket, key, opts)
 		}
 		if opts.Encryption != "" {
-			return nil, fmt.Errorf("backing %q cannot receive encrypted copies: %w", b.Name, errors.ErrUnsupported)
+			return nil, errNoWriteOptions(b.Name, opts)
 		}
 	}
 	imp, ok := b.Backend.(storage.VersionImporter)

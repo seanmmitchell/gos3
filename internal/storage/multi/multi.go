@@ -526,7 +526,9 @@ func (r *Router) AutoFailover() bool { return r.opts.AutoFailover }
 
 // isBackingError reports whether err (returned by a backing) indicates a
 // failure of the backing itself rather than an answer about the request
-// (not found, exists, precondition failed, ...) or a canceled request.
+// (not found, exists, precondition failed, ...), a canceled request or a
+// failure of one bucket's encryption (a missing key, an unavailable restic
+// repository), which other buckets on the backing do not share.
 func isBackingError(err error) bool {
 	if err == nil {
 		return false
@@ -536,7 +538,7 @@ func isBackingError(err error) bool {
 		storage.ErrObjectNotFound, storage.ErrVersionNotFound, storage.ErrUploadNotFound,
 		storage.ErrPartNotFound, storage.ErrConfigNotFound, storage.ErrPreconditionFailed,
 		storage.ErrInvalidName, storage.ErrStopWalk, context.Canceled, context.DeadlineExceeded,
-		errors.ErrUnsupported,
+		errors.ErrUnsupported, storage.ErrEncryptionUnavailable,
 	} {
 		if errors.Is(err, s) {
 			return false
