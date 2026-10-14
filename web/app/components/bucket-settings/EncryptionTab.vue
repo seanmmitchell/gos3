@@ -175,7 +175,7 @@ const saveProvider = useAsyncAction(async () => {
           Older gos3 versions only recorded encryption settings. Those existing objects remain unencrypted until uploaded or copied again.
         </p>
         <div class="flex justify-end gap-2 border-t border-default pt-4">
-          <UButton type="submit" icon="i-lucide-save" label="Save" :disabled="!dirty" :loading="save.loading.value" />
+          <UButton type="submit" icon="i-lucide-save" label="Save default encryption" :disabled="!dirty" :loading="save.loading.value" />
         </div>
       </form>
     </UCard>
@@ -231,7 +231,7 @@ const saveProvider = useAsyncAction(async () => {
           The server prepares the keys or repository before switching; if that fails, the current implementation stays in effect. Existing objects keep the implementation they were stored with.
         </p>
         <div class="flex justify-end gap-2 border-t border-default pt-4">
-          <UButton type="submit" icon="i-lucide-save" label="Save" :disabled="!providerDirty" :loading="saveProvider.loading.value" />
+          <UButton type="submit" icon="i-lucide-save" label="Save implementation" :disabled="!providerDirty" :loading="saveProvider.loading.value" />
         </div>
       </form>
     </UCard>
