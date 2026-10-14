@@ -82,6 +82,16 @@ export function validatePolicyDocument(value: unknown, kind: 'identity' | 'bucke
     const hasPrincipal = st.Principal !== undefined || st.NotPrincipal !== undefined
     if (kind === 'identity' && hasPrincipal) return `${where}: identity policies cannot contain Principal`
     if (kind === 'bucket' && !hasPrincipal) return `${where}: missing required field Principal`
+    if (kind === 'bucket') {
+      const principal = st.Principal ?? st.NotPrincipal
+      if (principal && typeof principal === 'object' && !Array.isArray(principal)) {
+        const entries = principal as Record<string, unknown>
+        const names = [...asList(entries.AWS), ...asList(entries.CanonicalUser)]
+        if (names.some(v => typeof v === 'string' && /^arn:[^:]+:iam::[^:]+:user\//.test(v))) {
+          return `${where}: IAM user ARNs are unsupported; use the local user name`
+        }
+      }
+    }
     if (st.Condition !== undefined && (typeof st.Condition !== 'object' || st.Condition === null || Array.isArray(st.Condition))) {
       return `${where}: Condition must be an object`
     }

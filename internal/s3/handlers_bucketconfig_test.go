@@ -498,7 +498,7 @@ func TestBucketPolicyStatus(t *testing.T) {
 		{"any ip", stmt(`"*"`, `{"IpAddress":{"aws:SourceIp":"0.0.0.0/0"}}`), true},
 		{"source vpc", stmt(`"*"`, `{"StringEquals":{"aws:SourceVpc":"vpc-123"}}`), false},
 		{"secure transport only", stmt(`"*"`, `{"Bool":{"aws:SecureTransport":"true"}}`), true},
-		{"user", stmt(`{"AWS":"arn:aws:iam::000000000000:user/alice"}`, ""), false},
+		{"user", stmt(`{"AWS":"alice"}`, ""), false},
 		{"deny all", `{"Version":"2012-10-17","Statement":[{"Effect":"Deny","Principal":"*","Action":"s3:*","Resource":"arn:aws:s3:::cfg/*"}]}`, false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -525,6 +525,7 @@ func TestBucketPolicyValidation(t *testing.T) {
 		{"no principal", `{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":"s3:GetObject","Resource":"arn:aws:s3:::cfg/*"}]}`, 400, "MalformedPolicy"},
 		{"other bucket", `{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":"*","Action":"s3:GetObject","Resource":"arn:aws:s3:::other/*"}]}`, 400, "MalformedPolicy"},
 		{"bad action", `{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":"*","Action":"ec2:Run","Resource":"arn:aws:s3:::cfg/*"}]}`, 400, "MalformedPolicy"},
+		{"unsupported user ARN", `{"Statement":[{"Effect":"Allow","Principal":{"AWS":"arn:aws:iam::123456789012:user/team/alice"},"Action":"s3:GetObject","Resource":"arn:aws:s3:::cfg/*"}]}`, 400, "MalformedPolicy"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			bcExpect(t, e.signed(http.MethodPut, "/cfg?policy", []byte(tc.policy), nil), tc.status, tc.code)

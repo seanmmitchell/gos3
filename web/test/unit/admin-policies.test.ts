@@ -217,9 +217,15 @@ describe('bucket policy templates', () => {
       const text = JSON.stringify(doc)
       expect(validatePolicyDocument(JSON.parse(text), 'bucket', 'photos')).toBeUndefined()
       expect(text).toContain('arn:aws:s3:::photos')
-      if (t.needsUser) expect(text).toContain('user/alice')
+      if (t.needsUser) expect(text).toContain('"AWS":["alice"]')
     })
   }
+
+  it('rejects an external IAM user ARN in a bucket policy', () => {
+    const doc = bucketPolicyTemplate('user-readonly', 'photos', { user: 'alice' })
+    doc.Statement[0]!.Principal = { AWS: ['arn:aws:iam::123456789012:user/team/alice'] }
+    expect(validatePolicyDocument(doc, 'bucket', 'photos')).toContain('IAM user ARNs are unsupported')
+  })
 
   it('replaces invalid text and appends to an existing policy, replacing equal Sids', () => {
     const first = applyBucketTemplate('', 'public-read', 'b')

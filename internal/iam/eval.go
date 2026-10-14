@@ -250,8 +250,8 @@ func (c *evalCtx) principalMatches(p *Principal, broad bool) bool {
 }
 
 // principalEntryMatches matches one principal entry: "*", a user name, an
-// access key ID (key, "" for none), arn:<p>:iam::<any>:user/[path/]<name>,
-// or an account principal arn:<p>:iam::<any>:root / 12-digit account ID
+// access key ID (key, "" for none), or an account principal
+// arn:<p>:iam::<any>:root / 12-digit account ID
 // (the root identity, or with broad every authenticated identity; see
 // principalMatches). A 12-digit entry is only ever the account principal:
 // it is never compared with user names or access key IDs.
@@ -270,14 +270,9 @@ func principalEntryMatches(v string, id auth.Identity, key string, broad bool) b
 		if parts[5] == "root" {
 			return id.IsRoot || broad
 		}
-		name, ok := strings.CutPrefix(parts[5], "user/")
-		if !ok || id.IsRoot {
-			return false
-		}
-		if i := strings.LastIndexByte(name, '/'); i >= 0 {
-			name = name[i+1:]
-		}
-		return name != "" && name == id.User
+		// There is no local account ID or IAM path to compare with a user
+		// ARN. Never reduce an external ARN to its final user name.
+		return false
 	}
 	if isAccountID(v) {
 		return id.IsRoot || broad

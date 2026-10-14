@@ -384,8 +384,8 @@ func validPrincipal(p *Principal) bool {
 }
 
 // validPrincipalEntry accepts "*", arn:<partition>:iam::<account>:root,
-// arn:<partition>:iam::<account>:user/[path/]<name>, account ids, user names
-// and access key ids.
+// account ids, user names and access key ids. User ARNs are unsupported:
+// gos3 has no account ID or IAM paths against which to validate them.
 func validPrincipalEntry(v string) bool {
 	if v == "*" {
 		return true
@@ -395,17 +395,7 @@ func validPrincipalEntry(v string) bool {
 		if len(parts) != 6 || parts[2] != "iam" || parts[4] == "" {
 			return false
 		}
-		if parts[5] == "root" {
-			return true
-		}
-		name, ok := strings.CutPrefix(parts[5], "user/")
-		if !ok {
-			return false
-		}
-		if i := strings.LastIndexByte(name, '/'); i >= 0 {
-			name = name[i+1:]
-		}
-		return validName(name, 64)
+		return parts[5] == "root"
 	}
 	return validName(v, 128)
 }

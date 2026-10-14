@@ -124,6 +124,13 @@ namespaces are kept apart: a key ID cannot equal a user name, `root`,
 a 12-digit account ID, and a bare 12-digit principal only ever names the
 account. Keys in an older `iam.json` that break this rule are refused at
 authentication and logged at startup and on first use; replace them.
+
+Bucket policies must name local users by bare name, not by an AWS IAM user
+ARN: gos3 cannot verify an ARN's account or path. Before upgrading, replace
+user ARNs in `Principal` and `NotPrincipal` with the intended local names.
+Existing policies that still contain user ARNs fail closed for non-root
+requests until root updates them.
+
 Choosing a key's ID (`"accessKey"` in `POST /users/{name}/keys`) needs
 `admin:CreateAccessKey` at service level, so a delegated administrator can
 only create keys with generated IDs. Principals, `arn:gos3:admin:::user/…`
@@ -447,6 +454,9 @@ already has a secret key. Under the global `*` rule:
 - Preflights are approved only when `Access-Control-Request-Headers`
   includes `authorization` or the URL is presigned; otherwise the answer is
   `403 AccessForbidden`.
+- A preflight's `Access-Control-Request-Headers` is limited to 8 KiB and 64
+  requested headers before matching bucket CORS rules; larger lists get
+  `400 BadRequest`.
 - Browser POST-policy uploads (PostObject) never count as signed, even when
   they come with an `Authorization` header or `X-Amz-*` query parameters:
   PostObject authenticates from its form fields and accepts forms without a
@@ -527,9 +537,10 @@ and `ForAllValues:` conditions never count as restricting; `ForAllValues:`
 conditions hold when the key is missing, as it is for anonymous callers.
 
 Allow statements for everyone that are restricted only by `aws:SourceIp`
-are judged together: the union of their ranges across the whole policy may
-cover at most four IPv4 /8 networks and four IPv6 /32 networks, so splitting
-a wide range across statements does not hide it. Overlapping or repeated
+are judged together: each IPv4 range must be /8 or narrower and each IPv6
+range /32 or narrower. The union across the whole policy may cover at most
+four IPv4 /8 networks and four IPv6 /32 networks, so splitting a wide range
+across statements does not hide it. Overlapping or repeated
 ranges are merged, not counted twice, and `::ffff:a.b.c.d/96+n` counts as
 the IPv4 /n. Wider allow-lists, such as `fd00::/8` or many large ranges,
 count as public. Statements that also carry another restricting key
