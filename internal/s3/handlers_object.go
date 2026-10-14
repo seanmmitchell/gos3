@@ -241,6 +241,26 @@ func (s *Server) storeObject(ctx context.Context, bucket, key string, src io.Rea
 	return info, nil
 }
 
+// precheckWriteConditions evaluates the conditional write headers cond of
+// a write to bucket/key before its data is received, when that data is
+// archived with restic (meta.Encryption): archiving costs a full upload
+// into the repository, which a write that is refused at commit anyway
+// should not cause. The commit evaluates the conditions again atomically.
+func (s *Server) precheckWriteConditions(ctx context.Context, bucket, key string, meta storage.ObjectMeta, cond storage.CommitOptions) error {
+	if meta.Encryption != storage.EncryptionRestic || (!cond.IfNoneMatch && cond.IfMatch == "") {
+		return nil
+	}
+	info, err := s.backend.GetObjectInfo(ctx, bucket, key, "")
+	if err != nil && !errors.Is(err, storage.ErrObjectNotFound) {
+		return bucketError(err, bucket)
+	}
+	exists := err == nil && !info.DeleteMarker
+	if (cond.IfNoneMatch && exists) || (cond.IfMatch != "" && (!exists || info.ETag != cond.IfMatch)) {
+		return s.commitError(ctx, storage.ErrPreconditionFailed, bucket, key, cond)
+	}
+	return nil
+}
+
 // newObjectPayload is newPayloadReader for object data: when the client
 // asked for no checksum, a CRC64NVME checksum is computed and stored by
 // default, as S3 does for new objects.
@@ -613,6 +633,9 @@ func (s *Server) handlePutObject(w http.ResponseWriter, r *http.Request, rc *req
 	if err := s.prepareNewObject(ctx, r, rc, bi, rc.key, &meta, opts); err != nil {
 		return err
 	}
+	if err := s.precheckWriteConditions(ctx, rc.bucket, rc.key, meta, cond); err != nil {
+		return err
+	}
 	cond.BeforePublish = func(m, _ *storage.ObjectMeta, created time.Time, config func(string) []byte) error {
 		return publishObjectRetention(m, created, config, opts.retentionSet)
 	}
@@ -821,6 +844,13 @@ func (s *Server) serveObject(w http.ResponseWriter, r *http.Request, rc *reqCont
 	if rng != nil && rng.Start > 0 {
 		if _, err := body.Seek(rng.Start, io.SeekStart); err != nil {
 			return err
+		}
+	}
+	// Data fetched on first use (restic) is fetched now, while a failure
+	// can still be reported with a proper status.
+	if p, ok := body.(storage.PreparingReader); ok {
+		if err := p.Prepare(); err != nil {
+			return mapStorageError(err)
 		}
 	}
 	w.WriteHeader(status)
