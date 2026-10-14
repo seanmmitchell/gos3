@@ -33,6 +33,16 @@ var (
 	ErrConfigNotFound     = errors.New("storage: bucket config not found")
 	ErrPreconditionFailed = errors.New("storage: precondition failed")
 	ErrInvalidName        = errors.New("storage: invalid name")
+	// ErrInvalidBacking is returned by CreateBucket for a backing name that
+	// is not configured.
+	ErrInvalidBacking = errors.New("storage: unknown backing")
+	// ErrBackingUnavailable is returned (wrapped) when the backing that
+	// holds a bucket's data is not configured any more or cannot be
+	// reached (network failure or a 5xx answer from a remote S3 service).
+	ErrBackingUnavailable = errors.New("storage: backing unavailable")
+	// ErrNotSupported is returned when the bucket's backing cannot perform
+	// an operation (e.g. versioning on a gateway backing).
+	ErrNotSupported = errors.New("storage: not supported by the bucket's backing")
 	// ErrStopWalk may be returned by a Walk callback to stop iteration early;
 	// the Walk method then returns nil.
 	ErrStopWalk = errors.New("storage: stop walk")
@@ -83,6 +93,9 @@ type BucketInfo struct {
 	Versioning        VersioningStatus
 	ObjectLockEnabled bool
 	Owner             string // IAM user name that created the bucket ("" = root)
+	// Backing names the configured backing that stores the bucket's data
+	// ("" = the server's own storage). See docs/backings.md.
+	Backing string
 }
 
 // CreateBucketOptions are passed to CreateBucket.
@@ -90,6 +103,11 @@ type CreateBucketOptions struct {
 	Region            string
 	ObjectLockEnabled bool // implies Versioning = Enabled
 	Owner             string
+	// Backing names the configured backing for the bucket's data ("" = the
+	// server's own storage); persisted and reported in BucketInfo.Backing.
+	// The routing layer (internal/storage/routed) validates it and returns
+	// ErrInvalidBacking for unknown names; plain backends store it as is.
+	Backing string
 }
 
 // ObjectMeta is the metadata supplied by the S3 layer when committing an

@@ -18,7 +18,13 @@ import (
 // is restored until the reader is read or prepared.
 func (b *Backend) openRestic(ctx context.Context, f *os.File, id string, size int64) (io.ReadSeekCloser, error) {
 	defer f.Close()
-	ref, err := io.ReadAll(io.LimitReader(f, snapshotRefSize+1))
+	return b.openResticRef(ctx, f, id, size)
+}
+
+// openResticRef is openRestic reading the snapshot reference from r (a
+// data file or, on a remote blob backing, the reference's blob).
+func (b *Backend) openResticRef(ctx context.Context, r io.Reader, id string, size int64) (io.ReadSeekCloser, error) {
+	ref, err := io.ReadAll(io.LimitReader(r, snapshotRefSize+1))
 	if err != nil {
 		return nil, err
 	}

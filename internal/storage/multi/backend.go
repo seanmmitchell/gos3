@@ -299,6 +299,7 @@ func (r *Router) ListBuckets(ctx context.Context) ([]storage.BucketInfo, error) 
 				continue
 			}
 			if in, ok := m[bs.name]; ok {
+				in.Backing = r.primaryOf(bs)
 				out = append(out, in)
 				found = true
 				break
@@ -311,18 +312,31 @@ func (r *Router) ListBuckets(ctx context.Context) ([]storage.BucketInfo, error) 
 	return out, nil
 }
 
-// CreateBucket creates the bucket on the default backing.
+// CreateBucket creates the bucket on opts.Backing (the x-gos3-backing
+// header), or on the default backing when it is empty. An unknown backing
+// yields storage.ErrInvalidBacking. The default replicas are added except
+// the chosen backing itself.
 func (r *Router) CreateBucket(ctx context.Context, name string, opts storage.CreateBucketOptions) error {
 	if r.closed.Load() {
 		return ErrClosed
 	}
-	var topology *backingTopology
+	var (
+		topology *backingTopology
+		target   *backing
+	)
 	for {
 		r.adminMu.Lock()
 		topology = r.topology.Load()
+		target = topology.def
+		if opts.Backing != "" {
+			if target = topology.backings[opts.Backing]; target == nil {
+				r.adminMu.Unlock()
+				return fmt.Errorf("%w: %q", storage.ErrInvalidBacking, opts.Backing)
+			}
+		}
 		r.mu.RLock()
 		exists := r.buckets[name] != nil
-		pj := r.purges[purgeRecord{Bucket: name, Backing: topology.def.Name}]
+		pj := r.purges[purgeRecord{Bucket: name, Backing: target.Name}]
 		r.mu.RUnlock()
 		if exists {
 			r.adminMu.Unlock()
@@ -332,21 +346,26 @@ func (r *Router) CreateBucket(ctx context.Context, name string, opts storage.Cre
 			break
 		}
 		// A copy of a deleted bucket with this name is still being
-		// removed from the default backing: wait for it.
+		// removed from the target backing: wait for it.
 		r.adminMu.Unlock()
 		if err := r.waitPurge(ctx, pj.rec); err != nil {
 			return err
 		}
 	}
 	defer r.adminMu.Unlock()
-	if err := topology.def.Backend.CreateBucket(ctx, name, opts); err != nil {
-		return r.observe(topology.def, err)
+	// The member backends do not know the router's backing names.
+	opts.Backing = ""
+	if err := target.Backend.CreateBucket(ctx, name, opts); err != nil {
+		return r.observe(target, err)
 	}
 	rec := &placementRecord{
 		Mode:    r.opts.NewBucketMode,
-		Members: []memberRecord{{Backing: topology.def.Name, Synced: true}},
+		Members: []memberRecord{{Backing: target.Name, Synced: true}},
 	}
 	for _, rep := range r.opts.NewBucketReplicas {
+		if rep == target.Name {
+			continue
+		}
 		r.mu.RLock()
 		pending := r.purges[purgeRecord{Bucket: name, Backing: rep}] != nil
 		r.mu.RUnlock()
@@ -366,7 +385,7 @@ func (r *Router) CreateBucket(ctx context.Context, name string, opts storage.Cre
 	r.buckets[name] = bs
 	r.mu.Unlock()
 	for _, ms := range bs.members {
-		if ms.backing != topology.def {
+		if ms.backing != target {
 			r.kick(ms)
 		}
 	}
@@ -410,7 +429,17 @@ func (r *Router) GetBucket(ctx context.Context, name string) (storage.BucketInfo
 		info, err = b.Backend.GetBucket(ctx, name)
 		return err
 	})
+	if err == nil {
+		info.Backing = r.primaryOf(bs)
+	}
 	return info, err
+}
+
+// primaryOf returns the name of the backing holding bs's primary copy.
+func (r *Router) primaryOf(bs *bucketState) string {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return bs.rec.primary()
 }
 
 // DeleteBucket deletes the (empty) bucket from its primary; the other

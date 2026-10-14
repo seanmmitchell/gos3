@@ -35,6 +35,10 @@ Run `gos3 serve`, point the AWS CLI, an SDK, `mc` or rclone at it, and open
   enabled per bucket, or enforced or disabled server-wide by the
   administrator. Already-compressed media types are skipped. See
   [docs/operations.md](docs/operations.md#compression).
+- **Remote S3 backings**: put individual buckets on AWS S3, MinIO, R2 or any
+  S3 service, chosen per bucket at creation: as opaque blobs with every gos3
+  feature, or as a gateway that stores native objects other tools can read.
+  See [docs/backings.md](docs/backings.md).
 - **Web UI**: embedded in the binary or run standalone to manage many gos3
   and other S3 servers. It has an object browser with uploads, versions,
   metadata and share links, bucket settings, users and policies, server
@@ -373,6 +377,7 @@ More in [docs/security.md](docs/security.md).
 |---|---|
 | [docs/configuration.md](docs/configuration.md) | every YAML key, environment variable and flag |
 | [docs/deployment.md](docs/deployment.md) | Docker, Compose, systemd, Kubernetes, reverse proxies, TLS |
+| [docs/backings.md](docs/backings.md) | storing buckets on remote S3 services (blob and gateway modes) |
 | [docs/operations.md](docs/operations.md) | health checks, metrics, logs, backups, lifecycle, upgrades |
 | [docs/security.md](docs/security.md) | authentication, stored secrets, exposure checklist |
 | [docs/s3-compatibility.md](docs/s3-compatibility.md) | supported S3 operations and differences from AWS |

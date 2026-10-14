@@ -37,9 +37,9 @@ gets `400 InvalidArgument`, whether it is signed or not.
 | Operation | Status | Notes |
 |---|---|---|
 | ListBuckets | ✅ | `max-buckets`, `continuation-token`, `prefix`, `bucket-region`. Every bucket on the server is listed (one account); `BucketRegion` is always included. |
-| CreateBucket | ✅ | Name rules as AWS. `LocationConstraint` is stored as the bucket region (`EU` → `eu-west-1`). Supports `x-amz-acl` (canned), `x-amz-object-ownership` and `x-amz-bucket-object-lock-enabled`. Directory buckets ❌. New buckets do **not** get AWS's 2023 defaults (BucketOwnerEnforced, Block Public Access): canned ACLs work as in classic S3. |
+| CreateBucket | ✅ | Name rules as AWS. `LocationConstraint` is stored as the bucket region (`EU` → `eu-west-1`). Supports `x-amz-acl` (canned), `x-amz-object-ownership` and `x-amz-bucket-object-lock-enabled`, plus the gos3 extension `x-gos3-backing` choosing where the data is stored ([backings.md](backings.md)). Directory buckets ❌. New buckets do **not** get AWS's 2023 defaults (BucketOwnerEnforced, Block Public Access): canned ACLs work as in classic S3. |
 | DeleteBucket | ✅ | `BucketNotEmpty` also counts noncurrent versions and delete markers. In-progress multipart uploads do not keep a bucket alive; they are aborted with it, as on AWS. |
-| HeadBucket | ✅ | `x-amz-bucket-region`. |
+| HeadBucket | ✅ | `x-amz-bucket-region`, and `x-gos3-backing` (gos3 extension). |
 | GetBucketLocation | ✅ | Empty `LocationConstraint` for `us-east-1`. |
 | ListObjects (v1) | ✅ | `prefix`, `delimiter`, `marker`, `max-keys` (≤ 1000), `encoding-type=url`. |
 | ListObjectsV2 | ✅ | Opaque continuation tokens, `start-after`, `fetch-owner`, `ChecksumAlgorithm` / `ChecksumType` per object. |
@@ -327,6 +327,9 @@ ListObjectsV2, ListParts and GetObjectAttributes.
   is invisible to S3 clients: objects stored compressed return the same
   bytes, ETag, checksums, sizes and ranges. It is configured through the
   admin API and the web UI, not through an S3 API.
+- **Gateway backings.** Buckets created on a [gateway backing](backings.md)
+  answer `501 NotImplemented` to PutBucketVersioning and object lock, and
+  `503 ServiceUnavailable` while the remote service is unreachable.
 - **No replication between gos3 servers.** Every server stores its own data.
   Discovery only finds servers; it does not cluster them.
 - With slow CopyObject and CompleteMultipartUpload calls (over about 5 s),

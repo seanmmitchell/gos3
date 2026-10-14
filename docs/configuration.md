@@ -203,6 +203,12 @@ storage:
     default_replicas: [archive]    # ...on archive
 ```
 
+A backing can also live on a remote S3 service: `backend: s3` with an `s3:`
+block (`mode: blob` or `gateway`, `endpoint`, `bucket`, credentials, ...);
+its `path` holds the backing's local metadata. See [backings.md](backings.md).
+New buckets can be put on any backing with CreateBucket's `x-gos3-backing`
+header or the web UI.
+
 Every bucket has a primary backing and optionally replicas; buckets can be
 moved between backings online. Placements are changed with the admin API or
 the web UI and saved in `<data>/.gos3/placements.json`. Existing buckets stay

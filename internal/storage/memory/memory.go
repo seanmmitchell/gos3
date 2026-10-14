@@ -408,6 +408,7 @@ func (b *Backend) CreateBucket(ctx context.Context, name string, opts storage.Cr
 		Region:            opts.Region,
 		ObjectLockEnabled: opts.ObjectLockEnabled,
 		Owner:             opts.Owner,
+		Backing:           opts.Backing,
 	}
 	if opts.ObjectLockEnabled {
 		info.Versioning = storage.VersioningEnabled

@@ -44,14 +44,23 @@ func (s BackingSettings) Apply(base StorageConfig) (StorageConfig, error) {
 		// The live backing form edits identity/placement, not restic secrets.
 		// Retain startup S3 settings when the same filesystem is kept, without
 		// putting credentials into the backing-definition response or overlay.
+		// The same holds for the remote service of an s3 backing, which can
+		// only be configured in the startup configuration.
 		for _, old := range previous {
 			oldPath, _ := filepath.Abs(old.Path)
 			newPath, _ := filepath.Abs(b.Path)
-			if old.Name == b.Name && old.Backend == b.Backend && oldPath == newPath && old.ResticS3 != nil {
+			if old.Name != b.Name || old.Backend != b.Backend || oldPath != newPath {
+				continue
+			}
+			if old.ResticS3 != nil {
 				cfg := *old.ResticS3
 				next.ResticS3 = &cfg
-				break
 			}
+			if old.S3 != nil {
+				cfg := *old.S3
+				next.S3 = &cfg
+			}
+			break
 		}
 		base.Backings = append(base.Backings, next)
 	}

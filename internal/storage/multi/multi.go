@@ -77,8 +77,11 @@ const (
 
 // Backing is one named storage backend.
 type Backing struct {
-	Name    string
-	Kind    string // "fs" or "memory" (informational)
+	Name string
+	Kind string // "fs", "memory" or "s3" (informational)
+	// Mode is the mode of an s3 backing: "blob" or "gateway" (a gateway
+	// backing stores no versions; informational).
+	Mode    string
 	Path    string // data directory ("" for memory)
 	Backend storage.Backend
 }

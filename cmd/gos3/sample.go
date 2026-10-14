@@ -66,6 +66,27 @@ storage:
   path: ./data
   # fsync object data before acknowledging writes (durable across power loss).
   fsync_data: true
+  # Additional backings (this one is named "default"): fs directories,
+  # memory, or remote S3 services (backend: s3, mode blob = opaque blobs
+  # with every feature, gateway = native remote objects without versioning).
+  # New buckets go to default_backing unless CreateBucket names another
+  # with the x-gos3-backing header. See docs/configuration.md and
+  # docs/backings.md.
+  # backings:
+  #   - name: hdd
+  #     path: /mnt/hdd/gos3
+  #   - name: cold
+  #     backend: s3
+  #     path: /var/lib/gos3-cold     # local metadata of this backing
+  #     s3:
+  #       mode: blob
+  #       endpoint: https://s3.eu-central-1.amazonaws.com
+  #       region: eu-central-1
+  #       bucket: acme-gos3-blobs
+  #       # credentials: access_key / secret_key, or GOS3_BACKING_COLD_ACCESS_KEY
+  #       # and GOS3_BACKING_COLD_SECRET_KEY
+  backings: []
+  default_backing: ""
 
 auth:
   # Root credentials. Prefer the environment (GOS3_ROOT_ACCESS_KEY /

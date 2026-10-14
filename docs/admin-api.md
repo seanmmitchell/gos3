@@ -140,7 +140,12 @@ Non-2xx responses: `{"error": {"code": "<Code>", "message": "<text>"}}`.
     "createOwnKeys": false,   // admin:CreateOwnAccessKey explicitly allowed (always false for root)
     "manageCompression": false // admin:PutBucketCompression
   },
-  "server": Info              // same as GET /_gos3/info
+  "server": Info,             // same as GET /_gos3/info
+  "backings": {               // storage backings a new bucket can be put on (x-gos3-backing),
+                              // shown to every caller; details: GET /backings
+    "default": "default",
+    "available": [ { "name": "default", "kind": "fs" }, { "name": "cold", "kind": "s3", "mode": "blob" } ]
+  }
 }
 ```
 
@@ -391,7 +396,8 @@ backing definitions on restart, like the runtime settings overlay.
 ```jsonc
 // Backing
 { "name": "fast",              // "default" is the backing configured by storage.backend / storage.path
-  "kind": "fs" | "memory",
+  "kind": "fs" | "memory" | "s3",
+  "mode": "blob" | "gateway",          // s3 backings only (see backings.md)
   "path": "/mnt/nvme/gos3",    // "" for memory
   "default": false,            // new buckets are created here
   "healthy": true,             // last health check or operation succeeded

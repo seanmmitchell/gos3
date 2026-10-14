@@ -34,6 +34,9 @@ discovery of gos3 servers on the network.
 | `internal/storage/fs/` | filesystem backend (bbolt index + data files) | storage-fs |
 | `internal/storage/multi/` | multi-backing router: bucket placement, replication (active-passive / active-active), online moves, backing health | storage-multi |
 | `internal/storage/storagetest/` | backend conformance suite | storage-conformance |
+| `internal/storage/routed/` | gateway s3 backings: bucket records on an fs backend, objects on a `DataStore` | backings |
+| `internal/storage/gateway/` | gateway backing: objects stored natively in a remote S3 service | backings |
+| `internal/s3client/` | minimal SigV4 S3 client for remote backings (+ `s3clienttest` in-process remote) | backings |
 | `internal/storage/compress/` | seekable block-compressed data format used by both backends | storage-compression |
 | `internal/storage/crypt/` | authenticated AES-256-GCM chunked stream format for natively encrypted (SSE-S3) data | storage-encryption |
 | `internal/compression/` | compression policy: bucket setting document, server mode, per-object decision | storage-compression |
@@ -278,6 +281,25 @@ See the doc comments in `storage.go`. Key points:
   `<root>/.gos3/restic-backing.json` (secret, like the keys). Keys,
   recovery records and repositories stay after a bucket is deleted. The
   data file of a restic-archived version holds only its snapshot ID.
+- `fs` blob mode: a bucket whose `Backing` names one of `fs.Options.Remotes`
+  (`fs.RemoteStore`: client, remote bucket, prefix; `Options.DefaultBacking`
+  puts every new bucket there) keeps all its metadata
+  in `meta.db` but stores object data as `<prefix>data/<bucket-id>/<id>` and
+  parts as `<prefix>uploads/<upload-id>/<part>` blobs in the remote bucket:
+  the stored bytes (compressed and/or encrypted as for local data, a restic
+  version's snapshot reference) are built in a `tmp/` file exactly as
+  locally and uploaded before the metadata commit. CompleteMultipartUpload
+  composes server-side (UploadPartCopy) only when the result is the plain
+  concatenation of the stored parts (no compression or encryption, all
+  parts but the last >= 5 MiB); otherwise it runs the local pipeline over
+  the remote parts and uploads the result.
+  Readers are lazy ranged GETs; open readers are refcounted per blob and the
+  delete of a superseded blob is deferred until the last one closes. Other
+  non-empty backings make data operations fail with
+  `storage.ErrBackingUnavailable` (also used for unreachable/5xx remotes).
+  Recovery deletes unreferenced remote blobs (never pending, held or
+  unrecognized keys) once older than `OrphanRetention`, and `Open` refuses
+  an empty `meta.db` while a remote holds blobs.
 - `fs` recovery (startup): cleans `tmp/`; unreferenced data files, part
   files, bucket directories and upload directories are **moved**, not
   deleted, to `<root>/.gos3/orphans/<UTC yyyymmddThhmmssZ>-<8 hex>/`
@@ -304,6 +326,18 @@ See the doc comments in `storage.go`. Key points:
   record uses record format 5 (format 4 plus `ObjectMeta.Encryption`,
   compressed or not), which builds before object encryption cannot read
   (rollback: [operations.md](operations.md#upgrades)).
+- s3 backings ([`docs/backings.md`](backings.md)): a `storage.backings`
+  entry with `backend: s3` is one more backing of the multi router, with
+  its local metadata in its `path`. **blob** mode is an fs backend whose
+  buckets all store their data in the remote bucket (fs blob mode above).
+  **gateway** mode is `routed.Backend` over an fs backend (bucket records
+  and configuration documents) and a `routed.DataStore`
+  (`internal/storage/gateway`) that stores native remote objects and keeps
+  multipart upload records in `<path>/.gos3/gateway/`. Gateway buckets are
+  unversioned (`storage.ErrNotSupported` → 501) and cannot receive copies
+  (replicas, moves). Remote failures are `storage.ErrBackingUnavailable`
+  (503). CreateBucket's `x-gos3-backing` header picks the primary backing
+  of a new bucket (`storage.ErrInvalidBacking` → 400 for unknown names).
 - `list.go` turns `WalkObjects`/`WalkVersions` into S3 listings (prefix,
   delimiter grouping, markers, truncation). When a common prefix `p` is found
   it restarts the walk after `p + "\xff"` (UTF-8 never contains 0xFF) so huge

@@ -39,6 +39,9 @@ type resticWriter struct {
 	size             int64
 	err              error // sticky
 	started, stopped bool
+	// rem is the remote blob backing that receives the snapshot reference
+	// (nil: a local data file).
+	rem *remote
 }
 
 // newResticWriter prepares the repository of the bucket with ID id (and
@@ -160,7 +163,7 @@ func (w *resticWriter) finish(check func() error) (dataID, path string, err erro
 		ref.discard()
 		return "", "", err
 	}
-	return w.b.finishData(ref, w.id)
+	return w.b.finishData(w.ctx, ref, w.id, w.rem)
 }
 
 // checkWriteConditions evaluates the preconditions of opts for a new

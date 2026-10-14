@@ -357,6 +357,14 @@ func (s *Server) openBackend() error {
 			s.backings = append(s.backings, multi.Backing{Name: bc.Name, Kind: config.BackendMemory, Backend: memory.New()})
 			continue
 		}
+		if bc.Backend == config.BackendS3 {
+			b, err := s.openS3Backing(bc)
+			if err != nil {
+				return fmt.Errorf("opening storage backing %q: %w", bc.Name, err)
+			}
+			s.backings = append(s.backings, b)
+			continue
+		}
 		b, err := fsbackend.Open(bc.Path, fsbackend.Options{
 			ResticS3:  bc.ResticS3,
 			FsyncData: s.cfg.Storage.FsyncData,
@@ -405,6 +413,9 @@ func (s *Server) openRouter() error {
 	if s.cfg.Admin.Enabled {
 		r.EnableBackingManagement(s.cfg.Storage, s.cfg.BackingsPath(), func(bc config.BackingDefinition) (multi.Backing, error) {
 			b := multi.Backing{Name: bc.Name, Kind: bc.Backend, Path: bc.Path}
+			if bc.Backend == config.BackendS3 {
+				return multi.Backing{}, errors.New("s3 backings are configured in the configuration file, not live")
+			}
 			if bc.Backend == config.BackendMemory {
 				b.Backend = memory.New()
 			} else {

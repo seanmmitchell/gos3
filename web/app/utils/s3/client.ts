@@ -531,7 +531,9 @@ export class S3Client {
       headers: {
         'Content-Type': body ? 'application/xml' : undefined,
         'x-amz-bucket-object-lock-enabled': opts.objectLock ? 'true' : undefined,
-        'x-amz-acl': opts.acl
+        'x-amz-acl': opts.acl,
+        // Signed like every other header passed to aws4fetch.
+        'x-gos3-backing': opts.backing || undefined
       }
     })
   }
@@ -540,10 +542,17 @@ export class S3Client {
     await this.send({ method: 'DELETE', bucket: name })
   }
 
-  /** HeadBucket; resolves with the bucket region when the server reports it. */
-  async headBucket(name: string, signal?: AbortSignal): Promise<{ region?: string }> {
+  /**
+   * HeadBucket; resolves with the bucket region when the server reports it,
+   * and on gos3 with the bucket's storage backing (x-gos3-backing, "local"
+   * for the server's own storage).
+   */
+  async headBucket(name: string, signal?: AbortSignal): Promise<{ region?: string, backing?: string }> {
     const { response } = await this.send({ method: 'HEAD', bucket: name, signal })
-    return { region: response.headers.get('x-amz-bucket-region') ?? undefined }
+    return {
+      region: response.headers.get('x-amz-bucket-region') ?? undefined,
+      backing: response.headers.get('x-gos3-backing') || undefined
+    }
   }
 
   /** True if the bucket exists (and is accessible); false on 404. */

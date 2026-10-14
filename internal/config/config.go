@@ -114,10 +114,14 @@ type BackingConfig struct {
 	// 1-32 characters of [a-z0-9_-], starting with a letter or digit, not
 	// DefaultBackingName.
 	Name    string `yaml:"name"`
-	Backend string `yaml:"backend"` // "fs" (default) or "memory"
+	Backend string `yaml:"backend"` // "fs" (default), "memory" or "s3"
 	// Path is the data directory of an fs backing (required for fs; must
-	// differ from every other backing's path and from storage.path).
+	// differ from every other backing's path and from storage.path). An s3
+	// backing keeps its local metadata there (also required).
 	Path string `yaml:"path"`
+	// S3 configures the remote service of an s3 backing (required for s3,
+	// see docs/backings.md and S3BackingConfig).
+	S3 *S3BackingConfig `yaml:"s3,omitempty"`
 }
 
 // ReplicationConfig configures bucket replication between backings.

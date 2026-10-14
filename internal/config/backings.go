@@ -59,10 +59,24 @@ func (c Config) validateBackings() error {
 			return fmt.Errorf("%s.name: %q is used twice", key, b.Name)
 		}
 		names[b.Name] = true
+		if b.Backend != BackendS3 && b.S3 != nil {
+			return fmt.Errorf("%s.s3: only allowed with backend s3", key)
+		}
 		switch b.Backend {
-		case BackendFS:
+		case BackendFS, BackendS3:
+			if b.Backend == BackendS3 {
+				if b.S3 == nil {
+					return fmt.Errorf("%s.s3: required for an s3 backing", key)
+				}
+				if b.ResticS3 != nil {
+					return fmt.Errorf("%s.restic_s3: not supported on an s3 backing", key)
+				}
+				if err := validateS3Backing(b.Name, *b.S3); err != nil {
+					return fmt.Errorf("%s.s3.%w", key, err)
+				}
+			}
 			if b.Path == "" {
-				return fmt.Errorf("%s.path: required for an fs backing", key)
+				return fmt.Errorf("%s.path: required for an %s backing", key, b.Backend)
 			}
 			abs, err := filepath.Abs(b.Path)
 			if err != nil {
@@ -77,7 +91,7 @@ func (c Config) validateBackings() error {
 				return fmt.Errorf("%s.path: a memory backing has no path", key)
 			}
 		default:
-			return fmt.Errorf("%s.backend: %q is invalid (expected fs or memory)", key, b.Backend)
+			return fmt.Errorf("%s.backend: %q is invalid (expected fs, memory or s3)", key, b.Backend)
 		}
 	}
 	// No backing directory may contain another one's system directory

@@ -114,6 +114,12 @@ export interface WhoAmI {
   policies: string[]
   capabilities: Capabilities
   server: Info
+  /**
+   * Storage backings new buckets can be created on (every authenticated
+   * caller; CreateBucket header x-gos3-backing). Absent from older servers;
+   * `available` is empty on servers without storage backings.
+   */
+  backings?: AvailableBackings
 }
 
 // ---------------------------------------------------------------------------
@@ -500,14 +506,39 @@ export interface BucketSummary {
 // Storage backings & bucket placement
 // ---------------------------------------------------------------------------
 
-/** "fs" | "memory" */
-export type BackingKind = 'fs' | 'memory'
+/** "fs" | "memory" | "s3" (a remote S3 service, see BackingMode) */
+export type BackingKind = 'fs' | 'memory' | 's3'
+
+/**
+ * How a kind "s3" backing stores data:
+ * - blob:    opaque blobs in a remote S3 bucket (every gos3 feature works)
+ * - gateway: objects stored natively in the remote S3 service (no
+ *            versioning, no object lock; cannot be a replica or move target)
+ */
+export type BackingMode = 'blob' | 'gateway'
+
+/** A backing new buckets can be created on (WhoAmI.backings.available). */
+export interface AvailableBacking {
+  name: string
+  kind: BackingKind | string
+  /** Kind "s3" only. */
+  mode?: BackingMode | string
+}
+
+/** WhoAmI.backings */
+export interface AvailableBackings {
+  /** Backing used when CreateBucket names none. */
+  default: string
+  available: AvailableBacking[] | null
+}
 
 /** A storage backend of the server (GET /backings). */
 export interface Backing {
   /** "default" is the backing configured by storage.backend / storage.path. */
   name: string
   kind: BackingKind | string
+  /** Kind "s3" only. */
+  mode?: BackingMode | string
   /** "" for memory. */
   path: string
   /** New buckets are created here. */

@@ -30,12 +30,22 @@ const counts = computed(() => {
           </h2>
           <UBadge v-if="backing.default" label="Default" color="primary" variant="subtle" size="sm" icon="i-lucide-star" />
         </div>
-        <UBadge :label="backing.kind" color="neutral" variant="outline" size="sm" class="font-mono" />
+        <UBadge
+          :label="backing.mode ? `${backing.kind} · ${backing.mode}` : backing.kind"
+          :title="backingKindInfo(backing).label"
+          color="neutral"
+          variant="outline"
+          size="sm"
+          class="font-mono"
+        />
       </div>
     </template>
 
     <p v-if="backing.path" class="truncate font-mono text-xs text-muted" :title="backing.path">
       {{ backing.path }}
+    </p>
+    <p v-else-if="backing.kind === 's3'" class="text-xs text-muted">
+      {{ backingKindInfo(backing).description }}
     </p>
     <p v-else class="text-xs text-muted">
       In memory (lost on restart)

@@ -48,9 +48,12 @@ const (
 	// single captured signed request).
 	MinRootSecretLen = 16
 
-	// BackendFS and BackendMemory are the StorageConfig.Backend values.
+	// BackendFS and BackendMemory are the StorageConfig.Backend values;
+	// BackingConfig.Backend may also be BackendS3 (a remote S3 service,
+	// see docs/backings.md).
 	BackendFS     = "fs"
 	BackendMemory = "memory"
+	BackendS3     = "s3"
 
 	// DefaultBackingName names the backing configured by storage.backend
 	// and storage.path.
@@ -92,7 +95,7 @@ var DefaultExposeHeaders = []string{
 	"x-amz-server-side-encryption", "x-amz-object-lock-mode",
 	"x-amz-object-lock-retain-until-date", "x-amz-object-lock-legal-hold",
 	"x-amz-expiration", "x-amz-restore", "x-amz-website-redirect-location",
-	"x-amz-abort-date", "x-amz-abort-rule-id",
+	"x-amz-abort-date", "x-amz-abort-rule-id", "x-amz-bucket-region", "x-gos3-backing",
 }
 
 // DefaultSkipContentTypes are the media types stored uncompressed by
@@ -201,6 +204,7 @@ func load(path string, lookup func(string) (string, bool), overrides []Override)
 			return Config{}, fmt.Errorf("config: %w", err)
 		}
 	}
+	cfg.applyBackingCredentials(lookup)
 	cfg.Normalize()
 	return cfg, nil
 }
@@ -288,6 +292,7 @@ func (c *Config) Normalize() {
 		}
 	}
 	c.Storage.DefaultBacking = strings.TrimSpace(c.Storage.DefaultBacking)
+	c.normalizeS3Backings()
 	rp := &c.Storage.Replication
 	rp.DefaultMode = strings.ToLower(strings.TrimSpace(rp.DefaultMode))
 	rp.DefaultReplicas = trimList(rp.DefaultReplicas)
@@ -639,11 +644,19 @@ func (c Config) TLSEnabled() bool { return c.Server.TLSCert != "" }
 // RedactedValue is the placeholder Config.Redacted substitutes for secrets.
 const RedactedValue = "<redacted>"
 
-// Redacted returns a deep copy with secrets (the root secret key) replaced
-// by "<redacted>", for printing and logging.
+// Redacted returns a deep copy with secrets (the root and backing secret
+// keys) replaced by "<redacted>", for printing and logging.
 func (c Config) Redacted() Config {
 	if c.Auth.RootSecretKey != "" {
 		c.Auth.RootSecretKey = RedactedValue
+	}
+	c.Storage.Backings = slices.Clone(c.Storage.Backings)
+	for i := range c.Storage.Backings {
+		if s3 := c.Storage.Backings[i].S3; s3 != nil && s3.SecretKey != "" {
+			cp := *s3
+			cp.SecretKey = RedactedValue
+			c.Storage.Backings[i].S3 = &cp
+		}
 	}
 	c.Server.Domains = slices.Clone(c.Server.Domains)
 	c.Server.TrustedProxies = slices.Clone(c.Server.TrustedProxies)
