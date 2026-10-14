@@ -16,6 +16,7 @@ import type {
   AccessKeyStatus,
   AdminErrorCode,
   BackingList,
+  BackingConfiguration,
   BucketCompression,
   BucketSummary,
   CreateAccessKeyRequest,
@@ -477,6 +478,14 @@ export class AdminClient {
   }
 
   // Storage backings & bucket placement ------------------------------------
+
+  getBackingConfiguration(): Promise<BackingConfiguration> {
+    return this.request('GET', '/backings/config')
+  }
+
+  putBackingConfiguration(body: BackingConfiguration): Promise<BackingConfiguration> {
+    return this.request('PUT', '/backings/config', { body })
+  }
 
   /** GET /backings (admin:ListBackings); `backings` is never null. */
   async listBackings(signal?: AbortSignal): Promise<BackingList> {

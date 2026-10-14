@@ -95,6 +95,7 @@ watch([id, isGos3], ([, gos3]) => {
         </div>
 
         <template v-if="state">
+          <AdminBackingConfiguration v-if="can('manageConfig')" :key="id" :backings="list" @saved="refresh" />
           <CommonErrorAlert v-if="backings.error.value" :error="backings.error.value" title="Refresh failed; showing the last known state" retryable @retry="refresh" />
           <UAlert
             v-if="unhealthy.length"

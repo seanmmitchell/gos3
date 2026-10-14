@@ -37,7 +37,7 @@ func (r *Router) lookup(bucket string) (*bucketState, error) {
 func (r *Router) readers(bs *bucketState, spread bool) []*backing {
 	r.mu.RLock()
 	rec := bs.rec
-	cands := []*backing{r.backings[rec.primary()]}
+	cands := []*backing{bs.members[rec.primary()].backing}
 	for _, m := range rec.Members[1:] {
 		ms := bs.members[m.Backing]
 		switch {
@@ -101,7 +101,7 @@ func (r *Router) writeRoute(bs *bucketState) *route {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 	rec := bs.rec
-	rt := &route{bs: bs, lead: r.backings[rec.primary()]}
+	rt := &route{bs: bs, lead: bs.members[rec.primary()].backing}
 	for _, m := range rec.Members[1:] {
 		ms := bs.members[m.Backing]
 		if rec.Mode == ModeActiveActive && ms.syncMode {
@@ -316,11 +316,13 @@ func (r *Router) CreateBucket(ctx context.Context, name string, opts storage.Cre
 	if r.closed.Load() {
 		return ErrClosed
 	}
+	var topology *backingTopology
 	for {
 		r.adminMu.Lock()
+		topology = r.topology.Load()
 		r.mu.RLock()
 		exists := r.buckets[name] != nil
-		pj := r.purges[purgeRecord{Bucket: name, Backing: r.def.Name}]
+		pj := r.purges[purgeRecord{Bucket: name, Backing: topology.def.Name}]
 		r.mu.RUnlock()
 		if exists {
 			r.adminMu.Unlock()
@@ -337,18 +339,18 @@ func (r *Router) CreateBucket(ctx context.Context, name string, opts storage.Cre
 		}
 	}
 	defer r.adminMu.Unlock()
-	if err := r.def.Backend.CreateBucket(ctx, name, opts); err != nil {
-		return r.observe(r.def, err)
+	if err := topology.def.Backend.CreateBucket(ctx, name, opts); err != nil {
+		return r.observe(topology.def, err)
 	}
 	rec := &placementRecord{
 		Mode:    r.opts.NewBucketMode,
-		Members: []memberRecord{{Backing: r.def.Name, Synced: true}},
+		Members: []memberRecord{{Backing: topology.def.Name, Synced: true}},
 	}
 	for _, rep := range r.opts.NewBucketReplicas {
 		r.mu.RLock()
 		pending := r.purges[purgeRecord{Bucket: name, Backing: rep}] != nil
 		r.mu.RUnlock()
-		if pending || !r.backings[rep].healthy.Load() {
+		if pending || !topology.backings[rep].healthy.Load() {
 			// Added later with SetReplication; mostly a stale copy.
 			r.log.Warn("new bucket created without one of its default replicas", "bucket", name, "backing", rep,
 				"copy_being_deleted", pending)
@@ -364,7 +366,7 @@ func (r *Router) CreateBucket(ctx context.Context, name string, opts storage.Cre
 	r.buckets[name] = bs
 	r.mu.Unlock()
 	for _, ms := range bs.members {
-		if ms.backing != r.def {
+		if ms.backing != topology.def {
 			r.kick(ms)
 		}
 	}
@@ -424,7 +426,7 @@ func (r *Router) DeleteBucket(ctx context.Context, name string) error {
 		return err
 	}
 	r.mu.RLock()
-	prim := r.backings[bs.rec.primary()]
+	prim := bs.members[bs.rec.primary()].backing
 	r.mu.RUnlock()
 	if err := prim.Backend.DeleteBucket(ctx, name); err != nil {
 		return r.observe(prim, err)
@@ -671,7 +673,7 @@ func (r *Router) primary(bucket string) (*backing, error) {
 	}
 	r.mu.RLock()
 	defer r.mu.RUnlock()
-	return r.backings[bs.rec.primary()], nil
+	return bs.members[bs.rec.primary()].backing, nil
 }
 
 // CreateMultipartUpload starts an upload on the primary.

@@ -44,6 +44,13 @@ func TestValidateBackings(t *testing.T) {
 		{"inside system dir", func(c *Config) {
 			c.Storage.Backings[0].Path = filepath.Join(c.Storage.Path, SystemDirName, "x")
 		}, "system directory"},
+		{"system dir itself", func(c *Config) {
+			c.Storage.Backings[0].Path = filepath.Join(c.Storage.Path, SystemDirName)
+		}, "system directory"},
+		{"memory system dir", func(c *Config) {
+			c.Storage.Backend = BackendMemory
+			c.Storage.Backings[0].Path = filepath.Join(c.Storage.Path, SystemDirName)
+		}, "system directory"},
 		{"unknown default", func(c *Config) { c.Storage.DefaultBacking = "nope" }, "storage.default_backing"},
 		{"bad mode", func(c *Config) { c.Storage.Replication.DefaultMode = "mirror" }, "default_mode"},
 		{"mode without replicas", func(c *Config) { c.Storage.Replication.DefaultMode = ReplicationActivePassive }, "default_replicas"},
