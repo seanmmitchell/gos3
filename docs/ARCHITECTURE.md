@@ -234,6 +234,11 @@ See the doc comments in `storage.go`. Key points:
     storage. The memory backend implements `EncryptionBackend` for `AES256`
     only and not `ResticBackingBackend`. See
     [encryption.md](encryption.md).
+  - In `encryption_providers.go`: `EncryptionProvidersBackend` reports which
+    SSE-S3 providers a bucket can use, so the admin API and web UI offer
+    only those: fs reports `restic` only while the restic executable is on
+    `PATH`, memory reports `AES256` only, and the multi router reports the
+    intersection over the bucket's backings.
   `storage.ListObjects`, `ListObjectVersions` and `ListUploads` return
   entries trimmed to the fields a listing reports (`storage.ListingInfo`).
   `uploads.go` builds on them: `storage.ListUploads` (S3
