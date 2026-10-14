@@ -16,13 +16,13 @@ func (r *Router) EncryptionProviders(ctx context.Context, bucket string) ([]stri
 	if err != nil {
 		return nil, err
 	}
+	// bs.members holds the members and the move target. Live backing
+	// reconfiguration refuses to remove or replace a backing that holds a
+	// bucket (including as move target), so these backings stay open.
 	r.mu.RLock()
-	var members []*backing
-	for _, m := range bs.rec.Members {
-		members = append(members, r.backings[m.Backing])
-	}
-	if mv := bs.rec.Move; mv != nil {
-		members = append(members, r.backings[mv.To])
+	members := make([]*backing, 0, len(bs.members))
+	for _, ms := range bs.members {
+		members = append(members, ms.backing)
 	}
 	r.mu.RUnlock()
 	var lists [][]string
