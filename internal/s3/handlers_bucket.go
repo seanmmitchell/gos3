@@ -203,6 +203,12 @@ func createBucketOwnershipXML(ownership string) ([]byte, error) {
 // s3:PutBucketVersioning, s3:PutBucketAcl and s3:PutBucketOwnershipControls.
 // An existing bucket yields BucketAlreadyOwnedByYou when the caller is its
 // owner (or root) and BucketAlreadyExists otherwise.
+//
+// The gos3 extension header x-gos3-backing names the backing that stores
+// the bucket's data ("default" or a configured backing, see
+// docs/backings.md; absent = the server's default backing). An unknown
+// backing is InvalidArgument; object lock on a gateway backing is
+// NotImplemented.
 func (s *Server) handleCreateBucket(w http.ResponseWriter, r *http.Request, rc *reqContext) error {
 	ctx := r.Context()
 	bucket := rc.bucket
@@ -232,6 +238,11 @@ func (s *Server) handleCreateBucket(w http.ResponseWriter, r *http.Request, rc *
 	if err != nil {
 		return err
 	}
+	backing := strings.ToLower(strings.TrimSpace(h.Get(headerBacking)))
+	if backing != "" && !validBackingName(backing) {
+		return s3err.ErrInvalidArgument.WithMessage("The x-gos3-backing header must name a backing (lowercase letters, digits, '_' and '-').").
+			With("ArgumentName", headerBacking).With("ArgumentValue", backing)
+	}
 	// The (optional) body may have taken long: the caller must still be
 	// allowed to create the bucket.
 	if err := s.revalidateWrite(rc, func() error { return s.reauthorizeOp(ctx, r, rc, nil) }); err != nil {
@@ -259,7 +270,7 @@ func (s *Server) handleCreateBucket(w http.ResponseWriter, r *http.Request, rc *
 	if !rc.identity.IsRoot && !rc.identity.IsAnonymous {
 		owner = rc.identity.User
 	}
-	err = s.backend.CreateBucket(ctx, bucket, storage.CreateBucketOptions{Region: region, ObjectLockEnabled: lock, Owner: owner})
+	err = s.backend.CreateBucket(ctx, bucket, storage.CreateBucketOptions{Region: region, ObjectLockEnabled: lock, Owner: owner, Backing: backing})
 	if errors.Is(err, storage.ErrBucketExists) {
 		return s.bucketExistsError(r, rc)
 	}
@@ -432,7 +443,9 @@ func (s *Server) handleDeleteBucket(w http.ResponseWriter, r *http.Request, rc *
 // --- HeadBucket ---
 
 // handleHeadBucket implements HeadBucket: 200 with x-amz-bucket-region and
-// x-amz-access-point-alias: false; a missing bucket is 404 (no body).
+// x-amz-access-point-alias: false; a missing bucket is 404 (no body). It
+// also reports the bucket's backing in the gos3 extension header
+// x-gos3-backing (the backing holding its primary copy).
 func (s *Server) handleHeadBucket(w http.ResponseWriter, r *http.Request, rc *reqContext) error {
 	bi, err := s.bucketInfo(r.Context(), rc)
 	if err != nil {
@@ -441,6 +454,7 @@ func (s *Server) handleHeadBucket(w http.ResponseWriter, r *http.Request, rc *re
 	h := w.Header()
 	h.Set("X-Amz-Bucket-Region", s.regionOfBucket(bi))
 	h.Set("X-Amz-Access-Point-Alias", "false")
+	h.Set(headerBacking, backingName(bi.Backing))
 	writeEmpty(w, http.StatusOK)
 	return nil
 }
@@ -465,4 +479,32 @@ func (s *Server) handleGetBucketLocation(w http.ResponseWriter, r *http.Request,
 		region = ""
 	}
 	return writeXML(w, http.StatusOK, locationConstraintResult{Region: region})
+}
+
+// headerBacking is the gos3 extension header naming a bucket's backing.
+const headerBacking = "X-Gos3-Backing"
+
+// validBackingName reports whether name has the shape of a backing name.
+func validBackingName(name string) bool {
+	if name == "" || len(name) > 32 {
+		return false
+	}
+	for i, c := range name {
+		switch {
+		case c >= 'a' && c <= 'z', c >= '0' && c <= '9':
+		case (c == '-' || c == '_') && i > 0:
+		default:
+			return false
+		}
+	}
+	return true
+}
+
+// backingName is the external name of a bucket's backing; "" (a backend
+// without named backings) is the system backing, "default".
+func backingName(backing string) string {
+	if backing == "" {
+		return "default"
+	}
+	return backing
 }

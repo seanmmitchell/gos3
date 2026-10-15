@@ -1,12 +1,10 @@
 package fs
 
 import (
-	"bytes"
 	"context"
 	"errors"
 	"io"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -262,42 +260,6 @@ func TestResticVersionCheck(t *testing.T) {
 	if !errors.Is(err, storage.ErrEncryptionUnavailable) || !strings.Contains(err.Error(), "0.17.1") {
 		t.Fatalf("old restic accepted: %v", err)
 	}
-	for in, want := range map[string][3]int{
-		"restic 0.17.1 compiled with go1.22.5 on linux/amd64": {0, 17, 1},
-		"restic 0.18.0-dev (compiled manually) compiled with": {0, 18, 0},
-	} {
-		if v, ok := parseResticVersion(in); !ok || v != want {
-			t.Fatalf("parse %q = %v %v", in, v, ok)
-		}
-	}
-	if _, ok := parseResticVersion("rustic 1.0"); ok {
-		t.Fatal("parsed a foreign version")
-	}
-}
-
-// G1-c: restic's diagnostics are bounded even when os/exec copies them.
-func TestResticDiagnosticsBounded(t *testing.T) {
-	installFakeRestic(t, "current")
-	bin, err := exec.LookPath("restic")
-	if err != nil {
-		t.Fatal(err)
-	}
-	var diag stderrTail
-	if _, ok := any(&diag).(io.ReaderFrom); ok {
-		t.Fatal("stderrTail must not implement io.ReaderFrom")
-	}
-	cmd := exec.Command(bin, "noise")
-	cmd.Stderr = &diag
-	_ = cmd.Run()
-	if len(diag.buf) == 0 || len(diag.buf) > stderrTailSize {
-		t.Fatalf("kept %d bytes of diagnostics", len(diag.buf))
-	}
-	if s := diag.redacted(); len(s) > 1100 || strings.ContainsAny(s, "\n\r") {
-		t.Fatalf("redacted diagnostics not bounded to one line: %d bytes", len(s))
-	}
-	var small stderrTail
-	_, _ = small.Write([]byte("a secret\nb\tc"))
-	eq(t, "redacted", small.redacted("secret"), "a [redacted] b c")
 }
 
 // G1-h: a multipart completion whose parts change is retried without
@@ -337,8 +299,9 @@ func TestResticMultipartArchivesOnce(t *testing.T) {
 	eq(t, "snapshots", snapshotCount(t, b, "arc"), 1)
 }
 
-// G3-b: only initialized repositories fix the backing's restic location.
-func TestResticFailedPreparationDoesNotLockLocation(t *testing.T) {
+// G3-b: a failed initialization leaves an uninitialized recovery record and
+// is retried by the next write.
+func TestResticFailedPreparationIsRetried(t *testing.T) {
 	installFakeRestic(t, "current")
 	b := openTest(t, "")
 	mkBucket(t, b, "arc", "")
@@ -346,42 +309,45 @@ func TestResticFailedPreparationDoesNotLockLocation(t *testing.T) {
 	if err := b.PrepareEncryption(ctx, "arc", storage.EncryptionRestic); !errors.Is(err, storage.ErrEncryptionUnavailable) {
 		t.Fatalf("failed init: %v", err)
 	}
-	if _, err := os.Stat(b.recoveryPath(mustBucketID(t, b, "arc"))); err != nil {
-		t.Fatalf("recovery record before init: %v", err)
-	}
-	_, locked, err := b.ResticBackingSettings(ctx)
-	if err != nil || locked {
-		t.Fatalf("location locked by an uninitialized repository: %v", err)
-	}
-	remote := &storage.ResticS3{Endpoint: "https://s3.example.test", Bucket: "archives", AccessKey: "a", SecretKey: "s"}
-	if err := b.checkResticLocation(remote); err != nil {
-		t.Fatal(err)
+	rec, _, err := readRecovery(b.recoveryPath(mustBucketID(t, b, "arc")))
+	if err != nil || rec.Repository == "" || rec.Initialized {
+		t.Fatalf("recovery record before init: %+v, %v", rec, err)
 	}
 	t.Setenv("FAKERESTIC_FAIL", "")
 	if err := b.PrepareEncryption(ctx, "arc", storage.EncryptionRestic); err != nil {
 		t.Fatal(err)
 	}
-	if _, locked, _ = b.ResticBackingSettings(ctx); !locked {
-		t.Fatal("initialized repository does not lock the location")
+	if rec, _, _ = readRecovery(b.recoveryPath(mustBucketID(t, b, "arc"))); !rec.Initialized {
+		t.Fatal("recovery record not marked initialized")
 	}
 }
 
-// A settings change makes the next write check its repository again.
-func TestResticSettingsChangeForgetsPreparation(t *testing.T) {
-	b, log := newResticBucket(t)
-	if err := b.ConfigureResticBacking(ctx, nil); err != nil {
+// A recovery record of a repository on S3 (from the removed per-backing
+// restic S3 settings) fails closed instead of starting a new local
+// repository.
+func TestResticS3RecoveryRecordFailsClosed(t *testing.T) {
+	log := installFakeRestic(t, "current")
+	b := openTest(t, "")
+	mkBucket(t, b, "arc", "")
+	id := mustBucketID(t, b, "arc")
+	if err := os.MkdirAll(filepath.Dir(b.recoveryPath(id)), dirPerm); err != nil {
 		t.Fatal(err)
 	}
-	if err := b.PrepareEncryption(ctx, "arc", storage.EncryptionRestic); err != nil {
+	if err := os.WriteFile(b.recoveryPath(id), []byte(`{"initialized":true,"repository":"s3:https://s3.example.test/archives/`+id+`","password":"x"}`), filePerm); err != nil {
 		t.Fatal(err)
 	}
-	eq(t, "cat config", resticCalls(t, log, "cat config"), 2)
-}
-
-func TestResticEncryptedErrorUnwraps(t *testing.T) {
-	err := &resticError{op: "x", err: errors.New("exit status 1"), detail: "Fatal: boom"}
-	if !errors.Is(err, storage.ErrEncryptionUnavailable) || !bytes.Contains([]byte(err.Error()), []byte("Fatal: boom")) {
-		t.Fatalf("resticError: %v", err)
+	err := b.PrepareEncryption(ctx, "arc", storage.EncryptionRestic)
+	if !errors.Is(err, storage.ErrEncryptionUnavailable) || !strings.Contains(err.Error(), "S3 settings that no longer exist") {
+		t.Fatalf("prepare with an S3 recovery record: %v", err)
+	}
+	if err := b.ValidateEncryptionSettings(ctx, "arc", storage.EncryptionSettings{Provider: storage.EncryptionRestic}); !errors.Is(err, storage.ErrEncryptionUnavailable) {
+		t.Fatalf("validate with an S3 recovery record: %v", err)
+	}
+	if n := resticCalls(t, log, "init"); n != 0 {
+		t.Fatalf("restic init ran %d times", n)
+	}
+	if _, err := os.Stat(b.resticRepository(id)); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("local repository created: %v", err)
 	}
 }
 

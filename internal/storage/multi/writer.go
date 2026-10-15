@@ -86,6 +86,9 @@ func (r *Router) NewObjectWriterWith(ctx context.Context, bucket, key string, op
 	if err := checkCompression(opts.Compression); err != nil {
 		return nil, err
 	}
+	if err := r.checkWriteEncryption(ctx, bucket, opts); err != nil {
+		return nil, err
+	}
 	rt, leave, err := r.enterWrite(ctx, bucket)
 	if err != nil {
 		return nil, err

@@ -66,7 +66,7 @@ The default image (`Dockerfile`, target `embedded`) builds the web UI with pnpm,
 static Go binary with the UI embedded (cross-compiled for the target
 architecture), and a `gcr.io/distroless/static-debian12:nonroot` runtime. That
 runtime has no shell, runs as uid/gid 65532, and is about 25 MB plus the
-bundled [restic](encryption.md#backing-storage-for-restic) executable (about
+bundled [restic](encryption.md#where-keys-and-repositories-live) executable (about
 30 MB) at `/usr/local/bin/restic`, which buckets with the restic encryption
 provider use. It is the official restic release for the target
 architecture, pinned to one version and verified against the SHA-256 sums
@@ -244,7 +244,7 @@ journalctl -u gos3 -f
 - `systemctl stop gos3` sends SIGTERM: in-flight requests get
   `server.shutdown_timeout` (30 s) to finish.
 - Buckets with the restic encryption provider need
-  [restic](encryption.md#backing-storage-for-restic) on the service's
+  [restic](encryption.md#where-keys-and-repositories-live) on the service's
   `PATH`: install the release executable as `/usr/local/bin/restic`
   (mode 0755). It runs as the service user with the same sandbox.
 

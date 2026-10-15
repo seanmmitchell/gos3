@@ -22,16 +22,17 @@ import (
 // env is the per-subtest environment: a fresh backend plus helpers that
 // report failures precisely through t.
 type env struct {
-	t       *testing.T
-	b       storage.Backend
-	ctx     context.Context
-	factory Factory
+	t     *testing.T
+	b     storage.Backend
+	ctx   context.Context
+	suite *suite
 }
 
-// newEnv creates a fresh backend from f and closes it when t finishes.
-func newEnv(t *testing.T, f Factory) *env {
+// newEnv creates a fresh backend from the suite's factory and closes it
+// when t finishes.
+func newEnv(t *testing.T, s *suite) *env {
 	t.Helper()
-	b := f(t)
+	b := s.factory(t)
 	if b == nil {
 		t.Fatal("storagetest: Factory returned a nil backend")
 	}
@@ -40,14 +41,15 @@ func newEnv(t *testing.T, f Factory) *env {
 			t.Errorf("Close: %v", err)
 		}
 	})
-	return &env{t: t, b: b, ctx: t.Context(), factory: f}
+	return &env{t: t, b: b, ctx: t.Context(), suite: s}
 }
 
 // run runs fn as a subtest sharing e's backend.
 func (e *env) run(name string, fn func(e *env)) {
 	e.t.Helper()
 	e.t.Run(name, func(t *testing.T) {
-		fn(&env{t: t, b: e.b, ctx: t.Context(), factory: e.factory})
+		e.suite.skipListed(t)
+		fn(&env{t: t, b: e.b, ctx: t.Context(), suite: e.suite})
 	})
 }
 
@@ -55,7 +57,8 @@ func (e *env) run(name string, fn func(e *env)) {
 func (e *env) runFresh(name string, fn func(e *env)) {
 	e.t.Helper()
 	e.t.Run(name, func(t *testing.T) {
-		fn(newEnv(t, e.factory))
+		e.suite.skipListed(t)
+		fn(newEnv(t, e.suite))
 	})
 }
 
@@ -110,7 +113,21 @@ func (e *env) mkBucket(name string) {
 
 func (e *env) mkBucketOpts(name string, opts storage.CreateBucketOptions) {
 	e.t.Helper()
-	e.noErr(fmt.Sprintf("CreateBucket(%q)", name), e.b.CreateBucket(e.ctx, name, opts))
+	err := e.b.CreateBucket(e.ctx, name, opts)
+	if opts.ObjectLockEnabled {
+		e.skipIfNotSupported(err)
+	}
+	e.noErr(fmt.Sprintf("CreateBucket(%q)", name), err)
+}
+
+// skipIfNotSupported skips the (sub)test when err says the backend cannot
+// do what the test needs (storage.ErrNotSupported, e.g. versioning or
+// object lock on a gateway backing); other errors are left to the caller.
+func (e *env) skipIfNotSupported(err error) {
+	e.t.Helper()
+	if errors.Is(err, storage.ErrNotSupported) {
+		e.t.Skipf("backend does not support this: %v", err)
+	}
 }
 
 // mkVersioned creates a bucket and sets its versioning status (no-op for
@@ -125,7 +142,9 @@ func (e *env) mkVersioned(name string, status storage.VersioningStatus) {
 
 func (e *env) setVersioning(name string, status storage.VersioningStatus) {
 	e.t.Helper()
-	e.noErr(fmt.Sprintf("SetBucketVersioning(%q, %q)", name, status), e.b.SetBucketVersioning(e.ctx, name, status))
+	err := e.b.SetBucketVersioning(e.ctx, name, status)
+	e.skipIfNotSupported(err)
+	e.noErr(fmt.Sprintf("SetBucketVersioning(%q, %q)", name, status), err)
 }
 
 // --- objects ---

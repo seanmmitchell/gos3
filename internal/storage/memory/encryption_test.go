@@ -49,9 +49,11 @@ func TestEncryptionRecordedNotTransformed(t *testing.T) {
 		if got := read(t, b, "bkt", "k", info.VersionID); got != data {
 			t.Fatalf("read %q, want %q", got, data)
 		}
-		v := b.buckets["bkt"].objects
-		obj, _ := v.Get("k")
-		if stored := obj.versions[len(obj.versions)-1].data; string(stored) != data {
+		v, _, err := b.buckets["bkt"].ix.Find("k", "")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if stored := v.Data; string(stored) != data {
 			t.Fatalf("stored %q, want the content as is", stored)
 		}
 	}

@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
@@ -20,6 +21,7 @@ import (
 	"github.com/seanmmitchell/gos3/internal/iam"
 	"github.com/seanmmitchell/gos3/internal/s3"
 	"github.com/seanmmitchell/gos3/internal/s3err"
+	"github.com/seanmmitchell/gos3/internal/storage/multi"
 	"github.com/seanmmitchell/gos3/internal/webui"
 )
 
@@ -191,10 +193,16 @@ func (s *Server) serveReady(w http.ResponseWriter, r *http.Request) {
 }
 
 // backendReady reports whether the backend answered ListBuckets within
-// readyTimeout. The result is reused for readyCacheTTL, and concurrent
-// callers share one check, so polling /_gos3/ready (anonymous) costs at
-// most one backend call per readyCacheTTL. Failures are logged when the
-// state changes, not on every request.
+// readyTimeout and the default backing (config.DefaultBackingName:
+// storage.backend) is healthy. The router answers ListBuckets from cached
+// bucket descriptions while a backing is down, so the listing alone would
+// not notice an unavailable default backing (e.g. an s3 default backing
+// whose service is unreachable at startup); other backings being down
+// leaves the server ready, as their buckets are the only ones affected.
+// The result is reused for readyCacheTTL, and concurrent callers share one
+// check, so polling /_gos3/ready (anonymous) costs at most one backend call
+// per readyCacheTTL. Failures are logged when the state changes, not on
+// every request.
 func (s *Server) backendReady() bool {
 	s.readyMu.Lock()
 	defer s.readyMu.Unlock()
@@ -204,6 +212,13 @@ func (s *Server) backendReady() bool {
 	ctx, cancel := context.WithTimeout(s.lifeCtx, readyTimeout)
 	_, err := s.backend.ListBuckets(ctx)
 	cancel()
+	if r, ok := s.backend.(*multi.Router); ok && err == nil {
+		for _, b := range r.Backings() {
+			if b.Name == config.DefaultBackingName && !b.Healthy {
+				err = fmt.Errorf("the default backing is unhealthy: %s", b.LastError)
+			}
+		}
+	}
 	ok := err == nil
 	switch {
 	case !ok && (s.readyOK || s.readyAt.IsZero()):

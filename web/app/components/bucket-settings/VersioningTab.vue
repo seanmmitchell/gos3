@@ -3,12 +3,15 @@ import type { VersioningStatus } from '~/types/s3'
 
 /**
  * Bucket versioning: enable or suspend. A bucket can never return to
- * "unversioned"; buckets with object lock cannot suspend versioning.
+ * "unversioned"; buckets with object lock cannot suspend versioning, and
+ * buckets on a gos3 gateway backing (`unsupported`) cannot be versioned.
  */
 const props = defineProps<{
   bucket: string
   status: VersioningStatus | null
   objectLock: boolean
+  /** The bucket's storage cannot keep versions (gos3 gateway backing). */
+  unsupported?: boolean
 }>()
 
 const emit = defineEmits<{ changed: [] }>()
@@ -47,7 +50,7 @@ async function suspend() {
   if (ok) await put.run('Suspended')
 }
 
-const label = computed(() => (props.status === 'Enabled' ? 'Enabled' : props.status === 'Suspended' ? 'Suspended' : props.status === '' ? 'Never enabled' : 'Unknown'))
+const label = computed(() => (props.unsupported && props.status !== 'Enabled' && props.status !== 'Suspended' ? 'Not supported' : props.status === 'Enabled' ? 'Enabled' : props.status === 'Suspended' ? 'Suspended' : props.status === '' ? 'Never enabled' : 'Unknown'))
 const color = computed(() => (props.status === 'Enabled' ? 'success' : props.status === 'Suspended' ? 'warning' : 'neutral'))
 </script>
 
@@ -68,7 +71,15 @@ const color = computed(() => (props.status === 'Enabled' ? 'success' : props.sta
     </template>
     <div class="space-y-4">
       <UAlert
-        v-if="objectLock"
+        v-if="unsupported"
+        color="neutral"
+        variant="subtle"
+        icon="i-lucide-cloud-cog"
+        title="Not available on a gateway backing"
+        description="This bucket’s objects are stored directly in a remote S3 service, which keeps no gos3 versions. Versioning cannot be enabled."
+      />
+      <UAlert
+        v-else-if="objectLock"
         color="info"
         variant="subtle"
         icon="i-lucide-shield-alert"
@@ -83,12 +94,12 @@ const color = computed(() => (props.status === 'Enabled' ? 'success' : props.sta
         title="Versioning is suspended"
         description="Existing versions are kept, but new writes overwrite the null version."
       />
-      <ul class="list-disc space-y-1 pl-5 text-sm text-muted">
+      <ul v-if="!unsupported" class="list-disc space-y-1 pl-5 text-sm text-muted">
         <li>Deleting an object in a versioned bucket adds a delete marker; older versions remain and can be restored.</li>
         <li>Noncurrent versions use storage — add a lifecycle rule to expire them.</li>
         <li>Once enabled, a bucket can only switch between “Enabled” and “Suspended”.</li>
       </ul>
-      <div class="flex flex-wrap gap-2">
+      <div v-if="!unsupported" class="flex flex-wrap gap-2">
         <UButton
           v-if="status !== 'Enabled'"
           icon="i-lucide-history"

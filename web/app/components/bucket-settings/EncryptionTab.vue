@@ -15,8 +15,10 @@ import { AdminError } from '~/utils/admin/client'
  * - SSE-S3 implementation (gos3 admin API /buckets/{name}/encryption-provider):
  *   native AES-256-GCM or restic, used by default encryption and by uploads
  *   that request AES256, so it stays visible when default encryption is
- *   off. Restic is offered only when the server reports it available for
- *   the bucket. Without admin:GetBucketEncryption (403), or on servers
+ *   off. Each is offered only when the server reports it available for
+ *   the bucket (native AES-256-GCM needs an encryption key on every S3
+ *   backing holding the bucket; restic needs the restic executable and a
+ *   filesystem or S3 backing for every copy). Without admin:GetBucketEncryption (403), or on servers
  *   without the endpoint (404), the card says so and default encryption
  *   keeps working through the S3 API alone.
  */
@@ -113,18 +115,26 @@ const providerUnavailable = computed(() => {
   return undefined
 })
 const available = computed(() => providerDoc.value?.available ?? ALL_PROVIDERS)
+const aesAvailable = computed(() => available.value.includes('AES256'))
 const resticAvailable = computed(() => available.value.includes('restic'))
+/** Why native encryption is unavailable (the only reason the server has). */
+const AES_UNAVAILABLE = 'Not available for this bucket: an S3 backing of this bucket has no encryption key.'
 const providerDirty = computed(() => !!providerDoc.value && provider.value !== providerDoc.value.provider)
 
 const providerItems = computed(() => [
-  { label: 'Native (AES-256-GCM)', value: 'AES256', description: 'Encrypt object data on the server’s storage with per-bucket keys.' },
+  {
+    label: 'Native (AES-256-GCM)',
+    value: 'AES256',
+    disabled: !aesAvailable.value,
+    description: aesAvailable.value ? 'Encrypt object data on the server’s storage with per-bucket keys.' : AES_UNAVAILABLE
+  },
   {
     label: 'Restic',
     value: 'restic',
     disabled: !resticAvailable.value,
     description: resticAvailable.value
       ? 'Encrypt and archive object data in restic repositories; downloads retrieve it from the archive.'
-      : 'Not available for this bucket: restic must be installed on the server and every copy of the bucket must be on a filesystem backing.'
+      : 'Not available for this bucket: restic must be installed on the server and every copy of the bucket must be on a filesystem backing or an S3 backing with an encryption key.'
   }
 ])
 
@@ -216,12 +226,21 @@ const saveProvider = useAsyncAction(async () => {
       <USkeleton v-else-if="!providerDoc" class="h-24 w-full" />
       <form v-else class="space-y-4" novalidate @submit.prevent="saveProvider.run()">
         <URadioGroup v-model="provider" :items="providerItems" legend="Implementation" />
+        <UAlert
+          v-if="!aesAvailable && providerDoc.provider === 'AES256'"
+          color="warning"
+          variant="subtle"
+          icon="i-lucide-key-round"
+          title="Native encryption unavailable"
+          description="An S3 backing of this bucket has no encryption key, so SSE-S3 uploads cannot be encrypted natively. Set an encryption key on that backing under the server’s Storage settings."
+          data-testid="aes-unavailable"
+        />
         <div v-if="provider === 'restic'" class="space-y-2">
           <p v-if="providerDoc.backings?.length" class="text-sm text-muted">
             Assigned backings: <span class="font-medium text-highlighted">{{ providerDoc.backings.join(', ') }}</span>.
           </p>
           <p class="text-sm text-muted">
-            Restic storage is inherited from this bucket’s placement. Configure local or S3 repositories and credentials on the assigned backings under server Storage settings. Replicas and moves use their destination backing’s settings.
+            Restic repositories live on the bucket’s backing: on a filesystem backing in its data directory, on an S3 backing in that backing’s bucket. Replicas and moves use the destination backing.
           </p>
           <p class="text-sm text-muted">
             Downloads retrieve the object into an encrypted temporary cache before serving it. Snapshots remain in the archive after S3 objects are deleted. Back up the server’s protected system directory with its keys and metadata: a repository alone does not preserve object names, versions and permissions.

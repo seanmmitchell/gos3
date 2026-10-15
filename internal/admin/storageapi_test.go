@@ -119,9 +119,9 @@ func TestStorageEndpointsAuthorization(t *testing.T) {
 
 func TestBackingConfigurationPermissionsAndValidation(t *testing.T) {
 	e, r := newRouterEnv(t)
-	r.EnableBackingManagement(config.StorageConfig{Backend: "memory", Backings: []config.BackingConfig{{Name: "fast", Backend: "memory"}}}, "", func(d config.BackingDefinition) (multi.Backing, error) {
+	r.EnableBackingManagement(config.StorageConfig{Backend: "memory", Backings: []config.BackingConfig{{Name: "fast", Backend: "memory"}}}, "", multi.BackingOpener{Open: func(d config.BackingDefinition) (multi.Backing, error) {
 		return multi.Backing{Name: d.Name, Kind: d.Backend, Backend: memory.New()}, nil
-	})
+	}})
 	var in multi.BackingConfiguration
 	e.root("GET", "/backings/config", nil).json(t, &in)
 	diag := e.addUser("storage-diag", iam.PolicyDiagnostics)

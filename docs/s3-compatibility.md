@@ -37,9 +37,9 @@ gets `400 InvalidArgument`, whether it is signed or not.
 | Operation | Status | Notes |
 |---|---|---|
 | ListBuckets | ✅ | `max-buckets`, `continuation-token`, `prefix`, `bucket-region`. Every bucket on the server is listed (one account); `BucketRegion` is always included. |
-| CreateBucket | ✅ | Name rules as AWS. `LocationConstraint` is stored as the bucket region (`EU` → `eu-west-1`). Supports `x-amz-acl` (canned), `x-amz-object-ownership` and `x-amz-bucket-object-lock-enabled`. Directory buckets ❌. New buckets do **not** get AWS's 2023 defaults (BucketOwnerEnforced, Block Public Access): canned ACLs work as in classic S3. |
+| CreateBucket | ✅ | Name rules as AWS. `LocationConstraint` is stored as the bucket region (`EU` → `eu-west-1`). Supports `x-amz-acl` (canned), `x-amz-object-ownership` and `x-amz-bucket-object-lock-enabled`, plus the gos3 extension `x-gos3-backing: <name>` choosing the backing that stores the bucket: a local directory, memory or a remote S3 service ([backings.md](backings.md)); without it the server's default backing is used, and an unknown name is `400 InvalidArgument`. Object lock on a gateway backing is `501 NotImplemented`. Directory buckets ❌. New buckets do **not** get AWS's 2023 defaults (BucketOwnerEnforced, Block Public Access): canned ACLs work as in classic S3. |
 | DeleteBucket | ✅ | `BucketNotEmpty` also counts noncurrent versions and delete markers. In-progress multipart uploads do not keep a bucket alive; they are aborted with it, as on AWS. |
-| HeadBucket | ✅ | `x-amz-bucket-region`. |
+| HeadBucket | ✅ | `x-amz-bucket-region`, and `x-gos3-backing` (gos3 extension: the backing holding the primary copy). |
 | GetBucketLocation | ✅ | Empty `LocationConstraint` for `us-east-1`. |
 | ListObjects (v1) | ✅ | `prefix`, `delimiter`, `marker`, `max-keys` (≤ 1000), `encoding-type=url`. |
 | ListObjectsV2 | ✅ | Opaque continuation tokens, `start-after`, `fetch-owner`, `ChecksumAlgorithm` / `ChecksumType` per object. |
@@ -50,14 +50,14 @@ gets `400 InvalidArgument`, whether it is signed or not.
 
 | Subresource | Get / Put / Delete | Notes |
 |---|---|---|
-| `?versioning` | ✅ | Enabled / Suspended. MFA Delete ❌. Suspending is refused while object lock or replication is configured. |
+| `?versioning` | ✅ | Enabled / Suspended. MFA Delete ❌. Suspending is refused while object lock or replication is configured. Buckets on a [gateway backing](backings.md#the-gateway-option): PUT is `501 NotImplemented`. |
 | `?tagging` | ✅ | Up to 50 tags. |
 | `?cors` | ✅ | Bucket rules override the server-wide `cors` settings. |
 | `?policy`, `?policyStatus` | ✅ | IAM policy language with conditions (see [Authorization](#authorization)). Policies are stored byte for byte. `IsPublic` reflects anonymous access. |
 | `?lifecycle` | 🟡 | Every rule form is validated and stored. Executed by the lifecycle worker: Expiration (Days, Date, ExpiredObjectDeleteMarker), NoncurrentVersionExpiration (NoncurrentDays, NewerNoncurrentVersions) and AbortIncompleteMultipartUpload. Filters: prefix (at most 1024 bytes), tags, object size. **Transitions are stored but never executed** (there are no storage tiers). `x-amz-expiration` and `x-amz-abort-date` headers are reported. |
-| `?encryption` | 🟡 | AES256 encrypts object data through native AES-256-GCM or the bucket’s restic provider. AWS KMS and SSE-C return 501. Legacy objects are unchanged and do not advertise encryption. See [encryption.md](encryption.md). |
+| `?encryption` | 🟡 | AES256 encrypts object data through native AES-256-GCM or the bucket’s restic provider. AWS KMS and SSE-C return 501. On an s3 backing both need the backing's encryption key. Legacy objects are unchanged and do not advertise encryption. See [encryption.md](encryption.md). |
 | `?acl` | 🟡 | Canned ACLs (`private`, `public-read`, `public-read-write`, `authenticated-read`, `log-delivery-write`), as `x-amz-acl` or as an equivalent `AccessControlPolicy`; what each grants is listed under [Authorization](#authorization). Grants to individual users or e-mail addresses and `x-amz-grant-*` headers ❌. |
-| `?object-lock` | ✅ | Default retention (GOVERNANCE / COMPLIANCE, Days or Years). Lock can be enabled at creation or later on a versioned bucket. |
+| `?object-lock` | ✅ | Default retention (GOVERNANCE / COMPLIANCE, Days or Years). Lock can be enabled at creation or later on a versioned bucket. Not on gateway backings (`501 NotImplemented`). |
 | `?ownershipControls` | ✅ | `BucketOwnerEnforced` disables ACLs. |
 | `?publicAccessBlock` | ✅ | Enforced: `BlockPublicAcls`, `IgnorePublicAcls`, `BlockPublicPolicy`, `RestrictPublicBuckets`. |
 | `?website` | 🟡 | Stored and returned only; there is no website endpoint. |
@@ -327,6 +327,19 @@ ListObjectsV2, ListParts and GetObjectAttributes.
   is invisible to S3 clients: objects stored compressed return the same
   bytes, ETag, checksums, sizes and ranges. It is configured through the
   admin API and the web UI, not through an S3 API.
+- **Backings.** Each bucket is stored on one of the server's backings,
+  chosen with the `x-gos3-backing` header of CreateBucket (see
+  [backings.md](backings.md)). The buckets of an
+  [s3 backing](backings.md) answer `503 ServiceUnavailable` while that
+  backing's remote service is unreachable or the backing is still loading
+  at startup; buckets on other backings are unaffected. Until such a
+  backing has been listed once, an unknown bucket name answers `503`
+  instead of `404 NoSuchBucket`, and CreateBucket of a new name is refused
+  with `503`, because the bucket might exist on that backing. AES256
+  uploads to a bucket with a copy on an s3 backing without an encryption
+  key answer `501 NotImplemented`. Buckets on a
+  [gateway backing](backings.md#the-gateway-option) are unversioned: they
+  answer `501 NotImplemented` to PutBucketVersioning and object lock.
 - **No replication between gos3 servers.** Every server stores its own data.
   Discovery only finds servers; it does not cluster them.
 - With slow CopyObject and CompleteMultipartUpload calls (over about 5 s),

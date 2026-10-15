@@ -24,7 +24,9 @@
 //
 // Copies keep version IDs, LastModified times and the order of every key's
 // versions; this needs the storage.VersionImporter extension on the
-// backings receiving copies (both built-in backends implement it). Keys
+// backings receiving copies (fs, memory and s3 implement it; an s3
+// gateway backing does not, so it can neither receive copies nor, keeping
+// no version history, be the source of replicas or moves). Keys
 // are copied by comparing their version lists (see syncKey), so copying is
 // idempotent and catching up after any failure is just another comparison.
 //
@@ -70,17 +72,25 @@ var (
 
 // Defaults of Options.
 const (
-	DefaultWorkers        = 2
-	DefaultHealthInterval = 10 * time.Second
-	DefaultCutoverTimeout = 60 * time.Second
+	DefaultWorkers         = 2
+	DefaultHealthInterval  = 10 * time.Second
+	DefaultCutoverTimeout  = 60 * time.Second
+	DefaultOpenListTimeout = 15 * time.Second
 )
 
 // Backing is one named storage backend.
 type Backing struct {
-	Name    string
-	Kind    string // "fs" or "memory" (informational)
-	Path    string // data directory ("" for memory)
-	Backend storage.Backend
+	Name string
+	Kind string // "fs", "memory" or "s3" (informational)
+	// Mode is "gateway" for an s3 gateway backing (which stores no
+	// versions and cannot hold replicas or receive moves) and "" otherwise
+	// (informational).
+	Mode string
+	Path string // data directory ("" for memory and s3)
+	// Location says where an s3 backing's data lives, without secrets
+	// (e.g. "s3://bucket/prefix/"); "" for fs and memory (informational).
+	Location string
+	Backend  storage.Backend
 }
 
 // Options configure a Router.
@@ -112,7 +122,12 @@ type Options struct {
 	// flight on the bucket (default DefaultCutoverTimeout). New writes
 	// wait meanwhile.
 	CutoverTimeout time.Duration
-	Logger         *slog.Logger
+	// OpenListTimeout bounds the listing of each backing's buckets in Open
+	// (default DefaultOpenListTimeout). A backing that fails to answer in
+	// time does not fail Open: it starts unhealthy, and the placements on
+	// it are kept as they are.
+	OpenListTimeout time.Duration
+	Logger          *slog.Logger
 }
 
 // backing is a configured backing with its health.
@@ -157,6 +172,16 @@ type Router struct {
 	buckets map[string]*bucketState
 	purges  map[purgeRecord]*purgeJob
 
+	// pendingAdopt names the backings whose buckets Open could not list:
+	// their buckets without a placement are adopted when the backing
+	// becomes healthy (see adoptPending). Guarded by mu.
+	pendingAdopt map[string]bool
+	// listWarnAt is when ListBuckets last warned about buckets it had to
+	// leave out (unix nanoseconds), to rate-limit that warning.
+	listWarnAt atomic.Int64
+	// probeNow receives backings the health loop probes at once.
+	probeNow chan *backing
+
 	saveMu sync.Mutex // serializes state file writes
 
 	keys keyLocks
@@ -181,6 +206,14 @@ type bucketState struct {
 	movePh  string                  // move phase ("copying" or "cutover")
 	removed bool                    // the bucket was deleted
 	rr      atomic.Uint32           // round-robin counter for active-active reads
+	// info is the bucket's description from the last successful listing or
+	// GetBucket, which ListBuckets reports when no copy can be reached.
+	info atomic.Pointer[storage.BucketInfo]
+}
+
+// cacheInfo remembers in as the bucket's description.
+func (bs *bucketState) cacheInfo(in storage.BucketInfo) {
+	bs.info.Store(&in)
 }
 
 var (
@@ -198,6 +231,13 @@ var (
 // without a placement are adopted as single-copy buckets on the backing
 // holding them), saves it and starts the background copy and health
 // workers. The backings are closed by Close, also when Open fails.
+//
+// A backing whose buckets cannot be listed (within
+// Options.OpenListTimeout) does not fail Open: it starts unhealthy, the
+// placements on it are kept unchanged (it is assumed to still hold its
+// copies), the adoption of its buckets without a placement waits until it
+// is healthy, and it is probed at once, its buckets failing over as at
+// runtime when their mode allows it.
 func Open(ctx context.Context, opts Options) (_ *Router, err error) {
 	if len(opts.Backings) == 0 {
 		return nil, errors.New("multi: no backings")
@@ -214,11 +254,16 @@ func Open(ctx context.Context, opts Options) (_ *Router, err error) {
 	if opts.CutoverTimeout <= 0 {
 		opts.CutoverTimeout = DefaultCutoverTimeout
 	}
+	if opts.OpenListTimeout <= 0 {
+		opts.OpenListTimeout = DefaultOpenListTimeout
+	}
 	r := &Router{
-		log:     opts.Logger,
-		opts:    opts,
-		buckets: map[string]*bucketState{},
-		purges:  map[purgeRecord]*purgeJob{},
+		log:          opts.Logger,
+		opts:         opts,
+		buckets:      map[string]*bucketState{},
+		purges:       map[purgeRecord]*purgeJob{},
+		pendingAdopt: map[string]bool{},
+		probeNow:     make(chan *backing, 16),
 	}
 	topology := &backingTopology{backings: map[string]*backing{}}
 	r.topology.Store(topology) // Close also owns partially opened backings on failure.
@@ -268,13 +313,21 @@ func Open(ctx context.Context, opts Options) (_ *Router, err error) {
 		if name == topology.def.Name || slices.Contains(opts.NewBucketReplicas[:i], name) {
 			return nil, fmt.Errorf("%w: new bucket replica %q is the default backing or listed twice", ErrInvalidPlacement, name)
 		}
+		if !canImport(topology.backings[name]) {
+			return nil, fmt.Errorf("%w: new bucket replica: %s", ErrInvalidPlacement, errNoImport(name))
+		}
+	}
+	if len(opts.NewBucketReplicas) > 0 && !canImport(topology.def) {
+		return nil, fmt.Errorf("%w: new buckets cannot have replicas: the default backing %q is an S3 gateway backing, "+
+			"which keeps no version history to copy", ErrInvalidPlacement, topology.def.Name)
 	}
 	r.opts = opts
 	st, err := loadState(opts.StatePath)
 	if err != nil {
 		return nil, err
 	}
-	if err := r.reconcile(ctx, st); err != nil {
+	unknown, err := r.reconcile(ctx, st)
+	if err != nil {
 		return nil, err
 	}
 	if err := r.save(); err != nil {
@@ -306,25 +359,91 @@ func Open(ctx context.Context, opts Options) (_ *Router, err error) {
 		r.startPurge(j)
 	}
 	r.mu.RUnlock()
+	// React to the backings that could not be listed as to a failure at
+	// runtime, and probe them at once: a transient failure should not
+	// wait for the next health check.
+	for _, b := range unknown {
+		r.wg.Add(1)
+		go func() {
+			defer r.wg.Done()
+			r.onBackingDown(b)
+			r.probe(b)
+		}()
+	}
 	return r, nil
 }
 
-// reconcile turns the loaded state into the runtime state, checking it
-// against the buckets the backings hold.
-func (r *Router) reconcile(ctx context.Context, st *stateFile) error {
-	present := map[string]map[string]bool{} // backing -> bucket set
-	for _, b := range r.topology.Load().order {
-		infos, err := b.Backend.ListBuckets(ctx)
-		if err != nil {
-			return fmt.Errorf("listing the buckets of backing %q: %w", b.Name, err)
-		}
-		set := make(map[string]bool, len(infos))
-		for _, in := range infos {
-			set[in.Name] = true
-		}
-		present[b.Name] = set
+// listAll lists the buckets of every backing concurrently, each within
+// Options.OpenListTimeout. A backing that fails is marked unhealthy and
+// returned in unknown instead; only the cancellation of ctx fails listAll.
+func (r *Router) listAll(ctx context.Context) (lists map[string][]storage.BucketInfo, unknown []*backing, err error) {
+	order := r.topology.Load().order
+	infos := make([][]storage.BucketInfo, len(order))
+	errs := make([]error, len(order))
+	var wg sync.WaitGroup
+	for i, b := range order {
+		wg.Go(func() {
+			lctx, cancel := context.WithTimeout(ctx, r.opts.OpenListTimeout)
+			defer cancel()
+			infos[i], errs[i] = b.Backend.ListBuckets(lctx)
+		})
 	}
-	has := func(backing, bucket string) bool { return present[backing][bucket] }
+	wg.Wait()
+	if err := ctx.Err(); err != nil {
+		return nil, nil, fmt.Errorf("listing the buckets of the backings: %w", err)
+	}
+	lists = map[string][]storage.BucketInfo{}
+	for i, b := range order {
+		err := errs[i]
+		if err == nil {
+			lists[b.Name] = infos[i]
+			continue
+		}
+		if errors.Is(err, context.DeadlineExceeded) {
+			err = fmt.Errorf("listing its buckets timed out after %s: %w", r.opts.OpenListTimeout, err)
+		}
+		b.setDown(err)
+		b.mu.Lock()
+		b.checkedAt = time.Now().UTC()
+		b.mu.Unlock()
+		r.log.Warn("could not list the buckets of a storage backing; starting with it unhealthy and keeping "+
+			"its bucket placements as they are", "backing", b.Name, "err", err)
+		unknown = append(unknown, b)
+	}
+	return lists, unknown, nil
+}
+
+// reconcile turns the loaded state into the runtime state, checking it
+// against the buckets the backings hold. It returns the backings whose
+// buckets could not be listed ("unknown"): they are assumed to still hold
+// every copy placed on them (no copy is forgotten or promoted because of
+// them), and the adoption of their other buckets waits until they are
+// healthy (pendingAdopt).
+func (r *Router) reconcile(ctx context.Context, st *stateFile) ([]*backing, error) {
+	lists, unknown, err := r.listAll(ctx)
+	if err != nil {
+		return nil, err
+	}
+	present := map[string]map[string]storage.BucketInfo{} // backing -> buckets
+	for name, infos := range lists {
+		set := make(map[string]storage.BucketInfo, len(infos))
+		for _, in := range infos {
+			set[in.Name] = in
+		}
+		present[name] = set
+	}
+	isUnknown := map[string]bool{}
+	for _, b := range unknown {
+		isUnknown[b.Name] = true
+		r.pendingAdopt[b.Name] = true
+	}
+	has := func(backing, bucket string) bool {
+		if isUnknown[backing] {
+			return true
+		}
+		_, ok := present[backing][bucket]
+		return ok
+	}
 
 	for _, p := range st.Purges {
 		if r.topology.Load().backings[p.Backing] == nil {
@@ -351,7 +470,7 @@ func (r *Router) reconcile(ctx context.Context, st *stateFile) error {
 			kept = append(kept, m)
 		}
 		if len(kept) == 0 {
-			return fmt.Errorf("bucket %q has no copy on a configured backing (it was on %s); configure that backing "+
+			return nil, fmt.Errorf("bucket %q has no copy on a configured backing (it was on %s); configure that backing "+
 				"again in storage.backings, or remove the bucket from %s to forget it",
 				name, memberNames(rec.Members), r.opts.StatePath)
 		}
@@ -401,25 +520,105 @@ func (r *Router) reconcile(ctx context.Context, st *stateFile) error {
 	// the configuration order.
 	adoptOrder := append([]*backing{r.topology.Load().def}, r.topology.Load().order...)
 	for _, b := range adoptOrder {
-		for name := range present[b.Name] {
-			if bs := r.buckets[name]; bs != nil {
-				if !bs.rec.holds(b.Name) && r.purges[purgeRecord{Bucket: name, Backing: b.Name}] == nil {
-					r.log.Warn("a backing holds a copy of a bucket that is placed elsewhere; the copy is ignored "+
-						"(delete it, or the bucket on that backing, by hand when it is not needed)",
-						"bucket", name, "backing", b.Name, "placement", memberNames(bs.rec.Members))
-				}
-				continue
-			}
-			if r.purges[purgeRecord{Bucket: name, Backing: b.Name}] != nil {
-				continue // a deleted bucket's copy still being removed
-			}
-			r.buckets[name] = r.newBucketState(name, &placementRecord{
-				Mode:    ModeSingle,
-				Members: []memberRecord{{Backing: b.Name, Synced: true}},
-			})
+		if !isUnknown[b.Name] {
+			r.adoptLocked(b, lists[b.Name])
 		}
 	}
-	return nil
+	// Seed the descriptions ListBuckets falls back on, preferring the
+	// primary's.
+	for name, bs := range r.buckets {
+		for _, m := range bs.rec.Members {
+			if in, ok := present[m.Backing][name]; ok {
+				bs.cacheInfo(in)
+				break
+			}
+		}
+	}
+	return unknown, nil
+}
+
+// adoptLocked gives the buckets of infos (listed on backing b) that have
+// no placement a single-copy placement on b, and warns about copies of
+// buckets placed elsewhere. It reports whether it adopted any. Router.mu
+// must be held (or Open must be running).
+func (r *Router) adoptLocked(b *backing, infos []storage.BucketInfo) bool {
+	adopted := false
+	for _, in := range infos {
+		name := in.Name
+		if bs := r.buckets[name]; bs != nil {
+			if !bs.rec.holds(b.Name) && r.purges[purgeRecord{Bucket: name, Backing: b.Name}] == nil {
+				r.log.Warn("a backing holds a copy of a bucket that is placed elsewhere; the copy is ignored "+
+					"(delete it, or the bucket on that backing, by hand when it is not needed)",
+					"bucket", name, "backing", b.Name, "placement", memberNames(bs.rec.Members))
+			}
+			continue
+		}
+		if r.purges[purgeRecord{Bucket: name, Backing: b.Name}] != nil {
+			continue // a deleted bucket's copy still being removed
+		}
+		bs := r.newBucketState(name, &placementRecord{
+			Mode:    ModeSingle,
+			Members: []memberRecord{{Backing: b.Name, Synced: true}},
+		})
+		bs.cacheInfo(in)
+		r.buckets[name] = bs
+		adopted = true
+	}
+	return adopted
+}
+
+// adoptPending adopts the buckets without a placement of backing b, which
+// Open could not list, now that b is healthy. The listing runs without
+// adminMu (it is remote I/O); the adoption under it. A failed listing
+// marks b unhealthy again, so that its next recovery retries.
+func (r *Router) adoptPending(b *backing) {
+	r.mu.RLock()
+	pending := r.pendingAdopt[b.Name]
+	r.mu.RUnlock()
+	if !pending || r.closed.Load() {
+		return
+	}
+	ctx, cancel := context.WithTimeout(r.ctx, r.opts.OpenListTimeout)
+	infos, err := b.Backend.ListBuckets(ctx)
+	cancel()
+	r.adminMu.Lock()
+	defer r.adminMu.Unlock()
+	r.mu.RLock()
+	pending = r.pendingAdopt[b.Name]
+	r.mu.RUnlock()
+	switch {
+	case !pending || r.closed.Load():
+		return // adopted meanwhile
+	case r.topology.Load().backings[b.Name] != b:
+		return // replaced or removed meanwhile, which settles its adoption
+	case err != nil:
+		if r.ctx.Err() == nil {
+			r.log.Warn("could not list the buckets of a recovered storage backing to adopt them; "+
+				"retrying when it recovers again", "backing", b.Name, "err", err)
+			if b.setDown(fmt.Errorf("listing its buckets: %w", err)) {
+				go r.onBackingDown(b)
+			}
+		}
+		return
+	}
+	if r.adoptListed(b, infos) {
+		r.saveLogged("adopting buckets")
+	}
+}
+
+// adoptListed ends the pending adoption of backing b (see pendingAdopt)
+// with infos, its buckets, and reports whether it adopted any (the caller
+// saves the placements then). The caller holds adminMu.
+func (r *Router) adoptListed(b *backing, infos []storage.BucketInfo) bool {
+	r.mu.Lock()
+	delete(r.pendingAdopt, b.Name)
+	adopted := r.adoptLocked(b, infos)
+	r.mu.Unlock()
+	if adopted {
+		r.log.Info("adopted the buckets without a placement of a storage backing that could not be listed at startup",
+			"backing", b.Name)
+	}
+	return adopted
 }
 
 func memberNames(ms []memberRecord) []string {
@@ -526,9 +725,11 @@ func (r *Router) AutoFailover() bool { return r.opts.AutoFailover }
 
 // isBackingError reports whether err (returned by a backing) indicates a
 // failure of the backing itself rather than an answer about the request
-// (not found, exists, precondition failed, ...), a canceled request or a
-// failure of one bucket's encryption (a missing key, an unavailable restic
-// repository), which other buckets on the backing do not share.
+// (not found, exists, precondition failed, an operation the backing does
+// not support, ...), a canceled request or a failure of one bucket's
+// encryption (a missing key, an unavailable restic repository), which
+// other buckets on the backing do not share. storage.ErrBackingUnavailable
+// (e.g. an unreachable remote service) is a backing error.
 func isBackingError(err error) bool {
 	if err == nil {
 		return false
@@ -538,7 +739,8 @@ func isBackingError(err error) bool {
 		storage.ErrObjectNotFound, storage.ErrVersionNotFound, storage.ErrUploadNotFound,
 		storage.ErrPartNotFound, storage.ErrConfigNotFound, storage.ErrPreconditionFailed,
 		storage.ErrInvalidName, storage.ErrStopWalk, context.Canceled, context.DeadlineExceeded,
-		errors.ErrUnsupported, storage.ErrEncryptionUnavailable,
+		errors.ErrUnsupported, storage.ErrEncryptionUnavailable, storage.ErrNotSupported,
+		storage.ErrInvalidBacking,
 	} {
 		if errors.Is(err, s) {
 			return false
@@ -576,11 +778,25 @@ func (r *Router) healthLoop() {
 		select {
 		case <-r.ctx.Done():
 			return
+		case b := <-r.probeNow:
+			if r.topology.Load().backings[b.Name] == b { // not replaced meanwhile
+				r.probe(b)
+			}
+			continue
 		case <-t.C:
 		}
 		for _, b := range r.topology.Load().order {
 			r.probe(b)
 		}
+	}
+}
+
+// requestProbe asks the health loop to probe b soon (e.g. after its
+// connection settings changed), rather than at the next interval.
+func (r *Router) requestProbe(b *backing) {
+	select {
+	case r.probeNow <- b:
+	default: // the periodic probe will do
 	}
 }
 
@@ -644,8 +860,21 @@ func (r *Router) onBackingDown(b *backing) {
 	}
 }
 
-// onBackingUp restarts the copy work that waited for a backing.
-func (r *Router) onBackingUp(*backing) {
+// onBackingUp restarts the copy work that waited for a backing, and
+// adopts its buckets without a placement when Open could not list them.
+func (r *Router) onBackingUp(b *backing) {
+	r.mu.RLock()
+	pending := r.pendingAdopt[b.Name]
+	r.mu.RUnlock()
+	if pending && r.ctx.Err() == nil {
+		// Not on the caller's goroutine: the health loop must not wait for
+		// the listing. The caller runs in r.wg, so Add cannot race Wait.
+		r.wg.Add(1)
+		go func() {
+			defer r.wg.Done()
+			r.adoptPending(b)
+		}()
+	}
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 	for _, bs := range r.buckets {

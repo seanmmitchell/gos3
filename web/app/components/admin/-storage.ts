@@ -6,6 +6,7 @@
 // The file name starts with "-" so Nuxt does not register it as a component:
 //
 //   import { placementBusy } from '~/components/admin/-storage'
+import { isGatewayBacking } from '~/utils/backings'
 import type { Backing, MemberState, Placement, PlacementMember, PlacementSummary, ReplicationMode } from '~/types/admin'
 
 /** Poll interval of the Placement tab while copies run or a move is in progress. */
@@ -98,13 +99,16 @@ export interface BackingChoice {
 }
 
 /**
- * Backings offered as replicas: every backing except the primary. Unhealthy
- * ones stay selectable (the copy starts once they recover) but are marked.
+ * Backings offered as replicas: every backing except the primary and
+ * gateway backings. Unhealthy ones stay selectable (the copy starts once they
+ * recover) but are marked.
  */
 export function replicaChoices(backings: readonly Backing[], p: Placement): BackingChoice[] {
   const names = new Set(backings.map(b => b.name))
+  const current = new Set(replicaNames(p))
   const list: BackingChoice[] = backings
-    .filter(b => b.name !== p.primary)
+    // Gateway backings cannot hold replicas (kept when one somehow is).
+    .filter(b => b.name !== p.primary && (!isGatewayBacking(b) || current.has(b.name)))
     .map(b => ({ value: b.name, label: b.name, healthy: b.healthy }))
   // Replicas on backings the listing did not return (ListBackings denied, or a backing removed from the config).
   for (const m of p.members ?? []) {
@@ -135,12 +139,15 @@ export function replicationChanged(p: Placement, mode: ReplicationMode, replicas
   return p.mode !== mode || cur.length !== replicas.length || cur.some(r => !replicas.includes(r))
 }
 
-/** Move targets: backings that hold no copy of the bucket (and are not a move target already). */
+/**
+ * Move targets: backings that hold no copy of the bucket (and are not a move
+ * target already). Gateway backings are listed but disabled.
+ */
 export function moveTargets(backings: readonly Backing[], p: Placement): BackingChoice[] {
   const members = new Set((p.members ?? []).map(m => m.backing))
   return backings
     .filter(b => !members.has(b.name))
-    .map(b => ({ value: b.name, label: b.name, healthy: b.healthy, disabledReason: b.healthy ? undefined : 'unhealthy' }))
+    .map(b => ({ value: b.name, label: b.name, healthy: b.healthy, disabledReason: isGatewayBacking(b) ? 'gateway backing' : b.healthy ? undefined : 'unhealthy' }))
     .sort((a, b) => a.label.localeCompare(b.label))
 }
 
@@ -194,11 +201,21 @@ export function placementWorthShowing(list: readonly (PlacementSummary | null | 
   return present.some(p => p.mode !== 'single' || p.moving || (p.replicas?.length ?? 0) > 0 || p.primary !== first)
 }
 
-/** Chips for a bucket's placement summary: primary backing, mode × copies, moving. */
-export function placementChips(p: PlacementSummary | null | undefined): PlacementChip[] {
+/**
+ * Chips for a bucket's placement summary: primary backing, mode × copies,
+ * moving. `describe` may give the primary backing's kind (label + icon, e.g.
+ * from WhoAmI.backings via backingKindInfo).
+ */
+export function placementChips(p: PlacementSummary | null | undefined, describe?: (backing: string) => { label: string, icon: string } | undefined): PlacementChip[] {
   if (!p) return []
   const replicas = p.replicas ?? []
-  const chips: PlacementChip[] = [{ label: p.primary, color: 'neutral', icon: 'i-lucide-hard-drive', title: `Primary copy on ${p.primary}` }]
+  const kind = describe?.(p.primary)
+  const chips: PlacementChip[] = [{
+    label: p.primary,
+    color: 'neutral',
+    icon: kind?.icon ?? 'i-lucide-hard-drive',
+    title: kind ? `Primary copy on ${p.primary} · ${kind.label}` : `Primary copy on ${p.primary}`
+  }]
   const opt = modeOption(p.mode)
   if (p.mode !== 'single') {
     const copies = replicas.length + 1

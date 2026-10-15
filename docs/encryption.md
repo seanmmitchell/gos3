@@ -6,9 +6,10 @@ gos3 implementation of SSE-S3. An explicit AES256 upload uses the bucket's
 provider even when default encryption is disabled.
 
 Storage follows placement. The bucket stores only its encryption provider.
-Each assigned backing owns its repository location and S3 credentials. A
-replica or move target uses its own backing's settings, keys, and repository;
-source backing credentials never replicate with bucket configuration.
+Each backing holding a copy of the bucket keeps that copy's keys and restic
+repository itself: an fs backing in its data directory, an s3 backing in its
+remote bucket. A replica or move target uses its own backing's keys and
+repository; nothing secret replicates with the bucket configuration.
 
 Native encryption uses gos3's authenticated AES-256-GCM stream format
 (`internal/storage/crypt`): 64 KiB chunks, each sealed with a nonce made of
@@ -16,10 +17,10 @@ its index and a final-chunk flag, so reordered, truncated or extended data
 fails authentication. HKDF-SHA256 derives a separate key for each immutable
 data file from a random bucket master key, so every stream has its own key
 and swapping objects' ciphertext fails authentication. Compression happens
-before encryption; range reads decrypt only the chunks they need. Filesystem
-upload staging and multipart parts are encrypted too. The memory backend
-records AES256 for SSE responses and replication but keeps its in-process
-data as is.
+before encryption; range reads decrypt only the chunks they need. Upload
+staging and multipart parts are encrypted too, on fs and on
+[s3 backings](backings.md). The memory backend records AES256 for SSE
+responses and replication but keeps its in-process data as is.
 
 AWS KMS (`aws:kms` / `aws:kms:dsse`) and SSE-C requests return
 `501 NotImplemented`. A KMS bucket default stored by an older build is applied
@@ -39,74 +40,82 @@ does not rewrite existing versions. Upload or copy with AES256 to create an
 encrypted version; older versions remain subject to normal deletion and Object
 Lock rules. Disabling encryption or switching provider preserves encrypted reads.
 
-## Backing storage for restic
+## Where keys and repositories live
+
+What a bucket's encryption needs depends on the backend of each backing
+that holds a copy of it (primary, replicas and a move target):
+
+| Backing | Native AES256 | Restic repository |
+|---|---|---|
+| fs | master key in `<path>/.gos3/keys/<bucket-id>` | local, `<path>/.gos3/restic/<bucket-id>` |
+| s3 | master key in the remote bucket at `<prefix>keys/<bucket-id>.key`, wrapped with the backing's `encryption_key`; **unavailable without one** | restic's s3 backend in the backing's own bucket, `<prefix>restic/<bucket-id>`, with the backing's current endpoint, region and credentials; needs the `encryption_key` and the credentials; recovery record `<prefix>keys/<bucket-id>.restic.json` without the password, which derives from the wrapped master key |
+| memory | recorded, data kept in memory as is | not offered |
+| s3 gateway | not offered (objects are stored as they are) | not offered |
 
 Restic needs the [restic](https://restic.readthedocs.io/en/stable/020_installation.html)
 executable, **0.17.1 or newer**, on the gos3 server's PATH. The gos3
 container images include a pinned, checksum-verified restic at
 `/usr/local/bin/restic` ([deployment.md](deployment.md#docker)); for the
 release archives and the systemd unit, install it yourself. Native AES256
-needs no extra executable; memory backings do not support restic.
+needs no extra executable.
 
-Restic cannot be selected while a memory backing holds a copy of the bucket,
-and a bucket that uses restic or holds restic versions cannot be replicated
-or moved to one.
+A provider is offered for a bucket only when every backing holding a copy
+can store it: the web UI's Encryption tab marks the others unavailable, and
+the admin API's `available` list leaves them out. AES256 writes (and
+preparing AES256 for the bucket) are refused with `501 NotImplemented`
+while any copy of the bucket, a replica or move target included, is on a
+backing that cannot store AES256, such as an s3 backing without an
+encryption key. For the same reason a bucket that uses a provider (as its
+provider, through its default encryption, or because it holds versions
+encrypted with it) cannot be replicated or moved to a backing that cannot
+store it, for example restic data to a memory backing, or AES256 or restic
+data to an s3 backing without an encryption key.
 
-On server **Storage**, open **Restic storage** for the assigned backing:
+Each physical bucket copy has its own ID and key, including replicas.
+Restic passwords are derived from that key and managed by the server.
+Bucket encryption has no repository URL, password, or credential fields: the
+repository location follows the backing, and is fixed for as long as the
+backing exists. To keep a bucket's archive elsewhere, move the bucket to
+another backing; existing archives stay where they were created.
 
-- **Local backing storage** (default): each bucket copy uses
-  `<backing>/.gos3/restic/<bucket-id>`.
-- **S3 storage**: configure the endpoint (`https://s3.example.com`), destination
-  S3 bucket, repository prefix, region, access key, secret key, and optional
-  session token. Each bucket copy derives its repository as
-  `s3:<endpoint>/<destination-bucket>/<prefix>/<bucket-id>`. Saving the
-  settings runs restic to check access to the destination (and to every
-  repository the backing already has), so restic must be installed first.
-
-Each physical bucket copy has its own ID and key, including replicas. Passwords
-are derived from that key and managed by the server. Bucket encryption has no
-repository URL, password, or credential fields. S3 settings may also be supplied
-in startup JSON/YAML as `storage.restic_s3` for the default backing and
-`storage.backings[].restic_s3` for additional filesystem backings:
-
-```yaml
-storage:
-  backend: fs
-  path: /srv/gos3
-  backings:
-    - name: archive
-      backend: fs
-      path: /srv/gos3-archive
-      restic_s3:
-        endpoint: https://s3.example.com
-        bucket: archives
-        prefix: gos3-archive
-        region: us-east-1
-        access_key: ARCHIVE_ACCESS_KEY
-        secret_key: ARCHIVE_SECRET_KEY
-```
-
-The filesystem path still holds metadata, keys, references, and encrypted
-staging. The backing's S3 configuration controls restic payload storage;
-unencrypted/native-AES objects on an fs backing continue to use its filesystem.
-The admin API does not expose S3 credentials. Blank credential inputs retain
-saved values; an expired session token can be explicitly cleared. Invalid
-credential updates leave working settings intact. Persisted settings override
-startup settings for that backing.
-
-Once a repository is initialized, its location is fixed, including after
-objects or buckets are deleted. Configure another backing and use **Placement**
-to move the bucket when changing storage. Existing archives stay with their
-original backing. Credentials and region can be updated at the same location.
-The destination may be a bucket on another gos3 server, but not one whose
+An s3 backing may be a bucket on another gos3 server, but not one whose
 provider is restic: gos3 rejects restic's own uploads (recognized by its
 `gos3-restic` user agent) to a bucket that would archive them through restic
-again. HTTPS protects transport; HTTP supports trusted local endpoints.
+again. An s3 backing can never point at the server itself. HTTPS protects
+transport; HTTP suits trusted local endpoints.
 
-Reading backing settings uses `admin:ListBackings`; updates require
-`admin:UpdateConfig` at service level. Bucket provider selection uses scoped
-`admin:GetBucketEncryption` / `admin:PutBucketEncryption`. Standard S3
-permissions separately govern enabling or disabling bucket-default encryption.
+Bucket provider selection uses scoped `admin:GetBucketEncryption` /
+`admin:PutBucketEncryption`; standard S3 permissions separately govern
+enabling or disabling bucket-default encryption. Backing settings, the
+encryption key included, are read with `admin:GetConfig` and changed with
+`admin:UpdateConfig` (see [admin-api.md](admin-api.md#storage-backings-and-bucket-placement)).
+
+### The encryption key of s3 backings
+
+An s3 backing stores each bucket's random master key in its remote bucket,
+encrypted (AES-256-GCM) with the backing's **key-encryption key**:
+`encryption_key` in its `s3` settings, `GOS3_S3_ENCRYPTION_KEY` for the
+default backing or `GOS3_BACKING_<NAME>_ENCRYPTION_KEY` for others, or the
+**Encryption key** field (with **Generate**) under **Advanced** in the
+Storage page's backing form. It is standard base64 of exactly 32 bytes:
+
+```sh
+openssl rand -base64 32
+```
+
+- The S3 service never sees a usable key; reading the remote bucket alone
+  does not decrypt the data.
+- A backing without the key offers neither AES256 nor restic. The key can
+  be added later (also live on the Storage page, where it is checked
+  against the keys the backing already holds), but not changed: a
+  different key is refused, because the existing master keys could no
+  longer be opened.
+- **Losing the key loses every encrypted object and restic archive of the
+  backing.** gos3 never regenerates a missing key. Keep it outside the
+  remote bucket (a password manager or secret store), and back it up with
+  the rest of the server's secrets.
+
+See [backings.md](backings.md#encryption-on-s3-backings).
 
 ## Archive behavior
 
@@ -131,8 +140,10 @@ whole object and adds repository latency. Errors fail the request without
 plaintext fallback; they concern the bucket only and do not mark its backing
 unhealthy. Restic's diagnostics appear (redacted) in the server log.
 
-Restic keeps a cache in `.gos3/restic-cache/` (one subdirectory per
-repository, managed by restic; safe to delete). Every object adds a snapshot
+Restic keeps a cache, on fs backings in `.gos3/restic-cache/` and on s3
+backings in the backing's temporary directory under the operating system's
+temporary directory (removed at shutdown); it is managed by restic and safe
+to delete. Every object adds a snapshot
 and an index file, so run `restic prune` on each repository periodically to
 consolidate its index (it forgets nothing; never run `restic forget` on
 snapshots still referenced by gos3). Prune takes an exclusive lock: writes
@@ -147,23 +158,31 @@ measure actual archive usage.
 
 ## Keys and recovery
 
-Back up metadata, keys, backing settings, and data/repositories together:
-a file-level backup of a backing's data directory includes all but remote S3
-repositories ([operations.md](operations.md#backups)). Native keys are
-`.gos3/keys/<bucket-id>`. Restic repository/password recovery records are
-`.gos3/keys/<bucket-id>.restic.json`. Keys, recovery records and local
-repositories (`.gos3/restic/<bucket-id>`) remain after the bucket is deleted.
-S3 settings and credentials live in the backing's protected
-`.gos3/restic-backing.json`, or its protected startup configuration; they are
-never stored in bucket configuration. Recovery records do not duplicate S3
-credentials. Repository snapshots retain object identity but do not replace
+Back up metadata, keys and data/repositories together
+([operations.md](operations.md#backups)):
+
+- **fs backings**: a file-level backup of the backing's data directory
+  includes everything. Native keys are `.gos3/keys/<bucket-id>`, restic
+  recovery records (repository location and password)
+  `.gos3/keys/<bucket-id>.restic.json`, local repositories
+  `.gos3/restic/<bucket-id>`.
+- **s3 backings**: the wrapped keys (`<prefix>keys/`), recovery records
+  (without passwords) and repositories (`<prefix>restic/`) are in the
+  remote bucket with the data; back up the backing's prefix and, separately,
+  its **encryption key** (see [backings.md](backings.md#backups)).
+
+Keys, recovery records and repositories remain after the bucket is
+deleted. Repository snapshots retain object identity but do not replace
 gos3 metadata for versions, tags, permissions, and retention.
 
-Missing native keys fail closed and are not silently regenerated. The key
-directory gets private filesystem permissions and a protected Windows ACL
+Missing native keys fail closed and are not silently regenerated. On fs
+backings the key directory gets private filesystem permissions and a protected Windows ACL
 before a key is created (failing that fails key creation); at startup existing
 key and recovery files are made private again, best effort with a logged
 warning, e.g. after a restore that did not keep permissions.
 Server-managed keys allow unattended access; a party holding keys and ciphertext
-can decrypt data. This feature does not protect against a compromised gos3
-process or a full copy of its keys and data. S3 metadata itself is not encrypted.
+(for an s3 backing: its encryption key and the remote bucket) can decrypt
+data. This feature does not protect against a compromised gos3 process or a
+full copy of its keys and data. S3 metadata itself is not encrypted: on an
+s3 backing, bucket names, object keys, user metadata and tags are readable
+in the journal and snapshots by anyone who can read the remote bucket.

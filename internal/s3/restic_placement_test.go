@@ -14,22 +14,18 @@ import (
 	"github.com/seanmmitchell/gos3/internal/storage/multi"
 )
 
+// Restic repositories follow the bucket's placement: the primary, a replica
+// and a move target each archive into a repository on their own backing.
 func TestResticInheritsReplicaAndMoveBackings(t *testing.T) {
 	if _, err := exec.LookPath("restic"); err != nil {
 		t.Skip("install restic >= 0.17.1")
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 	defer cancel()
-	remote := newTestEnv(t)
-	remote.createBucket("repositories")
 	var backings []multi.Backing
-	for i, name := range []string{"source", "replica", "target"} {
+	for _, name := range []string{"source", "replica", "target"} {
 		dir := t.TempDir()
-		var cfg *storage.ResticS3
-		if i != 1 {
-			cfg = &storage.ResticS3{Endpoint: remote.srv.URL, Bucket: "repositories", Prefix: name, AccessKey: testRoot.AccessKey, SecretKey: testRoot.SecretKey}
-		}
-		b, err := storagefs.Open(dir, storagefs.Options{ResticS3: cfg})
+		b, err := storagefs.Open(dir, storagefs.Options{})
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -94,26 +90,25 @@ func TestResticInheritsReplicaAndMoveBackings(t *testing.T) {
 		}
 	}
 	read(backings[1].Backend)
-	// Replica uses its local backing, although the source stores in remote S3.
-	files, err := filepath.Glob(filepath.Join(backings[1].Path, ".gos3", "restic", "*", "config"))
-	if err != nil || len(files) != 1 {
-		t.Fatal("replica inherited source S3 settings instead of its local backing")
+	// Every backing holding a copy keeps its own repository.
+	repository := func(b multi.Backing) {
+		t.Helper()
+		files, err := filepath.Glob(filepath.Join(b.Path, ".gos3", "restic", "*", "config"))
+		if err != nil || len(files) != 1 {
+			t.Fatalf("backing %s has no repository of its own: %v %v", b.Name, files, err)
+		}
 	}
+	repository(backings[0])
+	repository(backings[1])
 	if _, err := r.Move(ctx, "archive", "", "target"); err != nil {
 		t.Fatal(err)
 	}
 	wait("target")
 	read(r)
 	read(backings[2].Backend)
-	for _, prefix := range []string{"source/", "target/"} {
-		count := 0
-		err := remote.backend.WalkObjects(ctx, "repositories", prefix, "", func(i storage.ObjectInfo) error { count++; return nil })
-		if err != nil || count == 0 {
-			t.Fatalf("missing backing repository prefix %s: %v", prefix, err)
-		}
-	}
+	repository(backings[2])
 	raw, err := backings[2].Backend.GetBucketConfig(ctx, "archive", storage.ConfigEncryptionProvider)
 	if err != nil || string(raw) != `{"provider":"restic"}` {
-		t.Fatal("bucket replication copied storage settings or credentials")
+		t.Fatal("bucket replication lost the provider selection")
 	}
 }

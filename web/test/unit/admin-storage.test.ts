@@ -233,3 +233,37 @@ describe('placement helpers', () => {
     expect(sortBackings(null)).toEqual([])
   })
 })
+
+describe('s3 backings in placement', () => {
+  const S3 = [
+    backing('default', { default: true }),
+    backing('cold', { kind: 's3', path: '', location: 's3://gos3-cold/data/' }),
+    backing('aws', { kind: 's3', mode: 'gateway', path: '', location: 's3://' })
+  ]
+  const single = placement({ mode: 'single', members: [member('default', { role: 'primary' })] })
+
+  it('offers s3 backings as replicas and move targets, but not gateway ones', () => {
+    expect(replicaChoices(S3, single).map(c => c.value)).toEqual(['cold'])
+    expect(moveTargets(S3, single).map(t => [t.value, t.disabledReason])).toEqual([['aws', 'gateway backing'], ['cold', undefined]])
+  })
+
+  it('keeps a gateway backing that somehow holds a replica selectable', () => {
+    const p = placement({ members: [member('default', { role: 'primary' }), member('aws')] })
+    expect(replicaChoices(S3, p).map(c => c.value)).toEqual(['aws', 'cold'])
+  })
+})
+
+describe('AdminClient backing configuration', () => {
+  it('sends the s3 section of a PUT as given', async () => {
+    const config = {
+      backings: [{ name: 'cold', backend: 's3' as const, path: '', s3: { endpoint: 'https://s3.example.com', region: '', bucket: 'gos3-cold', prefix: '', addressing: '' as const, gateway: true, accessKey: 'AK', secretKey: 'SK' } }],
+      defaultBacking: 'default',
+      revision: 'r1',
+      persistent: true
+    }
+    const { admin, calls } = makeAdmin(() => json({ ...config, revision: 'r2' }))
+    expect((await admin.putBackingConfiguration(config)).revision).toBe('r2')
+    expect(calls[0]).toMatchObject({ method: 'PUT', url: 'http://localhost:9000/_gos3/admin/v1/backings/config' })
+    expect(JSON.parse(calls[0]!.body)).toEqual(config)
+  })
+})
