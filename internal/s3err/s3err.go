@@ -172,4 +172,7 @@ var (
 	// ErrInvalidTargetBucketForLogging is returned by PutBucketLogging when
 	// the target bucket does not exist.
 	ErrInvalidTargetBucketForLogging = def("InvalidTargetBucketForLogging", http.StatusBadRequest, "The target bucket for logging does not exist")
+	// ErrServiceUnavailable is returned when a remote service holding the
+	// bucket's data (a backing, see docs/backings.md) cannot be reached.
+	ErrServiceUnavailable = def("ServiceUnavailable", http.StatusServiceUnavailable, "The service holding this bucket's data is unavailable. Please try again.")
 )

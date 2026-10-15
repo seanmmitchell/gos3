@@ -32,7 +32,11 @@
 // reuses nonces and breaks confidentiality and authenticity of both. Callers
 // derive a fresh key for every stream (the fs backend derives a data file's
 // key with HKDF from the bucket master key and the file's random data ID,
-// and uses random keys for temporary files).
+// see ObjectDataKey, and uses random keys for temporary files).
+//
+// The package also wraps keys for storage (Wrap, Unwrap, KeyCheck): the s3
+// backing keeps bucket master keys in the remote, sealed under a
+// key-encryption key.
 package crypt
 
 import (

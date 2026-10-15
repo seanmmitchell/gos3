@@ -42,9 +42,19 @@ var envVars = []EnvVar{
 	{"GOS3_ALLOWED_HOSTS", "server.allowed_hosts", "extra host names clients use (\"*.example.com\" wildcards; \"*\" = no Host check), comma-separated", list(func(c *Config) *[]string { return &c.Server.AllowedHosts })},
 	{"GOS3_MAX_CONNECTIONS", "server.max_connections", "maximum open client connections (0 = no limit)", integer(func(c *Config) *int { return &c.Server.MaxConnections })},
 	{"GOS3_DATA", "storage.path", "data directory", str(func(c *Config) *string { return &c.Storage.Path })},
-	{"GOS3_STORAGE_BACKEND", "storage.backend", "fs or memory", str(func(c *Config) *string { return &c.Storage.Backend })},
+	{"GOS3_STORAGE_BACKEND", "storage.backend", "fs, memory or s3", str(func(c *Config) *string { return &c.Storage.Backend })},
+	{"GOS3_S3_ENDPOINT", "storage.s3.endpoint", "s3 backend: service URL, http(s)://host[:port]", s3str(func(s *S3Config) *string { return &s.Endpoint })},
+	{"GOS3_S3_REGION", "storage.s3.region", "s3 backend: signing region (default us-east-1)", s3str(func(s *S3Config) *string { return &s.Region })},
+	{"GOS3_S3_BUCKET", "storage.s3.bucket", "s3 backend: remote bucket", s3str(func(s *S3Config) *string { return &s.Bucket })},
+	{"GOS3_S3_PREFIX", "storage.s3.prefix", "s3 backend: key prefix in the bucket", s3str(func(s *S3Config) *string { return &s.Prefix })},
+	{"GOS3_S3_ADDRESSING", "storage.s3.addressing", "s3 backend: auto, path or virtual", s3str(func(s *S3Config) *string { return &s.Addressing })},
+	{"GOS3_S3_PART_SIZE", "storage.s3.part_size", "s3 backend: upload part size, bytes or 16MiB-style (5MiB-5GiB)", s3size(func(s *S3Config) *int64 { return &s.PartSize })},
+	{"GOS3_S3_ACCESS_KEY", "storage.s3.access_key", "s3 backend: access key", s3str(func(s *S3Config) *string { return &s.AccessKey })},
+	{"GOS3_S3_SECRET_KEY", "storage.s3.secret_key", "s3 backend: secret key", s3str(func(s *S3Config) *string { return &s.SecretKey })},
+	{"GOS3_S3_ENCRYPTION_KEY", "storage.s3.encryption_key", "s3 backend: key-encryption key, base64 of 32 bytes (enables AES256 and restic)", s3str(func(s *S3Config) *string { return &s.EncryptionKey })},
+	{"GOS3_S3_GATEWAY", "storage.s3.gateway", "s3 backend: store objects natively in same-named remote buckets (bool)", s3bool(func(s *S3Config) *bool { return &s.Gateway })},
 	{"GOS3_FSYNC", "storage.fsync_data", "fsync object data on commit (bool)", boolean(func(c *Config) *bool { return &c.Storage.FsyncData })},
-	{"GOS3_STORAGE_BACKINGS", "storage.backings", "extra backings, comma-separated name=/path (fs) or name=memory", backingsList},
+	{"GOS3_STORAGE_BACKINGS", "storage.backings", "extra backings, comma-separated name=/path (fs), name=memory or name=s3 (see GOS3_BACKING_<NAME>_*)", backingsList},
 	{"GOS3_DEFAULT_BACKING", "storage.default_backing", "backing new buckets are created on", str(func(c *Config) *string { return &c.Storage.DefaultBacking })},
 	{"GOS3_REPLICATION_MODE", "storage.replication.default_mode", "replication of new buckets: single, active-passive or active-active", str(func(c *Config) *string { return &c.Storage.Replication.DefaultMode })},
 	{"GOS3_REPLICATION_REPLICAS", "storage.replication.default_replicas", "backings new buckets are replicated to, comma-separated", list(func(c *Config) *[]string { return &c.Storage.Replication.DefaultReplicas })},
@@ -130,8 +140,20 @@ func WriteEnvTable(w io.Writer) error {
 		}
 		fmt.Fprintf(tw, "%s\t%s\t%s\n", e.Name, key, e.Description)
 	}
-	return tw.Flush()
+	if err := tw.Flush(); err != nil {
+		return err
+	}
+	_, err := fmt.Fprintf(w, "\n%s\n", backingEnvNote)
+	return err
 }
+
+// backingEnvNote documents the per-backing GOS3_BACKING_<NAME>_* family
+// (see BackingEnv) below the table.
+const backingEnvNote = `s3 backings in storage.backings (or GOS3_STORAGE_BACKINGS=<name>=s3) take each s3 setting that
+is not configured from GOS3_BACKING_<NAME>_<FIELD> (NAME upper-cased, '-' as '_'), FIELD one of
+ENDPOINT, REGION, BUCKET, PREFIX, ADDRESSING, PART_SIZE, ACCESS_KEY, SECRET_KEY, ENCRYPTION_KEY
+and GATEWAY, with the same formats as the GOS3_S3_* variables above. Values from the environment
+are never written to backings.json.`
 
 // applyEnv applies every set GOS3_* variable to c. Empty values are applied
 // too (e.g. GOS3_DOMAINS= clears the list), except for GOS3_CONFIG.
@@ -167,6 +189,26 @@ func applyEnv(c *Config, lookup func(string) (string, bool)) error {
 		}
 	}
 	return nil
+}
+
+// s3Block returns storage.s3, allocating it when unset.
+func s3Block(c *Config) *S3Config {
+	if c.Storage.S3 == nil {
+		c.Storage.S3 = &S3Config{}
+	}
+	return c.Storage.S3
+}
+
+func s3str(field func(*S3Config) *string) func(*Config, string) error {
+	return str(func(c *Config) *string { return field(s3Block(c)) })
+}
+
+func s3size(field func(*S3Config) *int64) func(*Config, string) error {
+	return size(func(c *Config) *int64 { return field(s3Block(c)) })
+}
+
+func s3bool(field func(*S3Config) *bool) func(*Config, string) error {
+	return boolean(func(c *Config) *bool { return field(s3Block(c)) })
 }
 
 func str(field func(*Config) *string) func(*Config, string) error {

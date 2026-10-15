@@ -62,7 +62,7 @@ func TestEnvVarsTable(t *testing.T) {
 // of its type and checks that the configuration changed, so the table's
 // keys and setters agree.
 func TestEveryKeySettable(t *testing.T) {
-	samples := []string{"true", "false", "42", "1h", "2h", "2GiB", "x.example", "a.example,b.example"}
+	samples := []string{"true", "false", "42", "1h", "2h", "2GiB", "x.example", "a.example,b.example", `[{"name":"x"}]`}
 	for _, key := range Keys() {
 		changed := false
 		for _, v := range samples {

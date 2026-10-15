@@ -7,6 +7,7 @@ import (
 	"io"
 	"slices"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -15,18 +16,41 @@ import (
 
 // --- routing ---
 
-// lookup returns the state of bucket.
+// lookup returns the state of bucket. While the buckets of a backing are
+// not known yet (see Router.pendingAdopt), a bucket without a placement
+// may live there: it is reported unavailable (storage.ErrBackingUnavailable)
+// rather than missing.
 func (r *Router) lookup(bucket string) (*bucketState, error) {
 	if r.closed.Load() {
 		return nil, ErrClosed
 	}
 	r.mu.RLock()
 	bs := r.buckets[bucket]
+	var err error
+	if bs == nil {
+		err = r.unknownBucketLocked(bucket)
+	}
 	r.mu.RUnlock()
 	if bs == nil {
-		return nil, fmt.Errorf("%w: %q", storage.ErrBucketNotFound, bucket)
+		return nil, err
 	}
 	return bs, nil
+}
+
+// unknownBucketLocked is the error for bucket, which has no placement:
+// storage.ErrBackingUnavailable while the buckets of a backing are not
+// known yet, storage.ErrBucketNotFound otherwise. Router.mu must be held.
+func (r *Router) unknownBucketLocked(bucket string) error {
+	if len(r.pendingAdopt) == 0 {
+		return fmt.Errorf("%w: %q", storage.ErrBucketNotFound, bucket)
+	}
+	names := make([]string, 0, len(r.pendingAdopt))
+	for name := range r.pendingAdopt {
+		names = append(names, name)
+	}
+	slices.Sort(names)
+	return fmt.Errorf("%w: bucket %q may be on backing %s, which is unavailable; the buckets on it are not known yet",
+		storage.ErrBackingUnavailable, bucket, strings.Join(names, ", "))
 }
 
 // readers returns the backings a read of the bucket may use, best first:
@@ -253,8 +277,14 @@ func (t *cbTracker) commitOptions(opts storage.CommitOptions) storage.CommitOpti
 
 // --- buckets ---
 
+// listWarnInterval rate-limits the warning about buckets ListBuckets
+// leaves out.
+const listWarnInterval = time.Minute
+
 // ListBuckets returns every bucket, as its first reachable copy describes
-// it.
+// it. A bucket none of whose copies can be reached is described as it
+// was last seen, or left out (with a rate-limited warning) when it was
+// never seen: a failing backing does not fail the whole listing.
 func (r *Router) ListBuckets(ctx context.Context) ([]storage.BucketInfo, error) {
 	if r.closed.Load() {
 		return nil, ErrClosed
@@ -289,6 +319,8 @@ func (r *Router) ListBuckets(ctx context.Context) ([]storage.BucketInfo, error) 
 		return m, nil
 	}
 	out := make([]storage.BucketInfo, 0, len(states))
+	var skipped []string
+	var skipErr error
 	for _, bs := range states {
 		var lastErr error
 		found := false
@@ -299,58 +331,113 @@ func (r *Router) ListBuckets(ctx context.Context) ([]storage.BucketInfo, error) 
 				continue
 			}
 			if in, ok := m[bs.name]; ok {
+				bs.cacheInfo(in)
+				in.Backing = r.primaryOf(bs)
 				out = append(out, in)
 				found = true
 				break
 			}
 		}
-		if !found && lastErr != nil {
-			return nil, lastErr
+		if found || lastErr == nil {
+			continue
+		}
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		if cached := bs.info.Load(); cached != nil {
+			in := *cached
+			in.Backing = r.primaryOf(bs)
+			out = append(out, in)
+			continue
+		}
+		skipped = append(skipped, bs.name)
+		skipErr = lastErr
+	}
+	if len(skipped) > 0 {
+		now := time.Now().UnixNano()
+		if last := r.listWarnAt.Load(); now-last >= int64(listWarnInterval) && r.listWarnAt.CompareAndSwap(last, now) {
+			r.log.Warn("buckets on unreachable backings are left out of the bucket list", "buckets", skipped, "err", skipErr)
 		}
 	}
 	return out, nil
 }
 
-// CreateBucket creates the bucket on the default backing.
+// CreateBucket creates the bucket on opts.Backing (the x-gos3-backing
+// header), or on the default backing when it is empty. An unknown backing
+// yields storage.ErrInvalidBacking. The default replicas are added except
+// the chosen backing itself.
 func (r *Router) CreateBucket(ctx context.Context, name string, opts storage.CreateBucketOptions) error {
 	if r.closed.Load() {
 		return ErrClosed
 	}
-	var topology *backingTopology
+	var (
+		topology *backingTopology
+		target   *backing
+	)
 	for {
 		r.adminMu.Lock()
 		topology = r.topology.Load()
+		target = topology.def
+		if opts.Backing != "" {
+			if target = topology.backings[opts.Backing]; target == nil {
+				r.adminMu.Unlock()
+				return fmt.Errorf("%w: %q", storage.ErrInvalidBacking, opts.Backing)
+			}
+		}
 		r.mu.RLock()
 		exists := r.buckets[name] != nil
-		pj := r.purges[purgeRecord{Bucket: name, Backing: topology.def.Name}]
+		pj := r.purges[purgeRecord{Bucket: name, Backing: target.Name}]
+		var unknown error
+		if !exists && len(r.pendingAdopt) > 0 {
+			// The name may be taken on a backing not listed yet: creating
+			// it elsewhere would shadow that bucket.
+			unknown = r.unknownBucketLocked(name)
+		}
 		r.mu.RUnlock()
 		if exists {
 			r.adminMu.Unlock()
 			return fmt.Errorf("%w: %q", storage.ErrBucketExists, name)
 		}
+		if unknown != nil {
+			r.adminMu.Unlock()
+			return unknown
+		}
 		if pj == nil {
 			break
 		}
 		// A copy of a deleted bucket with this name is still being
-		// removed from the default backing: wait for it.
+		// removed from the target backing: wait for it.
 		r.adminMu.Unlock()
 		if err := r.waitPurge(ctx, pj.rec); err != nil {
 			return err
 		}
 	}
 	defer r.adminMu.Unlock()
-	if err := topology.def.Backend.CreateBucket(ctx, name, opts); err != nil {
-		return r.observe(topology.def, err)
+	// The member backends do not know the router's backing names.
+	opts.Backing = ""
+	if err := target.Backend.CreateBucket(ctx, name, opts); err != nil {
+		return r.observe(target, err)
 	}
 	rec := &placementRecord{
 		Mode:    r.opts.NewBucketMode,
-		Members: []memberRecord{{Backing: topology.def.Name, Synced: true}},
+		Members: []memberRecord{{Backing: target.Name, Synced: true}},
 	}
 	for _, rep := range r.opts.NewBucketReplicas {
+		if rep == target.Name {
+			continue
+		}
+		rb := topology.backings[rep]
+		if rb == nil || !canImport(rb) || !canImport(target) {
+			// Open and live configuration refuse such replicas; a bucket
+			// on an s3 gateway backing keeps no versions to copy.
+			r.log.Warn("new bucket created without one of its default replicas, which cannot be used for it",
+				"bucket", name, "backing", rep, "primary", target.Name)
+			continue
+		}
 		r.mu.RLock()
 		pending := r.purges[purgeRecord{Bucket: name, Backing: rep}] != nil
 		r.mu.RUnlock()
-		if pending || !topology.backings[rep].healthy.Load() {
+		if pending || !rb.healthy.Load() {
 			// Added later with SetReplication; mostly a stale copy.
 			r.log.Warn("new bucket created without one of its default replicas", "bucket", name, "backing", rep,
 				"copy_being_deleted", pending)
@@ -366,7 +453,7 @@ func (r *Router) CreateBucket(ctx context.Context, name string, opts storage.Cre
 	r.buckets[name] = bs
 	r.mu.Unlock()
 	for _, ms := range bs.members {
-		if ms.backing != topology.def {
+		if ms.backing != target {
 			r.kick(ms)
 		}
 	}
@@ -410,7 +497,18 @@ func (r *Router) GetBucket(ctx context.Context, name string) (storage.BucketInfo
 		info, err = b.Backend.GetBucket(ctx, name)
 		return err
 	})
+	if err == nil {
+		bs.cacheInfo(info)
+		info.Backing = r.primaryOf(bs)
+	}
 	return info, err
+}
+
+// primaryOf returns the name of the backing holding bs's primary copy.
+func (r *Router) primaryOf(bs *bucketState) string {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return bs.rec.primary()
 }
 
 // DeleteBucket deletes the (empty) bucket from its primary; the other
@@ -751,6 +849,9 @@ func (r *Router) CompleteMultipartUpload(ctx context.Context, bucket, key, uploa
 func (r *Router) CompleteMultipartUploadWith(ctx context.Context, bucket, key, uploadID string, partNumbers []int,
 	meta storage.ObjectMeta, opts storage.CommitOptions, wopts storage.WriteOptions) (storage.ObjectInfo, error) {
 	if err := checkCompression(wopts.Compression); err != nil {
+		return storage.ObjectInfo{}, err
+	}
+	if err := r.checkWriteEncryption(ctx, bucket, wopts); err != nil {
 		return storage.ObjectInfo{}, err
 	}
 	var info storage.ObjectInfo

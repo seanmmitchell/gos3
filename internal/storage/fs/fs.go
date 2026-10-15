@@ -17,12 +17,8 @@
 //	                                prepared for the bucket)
 //	keys/<bucket-id>.restic.json    a bucket's restic repository location and
 //	                                password (secret)
-//	restic/<bucket-id>/             a bucket's local restic repository (when
-//	                                the backing has no restic S3 storage)
+//	restic/<bucket-id>/             a bucket's restic repository
 //	restic-cache/                   restic's local repository cache
-//	restic-backing.json             the backing's restic S3 storage settings,
-//	                                including credentials (secret; written by
-//	                                ConfigureResticBacking)
 //
 // Keys, recovery records and repositories are kept when a bucket is
 // deleted, so that its restic archive stays recoverable.
@@ -119,7 +115,6 @@ var ErrClosed = errors.New("fs: backend closed")
 
 // Options configures Open.
 type Options struct {
-	ResticS3 *storage.ResticS3
 	// FsyncData fsyncs every data file (and its directory) before the
 	// metadata referencing it is committed. Slower, but committed objects
 	// survive power loss.
@@ -148,21 +143,18 @@ const (
 type Backend struct {
 	// keyMu guards keys, the cache of bucket master keys by bucket ID
 	// (see bucketKey).
-	keyMu          sync.RWMutex
-	keys           map[string]*bucketKeyEntry
-	resticMu       sync.Mutex
-	resticConfigMu sync.RWMutex
-	resticS3       *storage.ResticS3
-	root           string
-	sysDir         string
-	dataDir        string
-	tmpDir         string
-	uploadDir      string
-	orphanDir      string
-	retention      time.Duration
-	fsync          bool
-	log            *slog.Logger
-	db             *bbolt.DB
+	keyMu     sync.RWMutex
+	keys      map[string]*bucketKeyEntry
+	root      string
+	sysDir    string
+	dataDir   string
+	tmpDir    string
+	uploadDir string
+	orphanDir string
+	retention time.Duration
+	fsync     bool
+	log       *slog.Logger
+	db        *bbolt.DB
 
 	closed atomic.Bool
 	cancel context.CancelFunc
@@ -242,10 +234,6 @@ func Open(root string, opts Options) (*Backend, error) {
 		return nil, fmt.Errorf("fs: open metadata database %s: %w", dbPath, err)
 	}
 	b.db = db
-	if err := b.loadResticBacking(opts.ResticS3); err != nil {
-		_ = db.Close()
-		return nil, err
-	}
 	b.tightenPerm(dbPath)
 	if err := b.initSchema(); err != nil {
 		_ = db.Close()

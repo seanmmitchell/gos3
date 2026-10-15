@@ -36,7 +36,10 @@ type Deps struct {
 	Discovery *discovery.Service // may be nil when disabled
 	// Info returns this server's public identity document.
 	Info func() discovery.Info
-	// BackendName is "fs" or "memory"; DataPath is the data directory ("" if none).
+	// BackendName is the kind of the default backing: "fs", "memory" or
+	// "s3". DataPath is the data directory: the fs backing's directory, or
+	// the directory holding only system state for memory and s3 ("" if
+	// none).
 	BackendName string
 	DataPath    string
 	Logger      *slog.Logger

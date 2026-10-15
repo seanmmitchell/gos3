@@ -17,9 +17,9 @@ import (
 func managedRouter(t *testing.T, path string) *Router {
 	t.Helper()
 	r := openRouter(t, Options{Backings: []Backing{{Name: "default", Kind: "memory", Backend: memory.New()}}})
-	r.EnableBackingManagement(config.StorageConfig{Backend: "memory"}, path, func(d config.BackingDefinition) (Backing, error) {
+	r.EnableBackingManagement(config.StorageConfig{Backend: "memory"}, path, BackingOpener{Open: func(d config.BackingDefinition) (Backing, error) {
 		return Backing{Name: d.Name, Kind: d.Backend, Path: d.Path, Backend: memory.New()}, nil
-	})
+	}})
 	return r
 }
 

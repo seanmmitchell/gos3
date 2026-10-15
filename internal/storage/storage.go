@@ -33,6 +33,16 @@ var (
 	ErrConfigNotFound     = errors.New("storage: bucket config not found")
 	ErrPreconditionFailed = errors.New("storage: precondition failed")
 	ErrInvalidName        = errors.New("storage: invalid name")
+	// ErrInvalidBacking is returned by CreateBucket for a backing name that
+	// is not configured.
+	ErrInvalidBacking = errors.New("storage: unknown backing")
+	// ErrBackingUnavailable is returned (wrapped) when the backing that
+	// holds a bucket's data is not configured any more or cannot be
+	// reached (network failure or a 5xx answer from a remote S3 service).
+	ErrBackingUnavailable = errors.New("storage: backing unavailable")
+	// ErrNotSupported is returned when the bucket's backing cannot perform
+	// an operation (e.g. versioning on a gateway backing).
+	ErrNotSupported = errors.New("storage: not supported by the bucket's backing")
 	// ErrStopWalk may be returned by a Walk callback to stop iteration early;
 	// the Walk method then returns nil.
 	ErrStopWalk = errors.New("storage: stop walk")
@@ -83,6 +93,10 @@ type BucketInfo struct {
 	Versioning        VersioningStatus
 	ObjectLockEnabled bool
 	Owner             string // IAM user name that created the bucket ("" = root)
+	// Backing names the backing holding the bucket's primary copy. The
+	// multi-backing router (internal/storage/multi) sets it; the backends
+	// behind it report "" (or what they were given). See docs/backings.md.
+	Backing string
 }
 
 // CreateBucketOptions are passed to CreateBucket.
@@ -90,6 +104,12 @@ type CreateBucketOptions struct {
 	Region            string
 	ObjectLockEnabled bool // implies Versioning = Enabled
 	Owner             string
+	// Backing names the backing to create the bucket on (the
+	// x-gos3-backing header; "" = the default backing). The multi-backing
+	// router (internal/storage/multi) validates it, returning
+	// ErrInvalidBacking for unknown names, and passes "" to the backing it
+	// creates the bucket on; other backends ignore it.
+	Backing string
 }
 
 // ObjectMeta is the metadata supplied by the S3 layer when committing an

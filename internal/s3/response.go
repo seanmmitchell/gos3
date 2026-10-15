@@ -268,6 +268,12 @@ func mapStorageError(err error) error {
 		return s3err.ErrPreconditionFailed
 	case errors.Is(err, storage.ErrInvalidName):
 		return s3err.ErrInvalidArgument.WithMessage("The specified name is not valid.")
+	case errors.Is(err, storage.ErrInvalidBacking):
+		return s3err.ErrInvalidArgument.WithMessage("The requested backing is not configured on this server.")
+	case errors.Is(err, storage.ErrNotSupported):
+		return s3err.ErrNotImplemented.WithMessage("This operation is not supported by the bucket's backing.")
+	case errors.Is(err, storage.ErrBackingUnavailable):
+		return s3err.ErrServiceUnavailable
 	case errors.Is(err, context.DeadlineExceeded), errors.Is(err, context.Canceled),
 		errors.Is(err, os.ErrDeadlineExceeded): // a stalled request body (countingBody)
 		return s3err.ErrRequestTimeout

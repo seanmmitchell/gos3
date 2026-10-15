@@ -48,9 +48,12 @@ const (
 	// single captured signed request).
 	MinRootSecretLen = 16
 
-	// BackendFS and BackendMemory are the StorageConfig.Backend values.
+	// BackendFS, BackendMemory and BackendS3 (a bucket of a remote S3
+	// service, see S3Config and docs/backings.md) are the values of
+	// StorageConfig.Backend and BackingConfig.Backend.
 	BackendFS     = "fs"
 	BackendMemory = "memory"
+	BackendS3     = "s3"
 
 	// DefaultBackingName names the backing configured by storage.backend
 	// and storage.path.
@@ -92,7 +95,7 @@ var DefaultExposeHeaders = []string{
 	"x-amz-server-side-encryption", "x-amz-object-lock-mode",
 	"x-amz-object-lock-retain-until-date", "x-amz-object-lock-legal-hold",
 	"x-amz-expiration", "x-amz-restore", "x-amz-website-redirect-location",
-	"x-amz-abort-date", "x-amz-abort-rule-id",
+	"x-amz-abort-date", "x-amz-abort-rule-id", "x-amz-bucket-region", "x-gos3-backing",
 }
 
 // DefaultSkipContentTypes are the media types stored uncompressed by
@@ -172,7 +175,12 @@ type Override struct {
 // call Validate before using it.
 //
 // storage.path defaults to DefaultDataPath for the fs backend only; with the
-// memory backend it stays empty (fully ephemeral) unless set explicitly.
+// memory and s3 backends it stays empty (system state is ephemeral) unless
+// set explicitly.
+//
+// After the overrides, the empty fields of every s3 backing in
+// storage.backings are filled from its GOS3_BACKING_<NAME>_* variables
+// (see BackingEnv).
 func Load(path string, overrides ...Override) (Config, error) {
 	return load(path, os.LookupEnv, overrides)
 }
@@ -200,6 +208,9 @@ func load(path string, lookup func(string) (string, bool), overrides []Override)
 		if err := cfg.Set(o.Key, o.Value); err != nil {
 			return Config{}, fmt.Errorf("config: %w", err)
 		}
+	}
+	if err := cfg.Storage.applyBackingEnv(lookup); err != nil {
+		return Config{}, fmt.Errorf("config: %w", err)
 	}
 	cfg.Normalize()
 	return cfg, nil
@@ -241,6 +252,7 @@ var yamlSections = map[string]string{
 	"config.ServerConfig":      "server",
 	"config.StorageConfig":     "storage",
 	"config.BackingConfig":     "storage.backings",
+	"config.S3Config":          "s3",
 	"config.ReplicationConfig": "storage.replication",
 	"config.AuthConfig":        "auth",
 	"config.UIConfig":          "ui",
@@ -288,6 +300,7 @@ func (c *Config) Normalize() {
 		}
 	}
 	c.Storage.DefaultBacking = strings.TrimSpace(c.Storage.DefaultBacking)
+	c.normalizeS3()
 	rp := &c.Storage.Replication
 	rp.DefaultMode = strings.ToLower(strings.TrimSpace(rp.DefaultMode))
 	rp.DefaultReplicas = trimList(rp.DefaultReplicas)
@@ -390,8 +403,15 @@ func (c Config) Validate() error {
 			return errors.New("storage.path: required for the fs backend")
 		}
 	case BackendMemory:
+	case BackendS3:
+		if c.Storage.S3 == nil {
+			return errNoS3
+		}
 	default:
-		return fmt.Errorf("storage.backend: %q is invalid (expected fs or memory)", c.Storage.Backend)
+		return fmt.Errorf("storage.backend: %q is invalid (expected fs, memory or s3)", c.Storage.Backend)
+	}
+	if c.Storage.Backend != BackendS3 && c.Storage.S3 != nil && !c.Storage.S3.IsZero() {
+		return fmt.Errorf("storage.s3: only used with storage.backend s3 (storage.backend is %q)", c.Storage.Backend)
 	}
 	if err := c.validateBackings(); err != nil {
 		return err
@@ -606,7 +626,8 @@ func normalizeSettings(s Settings) Settings {
 }
 
 // SystemDir returns the system state directory (<data>/.gos3), or "" when the
-// configuration is fully ephemeral (memory backend without a data path).
+// configuration is fully ephemeral (memory or s3 backend without a data
+// path).
 func (c Config) SystemDir() string {
 	if c.Storage.Path == "" {
 		return ""
@@ -639,12 +660,19 @@ func (c Config) TLSEnabled() bool { return c.Server.TLSCert != "" }
 // RedactedValue is the placeholder Config.Redacted substitutes for secrets.
 const RedactedValue = "<redacted>"
 
-// Redacted returns a deep copy with secrets (the root secret key) replaced
-// by "<redacted>", for printing and logging.
+// Redacted returns a deep copy with secrets (the root secret key and the
+// secret and encryption keys of s3 backings) replaced by "<redacted>", for
+// printing and logging.
 func (c Config) Redacted() Config {
 	if c.Auth.RootSecretKey != "" {
 		c.Auth.RootSecretKey = RedactedValue
 	}
+	c.Storage.S3 = c.Storage.S3.redacted()
+	c.Storage.Backings = slices.Clone(c.Storage.Backings)
+	for i := range c.Storage.Backings {
+		c.Storage.Backings[i].S3 = c.Storage.Backings[i].S3.redacted()
+	}
+	c.Storage.Replication.DefaultReplicas = slices.Clone(c.Storage.Replication.DefaultReplicas)
 	c.Server.Domains = slices.Clone(c.Server.Domains)
 	c.Server.TrustedProxies = slices.Clone(c.Server.TrustedProxies)
 	c.Server.AllowedHosts = slices.Clone(c.Server.AllowedHosts)

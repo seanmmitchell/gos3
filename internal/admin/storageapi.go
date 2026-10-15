@@ -3,7 +3,9 @@ package admin
 import (
 	"errors"
 	"net/http"
+	"strings"
 
+	"github.com/seanmmitchell/gos3/internal/config"
 	"github.com/seanmmitchell/gos3/internal/storage/multi"
 )
 
@@ -47,12 +49,46 @@ func (a *api) putBackingConfig(rc *reqCtx) (int, any, error) {
 	if err := rc.decodeBody(&in, false); err != nil {
 		return 0, nil, err
 	}
+	if err := a.checkBackingEndpoints(rc, r, in); err != nil {
+		return 0, nil, err
+	}
 	out, err := r.ConfigureBackings(rc.ctx, in)
 	if err != nil {
 		return 0, nil, err
 	}
 	a.log.Info("admin: backing configuration updated", "user", rc.id.User)
 	return http.StatusOK, out, nil
+}
+
+// checkBackingEndpoints refuses (400) an s3 backing of in whose endpoint
+// is new or changed and is this server (see checkNotSelf): the backing
+// would store its data back into this server. Unchanged endpoints are not
+// probed again.
+func (a *api) checkBackingEndpoints(rc *reqCtx, r *multi.Router, in multi.BackingConfiguration) error {
+	current := map[string]string{} // backing name -> configured s3 endpoint
+	if cur, err := r.BackingConfiguration(); err == nil {
+		for _, d := range cur.Backings {
+			if d.Backend == config.BackendS3 && d.S3 != nil {
+				current[d.Name] = d.S3.Endpoint
+			}
+		}
+	}
+	for _, d := range in.Backings {
+		if !strings.EqualFold(strings.TrimSpace(d.Backend), config.BackendS3) || d.S3 == nil {
+			continue
+		}
+		ep := strings.TrimRight(strings.TrimSpace(d.S3.Endpoint), "/")
+		if ep == "" {
+			continue // from the environment (BackingEnv): the operator's choice
+		}
+		if old, ok := current[strings.TrimSpace(d.Name)]; ok && old == ep {
+			continue
+		}
+		if err := a.checkNotSelf(rc.ctx, ep); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func (a *api) listBackings(rc *reqCtx) (int, any, error) {
@@ -64,7 +100,9 @@ func (a *api) listBackings(rc *reqCtx) (int, any, error) {
 	out := make([]backingJSON, len(list))
 	for i, b := range list {
 		out[i] = backingJSON{BackingStatus: b}
-		if b.Kind == "fs" && b.Path != "" {
+		// Disk statistics describe a local directory: fs backings only
+		// (memory and s3 backings have none).
+		if b.Kind == config.BackendFS && b.Path != "" {
 			out[i].Disk = diskUsage(b.Path)
 		}
 	}

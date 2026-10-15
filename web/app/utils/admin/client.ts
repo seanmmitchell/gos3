@@ -20,8 +20,6 @@ import type {
   BucketCompression,
   BucketEncryptionProvider,
   BucketEncryptionProviderInput,
-  ResticBacking,
-  ResticBackingInput,
   BucketSummary,
   CreateAccessKeyRequest,
   CreateUserRequest,
@@ -559,13 +557,6 @@ export class AdminClient {
 
   putBucketEncryptionProvider(name: string, body: BucketEncryptionProviderInput): Promise<BucketEncryptionProvider> {
     return this.request('PUT', `/buckets/${enc(name)}/encryption-provider`, { body })
-  }
-
-  getBackingRestic(name: string): Promise<ResticBacking> {
-    return this.request('GET', `/backings/${enc(name)}/restic`)
-  }
-  putBackingRestic(name: string, body: ResticBackingInput): Promise<ResticBacking> {
-    return this.request('PUT', `/backings/${enc(name)}/restic`, { body })
   }
 
   // Discovery --------------------------------------------------------------

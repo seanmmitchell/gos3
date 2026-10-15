@@ -114,6 +114,12 @@ export interface WhoAmI {
   policies: string[]
   capabilities: Capabilities
   server: Info
+  /**
+   * Storage backings new buckets can be created on (every authenticated
+   * caller; CreateBucket header x-gos3-backing). Absent from older servers;
+   * `available` is empty on servers without storage backings.
+   */
+  backings?: AvailableBackings
 }
 
 // ---------------------------------------------------------------------------
@@ -500,16 +506,44 @@ export interface BucketSummary {
 // Storage backings & bucket placement
 // ---------------------------------------------------------------------------
 
-/** "fs" | "memory" */
-export type BackingKind = 'fs' | 'memory'
+/** "fs" | "memory" | "s3" (a remote S3 service, see BackingMode) */
+export type BackingKind = 'fs' | 'memory' | 's3'
+
+/**
+ * Variant of a kind "s3" backing (absent = everything, data and metadata,
+ * stored in the remote bucket, every gos3 feature works):
+ * - gateway: objects stored natively in remote buckets named like the gos3
+ *            buckets (no versioning, no object lock; cannot be a replica or
+ *            move target)
+ */
+export type BackingMode = 'gateway'
+
+/** A backing new buckets can be created on (WhoAmI.backings.available). */
+export interface AvailableBacking {
+  name: string
+  kind: BackingKind | string
+  /** Kind "s3" only. */
+  mode?: BackingMode | string
+}
+
+/** WhoAmI.backings */
+export interface AvailableBackings {
+  /** Backing used when CreateBucket names none. */
+  default: string
+  available: AvailableBacking[] | null
+}
 
 /** A storage backend of the server (GET /backings). */
 export interface Backing {
   /** "default" is the backing configured by storage.backend / storage.path. */
   name: string
   kind: BackingKind | string
-  /** "" for memory. */
+  /** Kind "s3" only. */
+  mode?: BackingMode | string
+  /** "" for memory and s3. */
   path: string
+  /** Kind "s3" only: where the data lives, e.g. "s3://bucket/prefix/". */
+  location?: string
   /** New buckets are created here. */
   default: boolean
   /** The last health check or operation succeeded. */
@@ -526,13 +560,55 @@ export interface Backing {
   disk: DiskStats | null
 }
 
-/** GET /backings */
-export interface BackingDefinition {
-  name: string
-  backend: 'fs' | 'memory'
-  path: string
+/** Backend of a configured backing (GET/PUT /backings/config). */
+export type BackingBackend = 'fs' | 'memory' | 's3'
+
+/** S3 addressing style: '' = automatic. */
+export type S3Addressing = '' | 'path' | 'virtual'
+
+/**
+ * Connection and location of an s3 backing (BackingDefinition.s3). Secrets
+ * are write-only: GET reports whether they are set (and whether they come
+ * from the environment); a blank value on PUT keeps the stored one.
+ */
+export interface S3BackingDefinition {
+  /** Service URL, http(s) without a path. */
+  endpoint: string
+  region: string
+  bucket: string
+  /** Key prefix inside the bucket ("" = the whole bucket). */
+  prefix: string
+  addressing: S3Addressing
+  /** Multipart part size in bytes (0 / absent = server default). */
+  partSize?: number
+  /** Objects stored natively in remote buckets named like the gos3 buckets. */
+  gateway: boolean
+  accessKey: string
+  /** Write-only; blank keeps the stored secret. */
+  secretKey?: string
+  /** Write-only, base64 of 32 bytes; blank keeps the stored key. */
+  encryptionKey?: string
+  /** Read-only: a secret key is stored or set in the environment. */
+  secretKeyConfigured?: boolean
+  /** Read-only: an encryption key is stored or set in the environment. */
+  encryptionKeyConfigured?: boolean
+  /** Read-only: "env" when the secret key comes from the environment. */
+  secretKeySource?: 'env' | string
+  /** Read-only: "env" when the encryption key comes from the environment. */
+  encryptionKeySource?: 'env' | string
 }
 
+/** One configured backing (GET/PUT /backings/config). */
+export interface BackingDefinition {
+  name: string
+  backend: BackingBackend
+  /** fs only ("" otherwise). */
+  path: string
+  /** s3 only. */
+  s3?: S3BackingDefinition
+}
+
+/** GET/PUT /backings/config */
 export interface BackingConfiguration {
   backings: BackingDefinition[]
   defaultBacking: string
@@ -720,14 +796,14 @@ export type EncryptionProviderName = 'AES256' | 'restic'
 /**
  * GET/PUT /buckets/{name}/encryption-provider: the bucket's implementation
  * of SSE-S3 (native AES-256-GCM or restic), used for default encryption and
- * for uploads that request AES256. Restic storage is inherited from the
- * bucket's placement (backings).
+ * for uploads that request AES256. Restic repositories live on the backing
+ * holding each copy of the bucket.
  */
 export interface BucketEncryptionProvider {
   provider: EncryptionProviderName
   /**
    * Providers the bucket can use now (restic needs the restic executable on
-   * the server and filesystem storage for every copy). Absent when the
+   * the server and a filesystem or S3 backing for every copy). Absent when the
    * server cannot tell: then every provider is offered.
    */
   available?: EncryptionProviderName[]
@@ -735,24 +811,3 @@ export interface BucketEncryptionProvider {
   backings?: string[]
 }
 export interface BucketEncryptionProviderInput { provider: EncryptionProviderName }
-export interface ResticBacking {
- mode: 'local' | 's3'
- endpoint: string
- bucket: string
- prefix: string
- region: string
- credentialsConfigured: boolean
- sessionTokenConfigured: boolean
- locked: boolean
-}
-export interface ResticBackingInput {
- mode: 'local' | 's3'
- endpoint?: string
- bucket?: string
- prefix?: string
- region?: string
- accessKey?: string
- secretKey?: string
- sessionToken?: string
- clearSessionToken?: boolean
-}

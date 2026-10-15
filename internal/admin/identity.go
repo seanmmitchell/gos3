@@ -16,6 +16,8 @@ type whoAmI struct {
 	Policies     []string       `json:"policies"`
 	Capabilities capabilities   `json:"capabilities"`
 	Server       discovery.Info `json:"server"`
+	// Backings lets every caller pick a backing when creating a bucket.
+	Backings backingChoices `json:"backings"`
 }
 
 // capabilities are derived by evaluating admin actions for the caller at
@@ -97,7 +99,8 @@ func (a *api) whoami(rc *reqCtx) (int, any, error) {
 			// Root has no IAM keys to manage (POST /whoami/keys answers 400).
 			CreateOwnKeys: !rc.id.IsRoot && a.authorize(rc, actionCreateOwnKey, "", nil).Allowed,
 		},
-		Server: a.info(),
+		Server:   a.info(),
+		Backings: a.backingChoices(),
 	}, nil
 }
 

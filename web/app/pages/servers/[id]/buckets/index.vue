@@ -9,8 +9,8 @@ import { BYPASS_GOVERNANCE_HELP, FORCE_DELETE_LOCKED_TITLE, forceDeleteBlock } f
 
 /**
  * Bucket list. gos3 identities with admin rights get the admin listing
- * (usage, versioning, public / object-lock flags); everybody else gets plain
- * S3 ListBuckets.
+ * (usage, versioning, public / object-lock flags, placement);
+ * everybody else gets plain S3 ListBuckets.
  */
 useHead({ title: 'Buckets' })
 
@@ -19,7 +19,7 @@ const router = useRouter()
 const confirm = useConfirm()
 const toast = useToast()
 const { connection, isGos3, admin, s3, requireS3, requireAdmin } = useConnection()
-const { can } = useWhoAmI()
+const { can, whoami } = useWhoAmI()
 
 const serverId = computed(() => routeParam(route.params.id))
 
@@ -33,6 +33,17 @@ interface BucketRow {
   usage?: BucketUsage | null
   /** Storage backing / replication (gos3 with storage backings). */
   placement?: PlacementSummary
+}
+
+/** Kind / mode of a backing named in a placement (WhoAmI.backings). */
+function backingInfo(name: string) {
+  const b = findBacking(name, whoami.value?.backings)
+  return b ? backingKindInfo(b) : undefined
+}
+
+/** The bucket's primary copy is on a gateway backing (no versioning). */
+function onGateway(row: BucketRow): boolean {
+  return isGatewayBacking(findBacking(row.placement?.primary, whoami.value?.backings))
 }
 
 interface Listing {
@@ -419,11 +430,12 @@ const isAccessDenied = computed(() => {
         <template #versioning-cell="{ row }">
           <UBadge v-if="row.original.versioning === 'Enabled'" color="success" variant="subtle" size="sm" label="Enabled" />
           <UBadge v-else-if="row.original.versioning === 'Suspended'" color="warning" variant="subtle" size="sm" label="Suspended" />
+          <span v-else-if="onGateway(row.original)" class="text-sm text-muted" title="Gateway backings do not support versioning">n/a</span>
           <span v-else class="text-sm text-muted">Off</span>
         </template>
         <template #placement-cell="{ row }">
           <div class="flex flex-wrap items-center gap-1" data-testid="placement-chips">
-            <UTooltip v-for="chip in placementChips(row.original.placement)" :key="chip.label" :text="chip.title">
+            <UTooltip v-for="chip in placementChips(row.original.placement, backingInfo)" :key="chip.label" :text="chip.title">
               <UBadge :label="chip.label" :color="chip.color" :icon="chip.icon" variant="subtle" size="sm" />
             </UTooltip>
           </div>
@@ -477,6 +489,7 @@ const isAccessDenied = computed(() => {
       :client="s3"
       :default-region="connection?.region"
       :existing-names="data?.rows.map(r => r.name)"
+      :backings="isGos3 ? whoami?.backings : null"
       @created="onCreated"
     />
   </div>

@@ -2,8 +2,11 @@ package multi
 
 import (
 	"context"
+	"encoding/xml"
 	"errors"
 	"fmt"
+	"slices"
+	"strings"
 
 	"github.com/seanmmitchell/gos3/internal/storage"
 )
@@ -13,14 +16,19 @@ var _ storage.EncryptionBackend = (*Router)(nil)
 
 // PrepareEncryption prepares mode's keys or repository for the bucket on
 // its primary, which receives every write first (see
-// storage.EncryptionBackend). Replicas prepare their own copy when they
-// receive data.
+// storage.EncryptionBackend). Every other backing holding or receiving a
+// copy must offer mode too (see membersOffer), else the write is refused
+// (errors.ErrUnsupported): its copy could never be replicated. Replicas
+// prepare their own keys when they receive data.
 func (r *Router) PrepareEncryption(ctx context.Context, bucket, mode string) error {
-	b, err := r.primary(bucket)
+	members, err := r.placementBackings(bucket)
 	if err != nil {
 		return err
 	}
-	e, ok := b.Backend.(storage.EncryptionBackend)
+	if err := membersOffer(ctx, members, bucket, mode); err != nil {
+		return err
+	}
+	e, ok := members[0].Backend.(storage.EncryptionBackend)
 	if !ok {
 		return errors.ErrUnsupported
 	}
@@ -28,20 +36,16 @@ func (r *Router) PrepareEncryption(ctx context.Context, bucket, mode string) err
 }
 
 // ValidateEncryptionSettings checks cfg on the bucket's primary (see
-// storage.EncryptionBackend). Restic additionally requires that every
-// other backing holding or receiving a copy of the bucket can store restic
-// archives: a copy it cannot store would never be replicated.
+// storage.EncryptionBackend), after checking that every backing holding or
+// receiving a copy of the bucket offers the provider (see membersOffer): a
+// copy it cannot store would never be replicated.
 func (r *Router) ValidateEncryptionSettings(ctx context.Context, bucket string, cfg storage.EncryptionSettings) error {
 	members, err := r.placementBackings(bucket)
 	if err != nil {
 		return err
 	}
-	if cfg.Provider == storage.EncryptionRestic {
-		for _, b := range members[1:] {
-			if !storesRestic(b) {
-				return fmt.Errorf("backing %q of bucket %q cannot store restic archives: %w", b.Name, bucket, errors.ErrUnsupported)
-			}
-		}
+	if err := membersOffer(ctx, members, bucket, cfg.Provider); err != nil {
+		return err
 	}
 	e, ok := members[0].Backend.(storage.EncryptionBackend)
 	if !ok {
@@ -50,70 +54,47 @@ func (r *Router) ValidateEncryptionSettings(ctx context.Context, bucket string, 
 	return e.ValidateEncryptionSettings(ctx, bucket, cfg)
 }
 
-// ResticBacking returns the restic settings interface of the backing
-// name: errors.ErrUnsupported when it cannot store restic archives.
-func (r *Router) ResticBacking(name string) (storage.ResticBackingBackend, error) {
-	r.adminMu.Lock()
-	defer r.adminMu.Unlock()
-	if _, err := r.resticBackend(name); err != nil {
-		return nil, err
+// membersOffer checks that every backing of members can store bucket's
+// data encrypted with provider (see providersOf), returning a wrapped
+// errors.ErrUnsupported naming the first that cannot.
+func membersOffer(ctx context.Context, members []*backing, bucket, provider string) error {
+	for _, b := range members {
+		if !slices.Contains(providersOf(ctx, b, bucket), provider) {
+			return fmt.Errorf("backing %q holding a copy of bucket %q cannot store %s-encrypted data: %w",
+				b.Name, bucket, provider, errors.ErrUnsupported)
+		}
 	}
-	return routerResticBacking{r: r, name: name}, nil
+	return nil
 }
 
-// resticBackend returns the restic settings interface of the backing name.
-// Resolve under adminMu so live reconfiguration cannot close a backing while
-// its restic settings are being inspected or credentials are being validated.
-func (r *Router) resticBackend(name string) (storage.ResticBackingBackend, error) {
-	if r.closed.Load() {
-		return nil, ErrClosed
+// checkWriteEncryption refuses (fail closed) an encrypted write to bucket
+// when a backing holding or receiving a copy of it cannot store the
+// encryption: the version would never reach that copy. Writes through the
+// S3 layer are refused earlier, by PrepareEncryption.
+func (r *Router) checkWriteEncryption(ctx context.Context, bucket string, opts storage.WriteOptions) error {
+	if opts.Encryption == "" {
+		return nil
 	}
-	b := r.topology.Load().backings[name]
-	if b == nil {
-		return nil, ErrUnknownBacking
-	}
-	e, ok := b.Backend.(storage.ResticBackingBackend)
-	if !ok {
-		return nil, errors.ErrUnsupported
-	}
-	return e, nil
-}
-
-// routerResticBacking is the storage.ResticBackingBackend of one named
-// backing. Every call resolves the backing again under adminMu, so it acts
-// on the backing currently configured under that name.
-type routerResticBacking struct {
-	r    *Router
-	name string
-}
-
-// ResticBackingSettings implements storage.ResticBackingBackend.
-func (b routerResticBacking) ResticBackingSettings(ctx context.Context) (*storage.ResticS3, bool, error) {
-	b.r.adminMu.Lock()
-	defer b.r.adminMu.Unlock()
-	e, err := b.r.resticBackend(b.name)
-	if err != nil {
-		return nil, false, err
-	}
-	return e.ResticBackingSettings(ctx)
-}
-
-// ConfigureResticBacking implements storage.ResticBackingBackend.
-func (b routerResticBacking) ConfigureResticBacking(ctx context.Context, cfg *storage.ResticS3) error {
-	b.r.adminMu.Lock()
-	defer b.r.adminMu.Unlock()
-	e, err := b.r.resticBackend(b.name)
+	members, err := r.placementBackings(bucket)
 	if err != nil {
 		return err
 	}
-	return e.ConfigureResticBacking(ctx, cfg)
+	return membersOffer(ctx, members, bucket, opts.Encryption)
 }
 
-// storesRestic reports whether backing b can store restic archives (it has
-// restic repository settings; the memory backend has none).
-func storesRestic(b *backing) bool {
-	_, ok := b.Backend.(storage.ResticBackingBackend)
-	return ok
+// providersOf returns the SSE-S3 implementations backing b can store for
+// bucket (see storage.EncryptionProvidersBackend). A backend without that
+// interface, or one that fails to answer, supports none.
+func providersOf(ctx context.Context, b *backing, bucket string) []string {
+	e, ok := b.Backend.(storage.EncryptionProvidersBackend)
+	if !ok {
+		return nil
+	}
+	p, err := e.EncryptionProviders(ctx, bucket)
+	if err != nil {
+		return nil
+	}
+	return p
 }
 
 // placementBackings returns the backings holding or receiving a copy of
@@ -144,27 +125,53 @@ func (r *Router) placementBackings(bucket string) ([]*backing, error) {
 	return out, nil
 }
 
-// checkResticTarget refuses to place a copy of bucket on backing b when b
-// cannot store restic archives but the bucket archives new writes with
-// restic or holds restic versions: replication to b would never complete.
-// primary is the bucket's primary. Finding restic versions walks every
-// version of the bucket, which only happens for such backings.
-func (r *Router) checkResticTarget(ctx context.Context, bucket string, primary, b *backing) error {
-	if storesRestic(b) {
+// checkEncryptionTarget refuses to place a copy of bucket on backing b
+// when b lacks an SSE-S3 implementation the bucket uses or will use:
+//
+//   - the provider selected explicitly (storage.ConfigEncryptionProvider);
+//   - without one, the implicit storage.EncryptionAES256 when the bucket
+//     encrypts new objects by default (storage.ConfigEncryption);
+//   - that of any stored version (including versions kept after the
+//     provider changed).
+//
+// Replication to b would never complete. primary is the bucket's primary.
+// Finding the providers in use walks every version of the bucket, which is
+// skipped when b offers every known provider.
+func (r *Router) checkEncryptionTarget(ctx context.Context, bucket string, primary, b *backing) error {
+	offered := providersOf(ctx, b, bucket)
+	if slices.Contains(offered, storage.EncryptionAES256) && slices.Contains(offered, storage.EncryptionRestic) {
 		return nil
 	}
-	refuse := fmt.Errorf("%w: bucket %q stores restic archives, which backing %q cannot store", ErrInvalidPlacement, bucket, b.Name)
-	provider, err := storage.EncryptionProvider(ctx, primary.Backend, bucket)
-	if err != nil {
-		return err
+	refuse := func(provider string) error {
+		return fmt.Errorf("%w: bucket %q stores %s-encrypted data, which backing %q cannot store", ErrInvalidPlacement, bucket, provider, b.Name)
 	}
-	if provider == storage.EncryptionRestic {
-		return refuse
+	raw, err := primary.Backend.GetBucketConfig(ctx, bucket, storage.ConfigEncryptionProvider)
+	switch {
+	case err == nil:
+		provider, err := storage.ParseEncryptionProvider(raw)
+		if err != nil {
+			return err
+		}
+		if !slices.Contains(offered, provider) {
+			return refuse(provider)
+		}
+	case errors.Is(err, storage.ErrConfigNotFound):
+		raw, err := primary.Backend.GetBucketConfig(ctx, bucket, storage.ConfigEncryption)
+		switch {
+		case err == nil:
+			if defaultSSE(raw) && !slices.Contains(offered, storage.EncryptionAES256) {
+				return refuse(storage.EncryptionAES256)
+			}
+		case !errors.Is(err, storage.ErrConfigNotFound):
+			return r.observe(primary, err)
+		}
+	default:
+		return r.observe(primary, err)
 	}
-	found := false
+	missing := ""
 	err = primary.Backend.WalkVersions(ctx, bucket, "", "", "", func(oi storage.ObjectInfo) error {
-		if oi.Encryption == storage.EncryptionRestic {
-			found = true
+		if oi.Encryption != "" && !slices.Contains(offered, oi.Encryption) {
+			missing = oi.Encryption
 			return storage.ErrStopWalk
 		}
 		return nil
@@ -172,14 +179,59 @@ func (r *Router) checkResticTarget(ctx context.Context, bucket string, primary, 
 	if err != nil {
 		return r.observe(primary, err)
 	}
-	if found {
-		return refuse
+	if missing != "" {
+		return refuse(missing)
 	}
 	return nil
 }
 
-// checkNewMembers runs checkResticTarget for each backing of names that
-// does not hold a copy of the bucket (state bs) yet.
+// sseConfig is the part of a stored storage.ConfigEncryption document
+// (ServerSideEncryptionConfiguration XML) that says whether new objects
+// are encrypted by default.
+type sseConfig struct {
+	Rules []struct {
+		Default *struct {
+			SSEAlgorithm string `xml:"SSEAlgorithm"`
+		} `xml:"ApplyServerSideEncryptionByDefault"`
+	} `xml:"Rule"`
+}
+
+// defaultSSE reports whether the storage.ConfigEncryption document raw
+// encrypts new objects by default. The S3 layer applies SSE-S3 for any
+// algorithm (a legacy AWS KMS default included) and ignores an invalid
+// document.
+func defaultSSE(raw []byte) bool {
+	var doc sseConfig
+	if xml.Unmarshal(raw, &doc) != nil {
+		return false
+	}
+	for _, rule := range doc.Rules {
+		if rule.Default != nil && strings.TrimSpace(rule.Default.SSEAlgorithm) != "" {
+			return true
+		}
+	}
+	return false
+}
+
+// canImport reports whether backing b can receive copies of buckets
+// (storage.VersionImporter): an s3 gateway backing cannot.
+func canImport(b *backing) bool {
+	_, ok := b.Backend.(storage.VersionImporter)
+	return ok
+}
+
+// errNoImport describes why backing name cannot receive copies.
+func errNoImport(name string) string {
+	return fmt.Sprintf("backing %q cannot hold replicas or receive moves (S3 gateway backing)", name)
+}
+
+// checkNewMembers checks the backings of names that do not hold a copy of
+// the bucket (state bs) yet before they receive one: each must import
+// versions (see canImport) and store the bucket's encryption (see
+// checkEncryptionTarget). A bucket whose primary cannot import versions
+// either (an s3 gateway backing, which keeps no version history to copy
+// from) gets no new copies at all: replicas of it and moves of it are
+// refused.
 func (r *Router) checkNewMembers(ctx context.Context, bucket string, bs *bucketState, names []string) error {
 	r.mu.RLock()
 	rec := bs.rec
@@ -191,6 +243,7 @@ func (r *Router) checkNewMembers(ctx context.Context, bucket string, bs *bucketS
 	if primary == nil {
 		return fmt.Errorf("%w %q of bucket %q", ErrUnknownBacking, rec.primary(), bucket)
 	}
+	var added []*backing
 	for _, name := range names {
 		if rec.member(name) >= 0 {
 			continue
@@ -201,7 +254,17 @@ func (r *Router) checkNewMembers(ctx context.Context, bucket string, bs *bucketS
 		if b == nil {
 			return fmt.Errorf("%w %q", ErrUnknownBacking, name)
 		}
-		if err := r.checkResticTarget(ctx, bucket, primary, b); err != nil {
+		if !canImport(b) {
+			return fmt.Errorf("%w: %s", ErrInvalidPlacement, errNoImport(name))
+		}
+		added = append(added, b)
+	}
+	if len(added) > 0 && !canImport(primary) {
+		return fmt.Errorf("%w: bucket %q cannot be replicated or moved: its primary backing %q is an S3 gateway backing, "+
+			"which keeps no version history to copy", ErrInvalidPlacement, bucket, primary.Name)
+	}
+	for _, b := range added {
+		if err := r.checkEncryptionTarget(ctx, bucket, primary, b); err != nil {
 			return err
 		}
 	}
