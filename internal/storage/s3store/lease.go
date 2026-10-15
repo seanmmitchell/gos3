@@ -253,22 +253,48 @@ func (s *session) renew() error {
 }
 
 // releaseLease marks the lease released so another server can take over at
-// once (best effort; used by Close and failed Opens).
+// once (best effort; used by Close and failed Opens). The ETag the session
+// knows may be stale: a renewal can land after its context was cancelled
+// (Close stops the keeper mid-request) or after its answer was lost. On a
+// failed conditional write the lease is read back and, while it is still
+// ours (same owner and epoch), released again under its current ETag.
 func (s *session) releaseLease() {
 	if s.lease.etag == "" {
 		return
 	}
 	e := s.e
-	doc := s.lease.doc
-	doc.Released = true
-	doc.Renewals++
-	body, _ := json.Marshal(doc)
+	r := e.remote()
+	key := e.keys.lease()
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	etag, err := e.remote().put(ctx, e.keys.lease(), body, s3client.PutOptions{IfMatch: s.lease.etag, NoRetry: true})
-	if err != nil {
-		e.logger().Warn("s3store: lease release failed", "err", err)
-		return
+	cur, etag := s.lease.doc, s.lease.etag
+	var err error
+	for attempt := 0; attempt < 3; attempt++ {
+		doc := cur
+		doc.Released = true
+		doc.Renewals++
+		body, _ := json.Marshal(doc)
+		var newETag string
+		newETag, err = r.put(ctx, key, body, s3client.PutOptions{IfMatch: etag, NoRetry: true})
+		if err == nil {
+			s.lease.doc, s.lease.etag = doc, newETag
+			return
+		}
+		var got leaseDoc
+		gotETag, rerr := r.getJSON(ctx, key, &got)
+		switch {
+		case rerr != nil:
+			e.logger().Warn("s3store: lease release failed", "err", err, "readErr", rerr)
+			return
+		case got.Owner != s.owner || got.Epoch != s.epoch:
+			// Taken over meanwhile: nothing of ours to release.
+			return
+		case got.Released:
+			// Our release landed although its answer was lost.
+			s.lease.doc, s.lease.etag = got, gotETag
+			return
+		}
+		cur, etag = got, gotETag
 	}
-	s.lease.doc, s.lease.etag = doc, etag
+	e.logger().Warn("s3store: lease release failed", "err", err)
 }
