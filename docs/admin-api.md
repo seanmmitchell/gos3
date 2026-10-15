@@ -65,7 +65,8 @@ ARNs, policy variables such as `${aws:username}` included):
 |---|---|
 | `arn:gos3:admin:::user/<name>` | CreateUser (the new user's name), GetUser, UpdateUser, DeleteUser, CreateAccessKey (the target user; choosing the access key ID also needs it at service level), UpdateAccessKey / DeleteAccessKey (the key's owner; an unknown key is evaluated at service level) |
 | `arn:gos3:admin:::policy/<name>` | GetPolicy, PutPolicy, DeletePolicy |
-| `arn:gos3:admin:::bucket/<name>` | GetBucket, ForceDeleteBucket, GetBucketCompression, PutBucketCompression, GetBucketEncryption, PutBucketEncryption, GetBucketPlacement, UpdateBucketPlacement |
+| `arn:gos3:admin:::bucket/<name>` | GetBucket, CreateBucket, ForceDeleteBucket, ReleaseBucket, GetBucketCompression, PutBucketCompression, GetBucketEncryption, PutBucketEncryption, GetBucketPlacement, UpdateBucketPlacement |
+| `arn:gos3:admin:::backing/<name>` | ListRemoteBuckets, CreateRemoteBucket, AdoptRemoteBucket, ManageContainers (s3 backings, see [Remote buckets and containers](#remote-buckets-and-containers-s3-backings)) |
 | service level | every other action (list actions, config, stats, discovery, simulate, self-service) |
 
 The policy resources `*` and `arn:gos3:admin:::*` match every admin
@@ -78,7 +79,7 @@ Allow with `NotResource` covers only the namespaces its list names: `"Action":
 outside `secret` and no admin action (a Deny with `NotResource` applies to
 everything not listed, as on AWS). New policy
 documents may only use `arn:gos3:admin:::*` and
-`arn:gos3:admin:::<type>/<name>` with type `user`, `policy` or `bucket` (or
+`arn:gos3:admin:::<type>/<name>` with type `user`, `policy`, `bucket` or `backing` (or
 a wildcard pattern of them); other `arn:gos3:` resources are 400
 `InvalidPolicy`.
 
@@ -123,7 +124,7 @@ Non-2xx responses: `{"error": {"code": "<Code>", "message": "<text>"}}`.
   "policies": ["readwrite"],
   "capabilities": {           // derived by evaluating the actions below at
                               // service level (grants scoped to some users,
-                              // policies or buckets do not show here)
+                              // policies, buckets or backings do not show here)
     "admin": false,           // any admin:* allowed (self-service excluded)
     "viewInfo": true,         // admin:ServerInfo
     "viewStats": false,       // admin:GetStats
@@ -138,17 +139,30 @@ Non-2xx responses: `{"error": {"code": "<Code>", "message": "<text>"}}`.
     "scan": false,            // admin:ScanNetwork
     "probe": false,           // admin:ProbeNetwork
     "createOwnKeys": false,   // admin:CreateOwnAccessKey explicitly allowed (always false for root)
-    "manageCompression": false // admin:PutBucketCompression
+    "manageCompression": false, // admin:PutBucketCompression
+    "browseRemote": false,    // admin:ListRemoteBuckets
+    "createRemote": false,    // admin:CreateRemoteBucket
+    "adoptRemote": false,     // admin:AdoptRemoteBucket
+    "manageContainers": false // admin:ManageContainers
   },
   "server": Info,             // same as GET /_gos3/info
   "backings": {               // storage backings a new bucket can be put on (x-gos3-backing),
                               // shown to every caller; details: GET /backings
     "default": "default",
-    "available": [ { "name": "default", "kind": "fs" }, { "name": "cold", "kind": "s3" },
-                   { "name": "shared", "kind": "s3", "mode": "gateway" } ]  // mode: gateway backings only
+    "available": [
+      { "name": "default", "kind": "fs" },
+      { "name": "cloud", "kind": "s3",
+        "kinds": ["native", "wrapped"],   // bucket kinds offered (s3 backings only)
+        "defaultKind": "wrapped",         // kind of buckets created without x-gos3-bucket-kind
+        "containers": [                   // containers of wrapped buckets (x-gos3-container)
+          { "id": "home", "label": "shared", "default": true },
+          { "id": "c-7f3a", "label": "photos-archive" } ] } ]
   }
 }
 ```
+
+Container labels are set by administrators and shown to every caller (as
+are backing names); don't put secrets in them.
 
 ### Server
 | Method | Path | Action | Response |
@@ -264,7 +278,7 @@ environment and flags for these fields.
 | GET | `/policies/{name}` | GetPolicy | `iam.NamedPolicy` |
 | PUT | `/policies/{name}` | PutPolicy | body `{"description"?, "document": PolicyDocument}` → `iam.NamedPolicy` (creating a policy named `.` or `..` is 400 `InvalidName`) |
 | DELETE | `/policies/{name}` | DeletePolicy | 204 (409 if attached, 400 if builtin) |
-| POST | `/authz/simulate` | SimulatePolicy | body `{"user": "alice" \| "root" \| "" (anonymous), "action": "s3:GetObject", "bucket": "b", "key": "k", "resource"?: "arn:gos3:admin:::user/bob", "conditions"?: {"aws:SourceIp": "10.0.0.1" \| ["…"]}}` → `{"allowed": bool, "explicitDeny": bool, "reason": "…"}` (bucket policy and bucket ACL of `bucket` are included; 404 for an unknown user or bucket). `bucket`/`key` are for s3 actions, `resource` (empty = service level, or `arn:gos3:admin:::{user,policy,bucket}/<name>`) for admin actions; mixing them is 400 |
+| POST | `/authz/simulate` | SimulatePolicy | body `{"user": "alice" \| "root" \| "" (anonymous), "action": "s3:GetObject", "bucket": "b", "key": "k", "resource"?: "arn:gos3:admin:::user/bob", "conditions"?: {"aws:SourceIp": "10.0.0.1" \| ["…"]}}` → `{"allowed": bool, "explicitDeny": bool, "reason": "…"}` (bucket policy and bucket ACL of `bucket` are included; 404 for an unknown user or bucket). `bucket`/`key` are for s3 actions, `resource` (empty = service level, or `arn:gos3:admin:::{user,policy,bucket,backing}/<name>`) for admin actions; mixing them is 400 |
 
 ### Buckets (management helpers; regular bucket ops use the S3 API)
 | Method | Path | Action | Response |
@@ -274,12 +288,15 @@ environment and flags for these fields.
 | GET | `/buckets/{name}/compression` | GetBucketCompression | `BucketCompression` |
 | PUT | `/buckets/{name}/compression` | PutBucketCompression | body `{"enabled": bool}` → `BucketCompression`. 409 `Conflict` when it contradicts the server's `compression.mode` (`true` while `disabled`, `false` while `enforced`); 400 for any other body |
 | DELETE | `/buckets/{name}/compression` | PutBucketCompression | removes the bucket's setting (back to the server default) → 204; idempotent |
+| POST | `/buckets/{name}/release` | ReleaseBucket | forgets a **native** bucket of an s3 backing without touching the remote bucket or its objects → 204. 409 `Conflict` while the bucket has replicas or a move in progress ("remove replicas first"); 400 `InvalidRequest` for buckets that are not native (their data would be orphaned: delete them instead) |
 | DELETE | `/buckets/{name}?force=true` | ForceDeleteBucket | deletes all versions, delete markers, uploads and configs, then the bucket → 204. Without `force` behaves like S3 DeleteBucket (409 if not empty; in-progress uploads alone do not make a bucket non-empty, they are aborted with it). Object lock is honoured: any version under legal hold or unexpired COMPLIANCE retention → 409 before anything is deleted; unexpired GOVERNANCE retention → 409 unless `bypassGovernanceRetention=true` is added (only with `force`, else 400), which also requires `s3:BypassGovernanceRetention` on each such object (identity policies; 403 otherwise). |
 
 ```jsonc
 // BucketSummary
 { "name": "photos", "createdAt": "…", "region": "us-east-1",
   "versioning": "Enabled" | "Suspended" | "", "objectLock": false, "owner": "alice",
+  "kind": "native" | "wrapped",   // s3 backings only (omitted otherwise)
+  "location": "s3://acme-photos/", // s3 backings: remote bucket (native) or container (wrapped)
   "configs": { "policy": true, "cors": false, "lifecycle": true, "tagging": false,
                "encryption": false, "website": false, "objectLock": false, "acl": "private" },
   "public": false,          // bucket policy grants anonymous access or ACL public-*
@@ -313,10 +330,13 @@ repositories from each assigned backing.
 
 `available` lists the providers the bucket can use now, the ones every
 backing holding a copy of the bucket (primary, replicas and a move target)
-can store: `AES256` needs an encryption key on every s3 backing among them;
-`restic` needs the restic executable on the server and every copy on a
-filesystem backing or an s3 backing with an encryption key (not memory, not
-a gateway). See [encryption.md](encryption.md#where-keys-and-repositories-live).
+can store: `AES256` needs every copy on an s3 backing to be a wrapped bucket
+of a backing with an encryption key; `restic` needs the restic executable on
+the server and every copy on a filesystem backing or in a wrapped bucket of
+an s3 backing with an encryption key (not memory). Native buckets of s3
+backings (stored as-is in their remote bucket) offer no provider: their
+`available` list is empty and PUT answers 400. See
+[encryption.md](encryption.md#where-keys-and-repositories-live).
 PUT refuses an unavailable provider with 400. Otherwise it validates the provider and prepares the
 bucket's keys or restic repository **before** saving the selection; if that
 fails it returns 400 and the previous provider stays in effect. A missing
@@ -330,7 +350,7 @@ with the bucket.
 
 Restic repositories follow the bucket's backings and have no settings of
 their own: an fs backing keeps them in its data directory, an s3 backing in
-its remote bucket.
+the container holding the (wrapped) bucket.
 
 ### Storage backings and bucket placement
 
@@ -349,7 +369,7 @@ for the semantics.
 | PUT | `/backings/config` | UpdateConfig | full `BackingConfiguration` → updated configuration, applied live and persisted before success |
 | GET | `/buckets/{name}/placement` | GetBucketPlacement | `Placement` |
 | PUT | `/buckets/{name}/placement` | UpdateBucketPlacement | body `{"mode": "single" \| "active-passive" \| "active-active", "replicas": ["fast", …]}` → `Placement`. Sets the replication mode and the replica backings (the primary stays). `single` needs an empty `replicas`, the other modes at least one. New replicas start a full copy (`state` `syncing`); removed replicas lose their copy (deleted in the background). 400 `InvalidRequest` for an unknown backing, the primary listed as a replica, or a duplicate; 409 `Conflict` while a move is in progress or while the bucket's copy on a backing being added is still being deleted |
-| POST | `/buckets/{name}/placement/move` | UpdateBucketPlacement | body `{"to": "archive", "from"?: "<backing>"}` → 202 `Placement`. Moves the copy on `from` (default: the primary) to `to`, online: `to` is filled in the background while the bucket stays readable and writable, then a short cutover (writes to the bucket wait, at most 60 s, for in-flight writes to finish) makes `to` take `from`'s place and `from`'s copy is deleted. In-progress multipart uploads are not moved: after a move of the primary they fail with `NoSuchUpload`. 400 for an unknown backing or a `from` that is not a member; 409 when a move is already in progress or `to` already holds a copy |
+| POST | `/buckets/{name}/placement/move` | UpdateBucketPlacement | body `{"to": "archive", "from"?: "<backing>", "container"?: "<container id>"}` → 202 `Placement`. `container` chooses the container of the copy on an s3 `to` backing (default: the backing's default container; copies on s3 backings are always wrapped buckets). Moves the copy on `from` (default: the primary) to `to`, online: `to` is filled in the background while the bucket stays readable and writable, then a short cutover (writes to the bucket wait, at most 60 s, for in-flight writes to finish) makes `to` take `from`'s place and `from`'s copy is deleted. In-progress multipart uploads are not moved: after a move of the primary they fail with `NoSuchUpload`. 400 for an unknown backing or a `from` that is not a member; 409 when a move is already in progress or `to` already holds a copy |
 | DELETE | `/buckets/{name}/placement/move` | UpdateBucketPlacement | cancels the move in progress → `Placement` (the partial copy on `to` is deleted); 409 when there is none or its cutover already started |
 | POST | `/buckets/{name}/placement/promote` | UpdateBucketPlacement | body `{"backing": "fast", "force"?: false}` → `Placement`. Makes a replica the primary (the old primary becomes a replica). Without `force` the replica must have finished its initial copy, and pending changes are copied to it during a cutover (as for a move) before the switch, so nothing is lost. `force: true` switches immediately, e.g. when the primary's backing is down: changes not yet copied to the replica are lost (the old primary is re-copied from the new one). 400 when `backing` is not a replica; 409 when it has not finished its initial copy (without `force`) or a move is in progress |
 | POST | `/buckets/{name}/placement/resync` | UpdateBucketPlacement | body `{"backing"?: "fast"}` (default: every replica) → 202 `Placement`. Compares the replica(s) with the primary and copies every difference (versions, metadata, bucket configuration) |
@@ -374,11 +394,12 @@ system data directory, changes apply live but are lost at restart.
   "s3": {                      // s3 only (omitted otherwise); see backings.md
     "endpoint": "https://s3.eu-central-1.amazonaws.com",  // required, no path
     "region": "eu-central-1",  // "" = us-east-1
-    "bucket": "acme-gos3-cold",// required; must exist
-    "prefix": "gos3/",
+    "homeBucket": "acme-gos3", // optional: where gos3 keeps the backing's records and its shared
+                               // container; "" = records in the server's system directory
+    "homePrefix": "gos3/",     // optional, needs homeBucket
+    "defaultKind": "wrapped",  // "wrapped" (needs a home) | "native"; "" = wrapped with a home, else native
     "addressing": "",          // "" (auto) | "path" | "virtual"
     "partSize": 16777216,      // bytes, 5 MiB-5 GiB; omitted/0 = default
-    "gateway": false,
     "accessKey": "AKIA…",
     "secretKey": "…",          // write-only: never returned
     "encryptionKey": "…",      // write-only: base64 of 32 bytes, never returned
@@ -389,6 +410,10 @@ system data directory, changes apply live but are lost at restart.
     "encryptionKeySource": "env",
     "envFields": ["endpoint", "secret_key"] } } // read-only: fields filled from GOS3_BACKING_<NAME>_*
 ```
+
+The keys `bucket`, `prefix` and `gateway` of earlier versions are accepted
+on PUT (mapped to `homeBucket`, `homePrefix` and `defaultKind: "native"`)
+and never returned.
 
 The secret key and the encryption key are **write-only**. GET returns them
 blank, with `secretKeyConfigured` / `encryptionKeyConfigured` set; on PUT a
@@ -401,14 +426,14 @@ are ignored on PUT. `backings.json` (mode 0600) stores the other secrets.
 
 A backing is matched to its current definition by name. Unchanged
 definitions are left alone. A change of an s3 backing's connection settings
-(endpoint, region, credentials, encryption key, addressing, part size) is
-applied in place, also while it holds buckets: gos3 connects with the new
-settings and verifies the backing's marker and encryption key before
-switching; on failure the backing keeps running unchanged. A **gateway**
-backing's connection settings can change this way only while it holds no
-buckets (409 `Conflict` otherwise: change them in the configuration and
-restart). Any other change (an fs path; an s3 bucket, prefix or gateway
-switch; the backend) replaces the backing, which needs it unused and empty.
+(endpoint, region, credentials, encryption key, addressing, part size) or
+of its `defaultKind` is applied in place, also while it holds buckets: gos3
+connects with the new settings and verifies the home's and every
+container's marker and encryption key (and, for a backing without a home,
+access to its native buckets) before switching; on failure the backing
+keeps running unchanged. Any other change (an fs path; an s3 home bucket or
+prefix, including adding or removing the home; the backend) replaces the
+backing, which needs it unused and empty.
 An s3 backing that holds no placed bucket can be removed or replaced even
 while its service is unreachable (the remote data is left untouched).
 A new or replaced s3 backing must load within 30 seconds.
@@ -416,8 +441,8 @@ A new or replaced s3 backing must load within 30 seconds.
 Opening or reconfiguring an s3 backing fails with 409 `Conflict` when its
 prefix is in use by another gos3 server, and with 400 `InvalidRequest` for
 settings that are wrong: an encryption key that does not match the backing,
-a `gos3.json` marker that does not match (another backing, or the other
-gateway setting), a prefix holding gos3 data without a marker, a service
+a `gos3.json` marker that does not match (another backing), a home prefix
+holding gos3 data without a marker, a service
 without conditional writes, and credentials, bucket or region the service
 refuses (`AccessDenied`, `InvalidAccessKeyId`, `SignatureDoesNotMatch`,
 `NoSuchBucket`, `AuthorizationHeaderMalformed`, `PermanentRedirect`,
@@ -439,8 +464,11 @@ backing definitions on restart, like the runtime settings overlay.
 // Backing
 { "name": "fast",              // "default" is the backing configured by storage.backend / storage.path
   "kind": "fs" | "memory" | "s3",
-  "mode": "gateway",           // s3 gateway backings only (omitted otherwise; see backings.md)
-  "location": "s3://acme-gos3-cold/gos3/", // s3 backings: remote bucket and prefix (no endpoint, no secrets)
+  "location": "s3://acme-gos3/gos3/", // s3 backings: the home (no endpoint, no secrets), or "local:"
+                               // when the records are kept in the system directory
+  "kinds": ["native", "wrapped"], // s3 backings: bucket kinds offered (omitted otherwise)
+  "defaultKind": "wrapped",    // s3 backings: kind of new buckets without an explicit kind
+  "account": AccountInfo,      // s3 backings only (omitted otherwise), see below
   "path": "/mnt/nvme/gos3",    // fs directory; "" for memory and s3
   "default": false,            // new buckets are created here
   "healthy": true,             // last health check or operation succeeded (false while an
@@ -465,7 +493,8 @@ backing definitions on restart, like the runtime settings overlay.
       "lastSyncAt": "…",       // last completed full copy (omitted when none)
       "lastError": "" } ],
   "move": { "from": "default", "to": "archive", "startedAt": "…",
-            "phase": "copying" | "cutover" } | null }
+            "phase": "copying" | "cutover",
+            "target": { "kind": "wrapped", "container": "c-7f3a" } } | null } // target: when the move chose a container
 ```
 
 Member states: `in-sync` (an active-active replica receiving every write
@@ -476,6 +505,92 @@ back-off, see `lastError`); `offline` (the backing is unhealthy).
 
 `BucketSummary` (`GET /buckets`, `GET /buckets/{name}`) also has
 `"placement": {"mode": "single", "primary": "default", "replicas": [], "moving": false}`.
+
+### Remote buckets and containers (s3 backings)
+
+An s3 backing is a connection to an S3 service. Besides the buckets gos3
+manages there, the account may hold other buckets; these endpoints browse
+them, create remote buckets, adopt existing ones as **native** gos3 buckets
+and manage the **containers** that hold **wrapped** buckets (see
+[backings.md](backings.md)). They answer 404 `NotFound` for an unknown
+backing and 400 `InvalidRequest` for a backing that is not an s3 backing.
+Actions are evaluated against `arn:gos3:admin:::backing/<name>` (and
+`arn:gos3:admin:::bucket/<bucket>` where noted).
+
+| Method | Path | Action | Response |
+|---|---|---|---|
+| GET | `/backings/{name}/remote-buckets` | ListRemoteBuckets | query `prefix`, `continuationToken`, `maxBuckets` (1-1000), `probe=true` (check unmanaged buckets for gos3 data, one request each) → `RemoteBucketList` |
+| POST | `/backings/{name}/remote-buckets` | CreateRemoteBucket | body `{"name": "acme-new", "region"?: "eu-central-1", "objectLock"?: false}` → 201 `RemoteBucket` (an unmanaged remote bucket). 409 `Conflict` when it exists |
+| GET | `/backings/{name}/containers` | ListRemoteBuckets | `{"containers": ContainerInfo[]}` (the home first) |
+| POST | `/backings/{name}/containers` | ManageContainers, plus CreateRemoteBucket with `createBucket` or AdoptRemoteBucket without | body `ContainerSpec` → 201 `ContainerInfo`, once loaded (at most 30 s, else 503). Without `attach` the location must be empty (400 otherwise; 409 when it holds a gos3 store); it must not be claimed by another use or lie inside another gos3 store (409) |
+| PUT | `/backings/{name}/containers/default` | ManageContainers | body `{"id": "c-7f3a"}` → `{"containers": ContainerInfo[]}` (400 for an unknown container) |
+| DELETE | `/backings/{name}/containers/{id}` | ManageContainers | forgets an empty container (its remote data is left alone) → 204. 409 while it holds buckets; 400 for the home and for the default container (make another one the default first); 404 for an unknown container |
+| POST | `/backings/{name}/buckets` | CreateBucket on the bucket, plus on the backing AdoptRemoteBucket (`adopt`) or CreateRemoteBucket (a new native remote bucket), and with `newContainer` ManageContainers plus CreateRemoteBucket (`newContainer.createBucket`) or AdoptRemoteBucket (an existing remote bucket), as for `POST …/containers` | body `CreateOnBacking` → 201 `BucketSummary` (without usage). The bucket's owner is the caller |
+
+```jsonc
+// RemoteBucketList
+{ "buckets": RemoteBucket[],
+  "complete": true,              // false when the credentials may not list buckets: then only the
+  "listError": "AccessDenied …", //   locations the backing knows are listed (adopt others by name)
+  "continuationToken": "…" }     // omitted on the last page
+
+// RemoteBucket
+{ "name": "acme-photos", "region": "eu-central-1", "createdAt": "…",
+  "status": "native" | "home" | "container" | "claimed" | "gos3" | "inaccessible" | "unmanaged",
+  "uses": [ { "role": "native", "bucket": "photos", "created": false },          // gos3 bucket "photos"
+            { "role": "container", "containerId": "c-7f3a", "prefix": "gos3/" },
+            { "role": "claimed", "backing": "other" } ],                        // used by another backing
+  "note": "…" }
+
+// ContainerInfo
+{ "id": "home" | "c-7f3a", "label": "shared", "location": { "bucket": "acme-gos3", "prefix": "gos3/" },
+  "region": "eu-central-1", "role": "home" | "dedicated" | "existing", "default": true,
+  "buckets": 4, "state": "loading" | "ready" | "failed", "error": "", "added": "…" }
+
+// ContainerSpec
+{ "bucket": "acme-archive", "prefix"?: "gos3/", "region"?: "",
+  "createBucket"?: false,   // create the remote bucket (a dedicated container); else it must exist
+  "attach"?: false,         // use a location that already holds a gos3 store (e.g. moved from another server)
+  "label"?: "archive" }
+
+// CreateOnBacking
+{ "bucket": "photos",                 // gos3 bucket name
+  "kind": "native" | "wrapped",       // default: the kind the other fields imply (remoteBucket, region,
+                                      //   adopt: native; container, newContainer: wrapped), else the
+                                      //   backing's defaultKind
+  "objectLock"?: false,               // object lock (native: the remote bucket is created with it; not with adopt)
+  // native:
+  "remoteBucket"?: "acme-photos",     // default: the gos3 name
+  "region"?: "",                      // remote region (default: discovered / the backing's)
+  "adopt"?: false,                    // use the existing remote bucket (objects as they are) instead of
+                                      //   creating one; refused for buckets holding gos3 data or in use
+  // wrapped:
+  "container"?: "c-7f3a",             // default: the backing's default container
+  "newContainer"?: ContainerSpec }    // or create/register a container first (not with container)
+
+// AccountInfo (in Backing.account)
+{ "home": { "bucket": "acme-gos3", "prefix": "gos3/" } | null,
+  "records": "home" | "local", "defaultKind": "wrapped", "defaultContainer": "home",
+  "kinds": ["native", "wrapped"], "nativeBuckets": 2, "wrappedBuckets": 4,
+  "containers": ContainerInfo[] }
+```
+
+Errors: 409 `Conflict` when the gos3 bucket name is taken, the remote bucket
+to create exists (`adopt` it instead), the location is used by another
+bucket, container or backing (or by another gos3 server), or it holds a gos3
+store: a remote bucket to `adopt` with a `gos3.json` at its root or in one of
+its first 100 top-level prefixes, a container inside another gos3 store, or
+one holding a store without `attach`; 400 `InvalidRequest` for invalid
+names, contradicting fields, a remote bucket that does not exist (`adopt`,
+or a container in an existing bucket), a container location that is not
+empty, an unknown container, a wrapped bucket on a backing without
+containers, and when the remote service refuses the request
+made with the backing's credentials (e.g. `AccessDenied`; the message
+carries the remote error); 503 when the remote service cannot be reached or
+a container is not loaded. A taken gos3 bucket name is refused before
+anything is done remotely; when the bucket cannot be created after
+`newContainer` was added, the container stays registered and the message
+names it: retry with `container`.
 
 ### Discovery
 | Method | Path | Action | Response |

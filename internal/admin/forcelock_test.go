@@ -3,15 +3,19 @@ package admin
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"slices"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/seanmmitchell/gos3/internal/auth"
 	"github.com/seanmmitchell/gos3/internal/storage"
+	"github.com/seanmmitchell/gos3/internal/storage/memory"
 )
 
 // putLocked stores a version of bucket/key with the given object lock state.
@@ -139,5 +143,112 @@ func TestForceDeleteLockAppliedDuringDelete(t *testing.T) {
 	}
 	if _, err := e.backend.GetObjectInfo(context.Background(), "race", "late", ""); err != nil {
 		t.Errorf("locked version deleted: %v", err)
+	}
+}
+
+// bypassRecorder records, for every delete-like call reaching the backend,
+// whether its context carried an approved GOVERNANCE bypass.
+type bypassRecorder struct {
+	*memory.Backend
+	mu    sync.Mutex
+	calls []string // "<op> <key> bypass=<bool>"
+}
+
+func (b *bypassRecorder) record(op, key string, ctx context.Context) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.calls = append(b.calls, fmt.Sprintf("%s %s bypass=%v", op, key, storage.GovernanceBypass(ctx)))
+}
+
+func (b *bypassRecorder) DeleteObject(ctx context.Context, bucket, key, versionID string) (storage.DeleteResult, error) {
+	b.record("DeleteObject", key, ctx)
+	return b.Backend.DeleteObject(ctx, bucket, key, versionID)
+}
+
+func (b *bypassRecorder) DeleteObjectIf(ctx context.Context, bucket, key, versionID string, check func(storage.ObjectInfo) error) (storage.DeleteResult, error) {
+	b.record("DeleteObjectIf", key, ctx)
+	return b.Backend.DeleteObjectIf(ctx, bucket, key, versionID, check)
+}
+
+func (b *bypassRecorder) AbortMultipartUpload(ctx context.Context, bucket, key, uploadID string) error {
+	b.record("AbortMultipartUpload", key, ctx)
+	return b.Backend.AbortMultipartUpload(ctx, bucket, key, uploadID)
+}
+
+func (b *bypassRecorder) DeleteBucketConfig(ctx context.Context, bucket, key string) error {
+	if storage.GovernanceBypass(ctx) {
+		b.record("DeleteBucketConfig", key, ctx)
+	}
+	return b.Backend.DeleteBucketConfig(ctx, bucket, key)
+}
+
+func (b *bypassRecorder) DeleteBucket(ctx context.Context, bucket string) error {
+	b.record("DeleteBucket", bucket, ctx)
+	return b.Backend.DeleteBucket(ctx, bucket)
+}
+
+func (b *bypassRecorder) take() []string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	out := b.calls
+	b.calls = nil
+	slices.Sort(out)
+	return out
+}
+
+// TestForceDeleteGovernanceBypassContext checks that an approved GOVERNANCE
+// bypass reaches the backend (storage.WithGovernanceBypass) with the deletes
+// of the approved objects' versions only, so that a backend enforcing
+// retention itself (a native bucket's remote service) honours it, and that
+// it is never set otherwise.
+func TestForceDeleteGovernanceBypassContext(t *testing.T) {
+	var rec *bypassRecorder
+	e := newEnv(t, func(d *Deps) {
+		rec = &bypassRecorder{Backend: d.Backend.(*memory.Backend)}
+		d.Backend = rec
+	})
+	future := e.clock.Now().Add(time.Hour)
+	setup := func(name string) {
+		e.createBucket(name, storage.CreateBucketOptions{ObjectLockEnabled: true})
+		e.putObject(name, "plain", "x")
+		e.putLocked(name, "gov", "GOVERNANCE", future, false)
+		e.putLocked(name, "gov", "GOVERNANCE", future, false)
+		e.putLocked(name, "old", "GOVERNANCE", e.clock.Now().Add(-time.Hour), false)
+		if _, err := e.backend.CreateMultipartUpload(context.Background(), name, "gov", storage.ObjectMeta{}, ""); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// Approved: only the versions of "gov" (unexpired GOVERNANCE) carry it.
+	setup("approved")
+	e.root("DELETE", "/buckets/approved?force=true&bypassGovernanceRetention=true", nil).expectStatus(t, http.StatusNoContent)
+	want := []string{
+		"AbortMultipartUpload gov bypass=false",
+		"DeleteBucket approved bypass=false",
+		"DeleteObjectIf gov bypass=true", "DeleteObjectIf gov bypass=true",
+		"DeleteObjectIf old bypass=false", "DeleteObjectIf plain bypass=false",
+	}
+	if got := rec.take(); !slices.Equal(got, want) {
+		t.Errorf("calls = %q\nwant %q", got, want)
+	}
+
+	// A bypass asked for without GOVERNANCE retention in force is not set.
+	e.createBucket("unlocked", storage.CreateBucketOptions{})
+	e.putObject("unlocked", "plain", "x")
+	e.root("DELETE", "/buckets/unlocked?force=true&bypassGovernanceRetention=true", nil).expectStatus(t, http.StatusNoContent)
+	if got := rec.take(); slices.ContainsFunc(got, func(c string) bool { return strings.HasSuffix(c, "bypass=true") }) {
+		t.Errorf("calls = %q", got)
+	}
+
+	// Not asked for or not allowed: refused, nothing deleted with a bypass.
+	setup("refused")
+	e.root("DELETE", "/buckets/refused?force=true", nil).expectError(t, http.StatusConflict, codeConflict)
+	e.putPolicy("force-only", map[string]any{
+		"Effect": "Allow", "Action": []string{"admin:ForceDeleteBucket"}, "Resource": "arn:gos3:admin:::bucket/*",
+	})
+	u := e.addUser("force-only", "force-only")
+	e.do(&u, "DELETE", Prefix+"/buckets/refused?force=true&bypassGovernanceRetention=true", nil).expectError(t, http.StatusForbidden, codeAccessDenied)
+	if got := rec.take(); len(got) != 0 {
+		t.Errorf("calls = %q", got)
 	}
 }

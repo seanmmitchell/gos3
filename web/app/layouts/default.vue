@@ -24,7 +24,8 @@ const serverItems = computed<NavigationMenuItem[]>(() => {
     if (usersPageMode(c.kind, caps) === 'manage') items.push({ label: 'Users', icon: 'i-lucide-users', to: appRoutes.users(c.id) })
     if (caps.managePolicies) items.push({ label: 'Policies', icon: 'i-lucide-shield-check', to: appRoutes.policies(c.id) })
     if (caps.manageConfig) items.push({ label: 'Settings', icon: 'i-lucide-settings', to: appRoutes.settings(c.id) })
-    if (caps.viewStorage) items.push({ label: 'Storage', icon: 'i-lucide-hard-drive', to: appRoutes.storage(c.id) })
+    // Backing pages (/servers/:id/backings/:name) belong to Storage.
+    if (caps.viewStorage) items.push({ label: 'Storage', icon: 'i-lucide-hard-drive', to: appRoutes.storage(c.id), active: route.path.startsWith(`${appRoutes.server(c.id)}/backings/`) || undefined })
     if (caps.discovery) items.push({ label: 'Discovery', icon: 'i-lucide-radar', to: appRoutes.discovery(c.id) })
   }
   return items
@@ -58,6 +59,12 @@ const autoCrumbs = computed<BreadcrumbItem[]>(() => {
   const rest = path.slice(appRoutes.server(id).length).split('/').filter(Boolean).map(s => decodeURIComponent(s))
   const section = rest[0]
   if (!section) return items
+  if (section === 'backings') {
+    // Backing pages live under the Storage page.
+    items.push({ label: 'Storage', to: appRoutes.storage(id) })
+    if (rest[1]) items.push({ label: rest[1] })
+    return items
+  }
   items.push({ label: SECTION_LABELS[section] ?? section, to: `${appRoutes.server(id)}/${section}` })
   if (section === 'buckets' && rest[1]) {
     const bucket = rest[1]

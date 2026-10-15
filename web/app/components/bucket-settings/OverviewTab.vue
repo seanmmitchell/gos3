@@ -7,7 +7,7 @@ import type { BucketSettingsTab } from '~/components/admin/-capabilities'
  * Bucket overview: usage, owner, creation date, region and configured
  * sub-resources (gos3 admin API when available), plus what plain S3 can
  * tell (location, creation date, policy status) and, on gos3, the storage
- * backing.
+ * backing and, on s3 backings, the bucket's kind and location.
  */
 const props = defineProps<{
   bucket: string
@@ -18,8 +18,12 @@ const props = defineProps<{
   objectLock: boolean
   /** gos3 primary storage backing name, when known. */
   backing?: string
-  /** Its kind / mode (WhoAmI.backings), when listed. */
+  /** Its kind (WhoAmI.backings), when listed. */
   backingDetails?: AvailableBacking
+  /** s3 backings: the bucket kind (native or wrapped), when known. */
+  kind?: string
+  /** s3 backings: the remote bucket (native) or container (wrapped). */
+  location?: string
 }>()
 
 const emit = defineEmits<{ navigate: [tab: BucketSettingsTab] }>()
@@ -72,6 +76,7 @@ const configs = computed(() => {
 })
 
 const backingInfo = computed(() => (props.backingDetails ? backingKindInfo(props.backingDetails) : null))
+const kindInfo = computed(() => (props.kind ? bucketKindInfo(props.kind) : null))
 
 const versioningLabel = computed(() => (props.versioning === 'Enabled' ? 'Enabled' : props.versioning === 'Suspended' ? 'Suspended' : 'Never enabled'))
 </script>
@@ -133,6 +138,25 @@ const versioningLabel = computed(() => (props.versioning === 'Enabled' ? 'Enable
             <dd class="flex flex-wrap items-center gap-1.5">
               <span class="font-mono text-xs">{{ backing }}</span>
               <UBadge v-if="backingInfo" :label="backingInfo.label" :icon="backingInfo.icon" color="neutral" variant="subtle" size="sm" :title="backingInfo.description" />
+            </dd>
+          </template>
+          <template v-if="kindInfo">
+            <dt class="text-muted">
+              Bucket kind
+            </dt>
+            <dd data-testid="bucket-kind">
+              <UBadge :label="kindInfo.label" :icon="kindInfo.icon" color="neutral" variant="subtle" size="sm" />
+              <p class="mt-1 text-xs text-muted">
+                {{ kindInfo.description }}
+              </p>
+            </dd>
+          </template>
+          <template v-if="location">
+            <dt class="text-muted">
+              {{ kind === 'native' ? 'Remote bucket' : kind === 'wrapped' ? 'Container' : 'Location' }}
+            </dt>
+            <dd class="flex items-center gap-1 font-mono text-xs" data-testid="bucket-location">
+              <span class="truncate" :title="location">{{ location }}</span><CommonCopyButton :value="location" aria-label="Copy location" />
             </dd>
           </template>
           <dt class="text-muted">

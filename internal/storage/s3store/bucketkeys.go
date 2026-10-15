@@ -153,6 +153,9 @@ func (b *Backend) loadBucketKey(ctx context.Context, id string, kek []byte, mark
 		case !create:
 			return nil, fmt.Errorf("%w: bucket has no encryption key (%s)", storage.ErrEncryptionUnavailable, obj)
 		}
+		if err := b.recordKEK(ctx, kek); err != nil {
+			return nil, err
+		}
 		key := make([]byte, crypt.KeySize)
 		_, _ = rand.Read(key)
 		wrapped, err := crypt.Wrap(kek, key, aad)
@@ -174,6 +177,27 @@ func (b *Backend) loadBucketKey(ctx context.Context, id string, kek []byte, mark
 		}
 	}
 	return nil, fmt.Errorf("%w: cannot create the encryption key %s", storage.ErrBackingUnavailable, obj)
+}
+
+// recordKEK makes sure the marker holds the check value of kek before kek
+// wraps a new key. A KEK configured by Open was recorded then; one
+// committed by PrepareConnection on a backing without a check value is
+// recorded here, at its first use. Another recorded value (a different
+// KEK configured elsewhere meanwhile) is ErrWrongKEK.
+func (b *Backend) recordKEK(ctx context.Context, kek []byte) error {
+	m := b.eng.Marker()
+	if m.KEKCheck == crypt.KeyCheck(kek) {
+		return nil
+	}
+	m, err := recordKEKCheck(ctx, b.client(), b.opts.Bucket, b.opts.Prefix, m.BackingID, kek)
+	switch {
+	case errors.Is(err, ErrWrongKEK):
+		return fmt.Errorf("%w: %w", storage.ErrEncryptionUnavailable, err)
+	case err != nil:
+		return b.mapErr(ctx, "record the encryption key check", err)
+	}
+	b.eng.noteMarker(m)
+	return nil
 }
 
 // verifyKEK checks kek against the first bucket key object of the backing

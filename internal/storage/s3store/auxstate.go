@@ -12,10 +12,12 @@ import (
 	"github.com/seanmmitchell/gos3/internal/storage"
 )
 
-// AuxStore is the state a gateway backing keeps in its metadata backing
-// (Options.Gateway): journaled key/value records and staged part blobs
-// under gateway/parts/. internal/storage/gateway declares the identical
-// interface.
+// AuxStore is state another component keeps in the backing, in a namespace
+// of its own: journaled key/value records and staged blobs under
+// gateway/parts/<ns>/. The s3 account backend keeps its registry in one
+// (internal/storage/s3account) and its native buckets' multipart state in
+// another (internal/storage/native declares the identical StateStore
+// interface).
 type AuxStore interface {
 	// Records returns every record.
 	Records(ctx context.Context) (map[string][]byte, error)
@@ -23,7 +25,10 @@ type AuxStore interface {
 	PutRecord(ctx context.Context, key string, val []byte) error
 	// DeleteRecords removes every record whose key has the prefix.
 	DeleteRecords(ctx context.Context, prefix string) error
-	// PutStaged stores r[0:size] as the staged blob name.
+	// PutStaged stores r[0:size] as the staged blob name. Names should
+	// use only ASCII letters, digits, '.', '_' and '-' (at most 200
+	// bytes): the orphan recovery only deletes unreferenced staged blobs
+	// with such names.
 	PutStaged(ctx context.Context, name string, r io.ReaderAt, size int64) error
 	// OpenStaged opens the staged blob name of the given size.
 	OpenStaged(ctx context.Context, name string, size int64) (io.ReadSeekCloser, error)
@@ -49,10 +54,24 @@ func (st *state) auxNS(ns string) *auxNS {
 	return a
 }
 
-// AuxState returns the aux store of namespace ns. It is available on a
-// gateway backing only (Options.Gateway); otherwise its methods answer
-// storage.ErrNotSupported.
-func (b *Backend) AuxState(ns string) AuxStore { return &auxStore{b: b, ns: ns} }
+// AuxState returns the aux store of namespace ns: a non-empty name without
+// '/' (otherwise its methods answer storage.ErrInvalidName). The orphan
+// recovery reclaims unreferenced staged blobs of the namespaces the loaded
+// state holds and of those handed out here.
+func (b *Backend) AuxState(ns string) AuxStore {
+	if validAuxNS(ns) == nil {
+		b.auxNames.Store(ns, true)
+	}
+	return &auxStore{b: b, ns: ns}
+}
+
+// validAuxNS checks an aux namespace name.
+func validAuxNS(ns string) error {
+	if ns == "" || strings.Contains(ns, "/") {
+		return fmt.Errorf("%w: aux namespace %q", storage.ErrInvalidName, ns)
+	}
+	return nil
+}
 
 type auxStore struct {
 	b  *Backend
@@ -61,11 +80,8 @@ type auxStore struct {
 
 // check validates the store and returns the current state.
 func (s *auxStore) check(ctx context.Context) (*state, error) {
-	if !s.b.opts.Gateway {
-		return nil, fmt.Errorf("%w: aux state needs a gateway backing", storage.ErrNotSupported)
-	}
-	if s.ns == "" || strings.Contains(s.ns, "/") {
-		return nil, fmt.Errorf("%w: aux namespace %q", storage.ErrInvalidName, s.ns)
+	if err := validAuxNS(s.ns); err != nil {
+		return nil, err
 	}
 	return s.b.current(ctx)
 }
@@ -148,6 +164,25 @@ func validStagedName(name string) error {
 		return fmt.Errorf("%w: staged blob name %q", storage.ErrInvalidName, name)
 	}
 	return nil
+}
+
+// maxStagedName is the longest staged blob name the recovery reclaims.
+const maxStagedName = 200
+
+// reclaimableStagedName reports whether the orphan recovery may consider a
+// staged blob named name: the charset of generated names (ASCII letters,
+// digits, '.', '_', '-'; not "." or ".."), at most maxStagedName bytes.
+func reclaimableStagedName(name string) bool {
+	if name == "" || len(name) > maxStagedName || name == "." || name == ".." {
+		return false
+	}
+	for i := 0; i < len(name); i++ {
+		c := name[i]
+		if !(c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' || c >= '0' && c <= '9' || c == '.' || c == '_' || c == '-') {
+			return false
+		}
+	}
+	return true
 }
 
 func (s *auxStore) PutStaged(ctx context.Context, name string, r io.ReaderAt, size int64) error {

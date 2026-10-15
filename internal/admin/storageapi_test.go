@@ -2,6 +2,7 @@ package admin
 
 import (
 	"context"
+	"strings"
 	"testing"
 	"time"
 
@@ -161,4 +162,47 @@ func waitInSync(t *testing.T, r *multi.Router, bucket string) {
 		}
 		return true
 	})
+}
+
+// TestBackingConfigurationS3Definition checks that s3 definitions pass
+// through the admin API in their current form (homeBucket, homePrefix,
+// defaultKind), the legacy keys bucket, prefix and gateway being accepted
+// on PUT and never returned.
+func TestBackingConfigurationS3Definition(t *testing.T) {
+	e, r := newRouterEnv(t)
+	var opened []config.BackingDefinition
+	r.EnableBackingManagement(config.StorageConfig{Backend: "memory", Backings: []config.BackingConfig{{Name: "fast", Backend: "memory"}}}, "",
+		multi.BackingOpener{Open: func(d config.BackingDefinition) (multi.Backing, error) {
+			opened = append(opened, d)
+			return multi.Backing{Name: d.Name, Kind: d.Backend, Backend: memory.New()}, nil
+		}})
+	var in multi.BackingConfiguration
+	e.root("GET", "/backings/config", nil).json(t, &in)
+	body := map[string]any{"revision": in.Revision, "defaultBacking": "default", "backings": []any{
+		map[string]any{"name": "fast", "backend": "memory"},
+		map[string]any{"name": "cloud", "backend": "s3", "s3": map[string]any{
+			"endpoint": "http://127.0.0.1:1", "bucket": "acme-gos3", "prefix": "gos3", "gateway": true,
+			"accessKey": "AKIDEXAMPLE", "secretKey": "secret-example-123"}},
+	}}
+	res := e.root("PUT", "/backings/config", body)
+	res.expectStatus(t, 200)
+	for _, legacy := range []string{`"bucket"`, `"prefix"`, `"gateway"`, "secret-example-123"} {
+		if strings.Contains(string(res.body), legacy) {
+			t.Errorf("response has %s: %s", legacy, res.body)
+		}
+	}
+	var out multi.BackingConfiguration
+	res.json(t, &out)
+	var s3 *config.S3Definition
+	for _, d := range out.Backings {
+		if d.Name == "cloud" {
+			s3 = d.S3
+		}
+	}
+	if s3 == nil || s3.HomeBucket != "acme-gos3" || s3.HomePrefix != "gos3/" || s3.DefaultKind != "native" || !s3.SecretKeyConfigured {
+		t.Fatalf("cloud = %+v", s3)
+	}
+	if len(opened) != 1 || opened[0].S3 == nil || opened[0].S3.HomeBucket != "acme-gos3" {
+		t.Errorf("opened %+v", opened)
+	}
 }

@@ -24,14 +24,19 @@ const aclPrivate = "private"
 
 // bucketSummary is the BucketSummary document of docs/admin-api.md.
 type bucketSummary struct {
-	Name       string        `json:"name"`
-	CreatedAt  time.Time     `json:"createdAt"`
-	Region     string        `json:"region"`
-	Versioning string        `json:"versioning"`
-	ObjectLock bool          `json:"objectLock"`
-	Owner      string        `json:"owner"`
-	Configs    bucketConfigs `json:"configs"`
-	Public     bool          `json:"public"`
+	Name       string    `json:"name"`
+	CreatedAt  time.Time `json:"createdAt"`
+	Region     string    `json:"region"`
+	Versioning string    `json:"versioning"`
+	ObjectLock bool      `json:"objectLock"`
+	Owner      string    `json:"owner"`
+	// Kind and Location: how and where an s3 backing stores the bucket
+	// (native: its remote bucket; wrapped: its container), omitted for
+	// other backings.
+	Kind     string        `json:"kind,omitempty"`
+	Location string        `json:"location,omitempty"`
+	Configs  bucketConfigs `json:"configs"`
+	Public   bool          `json:"public"`
 	// Compression is the bucket's compression setting and whether new
 	// objects are compressed under the server's policy.
 	Compression bucketCompressionSummary `json:"compression"`
@@ -115,6 +120,8 @@ func (a *api) summarize(rc *reqCtx, info storage.BucketInfo, withUsage bool) (*b
 		Versioning: string(info.Versioning),
 		ObjectLock: info.ObjectLockEnabled,
 		Owner:      info.Owner,
+		Kind:       string(info.Kind),
+		Location:   info.Location,
 	}
 	if s.Owner == "" {
 		s.Owner = auth.RootUser
@@ -306,7 +313,10 @@ func (a *api) deleteBucket(rc *reqCtx) (int, any, error) {
 // before anything is deleted, and so is unexpired GOVERNANCE retention
 // unless the caller asked to bypass it (bypass) and holds
 // s3:BypassGovernanceRetention on the object. admin:ForceDeleteBucket alone
-// therefore never destroys locked data.
+// therefore never destroys locked data. An approved bypass also goes to the
+// backend with the deletes of those objects' versions
+// (storage.WithGovernanceBypass, see lockGuard.deleteContext), and with no
+// other call.
 func (a *api) forceDeleteBucket(rc *reqCtx, name string, bypass bool) error {
 	ctx := rc.ctx
 	bi, err := a.d.Backend.GetBucket(ctx, name)
@@ -366,7 +376,7 @@ func (a *api) emptyBucket(ctx context.Context, name string, guard *lockGuard) er
 		}
 		deleted := 0
 		for _, v := range batch {
-			err := deleteVersionIf(ctx, b, name, v.key, v.id, guard.check)
+			err := deleteVersionIf(guard.deleteContext(ctx, v.key), b, name, v.key, v.id, guard.check)
 			var locked *apiError
 			switch {
 			case err == nil:
@@ -449,6 +459,18 @@ type lockGuard struct {
 	bucket     string
 	now        time.Time
 	bypassKeys map[string]bool
+}
+
+// deleteContext returns the context to delete a version of key with: one
+// carrying the approved GOVERNANCE bypass (storage.WithGovernanceBypass)
+// for the keys in bypassKeys, so that a backend enforcing retention itself
+// (a native bucket's remote service) honours the approval as the S3 API's
+// does, and ctx unchanged for every other key.
+func (g *lockGuard) deleteContext(ctx context.Context, key string) context.Context {
+	if g.bypassKeys[key] {
+		return storage.WithGovernanceBypass(ctx)
+	}
+	return ctx
 }
 
 func (g *lockGuard) check(o storage.ObjectInfo) error {

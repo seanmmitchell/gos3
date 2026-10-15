@@ -2,8 +2,10 @@
 import type { Backing, Placement, PlacementMember, ReplicationMode } from '~/types/admin'
 import { AdminError } from '~/utils/admin/client'
 import { canManageStorage } from '~/components/admin/-capabilities'
+import { containerName, containerSelectItems, findContainer, preferredContainer } from '~/components/admin/-containers'
 import {
   MODE_OPTIONS,
+  NATIVE_PLACEMENT_NOTE,
   PLACEMENT_POLL_MS,
   addedReplicas,
   copyMembers,
@@ -26,10 +28,17 @@ import {
  * (GET /buckets/{name}/placement): the primary copy, replicas and a move in
  * progress, with each member's sync state. With admin:UpdateBucketPlacement
  * (capability manageStorage) the replication mode and replicas can be
- * changed, the bucket moved to another backing, a replica promoted and
- * replicas resynced. Polls while copies run or a move is in progress.
+ * changed, the bucket moved to another backing (choosing the container of
+ * the copy when the target is an s3 backing: copies there are wrapped
+ * buckets), a replica promoted and replicas resynced. Native buckets of s3
+ * backings keep their data in their remote bucket and can neither be
+ * replicated nor moved. Polls while copies run or a move is in progress.
  */
-const props = defineProps<{ bucket: string }>()
+const props = defineProps<{
+  bucket: string
+  /** s3 backings: the bucket kind (native or wrapped), when known. */
+  kind?: string
+}>()
 const emit = defineEmits<{ changed: [] }>()
 
 const { connection, requireAdmin } = useConnection()
@@ -37,6 +46,7 @@ const { capabilities } = useWhoAmI()
 const confirm = useConfirm()
 
 const canManage = computed(() => canManageStorage(connection.value?.kind, capabilities.value))
+const native = computed(() => props.kind === 'native')
 
 // --- loading ------------------------------------------------------------------
 
@@ -221,8 +231,17 @@ watch(placement, (p) => {
   if (moveTo.value && !targets.value.some(t => t.value === moveTo.value && !t.disabledReason)) moveTo.value = ''
 }, { immediate: true })
 
-const moveAction = useAsyncAction<[string, string], Placement>(
-  (to, from) => requireAdmin().moveBucket(props.bucket, to, from && from !== placement.value?.primary ? from : undefined),
+// Container of the copy on an s3 target (copies there are wrapped buckets).
+const targetBacking = computed(() => backingHealth.value.get(moveTo.value))
+const targetContainers = computed(() => (targetBacking.value?.kind === 's3' ? targetBacking.value.account?.containers ?? [] : []))
+const containerChoices = computed(() => containerSelectItems(targetContainers.value))
+const moveContainer = ref('')
+watch(moveTo, () => {
+  moveContainer.value = preferredContainer(targetContainers.value, targetBacking.value?.account?.defaultContainer)
+})
+
+const moveAction = useAsyncAction<[string, string, string], Placement>(
+  (to, from, container) => requireAdmin().moveBucket(props.bucket, to, from && from !== placement.value?.primary ? from : undefined, container || undefined),
   { successMessage: to => `Move to ${to} started`, errorTitle: 'Could not start the move' }
 )
 
@@ -231,15 +250,17 @@ async function onMove() {
   if (!p || !moveTo.value) return
   const from = moveFrom.value || p.primary
   const isPrimary = from === p.primary
+  const container = containerChoices.value.length ? moveContainer.value : ''
+  const into = container ? ` (container ${containerName(findContainer(targetContainers.value, container) ?? { id: container })})` : ''
   const ok = await confirm({
     title: `Move ${props.bucket} from ${from} to ${moveTo.value}?`,
-    description: `${moveTo.value} is filled in the background while the bucket stays readable and writable. A short cutover then makes ${moveTo.value} take ${from}'s place and the copy on ${from} is deleted.${isPrimary ? ' In-progress multipart uploads are not moved and will fail.' : ''}`,
+    description: `${moveTo.value}${into} is filled in the background while the bucket stays readable and writable. A short cutover then makes ${moveTo.value} take ${from}'s place and the copy on ${from} is deleted.${isPrimary ? ' In-progress multipart uploads are not moved and will fail.' : ''}`,
     confirmLabel: 'Start move',
     color: 'primary',
     icon: 'i-lucide-arrow-right-left'
   })
   if (!ok) return
-  const r = await moveAction.run(moveTo.value, from)
+  const r = await moveAction.run(moveTo.value, from, container)
   if (r) {
     moveTo.value = ''
     applied(r)
@@ -363,7 +384,9 @@ const hasReplicas = computed(() => members.value.some(m => m.role === 'replica')
       >
         <template #description>
           <p v-if="move.phase === 'copying'">
-            Copying to {{ move.to }}; the bucket stays readable and writable.
+            Copying to {{ move.to }}<template v-if="move.target?.container">
+              (container {{ move.target.container }})
+            </template>; the bucket stays readable and writable.
           </p>
           <p v-else>
             Cutover: writes wait briefly while {{ move.to }} takes {{ move.from }}'s place. It can no longer be canceled.
@@ -506,6 +529,16 @@ const hasReplicas = computed(() => members.value.some(m => m.role === 'replica')
         data-testid="placement-readonly"
       />
 
+      <UAlert
+        v-else-if="native"
+        color="neutral"
+        variant="subtle"
+        icon="i-lucide-cloud"
+        title="Native bucket"
+        :description="NATIVE_PLACEMENT_NOTE"
+        data-testid="placement-native"
+      />
+
       <template v-else>
         <CommonErrorAlert v-if="backingsError" :error="backingsError" title="Could not list the storage backings; only the bucket's own backings are offered" />
 
@@ -575,7 +608,10 @@ const hasReplicas = computed(() => members.value.some(m => m.role === 'replica')
             <UFormField label="Target backing" name="move-to" class="sm:w-56">
               <USelect v-model="moveTo" :items="targetItems" placeholder="Choose a backing" class="w-full" />
             </UFormField>
-            <UButton type="submit" icon="i-lucide-arrow-right-left" label="Move" :loading="moveAction.loading.value" :disabled="!moveTo" />
+            <UFormField v-if="containerChoices.length" label="Container" name="move-container" class="sm:w-56" help="Copies on S3 backings are wrapped buckets.">
+              <USelect v-model="moveContainer" :items="containerChoices" value-key="value" class="w-full" aria-label="Container" />
+            </UFormField>
+            <UButton type="submit" icon="i-lucide-arrow-right-left" label="Move" :loading="moveAction.loading.value" :disabled="!moveTo || (containerChoices.length > 0 && !moveContainer)" />
           </form>
         </UCard>
       </template>

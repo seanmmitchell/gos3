@@ -22,12 +22,13 @@ func (hanging) ListBuckets(ctx context.Context) ([]storage.BucketInfo, error) {
 	return nil, ctx.Err()
 }
 
-// gatewayLike is a backend without storage.VersionImporter, like an s3
-// gateway backing.
-type gatewayLike struct{ storage.Backend }
+// noImporter is a backend without storage.VersionImporter (and without
+// storage.BucketCapabilities): its buckets can neither receive copies nor
+// be copied from.
+type noImporter struct{ storage.Backend }
 
 // unsupported is a backend that refuses versioning with
-// storage.ErrNotSupported, like an s3 gateway backing.
+// storage.ErrNotSupported, like some remote S3 services.
 type unsupported struct{ storage.Backend }
 
 func (unsupported) SetBucketVersioning(context.Context, string, storage.VersioningStatus) error {
@@ -225,49 +226,51 @@ func TestNotSupportedIsNotBackingFailure(t *testing.T) {
 	}
 }
 
-// A backing without storage.VersionImporter (an s3 gateway backing) can
-// neither hold replicas nor receive moves, and the buckets on it can be
-// neither replicated nor moved.
-func TestGatewayBackingRefusedAsCopyTarget(t *testing.T) {
+// A backing without storage.VersionImporter can neither hold replicas nor
+// receive moves, and the buckets on it can be neither replicated nor
+// moved.
+func TestNonImportingBackingRefusedAsCopyTarget(t *testing.T) {
 	ctx := context.Background()
 	bk := func() []Backing {
 		return []Backing{
 			{Name: "a", Kind: "memory", Backend: memory.New()},
 			{Name: "b", Kind: "memory", Backend: memory.New()},
-			{Name: "g", Kind: "s3", Mode: "gateway", Backend: gatewayLike{memory.New()}},
+			{Name: "g", Kind: "memory", Backend: noImporter{memory.New()}},
 		}
 	}
 	if _, err := Open(ctx, Options{Backings: bk(), NewBucketReplicas: []string{"g"}}); !errors.Is(err, ErrInvalidPlacement) {
-		t.Fatalf("Open with a gateway default replica: %v", err)
+		t.Fatalf("Open with a non-importing default replica: %v", err)
 	}
 	if _, err := Open(ctx, Options{Backings: bk(), Default: "g", NewBucketReplicas: []string{"a"}}); !errors.Is(err, ErrInvalidPlacement) {
-		t.Fatalf("Open with a gateway default backing and default replicas: %v", err)
+		t.Fatalf("Open with a non-importing default backing and default replicas: %v", err)
 	}
 	r := openRouter(t, Options{Backings: bk(), NewBucketReplicas: []string{"b"}})
 	if err := r.CreateBucket(ctx, "x", storage.CreateBucketOptions{}); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := r.SetReplication(ctx, "x", ModeActivePassive, []string{"b", "g"}); !errors.Is(err, ErrInvalidPlacement) ||
-		!strings.Contains(err.Error(), "gateway") {
-		t.Fatalf("gateway replica: %v", err)
+		!strings.Contains(err.Error(), "cannot receive copied versions") {
+		t.Fatalf("non-importing replica: %v", err)
 	}
-	if _, err := r.Move(ctx, "x", "", "g"); !errors.Is(err, ErrInvalidPlacement) {
-		t.Fatalf("move to a gateway backing: %v", err)
+	if _, err := r.Move(ctx, "x", "", "g", nil); !errors.Is(err, ErrInvalidPlacement) {
+		t.Fatalf("move to a non-importing backing: %v", err)
 	}
-	// A bucket created on the gateway backing gets no default replica.
+	// A bucket created on the non-importing backing gets no default
+	// replica.
 	if err := r.CreateBucket(ctx, "gw", storage.CreateBucketOptions{Backing: "g"}); err != nil {
 		t.Fatal(err)
 	}
 	if p, _ := r.Placement("gw"); p.Mode != ModeSingle || len(p.Members) != 1 {
-		t.Fatalf("bucket on the gateway backing: %+v", p)
+		t.Fatalf("bucket on the non-importing backing: %+v", p)
 	}
-	if _, err := r.SetReplication(ctx, "gw", ModeActivePassive, []string{"a"}); !errors.Is(err, ErrInvalidPlacement) {
-		t.Fatalf("replica of a gateway bucket: %v", err)
+	if _, err := r.SetReplication(ctx, "gw", ModeActivePassive, []string{"a"}); !errors.Is(err, ErrInvalidPlacement) ||
+		!strings.Contains(err.Error(), "no version history") {
+		t.Fatalf("replica of a bucket on a non-importing backing: %v", err)
 	}
-	if _, err := r.Move(ctx, "gw", "", "a"); !errors.Is(err, ErrInvalidPlacement) {
-		t.Fatalf("move of a gateway bucket: %v", err)
+	if _, err := r.Move(ctx, "gw", "", "a", nil); !errors.Is(err, ErrInvalidPlacement) {
+		t.Fatalf("move of a bucket on a non-importing backing: %v", err)
 	}
 	if _, err := r.SetReplication(ctx, "gw", ModeSingle, nil); err != nil {
-		t.Fatalf("single placement of a gateway bucket: %v", err)
+		t.Fatalf("single placement of a bucket on a non-importing backing: %v", err)
 	}
 }

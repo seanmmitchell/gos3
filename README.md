@@ -35,11 +35,14 @@ Run `gos3 serve`, point the AWS CLI, an SDK, `mc` or rclone at it, and open
   enabled per bucket, or enforced or disabled server-wide by the
   administrator. Already-compressed media types are skipped. See
   [docs/operations.md](docs/operations.md#compression).
-- **S3 as a storage backend**: keep a whole server, or individual buckets,
-  in a bucket of AWS S3, MinIO, R2 or another S3 service that supports
-  conditional writes, with every gos3 feature and no local data directory;
-  or use the gateway option to store native objects other tools can read.
-  S3 backings can be added and edited live from the web UI. See
+- **S3 as a storage backend**: connect an account of AWS S3, MinIO, R2 or
+  another S3 service and keep a whole server, or individual buckets, there
+  with no local data directory. Wrapped buckets get every gos3 feature
+  (many of them share one remote bucket, on services that support
+  conditional writes); native buckets are remote buckets used as they
+  are, so other tools keep working with them, with their versioning and
+  object lock passed through. Browse the account's buckets, adopt existing
+  ones, and add and edit S3 backings live from the web UI. See
   [docs/backings.md](docs/backings.md).
 - **Web UI**: embedded in the binary or run standalone to manage many gos3
   and other S3 servers. It has an object browser with uploads, versions,
@@ -367,9 +370,10 @@ specified in [docs/discovery.md](docs/discovery.md).
   anyone who can reach it.
 - **Object encryption**: SSE-S3 encrypts new object data using server-managed
   keys. Per-bucket restic repositories provide encrypted archival on the
-  bucket's backing, a local directory or an S3 backing's bucket (restic is
-  bundled in the container images; install it next to a release binary).
-  On S3 backings the keys are wrapped with a key-encryption key you keep. Existing objects require rewriting to
+  bucket's backing, a local directory or the container of a wrapped bucket
+  on an S3 backing (restic is bundled in the container images; install it
+  next to a release binary). On S3 backings the keys are wrapped with a
+  key-encryption key you keep; native buckets are stored as they are. Existing objects require rewriting to
   encrypt them; back up the protected keys and metadata. See [encryption](docs/encryption.md).
 
 More in [docs/security.md](docs/security.md).
@@ -380,7 +384,7 @@ More in [docs/security.md](docs/security.md).
 |---|---|
 | [docs/configuration.md](docs/configuration.md) | every YAML key, environment variable and flag |
 | [docs/deployment.md](docs/deployment.md) | Docker, Compose, systemd, Kubernetes, reverse proxies, TLS |
-| [docs/backings.md](docs/backings.md) | storage backings: S3 as a backend (whole server or per bucket), the gateway option, live configuration |
+| [docs/backings.md](docs/backings.md) | storage backings: S3 accounts as a backend (whole server or per bucket), native and wrapped buckets, containers, the remote bucket browser, live configuration |
 | [docs/encryption.md](docs/encryption.md) | native AES256 and restic encryption, keys and recovery |
 | [docs/operations.md](docs/operations.md) | health checks, metrics, logs, backups, lifecycle, upgrades |
 | [docs/security.md](docs/security.md) | authentication, stored secrets, exposure checklist |

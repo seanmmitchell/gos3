@@ -103,6 +103,21 @@ export interface Capabilities {
    * bucketCompressionAccess() (~/components/admin/-capabilities).
    */
   manageCompression?: boolean
+  /**
+   * admin:ListRemoteBuckets at service level: browse the buckets of an s3
+   * backing's account and list its containers. Absent from servers without
+   * s3 accounts: treated as false.
+   */
+  browseRemote?: boolean
+  /** admin:CreateRemoteBucket: create buckets in an s3 backing's account. */
+  createRemote?: boolean
+  /**
+   * admin:AdoptRemoteBucket: adopt an existing remote bucket as a native
+   * gos3 bucket, or use one as a container.
+   */
+  adoptRemote?: boolean
+  /** admin:ManageContainers: add, remove and choose the default container of wrapped buckets. */
+  manageContainers?: boolean
 }
 
 export type CapabilityName = keyof Capabilities
@@ -500,30 +515,53 @@ export interface BucketSummary {
   compression?: BucketCompressionSummary
   /** Where the bucket is stored (servers with storage backings only). */
   placement?: PlacementSummary
+  /** s3 backings only: how the bucket is stored (omitted on other backings). */
+  kind?: BucketKind | string
+  /**
+   * s3 backings only: the remote bucket of a native bucket or the container
+   * of a wrapped one, e.g. "s3://acme-photos/".
+   */
+  location?: string
 }
 
 // ---------------------------------------------------------------------------
 // Storage backings & bucket placement
 // ---------------------------------------------------------------------------
 
-/** "fs" | "memory" | "s3" (a remote S3 service, see BackingMode) */
+/** "fs" | "memory" | "s3" (a connection to a remote S3 service's account) */
 export type BackingKind = 'fs' | 'memory' | 's3'
 
 /**
- * Variant of a kind "s3" backing (absent = everything, data and metadata,
- * stored in the remote bucket, every gos3 feature works):
- * - gateway: objects stored natively in remote buckets named like the gos3
- *            buckets (no versioning, no object lock; cannot be a replica or
- *            move target)
+ * How a bucket of an s3 backing is stored:
+ * - native:  objects stored as-is in a remote bucket of its own, readable by
+ *            other S3 tools; versioning and object lock are those of the
+ *            remote bucket
+ * - wrapped: gos3's own format inside a container (a remote bucket or a
+ *            prefix of one, shared by many wrapped buckets); every gos3
+ *            feature works
  */
-export type BackingMode = 'gateway'
+export type BucketKind = 'native' | 'wrapped'
+
+/** A container as offered to bucket creators (WhoAmI.backings.available[].containers). */
+export interface ContainerChoice {
+  /** "home" for the backing's shared container. */
+  id: string
+  /** Set by administrators; shown to every caller. */
+  label?: string
+  /** The container wrapped buckets get when none is chosen. */
+  default?: boolean
+}
 
 /** A backing new buckets can be created on (WhoAmI.backings.available). */
 export interface AvailableBacking {
   name: string
   kind: BackingKind | string
-  /** Kind "s3" only. */
-  mode?: BackingMode | string
+  /** Kind "s3" only: the bucket kinds offered (x-gos3-bucket-kind). */
+  kinds?: (BucketKind | string)[] | null
+  /** Kind "s3" only: the kind of buckets created without x-gos3-bucket-kind. */
+  defaultKind?: BucketKind | string
+  /** Kind "s3" only: the containers of wrapped buckets (x-gos3-container). */
+  containers?: ContainerChoice[] | null
 }
 
 /** WhoAmI.backings */
@@ -538,12 +576,20 @@ export interface Backing {
   /** "default" is the backing configured by storage.backend / storage.path. */
   name: string
   kind: BackingKind | string
-  /** Kind "s3" only. */
-  mode?: BackingMode | string
   /** "" for memory and s3. */
   path: string
-  /** Kind "s3" only: where the data lives, e.g. "s3://bucket/prefix/". */
+  /**
+   * Kind "s3" only: the home where gos3 keeps the backing's records, e.g.
+   * "s3://bucket/prefix/" (no endpoint, no secrets), or "local:" when the
+   * records are kept in the server's system directory.
+   */
   location?: string
+  /** Kind "s3" only: the bucket kinds offered. */
+  kinds?: (BucketKind | string)[] | null
+  /** Kind "s3" only: the kind of new buckets without an explicit kind. */
+  defaultKind?: BucketKind | string
+  /** Kind "s3" only: the account (home, containers, bucket counts). */
+  account?: AccountInfo
   /** New buckets are created here. */
   default: boolean
   /** The last health check or operation succeeded. */
@@ -567,22 +613,30 @@ export type BackingBackend = 'fs' | 'memory' | 's3'
 export type S3Addressing = '' | 'path' | 'virtual'
 
 /**
- * Connection and location of an s3 backing (BackingDefinition.s3). Secrets
+ * Connection and home of an s3 backing (BackingDefinition.s3). Secrets
  * are write-only: GET reports whether they are set (and whether they come
  * from the environment); a blank value on PUT keeps the stored one.
+ *
+ * The home bucket and prefix are the backing's identity: changing them
+ * replaces the backing. The connection fields and the default kind can be
+ * changed while it holds buckets.
  */
 export interface S3BackingDefinition {
   /** Service URL, http(s) without a path. */
   endpoint: string
   region: string
-  bucket: string
-  /** Key prefix inside the bucket ("" = the whole bucket). */
-  prefix: string
+  /**
+   * Where gos3 keeps the backing's records and its shared container of
+   * wrapped buckets; "" = records in the server's system directory.
+   */
+  homeBucket: string
+  /** Key prefix inside the home bucket ("" = the whole bucket); needs homeBucket. */
+  homePrefix: string
+  /** Kind of buckets created without one: "wrapped" (needs a home), "native", or "" (wrapped with a home, else native). */
+  defaultKind: BucketKind | ''
   addressing: S3Addressing
   /** Multipart part size in bytes (0 / absent = server default). */
   partSize?: number
-  /** Objects stored natively in remote buckets named like the gos3 buckets. */
-  gateway: boolean
   accessKey: string
   /** Write-only; blank keeps the stored secret. */
   secretKey?: string
@@ -596,6 +650,10 @@ export interface S3BackingDefinition {
   secretKeySource?: 'env' | string
   /** Read-only: "env" when the encryption key comes from the environment. */
   encryptionKeySource?: 'env' | string
+  /** Read-only: "env" when the access key comes from the environment. */
+  accessKeySource?: 'env' | string
+  /** Read-only: the fields filled from GOS3_BACKING_<NAME>_* (config key names, e.g. "secret_key"). */
+  envFields?: string[] | null
 }
 
 /** One configured backing (GET/PUT /backings/config). */
@@ -659,11 +717,18 @@ export interface PlacementMember {
 
 export type MovePhase = 'copying' | 'cutover'
 
+/** Where a move puts the copy on an s3 backing (when it chose a container). */
+export interface MoveTarget {
+  container?: string
+}
+
 export interface PlacementMove {
   from: string
   to: string
   startedAt: Timestamp
   phase: MovePhase
+  /** Present when the move chose a container on an s3 `to` backing. */
+  target?: MoveTarget | null
 }
 
 /** GET /buckets/{name}/placement */
@@ -682,10 +747,15 @@ export interface UpdatePlacementRequest {
   replicas: string[]
 }
 
-/** POST /buckets/{name}/placement/move body (`from` defaults to the primary). */
+/**
+ * POST /buckets/{name}/placement/move body (`from` defaults to the primary;
+ * `container` chooses the container of the copy on an s3 `to` backing,
+ * default its default container).
+ */
 export interface MoveBucketRequest {
   to: string
   from?: string
+  container?: string
 }
 
 /** POST /buckets/{name}/placement/promote body. */
@@ -700,6 +770,163 @@ export interface PlacementSummary {
   primary: string
   replicas: string[] | null
   moving: boolean
+}
+
+// ---------------------------------------------------------------------------
+// Remote buckets and containers (s3 backings)
+// ---------------------------------------------------------------------------
+
+/**
+ * What a bucket of an s3 backing's account is to gos3, in priority order:
+ * - native:       a native gos3 bucket (see uses)
+ * - home:         the backing's home (records and shared container)
+ * - container:    holds a container of wrapped buckets
+ * - claimed:      used by another backing of this server
+ * - gos3:         holds gos3 data (found by the probe)
+ * - inaccessible: the credentials cannot read it
+ * - unmanaged:    not used by gos3
+ */
+export type RemoteBucketStatus = 'native' | 'home' | 'container' | 'claimed' | 'gos3' | 'inaccessible' | 'unmanaged'
+
+/** One use of a remote bucket by gos3. */
+export interface RemoteBucketUse {
+  role: 'native' | 'home' | 'container' | 'claimed' | string
+  /** role native: the gos3 bucket. */
+  bucket?: string
+  /** role native: gos3 created the remote bucket (else it was adopted). */
+  created?: boolean
+  /** role home / container: the container's ID. */
+  containerId?: string
+  /** role home / container: the container's prefix in the remote bucket. */
+  prefix?: string
+  /** role claimed: the other backing using it. */
+  backing?: string
+}
+
+/** A bucket of an s3 backing's account (GET /backings/{name}/remote-buckets). */
+export interface RemoteBucket {
+  name: string
+  region?: string
+  createdAt?: Timestamp
+  status: RemoteBucketStatus | string
+  uses?: RemoteBucketUse[] | null
+  /** Extra detail, e.g. why it is inaccessible. */
+  note?: string
+}
+
+/** GET /backings/{name}/remote-buckets */
+export interface RemoteBucketList {
+  buckets: RemoteBucket[] | null
+  /**
+   * false when the credentials may not list the account's buckets: then only
+   * the locations the backing knows are listed (others can be adopted by name).
+   */
+  complete: boolean
+  /** Why the list is incomplete, e.g. "AccessDenied …". */
+  listError?: string
+  /** Omitted on the last page. */
+  continuationToken?: string
+}
+
+/** Query of GET /backings/{name}/remote-buckets. */
+export interface ListRemoteBucketsOptions {
+  prefix?: string
+  continuationToken?: string
+  /** 1–1000. */
+  maxBuckets?: number
+  /** Check unmanaged buckets for gos3 data (one request each). */
+  probe?: boolean
+  signal?: AbortSignal
+}
+
+/** POST /backings/{name}/remote-buckets body: a new unmanaged remote bucket. */
+export interface CreateRemoteBucketRequest {
+  name: string
+  region?: string
+  objectLock?: boolean
+}
+
+/** A remote bucket and prefix. */
+export interface RemoteLocation {
+  bucket: string
+  prefix?: string
+}
+
+/**
+ * - home:      the backing's home (implicit, ID "home")
+ * - dedicated: a remote bucket gos3 created for it
+ * - existing:  a prefix of an existing remote bucket
+ */
+export type ContainerRole = 'home' | 'dedicated' | 'existing'
+
+export type ContainerState = 'loading' | 'ready' | 'failed'
+
+/** A container of wrapped buckets (GET /backings/{name}/containers). */
+export interface ContainerInfo {
+  /** "home" or a generated ID like "c-7f3a". */
+  id: string
+  label?: string
+  location: RemoteLocation
+  region?: string
+  role: ContainerRole | string
+  /** Wrapped buckets get this container when none is chosen. */
+  default?: boolean
+  /** Wrapped buckets in it. */
+  buckets: number
+  state: ContainerState | string
+  /** Why it failed ("" otherwise). */
+  error?: string
+  added?: Timestamp
+}
+
+/** POST /backings/{name}/containers body (also CreateOnBacking.newContainer). */
+export interface ContainerSpec {
+  bucket: string
+  prefix?: string
+  region?: string
+  /** Create the remote bucket (a dedicated container); else it must exist. */
+  createBucket?: boolean
+  /** Use a location that already holds a gos3 store (e.g. moved from another server). */
+  attach?: boolean
+  label?: string
+}
+
+/**
+ * POST /backings/{name}/buckets body: adopt a remote bucket, create a native
+ * bucket with a new remote bucket, or create a wrapped bucket.
+ */
+export interface CreateOnBacking {
+  /** gos3 bucket name. */
+  bucket: string
+  /** Default: the backing's defaultKind. */
+  kind?: BucketKind
+  /** native: the remote bucket (default: the gos3 name). */
+  remoteBucket?: string
+  /** native: the remote region (default: discovered / the backing's). */
+  region?: string
+  /** native: use the existing remote bucket instead of creating one. */
+  adopt?: boolean
+  /** native: create the remote bucket with object lock (not with adopt). */
+  objectLock?: boolean
+  /** wrapped: the container (default: the backing's default container). */
+  container?: string
+  /** wrapped: create or register a container first (not with container). */
+  newContainer?: ContainerSpec
+}
+
+/** Backing.account of an s3 backing. */
+export interface AccountInfo {
+  /** null when the records are kept in the server's system directory. */
+  home: RemoteLocation | null
+  records: 'home' | 'local' | string
+  defaultKind: BucketKind | string
+  /** "" when there is no container. */
+  defaultContainer: string
+  kinds: (BucketKind | string)[] | null
+  nativeBuckets: number
+  wrappedBuckets: number
+  /** The home first. */
+  containers: ContainerInfo[] | null
 }
 
 // ---------------------------------------------------------------------------

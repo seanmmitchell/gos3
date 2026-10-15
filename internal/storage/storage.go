@@ -16,6 +16,7 @@ package storage
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"time"
 )
@@ -46,6 +47,28 @@ var (
 	// ErrStopWalk may be returned by a Walk callback to stop iteration early;
 	// the Walk method then returns nil.
 	ErrStopWalk = errors.New("storage: stop walk")
+
+	// ErrBucketUnavailable is returned (wrapped) when one bucket's remote
+	// location cannot be used (its remote bucket was deleted, access to it is
+	// denied, a wrapped bucket's container cannot be loaded) while the rest
+	// of the backing works. It wraps ErrBackingUnavailable, so the S3 layer
+	// answers 503, but the multi router does not mark the backing down.
+	ErrBucketUnavailable = fmt.Errorf("storage: the bucket's remote location is unavailable: %w", ErrBackingUnavailable)
+	// ErrRemoteDenied is returned (wrapped) when a remote S3 service refused
+	// an object operation with 403 (object lock, a remote bucket policy,
+	// missing permissions of the backing's credentials).
+	ErrRemoteDenied = errors.New("storage: the remote service denied the request")
+	// ErrRemoteRejected is returned (wrapped) when a remote S3 service
+	// rejected a request with a 4xx answer gos3 has no better mapping for.
+	ErrRemoteRejected = errors.New("storage: the remote service rejected the request")
+	// ErrInvalidTarget is returned by CreateBucket (and placement changes)
+	// for a BucketTarget the backing cannot honour: an unknown container, a
+	// kind the backing does not offer, a remote location claimed elsewhere.
+	ErrInvalidTarget = errors.New("storage: invalid bucket target")
+	// ErrRemoteBucketExists is returned by CreateBucket when a native bucket
+	// would create a remote bucket that already exists (an administrator can
+	// adopt it instead). It wraps ErrBucketExists.
+	ErrRemoteBucketExists = fmt.Errorf("storage: remote bucket exists: %w", ErrBucketExists)
 )
 
 // NullVersionID is the version ID of objects written while versioning is
@@ -97,6 +120,45 @@ type BucketInfo struct {
 	// multi-backing router (internal/storage/multi) sets it; the backends
 	// behind it report "" (or what they were given). See docs/backings.md.
 	Backing string
+	// Kind and Location are reported by backings that hold buckets of
+	// several kinds (s3 backings, see BucketKind): the bucket's kind and a
+	// human-readable location such as "s3://remote-bucket" or
+	// "s3://container/prefix". Other backends leave them empty. They are
+	// output only: backends never persist them from their input.
+	Kind     BucketKind `json:",omitempty"`
+	Location string     `json:",omitempty"`
+}
+
+// BucketKind is how an s3 backing stores a bucket (see docs/backings.md).
+type BucketKind string
+
+const (
+	// BucketKindNative buckets map to one remote bucket whose objects are
+	// stored as-is; versioning and object lock are the remote bucket's.
+	BucketKindNative BucketKind = "native"
+	// BucketKindWrapped buckets are stored in gos3's own format inside a
+	// container (a remote bucket/prefix shared by many buckets), with every
+	// gos3 feature.
+	BucketKindWrapped BucketKind = "wrapped"
+)
+
+// BucketTarget chooses where a backing that offers several bucket kinds
+// creates a bucket. Backends without kinds refuse a non-nil target with
+// ErrInvalidTarget (the multi router checks this before calling them).
+type BucketTarget struct {
+	// Kind is the bucket kind ("" = the backing's default kind).
+	Kind BucketKind `json:"kind,omitempty"`
+	// RemoteBucket is the remote bucket of a native bucket ("" = the gos3
+	// bucket name) and RemoteRegion its region ("" = discovered or the
+	// backing's region).
+	RemoteBucket string `json:"remoteBucket,omitempty"`
+	RemoteRegion string `json:"remoteRegion,omitempty"`
+	// Container is the ID of the container of a wrapped bucket ("" = the
+	// backing's default container).
+	Container string `json:"container,omitempty"`
+	// Adopt makes a native bucket use an existing remote bucket instead of
+	// creating one. Only the admin API sets it.
+	Adopt bool `json:"adopt,omitempty"`
 }
 
 // CreateBucketOptions are passed to CreateBucket.
@@ -110,6 +172,13 @@ type CreateBucketOptions struct {
 	// ErrInvalidBacking for unknown names, and passes "" to the backing it
 	// creates the bucket on; other backends ignore it.
 	Backing string
+	// Target chooses the bucket kind and location on backings that offer
+	// several (nil = the backing's defaults). See BucketTarget.
+	Target *BucketTarget
+	// Import tells the backing the bucket will receive imported versions
+	// (a replica or move target, a copy job target), so it must be created
+	// where VersionImporter works. Backends without kinds ignore it.
+	Import bool
 }
 
 // ObjectMeta is the metadata supplied by the S3 layer when committing an

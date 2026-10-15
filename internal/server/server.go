@@ -49,6 +49,7 @@ import (
 	fsbackend "github.com/seanmmitchell/gos3/internal/storage/fs"
 	"github.com/seanmmitchell/gos3/internal/storage/memory"
 	"github.com/seanmmitchell/gos3/internal/storage/multi"
+	"github.com/seanmmitchell/gos3/internal/storage/s3account"
 	"github.com/seanmmitchell/gos3/internal/version"
 	"github.com/seanmmitchell/gos3/internal/webui"
 )
@@ -124,10 +125,13 @@ type Server struct {
 	hosts       *hostPolicy   // which Host headers name this server
 	dirLock     *os.File      // exclusive lock on <systemDir>/lock (nil when ephemeral)
 
-	tempMu    sync.Mutex
-	tempTag   string         // server ID in temporary directory names ("" when unknown)
-	tempDirs  []string       // temporary directories of open s3 backings
-	s3Buckets map[string]int // remote bucket (lower case) -> open s3 backings on it
+	tempMu   sync.Mutex
+	tempTag  string   // server ID in temporary directory names ("" when unknown)
+	tempDirs []string // temporary directories of open s3 backings
+
+	// claims are the remote locations in use by the s3 backings, shared
+	// by all of them (s3account.NewClaims).
+	claims s3account.Claims
 
 	serverID    string
 	startedAt   time.Time
@@ -180,6 +184,12 @@ func New(cfg config.Config, logger *slog.Logger, opts ...Option) (_ *Server, err
 	if err := cfg.Validate(); err != nil {
 		return nil, fmt.Errorf("invalid configuration: %w", err)
 	}
+	// Deprecated s3 keys (bucket, prefix, gateway) keep working, mapped
+	// to their replacements; say so, so that the configuration is updated.
+	for _, d := range cfg.Deprecations() {
+		logger.Warn(d.String()+"; update the configuration (gos3 config print shows the new keys)",
+			"backing", d.Backing, "key", d.Key, "use", d.Use)
+	}
 
 	s := &Server{
 		cfg:        cfg,
@@ -192,6 +202,7 @@ func New(cfg config.Config, logger *slog.Logger, opts ...Option) (_ *Server, err
 		bodyIdle:   systemBodyIdleTimeout,
 		writeIdle:  responseWriteIdle,
 		hosts:      newHostPolicy(cfg),
+		claims:     s3account.NewClaims(),
 	}
 	if s.clientIP, err = cfg.ClientIP(); err != nil {
 		return nil, fmt.Errorf("invalid configuration: %w", err)
@@ -363,7 +374,7 @@ func (s *Server) openBackend() error {
 		if s.systemDir == "" {
 			s.log.Warn("the default backing is s3 without storage.path: system state (IAM users and policies, settings, " +
 				"bucket placements, live backing configuration, generated root credentials) is ephemeral and lost on " +
-				"restart; the buckets survive in the remote bucket. Set storage.path (GOS3_DATA) to keep it")
+				"restart; the buckets survive in the remote service. Set storage.path (GOS3_DATA) to keep it")
 		}
 	default:
 		b, err := s.openFS(config.DefaultBackingName, st.Path)

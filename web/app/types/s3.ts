@@ -491,6 +491,33 @@ export interface CreateBucketOptions {
    * Never set it for generic S3 servers.
    */
   backing?: string
+  /**
+   * gos3 only, s3 backings: how the bucket is stored (x-gos3-bucket-kind):
+   * "native" (a remote bucket of its own) or "wrapped" (inside a container).
+   * Omitted = the backing's default kind.
+   */
+  kind?: 'native' | 'wrapped'
+  /**
+   * gos3 only, native buckets: the remote bucket to create
+   * (x-gos3-remote-bucket). Omitted = the bucket name. CreateBucket never
+   * adopts an existing remote bucket; that is an administrator action.
+   */
+  remoteBucket?: string
+  /**
+   * gos3 only, wrapped buckets: the container's ID (x-gos3-container).
+   * Omitted = the backing's default container.
+   */
+  container?: string
+}
+
+/** HeadBucket result. */
+export interface HeadBucketResult {
+  /** x-amz-bucket-region, when the server reports it. */
+  region?: string
+  /** gos3: the bucket's primary storage backing (x-gos3-backing). */
+  backing?: string
+  /** gos3, s3 backings: how the bucket is stored (x-gos3-bucket-kind). */
+  kind?: 'native' | 'wrapped' | string
 }
 
 export interface PresignOptions {

@@ -21,17 +21,25 @@ import type {
   BucketEncryptionProvider,
   BucketEncryptionProviderInput,
   BucketSummary,
+  ContainerInfo,
+  ContainerSpec,
   CreateAccessKeyRequest,
+  CreateOnBacking,
+  CreateRemoteBucketRequest,
   CreateUserRequest,
   CreateUserResponse,
   Decision,
   DiscoveryState,
   HealthStatus,
   Info,
+  ListRemoteBucketsOptions,
+  MoveBucketRequest,
   NamedPolicy,
   Peer,
   Placement,
   PutPolicyRequest,
+  RemoteBucket,
+  RemoteBucketList,
   ReplicationMode,
   ScanRequest,
   ScanResult,
@@ -49,6 +57,13 @@ import { normalizeEndpoint } from '../s3/url'
 
 export const ADMIN_PREFIX = '/_gos3/admin/v1'
 export const INFO_PATH = '/_gos3/info'
+
+/**
+ * Timeout of requests that may wait for a remote S3 service: adding a
+ * container (the server waits up to 30 s for it to load), creating buckets
+ * on an s3 backing and probing remote buckets for gos3 data.
+ */
+export const REMOTE_TIMEOUT_MS = 90000
 
 export type FetchLike = (input: Request) => Promise<Response>
 
@@ -479,6 +494,15 @@ export class AdminClient {
     })
   }
 
+  /**
+   * Forgets a native bucket of an s3 backing without touching the remote
+   * bucket or its objects (204). 409 while it has replicas or a move in
+   * progress; 400 for buckets that are not native.
+   */
+  releaseBucket(name: string): Promise<void> {
+    return this.request('POST', `/buckets/${enc(name)}/release`, { expect: 'none' })
+  }
+
   // Storage backings & bucket placement ------------------------------------
 
   getBackingConfiguration(): Promise<BackingConfiguration> {
@@ -509,9 +533,16 @@ export class AdminClient {
     return this.request('PUT', `/buckets/${enc(name)}/placement`, { body: { mode, replicas } })
   }
 
-  /** Moves the copy on `from` (default: the primary) to `to`, online (202). */
-  moveBucket(name: string, to: string, from?: string): Promise<Placement> {
-    return this.request('POST', `/buckets/${enc(name)}/placement/move`, { body: from ? { to, from } : { to } })
+  /**
+   * Moves the copy on `from` (default: the primary) to `to`, online (202).
+   * `container` chooses the container of the copy on an s3 `to` backing
+   * (default: that backing's default container).
+   */
+  moveBucket(name: string, to: string, from?: string, container?: string): Promise<Placement> {
+    const body: MoveBucketRequest = { to }
+    if (from) body.from = from
+    if (container) body.container = container
+    return this.request('POST', `/buckets/${enc(name)}/placement/move`, { body })
   }
 
   /** Cancels the move in progress (409 once its cutover started). */
@@ -557,6 +588,69 @@ export class AdminClient {
 
   putBucketEncryptionProvider(name: string, body: BucketEncryptionProviderInput): Promise<BucketEncryptionProvider> {
     return this.request('PUT', `/buckets/${enc(name)}/encryption-provider`, { body })
+  }
+
+  // Remote buckets and containers (s3 backings) ----------------------------
+
+  /**
+   * One page of the buckets of an s3 backing's account
+   * (admin:ListRemoteBuckets); `buckets` is never null. With `probe`, every
+   * unmanaged bucket is checked for gos3 data (one request each).
+   */
+  async listRemoteBuckets(backing: string, opts: ListRemoteBucketsOptions = {}): Promise<RemoteBucketList> {
+    const r = await this.request<RemoteBucketList>('GET', `/backings/${enc(backing)}/remote-buckets`, {
+      query: {
+        prefix: opts.prefix || undefined,
+        continuationToken: opts.continuationToken || undefined,
+        maxBuckets: opts.maxBuckets,
+        probe: opts.probe ? 'true' : undefined
+      },
+      signal: opts.signal,
+      // Probing checks every unmanaged bucket of the page.
+      timeoutMs: opts.probe ? REMOTE_TIMEOUT_MS : undefined
+    })
+    return { ...r, buckets: r.buckets ?? [] }
+  }
+
+  /** Creates an unmanaged remote bucket (admin:CreateRemoteBucket); 409 when it exists. */
+  createRemoteBucket(backing: string, req: CreateRemoteBucketRequest): Promise<RemoteBucket> {
+    return this.request('POST', `/backings/${enc(backing)}/remote-buckets`, { body: req })
+  }
+
+  /** The containers of an s3 backing's wrapped buckets, the home first (admin:ListRemoteBuckets). */
+  async listContainers(backing: string, signal?: AbortSignal): Promise<ContainerInfo[]> {
+    const r = await this.request<{ containers: ContainerInfo[] | null }>('GET', `/backings/${enc(backing)}/containers`, { signal })
+    return r.containers ?? []
+  }
+
+  /**
+   * Adds a container (admin:ManageContainers, plus CreateRemoteBucket with
+   * `createBucket` or AdoptRemoteBucket without). Resolves once it is
+   * loaded; the server waits up to 30 s (503 after that).
+   */
+  addContainer(backing: string, spec: ContainerSpec): Promise<ContainerInfo> {
+    return this.request('POST', `/backings/${enc(backing)}/containers`, { body: spec, timeoutMs: REMOTE_TIMEOUT_MS })
+  }
+
+  /** Makes `id` the default container of new wrapped buckets; returns every container. */
+  async setDefaultContainer(backing: string, id: string): Promise<ContainerInfo[]> {
+    const r = await this.request<{ containers: ContainerInfo[] | null }>('PUT', `/backings/${enc(backing)}/containers/default`, { body: { id } })
+    return r.containers ?? []
+  }
+
+  /** Forgets an empty container, leaving its remote data alone (204; 409 while it holds buckets, 400 for the home). */
+  removeContainer(backing: string, id: string): Promise<void> {
+    return this.request('DELETE', `/backings/${enc(backing)}/containers/${enc(id)}`, { expect: 'none' })
+  }
+
+  /**
+   * Creates a bucket on an s3 backing through the admin API: adopts an
+   * existing remote bucket (`adopt`), creates a native bucket with a new
+   * remote bucket, or a wrapped bucket (in `container` or a `newContainer`).
+   * The caller becomes the owner.
+   */
+  createBucketOnBacking(backing: string, req: CreateOnBacking): Promise<BucketSummary> {
+    return this.request('POST', `/backings/${enc(backing)}/buckets`, { body: req, timeoutMs: REMOTE_TIMEOUT_MS })
   }
 
   // Discovery --------------------------------------------------------------

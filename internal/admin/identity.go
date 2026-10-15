@@ -41,6 +41,12 @@ type capabilities struct {
 	// ManageCompression: admin:PutBucketCompression (bucket compression
 	// settings).
 	ManageCompression bool `json:"manageCompression"`
+	// Remote buckets and containers of s3 backings (granted on every
+	// backing: a grant on arn:gos3:admin:::backing/<name> does not show).
+	BrowseRemote     bool `json:"browseRemote"`     // admin:ListRemoteBuckets
+	CreateRemote     bool `json:"createRemote"`     // admin:CreateRemoteBucket
+	AdoptRemote      bool `json:"adoptRemote"`      // admin:AdoptRemoteBucket
+	ManageContainers bool `json:"manageContainers"` // admin:ManageContainers
 }
 
 // adminActions are every admin:* action used by the API; "admin" in
@@ -50,9 +56,10 @@ var adminActions = []string{
 	"ListUsers", "CreateUser", "GetUser", "UpdateUser", "DeleteUser",
 	"CreateAccessKey", "UpdateAccessKey", "DeleteAccessKey",
 	"ListPolicies", "GetPolicy", "PutPolicy", "DeletePolicy", "SimulatePolicy",
-	"ListBuckets", "GetBucket", "ForceDeleteBucket", "GetBucketCompression", "PutBucketCompression",
-	"GetBucketEncryption", "PutBucketEncryption",
+	"ListBuckets", "GetBucket", "CreateBucket", "ForceDeleteBucket", "ReleaseBucket",
+	"GetBucketCompression", "PutBucketCompression", "GetBucketEncryption", "PutBucketEncryption",
 	"ListBackings", "GetBucketPlacement", "UpdateBucketPlacement",
+	"ListRemoteBuckets", "CreateRemoteBucket", "AdoptRemoteBucket", "ManageContainers",
 	"GetDiscovery", "ScanNetwork", "ProbeNetwork",
 }
 
@@ -96,11 +103,15 @@ func (a *api) whoami(rc *reqCtx) (int, any, error) {
 			Scan:              allowed["ScanNetwork"],
 			Probe:             allowed["ProbeNetwork"],
 			ManageCompression: allowed["PutBucketCompression"],
+			BrowseRemote:      allowed["ListRemoteBuckets"],
+			CreateRemote:      allowed["CreateRemoteBucket"],
+			AdoptRemote:       allowed["AdoptRemoteBucket"],
+			ManageContainers:  allowed["ManageContainers"],
 			// Root has no IAM keys to manage (POST /whoami/keys answers 400).
 			CreateOwnKeys: !rc.id.IsRoot && a.authorize(rc, actionCreateOwnKey, "", nil).Allowed,
 		},
 		Server:   a.info(),
-		Backings: a.backingChoices(),
+		Backings: a.backingChoices(rc.ctx),
 	}, nil
 }
 

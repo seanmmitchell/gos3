@@ -1,6 +1,7 @@
 // Storage backings and bucket placement components: the backing card of the
-// server Storage page and the bucket settings Placement tab, against a fake
-// gos3 admin API.
+// server Storage page, the backing configuration and the bucket settings
+// Placement tab (native buckets, containers of moves to s3 backings),
+// against a fake gos3 admin API.
 import { mountSuspended } from '@nuxt/test-utils/runtime'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { defineComponent, h, nextTick, type Component } from 'vue'
@@ -47,7 +48,7 @@ function basePlacement(): Placement {
 interface Seen { method: string, path: string, body: string }
 
 /** Fake gos3 at 10.9.9.2:9000: whoami with `caps`, backings and the placement of "photos". */
-function fakeServer(caps: Partial<Capabilities>, placement: Placement = basePlacement(), initialConfig?: BackingConfig) {
+function fakeServer(caps: Partial<Capabilities>, placement: Placement = basePlacement(), initialConfig?: BackingConfig, backings: Backing[] = BACKINGS) {
   const seen: Seen[] = []
   let current = placement
   let config: BackingConfig = initialConfig ?? { backings: [{ name: 'fast', backend: 'fs', path: '/mnt/fast' }], defaultBacking: 'default', revision: 'v1', persistent: true }
@@ -62,7 +63,7 @@ function fakeServer(caps: Partial<Capabilities>, placement: Placement = basePlac
     const p = url.pathname.replace('/_gos3/admin/v1', '')
     if (url.pathname === '/_gos3/info') return json(INFO)
     if (p === '/whoami') return json(whoami())
-    if (p === '/backings') return json({ defaultBacking: 'default', autoFailover: false, backings: BACKINGS })
+    if (p === '/backings') return json({ defaultBacking: 'default', autoFailover: false, backings })
     if (p === '/backings/config' && req.method === 'GET') return json(config)
     if (p === '/backings/config' && req.method === 'PUT') {
       config = { ...JSON.parse(body), revision: 'v2' }
@@ -79,6 +80,11 @@ function fakeServer(caps: Partial<Capabilities>, placement: Placement = basePlac
       return json(current)
     }
     if (p === '/buckets/photos/placement/resync') return json(current, 202)
+    if (p === '/buckets/photos/placement/move' && req.method === 'POST') {
+      const r = JSON.parse(body) as { to: string, container?: string }
+      current = { ...current, move: { from: current.primary, to: r.to, startedAt: '2026-10-12T10:00:00Z', phase: 'copying', target: r.container ? { container: r.container } : null } }
+      return json(current, 202)
+    }
     return new Response('', { status: 404 })
   })
   vi.stubGlobal('fetch', fetch)
@@ -131,19 +137,32 @@ describe('BackingCard', () => {
     expect(w.find('[role="meter"]').exists()).toBe(false)
   })
 
-  it('shows the location and kind of an s3 backing', async () => {
-    const { w } = await mountInApp(BackingCard, { backing: backing('cold', { kind: 's3', path: '', location: 's3://gos3-cold/data/' }) })
+  it('shows the home, default kind and bucket kinds of an s3 backing and links to its page', async () => {
+    const account: Backing['account'] = {
+      home: { bucket: 'gos3-cold', prefix: 'data/' }, records: 'home', defaultKind: 'wrapped', defaultContainer: 'home', kinds: ['native', 'wrapped'],
+      nativeBuckets: 2, wrappedBuckets: 4, containers: []
+    }
+    const { w } = await mountInApp(BackingCard, { backing: backing('cold', { kind: 's3', path: '', location: 's3://gos3-cold/data/', kinds: ['native', 'wrapped'], defaultKind: 'wrapped', account }), serverId: 'nas' })
     expect(w.find('[data-testid="backing-location"]').text()).toBe('s3://gos3-cold/data/')
     expect(w.find('[data-testid="backing-location"]').classes()).toEqual(expect.arrayContaining(['font-mono', 'truncate']))
-    expect(w.text()).toContain('Data and metadata stored in a remote S3 bucket')
+    expect(w.text()).toContain('A remote S3 account')
+    expect(w.find('[data-testid="backing-default-kind"]').text()).toBe('New buckets: wrapped')
+    expect(w.text()).toContain('2 native · 4 wrapped')
     expect(w.findAll('span').some(e => e.text() === 's3')).toBe(true)
     expect(w.text()).not.toContain('In memory')
+    const manage = w.find('a[href="/servers/nas/backings/cold"]')
+    expect(manage.exists()).toBe(true)
+    expect(manage.text()).toBe('Manage')
   })
 
-  it('marks a gateway backing in its badge', async () => {
-    const { w } = await mountInApp(BackingCard, { backing: backing('aws', { kind: 's3', mode: 'gateway', path: '', location: 's3://' }) })
-    expect(w.findAll('span').some(e => e.text() === 's3 · gateway')).toBe(true)
-    expect(w.text()).toContain('Objects stored natively; no versioning or object lock.')
+  it('says when an s3 backing keeps its records locally, and has no link without a server', async () => {
+    const { w } = await mountInApp(BackingCard, { backing: backing('acct', { kind: 's3', path: '', location: 'local:', defaultKind: 'native' }) })
+    expect(w.find('[data-testid="backing-location"]').text()).toBe('No home: records kept on this server')
+    expect(w.find('[data-testid="backing-default-kind"]').text()).toBe('New buckets: native')
+    expect(w.find('a').exists()).toBe(false)
+    // Other backings never link to a backing page.
+    const fs = await mountInApp(BackingCard, { backing: backing('fast'), serverId: 'nas' })
+    expect(fs.w.find('a').exists()).toBe(false)
   })
 })
 
@@ -196,7 +215,7 @@ describe('BackingConfiguration', () => {
         backend: 's3',
         path: '',
         s3: {
-          endpoint: 'https://s3.example.com', region: 'eu-1', bucket: 'gos3-cold', prefix: 'data/', addressing: '', gateway: false, accessKey: 'AKCOLD',
+          endpoint: 'https://s3.example.com', region: 'eu-1', homeBucket: 'gos3-cold', homePrefix: 'data/', defaultKind: '', addressing: '', accessKey: 'AKCOLD',
           secretKeyConfigured: true, encryptionKeyConfigured: true, encryptionKeySource: 'env'
         }
       }],
@@ -210,22 +229,25 @@ describe('BackingConfiguration', () => {
     const button = (label: string) => w.findAll('button').find(b => b.text() === label)!
     await button('Configure backings').trigger('click')
     await vi.waitFor(() => expect(w.find('form').exists()).toBe(true))
-    expect(w.text()).toContain('new S3 backings an empty bucket or prefix')
+    expect(w.text()).toContain('a new S3 backing\'s home must be an empty bucket or prefix')
 
     const row = w.find('[data-testid="s3-fields"]')
     const input = (label: string, r = row) => r.find(`input[aria-label="${label}"]`)
-    // In use: the location is locked, the connection stays editable.
-    expect(input('Bucket').attributes('disabled')).toBeDefined()
-    expect(input('Prefix').attributes('disabled')).toBeDefined()
-    expect(row.find('button[role="checkbox"]').attributes('disabled')).toBeDefined()
+    // In use: the home (the backing's identity) is locked; the connection and the default kind stay editable.
+    expect(input('Home bucket').attributes('disabled')).toBeDefined()
+    expect(input('Home prefix').attributes('disabled')).toBeDefined()
+    expect(row.find('[aria-label="Default bucket kind"]').exists()).toBe(true)
+    expect(row.find('[aria-label="Default bucket kind"]').attributes('disabled')).toBeUndefined()
+    expect(row.text()).toContain('Automatic (wrapped with a home, else native)')
+    expect(row.find('button[role="checkbox"]').exists()).toBe(false)
     expect(input('Endpoint').attributes('disabled')).toBeUndefined()
     expect(input('Access key').attributes('disabled')).toBeUndefined()
     expect(input('Secret key').attributes('type')).toBe('password')
     expect(input('Secret key').attributes('placeholder')).toBe('Saved – leave blank to keep')
     expect(input('Encryption key').attributes('placeholder')).toBe('From GOS3_BACKING_COLD_ENCRYPTION_KEY')
-    expect(row.text()).toContain('Objects stored natively in remote buckets named like the gos3 buckets')
+    expect(row.text()).toContain('Leave empty to keep records on this server (system directory)')
     expect(row.find('[data-testid="s3-advanced"]').text()).toContain('Losing it makes encrypted objects unreadable')
-    expect(w.text()).toContain('connection settings can change')
+    expect(w.text()).toContain('connection settings and the default bucket kind can change')
 
     // A new s3 backing: every field is editable, the secret is required.
     await button('Add backing').trigger('click')
@@ -235,11 +257,13 @@ describe('BackingConfiguration', () => {
     const rows = w.findAll('[data-testid="s3-fields"]')
     expect(rows).toHaveLength(2)
     const added = rows[1]!
-    expect(input('Bucket', added).attributes('disabled')).toBeUndefined()
+    expect(input('Home bucket', added).attributes('disabled')).toBeUndefined()
+    // The home prefix needs a home bucket.
+    expect(input('Home prefix', added).attributes('disabled')).toBeDefined()
     expect(input('Secret key', added).attributes('placeholder')).toBe('')
     await w.findAll('input[aria-label="Backing name"]')[1]!.setValue('warm')
     await input('Endpoint', added).setValue('http://minio:9000')
-    await input('Bucket', added).setValue('gos3-warm')
+    await input('Home bucket', added).setValue('gos3-warm')
     await input('Access key', added).setValue('AKWARM')
     await w.find('form').trigger('submit')
     expect(w.text()).toContain('Enter the secret key of "warm".')
@@ -256,10 +280,10 @@ describe('BackingConfiguration', () => {
     await vi.waitFor(() => expect(inner.emitted('saved')).toHaveLength(1))
     const request = JSON.parse(seen.find(s => s.method === 'PUT')!.body) as BackingConfig
     // Blank secrets and read-only fields are left out: the server keeps the stored ones.
-    expect(request.backings[0]).toEqual({ name: 'cold', backend: 's3', path: '', s3: { endpoint: 'https://s3.example.com', region: 'eu-1', bucket: 'gos3-cold', prefix: 'data/', addressing: '', gateway: false, accessKey: 'AKCOLD' } })
+    expect(request.backings[0]).toEqual({ name: 'cold', backend: 's3', path: '', s3: { endpoint: 'https://s3.example.com', region: 'eu-1', homeBucket: 'gos3-cold', homePrefix: 'data/', defaultKind: '', addressing: '', accessKey: 'AKCOLD' } })
     expect(request.backings[1]).toEqual({
       name: 'warm', backend: 's3', path: '',
-      s3: { endpoint: 'http://minio:9000', region: '', bucket: 'gos3-warm', prefix: '', addressing: '', gateway: false, accessKey: 'AKWARM', secretKey: 'SKWARM', encryptionKey: key }
+      s3: { endpoint: 'http://minio:9000', region: '', homeBucket: 'gos3-warm', homePrefix: '', defaultKind: '', addressing: '', accessKey: 'AKWARM', secretKey: 'SKWARM', encryptionKey: key }
     })
     w.unmount()
   })
@@ -341,4 +365,60 @@ describe('PlacementTab', () => {
     await vi.waitFor(() => expect(gets()).toBeGreaterThan(before), { timeout: 6000, interval: 100 })
     w.unmount()
   }, 15000)
+
+  it('neither replicates nor moves a native bucket', async () => {
+    const native = basePlacement()
+    native.mode = 'single'
+    native.members = [native.members![0]!]
+    fakeServer({ admin: true, viewStorage: true, manageStorage: true }, native)
+    await connect()
+    const { w } = await mountInApp(PlacementTab, { bucket: 'photos', kind: 'native' })
+    await vi.waitFor(() => expect(w.find('[data-testid="member-default"]').exists()).toBe(true))
+    expect(w.find('[data-testid="placement-native"]').text()).toContain('Native buckets keep their data in their remote bucket; copy them with a copy job instead.')
+    expect(w.find('[data-testid="replication-form"]').exists()).toBe(false)
+    expect(w.find('[data-testid="move-form"]').exists()).toBe(false)
+  })
+
+  it('offers the containers of an s3 move target and sends the chosen one', async () => {
+    const containers = [
+      { id: 'home', label: 'shared', location: { bucket: 'gos3-cloud', prefix: 'gos3/' }, role: 'home', default: true, buckets: 3, state: 'ready' },
+      { id: 'c-7f3a', label: 'archive', location: { bucket: 'acme-archive' }, role: 'dedicated', buckets: 0, state: 'ready' }
+    ]
+    const cloud = backing('cloud', {
+      kind: 's3', path: '', location: 's3://gos3-cloud/gos3/', kinds: ['native', 'wrapped'], defaultKind: 'wrapped',
+      account: { home: { bucket: 'gos3-cloud', prefix: 'gos3/' }, records: 'home', defaultKind: 'wrapped', defaultContainer: 'home', kinds: ['native', 'wrapped'], nativeBuckets: 0, wrappedBuckets: 3, containers }
+    })
+    const bare = backing('bare', {
+      kind: 's3', path: '', location: 'local:', kinds: ['native'], defaultKind: 'native',
+      account: { home: null, records: 'local', defaultKind: 'native', defaultContainer: '', kinds: ['native'], nativeBuckets: 1, wrappedBuckets: 0, containers: [] }
+    })
+    const { seen } = fakeServer({ admin: true, viewStorage: true, manageStorage: true }, basePlacement(), undefined, [...BACKINGS, cloud, bare])
+    await connect()
+    const { w } = await mountInApp(PlacementTab, { bucket: 'photos', kind: 'wrapped' })
+    await vi.waitFor(() => expect(w.find('[data-testid="move-form"]').exists()).toBe(true))
+    const vm = w.findComponent(PlacementTab).vm as unknown as {
+      targets: { value: string, disabledReason?: string }[]
+      moveTo: string
+      moveContainer: string
+      containerChoices: { value: string }[]
+      moveAction: { run: (to: string, from: string, container: string) => Promise<unknown> }
+    }
+    await vi.waitFor(() => expect(vm.targets.map(t => t.value)).toContain('cloud'))
+    expect(vm.targets.find(t => t.value === 'bare')?.disabledReason).toBe('no container')
+    expect(w.find('[data-testid="replica-bare"]').exists()).toBe(false)
+
+    vm.moveTo = 'cloud'
+    await nextTick()
+    expect(vm.containerChoices.map(c => c.value)).toEqual(['home', 'c-7f3a'])
+    expect(vm.moveContainer).toBe('home')
+    expect(w.find('[data-testid="move-form"]').text()).toContain('Container')
+
+    vm.moveTo = 'archive'
+    await nextTick()
+    expect(vm.containerChoices).toEqual([])
+
+    await vm.moveAction.run('cloud', 'default', 'c-7f3a')
+    const move = seen.find(s => s.method === 'POST' && s.path.endsWith('/placement/move'))!
+    expect(JSON.parse(move.body)).toEqual({ to: 'cloud', container: 'c-7f3a' })
+  })
 })

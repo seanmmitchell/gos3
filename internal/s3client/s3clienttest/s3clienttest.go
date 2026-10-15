@@ -68,21 +68,46 @@ type Remote struct {
 	srv *httptest.Server
 }
 
+// Options configure a remote started with StartWith.
+type Options struct {
+	// Wrap, when set, wraps the remote's S3 handler. Tests use it to
+	// emulate the quirks of other services: answering 400 for unknown
+	// version IDs, 204 for deleting a missing version, dropping
+	// x-amz-delete-marker, 501 for ?versioning, requiring Content-MD5, ...
+	// The handler it wraps authenticates the request, so a wrapper that
+	// changes signed parts of it (the query, signed headers) must answer
+	// itself instead. Fail, After and IgnoreConditionals apply before it.
+	Wrap func(http.Handler) http.Handler
+	// StrictRegion rejects requests signed for a region other than Region
+	// with 400 AuthorizationHeaderMalformed naming the region (as AWS
+	// does), instead of accepting any region.
+	StrictRegion bool
+}
+
 // Start starts a remote; it is stopped by t.Cleanup.
 func Start(t testing.TB) *Remote {
+	t.Helper()
+	return StartWith(t, Options{})
+}
+
+// StartWith starts a remote configured by o; it is stopped by t.Cleanup.
+func StartWith(t testing.TB, o Options) *Remote {
 	t.Helper()
 	mgr, err := iam.Open(iam.Options{RootAccessKey: AccessKey, RootSecretKey: SecretKey})
 	if err != nil {
 		t.Fatalf("s3clienttest: iam.Open: %v", err)
 	}
 	be := memory.New()
-	h := s3.New(s3.Options{
+	var h http.Handler = s3.New(s3.Options{
 		Backend:  be,
-		Verifier: auth.NewVerifier(mgr, auth.Options{Region: Region}),
+		Verifier: auth.NewVerifier(mgr, auth.Options{Region: Region, StrictRegion: o.StrictRegion}),
 		IAM:      mgr,
 		Logger:   slog.New(slog.DiscardHandler),
 		Version:  "remote",
 	})
+	if o.Wrap != nil {
+		h = o.Wrap(h)
+	}
 	r := &Remote{Backend: be}
 	r.srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
 		r.Requests.Add(1)

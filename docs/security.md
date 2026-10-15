@@ -18,9 +18,10 @@ the settings to review before you expose a server.
       `server.public_info`.
 - [ ] Keep the data directory private (mode 0700) and back it up; it contains
       secrets.
-- [ ] For s3 backings: scope their credentials to their bucket, keep the
-      remote bucket private, and store each backing's encryption key
-      somewhere safe (see [s3 backings](#s3-backings)).
+- [ ] For s3 backings: scope their credentials to the remote buckets they
+      use, keep those buckets private, decide who may adopt remote buckets,
+      and store each backing's encryption key somewhere safe (see
+      [s3 backings](#s3-backings)).
 - [ ] If metrics are public (`metrics.public`), restrict who can reach
       `/_gos3/metrics`.
 - [ ] Enable a standalone web UI's local discovery
@@ -180,10 +181,14 @@ To delegate part of user or policy management, scope these actions with the
 per-target resources (see
 [admin-api.md](admin-api.md#resources-and-condition-keys)):
 `arn:gos3:admin:::user/<name>` for user and key actions (a key is evaluated
-as its owner), `arn:gos3:admin:::policy/<name>` for policy actions and
-`arn:gos3:admin:::bucket/<name>` for `admin:GetBucket`,
-`admin:ForceDeleteBucket`, `admin:GetBucketCompression` and
-`admin:PutBucketCompression`, with wildcards, and limit which policies may be
+as its owner), `arn:gos3:admin:::policy/<name>` for policy actions,
+`arn:gos3:admin:::bucket/<name>` for bucket actions (`admin:GetBucket`,
+`admin:CreateBucket`, `admin:ForceDeleteBucket`, `admin:ReleaseBucket`, the
+compression, encryption provider and placement actions) and
+`arn:gos3:admin:::backing/<name>` for the remote buckets and containers of
+an s3 backing (`admin:ListRemoteBuckets`, `admin:CreateRemoteBucket`,
+`admin:AdoptRemoteBucket`, `admin:ManageContainers`; see
+[s3 backings](#s3-backings)), with wildcards, and limit which policies may be
 attached with the multi-valued condition key `admin:PolicyName`. For
 example, this help-desk policy manages only `team-*` users, which cannot
 include the help-desk user itself, and may attach only `readonly`:
@@ -269,6 +274,7 @@ The data directory (default `./data`, `/data` in the container) holds:
 | `.gos3/iam.json` | IAM users, access **and secret** keys, policies | **secret** (0600) |
 | `.gos3/settings.json` | runtime settings | private (0600) |
 | `.gos3/backings.json` | backings configured in the web UI (names, backends, paths, s3 settings **including s3 secret keys and encryption keys**, except values taken from the environment) | **secret** (0600) |
+| `.gos3/s3/<backing>/` | records of an s3 backing without a home: its buckets and containers, the configuration of its native buckets, overlay metadata, staged small multipart parts | private (0700) |
 | `.gos3/meta.db` | bucket and object metadata, bucket policies and configurations (fs backend) | private (0600) |
 | `.gos3/data/`, `.gos3/uploads/` | object and part data | your data (files 0600) |
 | `.gos3/keys/` | bucket encryption keys and restic repository passwords (fs backend) | **secret** (0600) |
@@ -300,24 +306,104 @@ its data and keys. See [encryption.md](encryption.md).
 
 ### s3 backings
 
-An [s3 backing](backings.md) keeps everything of its buckets in a remote
-bucket: the metadata journal and snapshots (bucket names, object keys, user
-metadata, tags, policies and other bucket configuration, unencrypted),
-object data, wrapped encryption keys and restic repositories. Anyone who
-can read that bucket can read the metadata and every unencrypted object;
-anyone who can write it can change or destroy the backing. Give the
-backing's credentials access to its bucket (and, for a gateway, to creating
-and using the remote buckets named like the gos3 buckets) and nothing
-else, and protect the bucket like the data directory.
+An [s3 backing](backings.md) is a connection to an account of an S3
+service. What it keeps there:
 
-- **Encryption key (KEK).** The per-bucket master keys of an s3 backing
-  are stored in the remote bucket wrapped (AES-256-GCM) with the backing's
-  `encryption_key`, which is never stored there (only a check value, which
-  does not reveal it). The remote bucket alone therefore does not decrypt
-  AES256 or restic data. The KEK lives in the configuration file, the
-  environment (`GOS3_S3_ENCRYPTION_KEY`,
-  `GOS3_BACKING_<NAME>_ENCRYPTION_KEY`) or `backings.json`; keep a copy
-  elsewhere, because losing it loses the encrypted data.
+- Its **home and containers** hold their wrapped buckets completely: the
+  metadata journal and snapshots (bucket names, object keys, user
+  metadata, tags, policies and other bucket configuration, unencrypted),
+  object data, wrapped encryption keys and restic repositories. The home
+  also holds the backing's records: its buckets and containers, the
+  configuration of its native buckets and their overlay metadata. Anyone
+  who can read these locations can read the metadata and every
+  unencrypted object; anyone who can write them can change or destroy the
+  backing's buckets.
+- Its **native buckets** are ordinary remote buckets. gos3's IAM, bucket
+  policies and ACLs govern requests made through gos3 only: whoever has
+  access to the remote bucket on the service has access to its objects.
+  Anyone who can write the remote bucket can also set metadata that gos3
+  reads from the objects, most importantly their tags (which
+  `s3:ExistingObjectTag` conditions rely on): treat write access to a
+  native bucket's remote bucket like `s3:PutObjectTagging` on the gos3
+  bucket. An object's **ACL and website redirect** are different: gos3 keeps them
+  only in its own records (overlay records bound to the exact remote version
+  gos3 wrote or changed), never in the object's headers, so another tool
+  cannot make an object public through gos3 or redirect its website, not
+  even by copying or restoring an object gos3 wrote. Objects written by
+  another tool, or by the former gateway option, read as private without a
+  redirect; set the ACL again through gos3 to grant access.
+
+Give the backing's credentials access to exactly the remote buckets it
+uses (the actions are listed in
+[backings.md](backings.md#permissions-of-the-backings-credentials)) and
+nothing else, and protect them like the data directory.
+
+- **Adoption is an administrator action.** The S3 API never adopts an
+  existing remote bucket: CreateBucket of a native bucket creates a new
+  remote bucket and fails (`409 BucketAlreadyExists`) when it exists.
+  Adopting needs `admin:AdoptRemoteBucket` on
+  `arn:gos3:admin:::backing/<name>` (and `admin:CreateBucket` on the new
+  bucket), so a holder of `s3:CreateBucket` cannot take over a remote
+  bucket that the backing's credentials happen to reach (another
+  application's data, another server's container) and read it through gos3
+  under policies of its own choosing. The adopter becomes the new bucket's
+  owner, so grant `admin:AdoptRemoteBucket` only to those who may read and
+  write every remote bucket the backing's credentials reach. Putting a
+  container into an existing remote bucket counts as adopting it. Adoption refuses a remote bucket
+  that another use of this server claims, or that holds a gos3 store
+  (`gos3.json` at its root or in one of its first 100 top-level prefixes),
+  so a container's data never becomes a native bucket's objects.
+- **Creating remote buckets.** `s3:CreateBucket` on a backing that offers
+  native buckets does let its holder create new remote buckets in the
+  account (with `x-gos3-bucket-kind: native` and a name of its choice in
+  `x-gos3-remote-bucket`), and deleting such a bucket deletes the remote
+  bucket. To rule that out, do not give the backing's credentials
+  `s3:CreateBucket` on the service (adding dedicated containers then needs
+  buckets created by other means).
+- **Claims.** Every remote location in use is claimed server-wide: a
+  native bucket's remote bucket is used by nothing else, and homes and
+  containers never overlap (equal or nested prefixes in one remote bucket).
+  Remote buckets are compared case-insensitively per service (the
+  endpoint's host and port), so two backings with different credentials
+  cannot use one location in two ways; two spellings of one service's
+  address (for example a regional and a global AWS endpoint) are not
+  recognised as the same service, but the lease still keeps two stores out
+  of one home or container. Claims cover one server; the lease keeps a second
+  server out of a home or container, while a native bucket's remote bucket
+  can be used by any other client, gos3 servers included.
+- **Overlay ACLs.** An ACL (or other metadata) changed through gos3 on a
+  native object is kept in an overlay record that applies only to the
+  exact remote version it was made for: its version ID, its remote ETag
+  and, for `null` versions, its LastModified second. When another tool
+  replaces the object, the new object does not inherit the overlay, so a
+  `public-read` granted through gos3 never carries over to content gos3
+  did not see (except an identical replacement within the same second).
+  Releasing a native bucket drops its overlays: adopting the remote bucket
+  again on the same backing shows its objects as private, so set ACLs again
+  after adopting a bucket again.
+- **Recovery never deletes foreign data.** Every data object of a home or
+  container carries the user metadata `x-amz-meta-gos3-store` with its
+  store's ID. The background pass that removes unreferenced data deletes
+  only objects whose name gos3 generates **and** whose tag names its own
+  store; untagged objects and those of other stores are never deleted. New
+  containers must also be empty and must not be nested in another gos3
+  store.
+- **GOVERNANCE bypass.** A native bucket's retention is enforced by its
+  remote service. gos3 sends `x-amz-bypass-governance-retention` to the
+  remote only after approving the bypass for the request (the caller sent
+  the header and holds `s3:BypassGovernanceRetention`); internal callers
+  such as the lifecycle worker never bypass. The backing's credentials need
+  `s3:BypassGovernanceRetention` on the service for approved bypasses to
+  work; without it, GOVERNANCE retention cannot be bypassed through gos3.
+- **Encryption key (KEK).** The per-bucket master keys of an s3 backing's
+  wrapped buckets are stored in their containers wrapped (AES-256-GCM) with
+  the backing's `encryption_key`, which is never stored there (only a check
+  value, which does not reveal it). The remote buckets alone therefore do
+  not decrypt AES256 or restic data. Native buckets are not encrypted by
+  gos3. The KEK lives in the configuration file, the environment
+  (`GOS3_S3_ENCRYPTION_KEY`, `GOS3_BACKING_<NAME>_ENCRYPTION_KEY`) or
+  `backings.json`; keep a copy elsewhere, because losing it loses the
+  encrypted data.
 - **Where the secrets are.** The s3 `secret_key` and `encryption_key` come
   from the configuration file, the environment, or the web UI (then saved
   in `backings.json`, mode 0600, never with values that came from the
@@ -328,7 +414,7 @@ else, and protect the bucket like the data directory.
   write-only (`GET /backings/config` reports only `secretKeyConfigured`,
   `encryptionKeyConfigured` and whether a value comes from the
   environment), and the Storage page shows them as "Saved – leave blank to
-  keep". Backing status shows the location (`s3://bucket/prefix/`), not
+  keep". Backing status shows locations (`s3://bucket/prefix/`), not
   credentials. Restic runs with the credentials in its environment, never
   on its command line, and its diagnostics are redacted before they are
   logged.
@@ -336,7 +422,16 @@ else, and protect the bucket like the data directory.
   `admin:GetConfig` and changing it `admin:UpdateConfig` at service level;
   an administrator who can change backings can point a backing at any
   S3 service, so treat it like root. An endpoint that is this server
-  itself is refused.
+  itself is refused. The remote buckets and containers of a backing are
+  admin actions on `arn:gos3:admin:::backing/<name>`: `admin:ListRemoteBuckets`
+  (browse the account's buckets, list containers), `admin:CreateRemoteBucket`,
+  `admin:AdoptRemoteBucket` and `admin:ManageContainers`; releasing a native
+  bucket is `admin:ReleaseBucket` on the bucket. The built-in `diagnostics`
+  policy does not allow `admin:ListRemoteBuckets`, but through
+  `admin:ListBackings` it sees each s3 backing's account summary: its home,
+  default kind, bucket counts and containers with their labels and
+  locations. Container labels are also shown to every caller of
+  `GET /whoami` (as are backing names): do not put secrets in them.
 
 Compressed objects (see [operations.md](operations.md#compression)) are
 not protected by compression alone: without object encryption, anyone who
@@ -757,7 +852,10 @@ then cannot verify it.
   `s3:BypassGovernanceRetention` on each locked object (`403` otherwise), so a
   key with only `admin:ForceDeleteBucket` cannot destroy locked data. Remove
   legal holds through the S3 API first; COMPLIANCE data stays until its
-  retention expires.
+  retention expires. On a native bucket of an s3 backing it deletes the
+  objects of the remote bucket, also of an adopted one; `POST
+  /buckets/{name}/release` (`admin:ReleaseBucket`) forgets such a bucket
+  without deleting anything.
 - `PUT /_gos3/admin/v1/config` (`admin:UpdateConfig`) can change CORS,
   discovery and the public URL. Treat it like root access (see
   [Scoping admin permissions](#scoping-admin-permissions) for the other

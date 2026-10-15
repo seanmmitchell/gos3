@@ -112,6 +112,7 @@ gos3 logs to stderr with Go's `log/slog`, as `text` (default) or `json`
     ├── settings.json            runtime settings, after the first change
     ├── placements.json          which backings hold which buckets
     ├── backings.json            backings configured in the web UI, after the first change (secret: s3 credentials)
+    ├── s3/<backing>/            records of an s3 backing without a home (state.db, staged/)
     └── server-id                this server's discovery ID
 ```
 
@@ -126,12 +127,15 @@ Each additional fs backing has its own `keys/`, `restic/` and
 With the memory backend and a data path, only the system files (`iam.json`,
 `settings.json`, `placements.json`, `backings.json`, `server-id`,
 `root-credentials.json`) are kept; objects live in memory. The same holds
-when the default backing is an [s3 backing](backings.md): its buckets,
-metadata, keys and restic repositories live in the remote bucket, and
+when the default backing is an [s3 backing](backings.md) with a home: its
+buckets, metadata, keys and restic repositories live in its S3 account, and
 `storage.path` is optional and only holds the system files. Without it they
 are ephemeral (the server logs a warning): IAM users, settings, placements
 and live backing changes are lost on restart, and root credentials are
-generated anew unless configured. s3 backings need no local directory:
+generated anew unless configured. An s3 backing without a home keeps its
+records (its buckets and containers, the configuration of its native
+buckets) in `.gos3/s3/<backing>/` and requires `storage.path`; back that
+directory up with the rest. s3 backings need no local data directory:
 each gets a temporary directory under the operating system's temporary
 directory (`gos3-<backing>-*`, removed at shutdown) for upload spool files,
 restic's cache and restores. Every backend takes an exclusive lock on `.gos3/lock` while it runs
@@ -164,18 +168,18 @@ Use **Storage → Configure backings** to add storage (a directory, memory or
 a bucket of an S3 service) and choose the default for new buckets without
 restarting. You can replace or remove additional backings once their
 buckets and replicas have been moved or removed and background cleanup has
-finished; the connection settings and credentials of an s3 backing can be
-changed at any time (of a gateway backing, only while it holds no buckets). Backing definitions persist in
+finished; the connection settings, credentials and default bucket kind of
+an s3 backing can be changed at any time. Backing definitions persist in
 `backings.json` in the system directory; the UI indicates when the server
 has no persistent settings directory. The system backing named `default`
 is fixed at startup.
 
 A server can store buckets on several backings (see
 [configuration.md](configuration.md#storage-backings)), typically one fs
-directory per disk, or a bucket of a remote S3 service
+directory per disk, or an account of a remote S3 service
 ([backings.md](backings.md)). Each fs backing directory has its own
 `.gos3/` with its own `meta.db`, data files and lock, and each s3 backing
-its own bucket and prefix; the system state (`iam.json`, `settings.json`,
+its own home, containers and native remote buckets; the system state (`iam.json`, `settings.json`,
 `placements.json`, ...) stays in `storage.path`. Every bucket has a **placement**, managed in the web UI (bucket
 settings, Placement tab, and the server's Storage page) or the admin API
 ([admin-api.md](admin-api.md#storage-backings-and-bucket-placement)):
@@ -216,15 +220,27 @@ Things to know:
 - In-progress multipart uploads live on the primary only. After the primary
   changes (move, promotion, failover) they fail with `NoSuchUpload` and must
   be restarted.
+- s3 backings: [native buckets](backings.md#bucket-kinds) can be neither
+  replicated nor moved, and replicas and move targets on an s3 backing are
+  always wrapped buckets, in the backing's default container or the
+  container a move names (`container` in the move request, or the Container
+  field of Move in the web UI). An s3 backing without any container can
+  hold no replicas. A native bucket that is no longer wanted in gos3 can be
+  released (`POST /buckets/{name}/release`): gos3 forgets it and its remote
+  bucket stays as it is.
 - Changes waiting to be copied are kept in memory. After a restart every
   replica is compared with its primary in full, in the background (cost:
   reading the metadata of every object on both sides); active-active replicas
   serve reads and receive synchronous writes again when that finishes.
 - Backing health: a backing is marked unhealthy when an operation on it fails
-  with an I/O error, or when it does not list its buckets within 5 s at the
-  periodic check (`storage.replication.health_interval`); it is healthy again
-  after the next successful check. `GET /_gos3/admin/v1/backings` and the
-  Storage page show the state and the last error.
+  with an I/O error, or when it fails the periodic check
+  (`storage.replication.health_interval`): listing its buckets within 5 s,
+  or for an s3 backing, its home serving (without a home, its service
+  answering); it is healthy again after the next successful check. A
+  failure of one bucket's remote location (a native bucket's remote
+  bucket, a container) leaves the backing healthy and affects that bucket
+  only. `GET /_gos3/admin/v1/backings` and the Storage page show the state
+  and the last error.
 - Removing a backing from the configuration: replicas on it are forgotten (a
   replica is promoted where it was the primary). gos3 refuses to start when a
   bucket's only copy was on it; configure the backing again, or remove the
@@ -278,16 +294,18 @@ data, objects written after that backup are not destroyed: they land in
 expires. Never delete `meta.db` to get past a "locked by another process"
 error: stop the other process instead.
 
-Buckets on [s3 backings](backings.md) live entirely in the remote bucket
-under the backing's prefix: metadata, data, wrapped keys and restic
-repositories. The data directory holds none of it. Protect the remote
-bucket with the service's own means (bucket versioning, replication), or
-copy the whole prefix while gos3 is stopped; see
-[backings.md](backings.md#backups). **Keep the encryption key** of each
-s3 backing (`encryption_key`, `GOS3_S3_ENCRYPTION_KEY` or
-`GOS3_BACKING_<NAME>_ENCRYPTION_KEY`) in a safe place of its own: without
-it the backing's encrypted objects and restic archives are lost. Gateway
-buckets hold ordinary objects that any S3 tool can back up.
+Buckets on [s3 backings](backings.md) live in the backing's S3 account:
+wrapped buckets entirely in their container (metadata, data, wrapped keys
+and restic repositories), native buckets as ordinary objects of their
+remote bucket, which any S3 tool can back up. The data directory holds
+none of it, except the records of an s3 backing without a home
+(`.gos3/s3/<backing>/`). Protect the remote buckets with the service's own
+means (bucket versioning, replication), or copy a container's whole prefix
+while gos3 is stopped; see [backings.md](backings.md#backups). **Keep the
+encryption key** of each s3 backing (`encryption_key`,
+`GOS3_S3_ENCRYPTION_KEY` or `GOS3_BACKING_<NAME>_ENCRYPTION_KEY`) in a safe
+place of its own: without it the backing's encrypted objects and restic
+archives are lost.
 
 **2. Object-level copy (portable).** Mirror buckets with any S3 tool, for
 example `rclone sync gos3:bucket backup:bucket` or
@@ -444,6 +462,16 @@ local, and an s3 backing is configured as described in
 `restic_s3` key, is a configuration error). Data written by those builds to
 a remote bucket is not picked up; copy such buckets through S3 into a
 backing of the current version.
+
+Later development builds configured an s3 backing with `bucket`, `prefix`
+and `gateway`. These keys are still accepted (a deprecation warning is
+logged at startup; `gos3 config print` shows `home_bucket`, `home_prefix`
+and `default_kind`), and the backing's data is migrated in place when it
+is first loaded: a plain backing's buckets become wrapped buckets in its
+home, a gateway backing's buckets native buckets. Builds before the
+migration cannot open a migrated backing, so back up its prefix before
+upgrading if you may need to roll back. See
+[backings.md](backings.md#migration-from-earlier-development-builds).
 `gos3 version` (or `GET /_gos3/info`) shows the running version.
 
 ## Troubleshooting
@@ -460,7 +488,9 @@ backing of the current version.
 | Startup warning: `recovery moved unreferenced files to the quarantine` | Files no metadata references were moved to `.gos3/orphans/`; inspect them if objects are missing. |
 | Startup: `settings.json: …` | The runtime settings file is corrupt or invalid; fix or remove it. |
 | The buckets of one backing answer `503 ServiceUnavailable` | Its S3 service is unreachable, or the backing is still loading; the Storage page shows the last error. See [backings.md](backings.md#behaviour-when-the-remote-is-unreachable). |
-| s3 backing: `prefix in use by another server` | Another gos3 server runs on the same bucket and prefix. After a crash, the next start waits until the old lease is 30 s old. |
+| Only one bucket of an s3 backing answers `503 ServiceUnavailable` | Its own remote location fails: a native bucket's remote bucket was deleted or is forbidden to the backing's credentials, or a wrapped bucket's container is still loading or cannot be used (see its state on the backing's page). See [backings.md](backings.md#behaviour-when-the-remote-is-unreachable). |
+| CreateBucket of a native bucket: `BucketAlreadyExists` ("an administrator can adopt it") | The remote bucket to create exists in the backing's account. The S3 API never adopts remote buckets; an administrator can, on the backing's Remote buckets page. |
+| s3 backing: `prefix in use by another server` | Another gos3 server runs on the same home or container. After a crash, the next start waits until the old lease is 30 s old. |
 | s3 backing: `the S3 service does not support conditional writes` | The service ignores `If-None-Match` / `If-Match` on PUT; gos3 cannot use it for an s3 backing. |
 | s3 backing: `encryption key does not match this backing` | The configured `encryption_key` differs from the one the backing's keys are wrapped with; configure the original key. |
 | Peers show `unverified` with a TLS error | The peer uses a certificate that this server does not trust. |

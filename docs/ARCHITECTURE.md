@@ -29,17 +29,18 @@ discovery of gos3 servers on the network.
 | `internal/config/` | config types (contract) + loading (file/env/flags) + settings persistence | integration |
 | `internal/webui/` | `embed` of the built UI (`dist/`), SPA fallback handler | integration |
 | `internal/s3err/` | S3 error codes (contract; append-only) | — |
-| `internal/storage/` | Backend contract + generic list helpers (`list.go`) | contract / storage-memory |
+| `internal/storage/` | Backend contract (+ per-bucket capabilities `capabilities.go`, approved GOVERNANCE bypass `lockctx.go`) + generic list helpers (`list.go`) | contract / storage-memory |
 | `internal/storage/index/` | in-memory object index (skip list, version stamps, versioning semantics, walks, uploads), generic over the data payload; shared by memory and s3store | storage-memory |
 | `internal/storage/memory/` | in-memory backend (on `index`) | storage-memory |
 | `internal/storage/fs/` | filesystem backend (bbolt index + data files) | storage-fs |
-| `internal/storage/s3store/` | `s3` backend: everything in a remote S3 bucket/prefix (`index` in memory, journaled to S3; data blobs; wrapped keys; restic repositories) | backings |
+| `internal/storage/s3account/` | `s3` backend: one `storage.Backend` per S3 account connection; registry of native and wrapped buckets, home and containers, server-wide claims on remote locations, remote bucket browser, migration of earlier layouts | backings |
+| `internal/storage/s3store/` | a gos3 store in a remote S3 bucket/prefix, used as an s3 backing's home or container of wrapped buckets (`index` in memory, journaled to S3; tagged data blobs; wrapped keys; restic repositories; aux namespaces for other components' records) | backings |
+| `internal/storage/native/` | native buckets of s3 backings: objects stored as-is in remote buckets, versioning and object lock passed through, gos3 metadata in `x-amz-meta-gos3-meta` and overlay records, multipart staging | backings |
+| `internal/storage/localstate/` | local records of s3 backings without a home (bbolt `state.db` + staged files under the system directory) | backings |
 | `internal/storage/restic/` | restic runner shared by fs and s3store: prepare/init/validate, stdin archiver, lazy shared restores (+ `restictest` fake restic) | storage-encryption |
-| `internal/storage/multi/` | multi-backing router: bucket placement, replication (active-passive / active-active), online moves, backing health, tolerant open, live backing configuration | storage-multi |
+| `internal/storage/multi/` | multi-backing router: bucket placement, replication (active-passive / active-active), online moves, release, per-bucket capability checks, backing health, tolerant open, live backing configuration | storage-multi |
 | `internal/storage/storagetest/` | backend conformance suite | storage-conformance |
-| `internal/storage/routed/` | gateway s3 backings: bucket records on an s3store opened in gateway mode, objects on a `DataStore` | backings |
-| `internal/storage/gateway/` | gateway `DataStore`: objects stored natively in remote buckets; upload state in a `StateStore` (s3store `AuxState`) | backings |
-| `internal/s3client/` | minimal SigV4 S3 client for s3 backings (+ `s3clienttest` in-process remote with fault injection) | backings |
+| `internal/s3client/` | minimal SigV4 S3 client for s3 backings: objects, versions, multipart, buckets, regions, object lock, tagging (+ `s3clienttest` in-process remote with fault injection and provider quirks) | backings |
 | `internal/storage/compress/` | seekable block-compressed data format used by the fs, memory and s3 backends | storage-compression |
 | `internal/storage/crypt/` | authenticated AES-256-GCM chunked stream format for natively encrypted (SSE-S3) data | storage-encryption |
 | `internal/compression/` | compression policy: bucket setting document, server mode, per-object decision | storage-compression |
@@ -245,8 +246,31 @@ See the doc comments in `storage.go`. Key points:
     only those: fs reports `restic` only while the restic executable is on
     `PATH`, memory reports `AES256` only, s3store reports nothing without a
     KEK and `AES256` (plus `restic` when the executable is on `PATH`) with
-    one, and the multi router reports the intersection over the bucket's
-    backings.
+    one, the s3 backend reports its container's for a wrapped bucket and
+    nothing for a native one, and the multi router reports the intersection
+    over the bucket's backings.
+  - In `capabilities.go`: `BucketCapabilities` reports what one bucket
+    supports (`BucketCaps`: kind, `Import` of copied versions, a copyable
+    `History`, versioning, object lock, compression), and with
+    `NewBucketCaps` what a bucket about to be created with given options
+    would support, without I/O. `CapsOf` / `NewCapsOf` fall back to full
+    capabilities for backends implementing `VersionImporter` (fs, memory).
+    `BucketReleaser` forgets a bucket without deleting its data,
+    `HealthProber` replaces the `ListBuckets` health probe, and
+    `KindReporter` reports the bucket kinds a backing offers and its
+    default. The s3 backend implements all four.
+  - In `lockctx.go`: `WithGovernanceBypass` marks a context whose
+    GOVERNANCE bypass the S3 layer has approved; backends that enforce
+    retention themselves (native buckets, through their remote service)
+    pass it on, the others ignore it.
+  - Remote-location errors: `ErrBucketUnavailable` (one bucket's remote
+    location fails; wraps `ErrBackingUnavailable`, so 503, but never marks
+    the backing down), `ErrRemoteDenied` (403), `ErrRemoteRejected` (500
+    naming at most the remote's error code; the S3 layer logs the full
+    error and sends clients fixed messages), `ErrInvalidTarget` (a
+    `BucketTarget` the backing cannot honour, 400, without detail on the
+    S3 API) and `ErrRemoteBucketExists` (wraps
+    `ErrBucketExists`; 409 `BucketAlreadyExists`).
   `storage.ListObjects`, `ListObjectVersions` and `ListUploads` return
   entries trimmed to the fields a listing reports (`storage.ListingInfo`).
   `uploads.go` builds on them: `storage.ListUploads` (S3
@@ -315,15 +339,33 @@ See the doc comments in `storage.go`. Key points:
   record uses record format 5 (format 4 plus `ObjectMeta.Encryption`,
   compressed or not), which builds before object encryption cannot read
   (rollback: [operations.md](operations.md#upgrades)).
-- `s3store` (the `s3` backend, [`docs/backings.md`](backings.md)): a full
-  `storage.Backend` implementing every optional extension fs and memory
-  implement, with everything under `P = <bucket>/<prefix>` of one remote
-  bucket and no local state (upload spool and restic temporaries aside):
-  - **Layout**: `gos3.json` (marker: format, backing ID, gateway flag, KEK
-    check value), `meta/lease.json`, `meta/journal/<epoch>/<seq>`,
-    `meta/snapshots/<lsn>-<epoch>`, `data/<bucket-id>/<data-id>`,
-    `parts/<upload-id>/<n>-<id>`, `keys/<bucket-id>.key` (+ `.restic.json`,
-    without password), `restic/<bucket-id>/`, `gateway/parts/...`.
+- `s3store` (a gos3 store in a remote bucket, [`docs/backings.md`](backings.md)):
+  a full `storage.Backend` implementing every optional extension fs and
+  memory implement, with everything under `P = <bucket>/<prefix>` of one
+  remote bucket and no local state (upload spool and restic temporaries
+  aside). The s3 backend (`s3account`, below) opens one per container:
+  its home and each further container of wrapped buckets.
+  - **Layout**: `gos3.json` (marker: format, store ID, role `home` or
+    `container`, `blobTags`, KEK check value; the legacy gateway flag stays
+    readable for the migration), `meta/lease.json`,
+    `meta/journal/<epoch>/<seq>`, `meta/snapshots/<lsn>-<epoch>`,
+    `data/<bucket-id>/<data-id>`, `parts/<upload-id>/<n>-<id>`,
+    `keys/<bucket-id>.key` (+ `.restic.json`, without password),
+    `restic/<bucket-id>/`, `gateway/parts/<ns>/<name>` (staged blobs of aux
+    namespaces).
+  - **Create modes** (`Options.Create`): `CreateIfNoData` (default, homes:
+    a prefix holding `meta/`, `data/`, `parts/`, `keys/`, `restic/` or
+    `gateway/` objects without a marker is `ErrUnmanagedPrefix`; other keys
+    are tolerated), `CreateIfEmpty` (new containers: any key but a zero-byte
+    folder placeholder and probe leftovers is `ErrPrefixNotEmpty`, checked
+    again right before the marker is written) and `MustExist` (registered
+    or attached containers: `ErrMarkerMissing`). `Options.ExpectBackingID`
+    refuses a marker of another store (`ErrMarkerMismatch`), so a swapped
+    location is never used.
+  - **Aux namespaces** (`AuxState(ns)`): journaled key/value records plus
+    staged blobs for other components, with the method set of
+    `AuxStore`: the s3 backend's registry (`account`) and the native
+    store's state (`gateway`, the namespace legacy gateway backings used).
   - **Metadata engine** (`engine.go`, `journal.go`, `lease.go`,
     `marker.go`, `replay.go`, `snapshot.go`): metadata is an `index` held in
     memory; every change is a journal record (its exact `index.Change`, so
@@ -346,13 +388,17 @@ See the doc comments in `storage.go`. Key points:
     (journal bytes, batch count, age; and at Close). The two newest are
     kept, and journal batches older than the older one are deleted, except
     seals and the last slot of each epoch. Documented envelope: a few
-    million versions per backing.
+    million versions per store (container).
   - **Data path**: compress, encrypt, spool, upload, then the journal
     record. Readers are lazy ranged GETs; open readers are refcounted per
     blob and the delete of a superseded blob is deferred until the last
     one closes. CompleteMultipartUpload composes server-side
-    (UploadPartCopy) only for plain data. An age-based recovery pass
-    (24 h default) deletes unreferenced blobs.
+    (UploadPartCopy) only for plain data. Every blob carries
+    `x-amz-meta-gos3-store: <store ID>`. An age-based recovery pass (24 h
+    default, hourly) deletes an unreferenced blob only when its name is
+    one the store generates and a HEAD shows its own store ID: untagged
+    and foreign objects are never deleted (counted at debug level), which
+    is what makes containers in shared buckets and existing prefixes safe.
   - **Keys**: per-bucket master keys are wrapped (AES-256-GCM with AAD) by
     the KEK (`Options.KEK`) and created with `If-None-Match`; a bucket
     marked encrypted whose key is missing is `ErrEncryptionUnavailable`
@@ -369,34 +415,93 @@ See the doc comments in `storage.go`. Key points:
     an unmanaged prefix, a service without conditional writes and a
     damaged journal are hard errors reported through the backing's health.
     `PrepareConnection` verifies new connection settings (marker, KEK)
-    before a live reconfiguration swaps them in. The server
-    (`internal/server/s3backing.go`) waits up to 15 s at startup for s3
-    backings to load and starts the rest unhealthy; a backing added live
-    must load within 30 s, and its errors are classified for the admin API
-    (`ErrInUse` → 409; wrong KEK, marker mismatch, unmanaged prefix, no
-    conditional writes and remote auth/bucket/region errors → 400;
-    `storage.ErrBackingUnavailable` → 503). Each s3 backing gets a temporary
-    directory under `os.TempDir()` (spool, restic cache and restores),
-    removed at Close.
-- **Gateway** s3 backings (`s3.gateway: true`) are `routed.New` with an
-  s3store opened with `Gateway: true` on the metadata bucket/prefix as the
-  primary (bucket records and configuration documents; its object
-  operations answer `storage.ErrNotSupported`) and a `routed.DataStore`
-  (`internal/storage/gateway`) that stores native objects in remote buckets
-  named like the gos3 buckets. The gateway keeps its multipart upload
-  records and staged small parts in a `StateStore`, implemented by the
-  s3store's `AuxState("gateway")` (journaled aux records plus blobs under
-  `gateway/parts/`). `routed` exists for this case only. The gateway store
-  runs in per-bucket mode with no key prefix, and refuses a gos3 bucket
-  named like the metadata bucket (`ReservedBucket`). Its connection can be
-  reconfigured live only while it holds no buckets (409 otherwise). Gateway buckets
-  are unversioned (`storage.ErrNotSupported` -> 501) and, as
-  `routed.Backend` does not implement `storage.VersionImporter`, cannot
-  receive copies (replicas, moves). Remote failures are
-  `storage.ErrBackingUnavailable` (503).
+    before a live reconfiguration swaps them in.
+- `s3account` (the `s3` backend, [`docs/backings.md`](backings.md)): one
+  `storage.Backend` per s3 backing, i.e. per connection to an S3 account
+  (endpoint + credentials), holding buckets of two kinds
+  (`storage.BucketKind`):
+  - **Registry** (`registry.go`): records in the aux namespace `account` of
+    the home's s3store, or, for a backing without a home, of a local
+    `internal/storage/localstate` database (`<sys>/s3/<backing>/state.db`
+    plus staged files, mode 0700, locked while open): `k/<container>/`
+    (containers other than the home), `b/<bucket>/` (every bucket: kind,
+    container or remote bucket and region, whether gos3 created it, cached
+    `BucketInfo`), `c/<bucket>/<config>/` (native buckets' configuration
+    documents), `d/default-container`. Loaded into memory, written through
+    under `adminMu`; a record of a newer schema is refused.
+  - **Wrapped** buckets live in a **container**, an s3store: the home
+    (implicit ID `home`, opened `CreateIfNoData`) or a registered one
+    (`dedicated`: a remote bucket gos3 created; `existing`: a prefix of an
+    existing bucket; opened `MustExist` with the recorded store ID, or
+    `CreateIfEmpty` when added). Containers load in the background; at most
+    64 per backing. Errors of a container other than the home are
+    classified (`containers.go`): transport errors and 5xx stay
+    backing-level, anything else (not loaded, `ErrInUse`, wrong KEK, a
+    deleted or forbidden bucket) becomes `storage.ErrBucketUnavailable`.
+  - **Native** buckets are served by one `internal/storage/native` store
+    whose state (multipart records, staged small parts, overlay records)
+    is the aux namespace `gateway`. The store keeps no bucket records: it
+    resolves each bucket's binding (remote bucket, region, owned) and
+    recorded versioning/lock on every operation, reports contradicting
+    remote answers (`OnDrift`), and the backing then refreshes the record.
+    Remote errors map as in `native/errors.go` (bucket-level failures →
+    `ErrBucketUnavailable`, object-level 403 → `ErrRemoteDenied`, other 4xx
+    → `ErrRemoteRejected`, 5xx/transport → `ErrBackingUnavailable`).
+  - **Dispatch** (`dispatch.go`): wrapped buckets forward everything to
+    their container; native buckets go to the native store, with bucket
+    configuration from the registry (object lock configuration and
+    versioning are mirrored to the remote first). Native buckets refuse
+    imports (`errors.ErrUnsupported`) and encryption, and store compressed
+    writes uncompressed. `ReleaseBucket` detaches a native bucket without a
+    remote DELETE; `DeleteBucket` deletes the remote bucket only when gos3
+    created it.
+  - **Claims** (`claims.go`, `NewClaims`): a server-wide in-memory registry
+    of remote locations, keyed by service (the endpoint's host and port,
+    normalised like config's overlap check) and lower-cased bucket: a
+    native claim conflicts with any claim on its bucket of that service,
+    home and container claims with each other when their prefixes nest.
+    Conflicts found while loading make the container or bucket unavailable
+    (logged); new ones are `ErrInvalidTarget`.
+  - **Remote manager** (`remote.go`, CONTRACT `RemoteManager`, used by the
+    admin API): `RemoteBuckets` (the account's buckets with their uses and
+    status; incomplete when ListBuckets is denied), `CheckAdoptable` (no
+    claim, no `gos3.json` at the root or in the first 100 top-level
+    prefixes), `CreateRemoteBucket`, `AddContainer` / `RemoveContainer` /
+    `SetDefaultContainer`, `Info`. Adoption is only reachable through the
+    admin API (`BucketTarget.Adopt`).
+  - **Reconcile and migration** (`reconcile.go`, `migrate.go`): records are
+    written after (creation) or deleted after (deletion) the container
+    change, and each loaded container is reconciled: a bucket without a
+    record is recorded as wrapped (which is also how the home of a plain
+    s3 backing of an earlier build migrates), a record whose bucket is gone
+    is dropped. A legacy gateway home (`Marker.Gateway`) is migrated bucket
+    by bucket into native records bound to the same-named remote bucket
+    (as adopted), then its marker flag is cleared (`ClearLegacyGateway`).
+    Every step is idempotent.
+  - **Connection** (`connection.go`): `PrepareConnection` verifies the
+    home's and every loaded container's marker and KEK (and, without a
+    home, the credentials and up to 20 native remote buckets); its commit
+    swaps the client pool (per-region clones), every store and the native
+    store. `SetDefaultKind` changes the default kind in place.
+
+  The server (`internal/server/s3backing.go`) opens one `s3account` per s3
+  backing with the server-wide claims, waits up to 15 s at startup for
+  them to be ready (a backing without a home is ready at once) and starts
+  the rest unhealthy; a backing added live must load within 30 s, and its
+  errors are classified for the admin API (`s3store.ErrInUse`,
+  `ErrFenced`, `s3account.ErrClaimed` and `localstate.ErrLocked` → 409;
+  wrong KEK, marker mismatch or missing marker, unmanaged or non-empty
+  prefix, no conditional writes, other invalid targets and remote
+  auth/bucket/region errors → 400; `storage.ErrBackingUnavailable` → 503). Each s3 backing gets a temporary
+  directory under `os.TempDir()` (spool, restic cache and restores),
+  removed at Close.
 - CreateBucket's `x-gos3-backing` header picks the primary backing of a new
   bucket (`storage.ErrInvalidBacking` -> 400 for unknown names);
-  `BucketInfo.Backing` reports it.
+  `BucketInfo.Backing` reports it. On s3 backings `x-gos3-bucket-kind`,
+  `x-gos3-container` and `x-gos3-remote-bucket` build a
+  `storage.BucketTarget` (`CreateBucketOptions.Target`; `Adopt` is never
+  set by the S3 layer), and `BucketInfo.Kind` / `Location` report the
+  result (HeadBucket: `x-gos3-bucket-kind`).
 - `list.go` turns `WalkObjects`/`WalkVersions` into S3 listings (prefix,
   delimiter grouping, markers, truncation). When a common prefix `p` is found
   it restarts the walk after `p + "\xff"` (UTF-8 never contains 0xFF) so huge
@@ -406,8 +511,8 @@ See the doc comments in `storage.go`. Key points:
 
 The server's backend is always a `multi.Router` over one or more named
 backings (`default` = `storage.backend` with `storage.path` or
-`storage.s3`, plus `storage.backings`; each is an fs, memory or s3store
-backend, or a gateway). It implements `storage.Backend` and every optional
+`storage.s3`, plus `storage.backings`; each is an fs, memory or s3
+(`s3account`) backend). It implements `storage.Backend` and every optional
 extension by routing each bucket to its placement: a primary backing and
 optional replicas, in mode `single`, `active-passive` (changed keys copied
 in the background, read fallback, promotion by hand or with
@@ -424,6 +529,21 @@ adopted where they are found at startup.
   therefore idempotent, and every repair is just another comparison: changed
   keys are queued per replica (in memory; a full comparison runs after a
   restart, after a write to a replica fails and when a queue overflows).
+- **Per-bucket capabilities** (`caps.go`): a bucket can receive copies
+  (be a replica or move target) when the target backing reports `Import`
+  for it (`storage.NewCapsOf` with `Import` set and the move's
+  `BucketTarget`, no I/O), and be the primary of replicas or a move source
+  when its own copy reports `History` (`storage.CapsOf`). A native bucket
+  has neither, so it can be neither replicated nor moved, and replicas and
+  move targets on s3 backings are created with `CreateBucketOptions.Import`
+  set, which makes them wrapped buckets. `checkNewMembers`, the default
+  replicas of new buckets and live backing configuration use these checks.
+  A move may name the target's container (`Router.Move` with a
+  `BucketTarget`), persisted with the move in `placements.json`.
+- **Release** (`Router.ReleaseBucket`): a bucket with a single copy and no
+  move in progress, on a backing implementing `storage.BucketReleaser`, is
+  forgotten without the background deletion that follows DeleteBucket (a
+  native bucket keeps its remote bucket and objects).
 - A per-bucket gate counts writes in flight; cutovers (end of a move,
   graceful promotion, an active-active replica switching to synchronous
   writes, failover) close it, wait for in-flight writes, copy the last
@@ -431,7 +551,12 @@ adopted where they are found at startup.
   versions in the primary's order.
 - A backing is unhealthy after an I/O error (any error that is not a
   storage sentinel, a context error or the caller's callback error) or a
-  failed periodic `ListBuckets` probe. Reads skip unhealthy backings; walks
+  failed periodic probe (`storage.HealthProber` when the backend has one,
+  else `ListBuckets`). `storage.ErrBucketUnavailable`, `ErrRemoteDenied`,
+  `ErrRemoteRejected` and `ErrInvalidTarget` concern one bucket and never
+  mark the backing down: reads fall back to another copy on
+  `ErrBucketUnavailable` and an active-active follower failing with it is
+  demoted to background copying. Reads try unhealthy backings last; walks
   fall back only before the first entry was delivered.
 - **Tolerant open**: at `Open`, `reconcile()` lists each backing with a
   timeout. A backing that fails (an s3 backing whose service is down or
@@ -443,16 +568,19 @@ adopted where they are found at startup.
   `ErrInvalidBacking` are not backing failures.
 - **Live configuration** (`ConfigureBackings` with a `BackingOpener`):
   backings are compared with their current definition by identity
-  (`config.BackingDefinition.Identity`: fs path; s3 bucket, prefix and
-  gateway flag). A different identity replaces the backing (it must be
-  unused and empty, and a new backing must hold no buckets); a
-  connection-only change of an s3 backing (endpoint, region, credentials,
-  KEK, addressing, part size) goes through `BackingOpener.Reconfigure`
-  (`s3store.PrepareConnection` verifies marker and KEK and returns a
-  commit that swaps the connection). The revision is a hash of the
-  redacted settings plus a generation counter. `Backing` and
-  `BackingStatus` carry `Location` (`s3://bucket/prefix/`) and `Mode`
-  (`gateway` or empty).
+  (`config.BackingDefinition.Identity`: fs path; s3 `home:<bucket>/<prefix>`,
+  or `local:<name>` for a backing without a home). A different identity
+  replaces the backing (it must be unused and empty, and a new backing must
+  hold no buckets); a change of an s3 backing's connection (endpoint,
+  region, credentials, KEK, addressing, part size) or default kind goes
+  through `BackingOpener.Reconfigure` (`s3account.PrepareConnection`
+  verifies the home's and containers' markers and KEK and returns a commit
+  that swaps the connection). The revision is a hash of the redacted
+  settings plus a generation counter. `Backing` and `BackingStatus` carry
+  `Location` (an s3 backing's home, `s3://bucket/prefix/`); `BackingStatus`
+  also carries the `Kinds` and `DefaultKind` an s3 backing reports
+  (`storage.KindReporter`), read at status time; `Router.BackingBackend`
+  gives the admin API the backend itself (`s3account.RemoteManager`).
 - Multipart uploads live on the primary only (not copied).
 - Compression: the router implements `storage.CompressingBackend` by
   forwarding to the primary; active-active replicas receive the same write
@@ -463,8 +591,7 @@ adopted where they are found at startup.
   `providersOf()` (`EncryptionProvidersBackend`) over its backings, and
   `checkEncryptionTarget` refuses a replica or move target that cannot
   store a provider the bucket uses (restic to memory, AES256 or restic to
-  a KEK-less s3 backing); `checkNewMembers` refuses targets without
-  `VersionImporter` (gateway). Copies of an encrypted version are
+  a KEK-less s3 backing). Copies of an encrypted version are
   encrypted on the receiving backing with that backing's own key and
   repository (`WriteOptions.Encryption`); a backing that cannot store the
   provider fails the copy instead of storing plaintext.
@@ -476,10 +603,11 @@ running server, whatever the backend; a no-op on platforms without
 overrides `storage.backings` and `storage.default_backing` at the next
 start while management is enabled), `settings.json` (written on
 the first runtime settings update, then it wins over file/env/flags for the
-Settings fields), `server-id`, and `root-credentials.json` (only when root
-keys were generated). With a memory or s3 default backing this needs
+Settings fields), `server-id`, `root-credentials.json` (only when root
+keys were generated) and `s3/<backing>/` (the records of s3 backings
+without a home). With a memory or s3 default backing this needs
 `storage.path`; without it the system state is ephemeral (a warning is
-logged). Bucket names cannot start with `.`,
+logged), and s3 backings without a home are refused. Bucket names cannot start with `.`,
 so no clash.
 
 ### Compression
@@ -538,8 +666,11 @@ version is stored.
   explicit Deny wins; anonymous requests are allowed only by bucket policy
   (`Principal: "*"`) or public canned ACLs.
 - Admin API actions are `admin:<Action>`, evaluated against
-  `arn:gos3:admin:::user/<name>`, `…:policy/<name>`, `…:bucket/<name>` or
-  service level (see `docs/admin-api.md`); s3 and admin ARNs never
+  `arn:gos3:admin:::user/<name>`, `…:policy/<name>`, `…:bucket/<name>`,
+  `…:backing/<name>` (the remote buckets and containers of an s3 backing:
+  `ListRemoteBuckets`, `CreateRemoteBucket`, `AdoptRemoteBucket`,
+  `ManageContainers`) or service level (see `docs/admin-api.md`); policy
+  documents may use these types with wildcards; s3 and admin ARNs never
   cross-match. Admin request bodies must be signed (hex SHA-256 or signed
   streaming).
 
@@ -581,9 +712,10 @@ seeds, DNS SRV and active scans; every candidate is verified by fetching
   (folders via delimiter, upload/drag&drop, download, delete, rename/copy,
   metadata, tags, versions, presigned share links); bucket settings
   (versioning, policy editor with templates, CORS, lifecycle, tags, object
-  lock, encryption, ACL); IAM users/keys/policies; server settings; metrics
-  dashboard; discovery (per-server peers, scans, local discovery, one-click
-  "add server").
+  lock, encryption, ACL, placement); IAM users/keys/policies; server
+  settings; storage backings (live configuration; for s3 backings the
+  remote bucket browser and containers); metrics dashboard; discovery
+  (per-server peers, scans, local discovery, one-click "add server").
 
 ## Build, test & conventions
 

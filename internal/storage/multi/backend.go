@@ -91,13 +91,15 @@ func (r *Router) readers(bs *bucketState, spread bool) []*backing {
 }
 
 // readFrom calls fn with the bucket's readers in order until one answers
-// with something other than a backing failure.
-// cb, when not nil, tells errors of the caller's callback apart.
+// with something other than a backing failure or the unavailability of its
+// copy's remote location (storage.ErrBucketUnavailable, which leaves the
+// backing healthy). cb, when not nil, tells errors of the caller's
+// callback apart.
 func (r *Router) readFrom(bs *bucketState, spread bool, cb *cbTracker, fn func(b *backing) error) error {
 	var first error
 	for _, b := range r.readers(bs, spread) {
 		err := fn(b)
-		if !isBackingError(err) || cb.isCaller(err) {
+		if !fallBack(err) || cb.isCaller(err) {
 			return err
 		}
 		r.observe(b, err)
@@ -106,6 +108,13 @@ func (r *Router) readFrom(bs *bucketState, spread bool, cb *cbTracker, fn func(b
 		}
 	}
 	return first
+}
+
+// fallBack reports whether a read that failed with err should be retried
+// on another copy of the bucket: after a failure of the backing, or of the
+// copy's remote location alone (storage.ErrBucketUnavailable).
+func fallBack(err error) bool {
+	return isBackingError(err) || errors.Is(err, storage.ErrBucketUnavailable)
 }
 
 // route says where a write to a bucket goes.
@@ -364,8 +373,13 @@ func (r *Router) ListBuckets(ctx context.Context) ([]storage.BucketInfo, error) 
 
 // CreateBucket creates the bucket on opts.Backing (the x-gos3-backing
 // header), or on the default backing when it is empty. An unknown backing
-// yields storage.ErrInvalidBacking. The default replicas are added except
-// the chosen backing itself.
+// yields storage.ErrInvalidBacking. opts.Target (the bucket's kind and
+// location) needs a backing with bucket kinds
+// (storage.BucketCapabilities), else storage.ErrInvalidTarget; it is
+// checked (storage.NewCapsOf) before anything is created. The default
+// replicas are added except the chosen backing itself, when the new bucket
+// keeps a version history to copy (not a native bucket) and they can
+// receive copies.
 func (r *Router) CreateBucket(ctx context.Context, name string, opts storage.CreateBucketOptions) error {
 	if r.closed.Load() {
 		return ErrClosed
@@ -415,6 +429,16 @@ func (r *Router) CreateBucket(ctx context.Context, name string, opts storage.Cre
 	defer r.adminMu.Unlock()
 	// The member backends do not know the router's backing names.
 	opts.Backing = ""
+	if opts.Target != nil {
+		if _, ok := target.Backend.(storage.BucketCapabilities); !ok {
+			return fmt.Errorf("%w: backing %q has no bucket kinds or locations to choose from", storage.ErrInvalidTarget, target.Name)
+		}
+	}
+	// Refuse a target the backing cannot honour before creating anything.
+	caps, err := storage.NewCapsOf(ctx, target.Backend, opts)
+	if err != nil {
+		return err
+	}
 	if err := target.Backend.CreateBucket(ctx, name, opts); err != nil {
 		return r.observe(target, err)
 	}
@@ -427,11 +451,20 @@ func (r *Router) CreateBucket(ctx context.Context, name string, opts storage.Cre
 			continue
 		}
 		rb := topology.backings[rep]
-		if rb == nil || !canImport(rb) || !canImport(target) {
-			// Open and live configuration refuse such replicas; a bucket
-			// on an s3 gateway backing keeps no versions to copy.
+		var why error
+		switch {
+		case rb == nil:
+			why = fmt.Errorf("%w %q", ErrUnknownBacking, rep)
+		case !caps.History:
+			why = errNoHistory(target, name, caps.Kind)
+		default:
+			why = importTarget(ctx, rb, nil)
+		}
+		if why != nil {
+			// Open and live configuration refuse replicas that no new
+			// bucket can have; this bucket's kind or backing rules them out.
 			r.log.Warn("new bucket created without one of its default replicas, which cannot be used for it",
-				"bucket", name, "backing", rep, "primary", target.Name)
+				"bucket", name, "backing", rep, "primary", target.Name, "reason", why)
 			continue
 		}
 		r.mu.RLock()
@@ -718,7 +751,7 @@ func (r *Router) DeleteObjectChecked(ctx context.Context, bucket, key, versionID
 }
 
 // walk runs a walk on the bucket's readers. It falls back to the next
-// reader on a backing failure only when nothing was delivered yet.
+// reader (see fallBack) only when nothing was delivered yet.
 func (r *Router) walk(bs *bucketState, fn func(storage.ObjectInfo) error, run func(b storage.Backend, fn func(storage.ObjectInfo) error) error) error {
 	cands := r.readers(bs, false)
 	cb := &cbTracker{}
@@ -728,7 +761,7 @@ func (r *Router) walk(bs *bucketState, fn func(storage.ObjectInfo) error, run fu
 			delivered = true
 			return cb.note(fn(oi))
 		})
-		if !isBackingError(err) || cb.isCaller(err) {
+		if !fallBack(err) || cb.isCaller(err) {
 			return err
 		}
 		r.observe(b, err)

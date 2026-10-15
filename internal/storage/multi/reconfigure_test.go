@@ -46,9 +46,6 @@ func (f *fakeS3) opener(reconfigure bool) BackingOpener {
 				b.Backend = f.newBackend()
 			}
 			b.Location = d.Config().S3.Location()
-			if d.S3.Gateway {
-				b.Mode, b.Backend = "gateway", gatewayLike{b.Backend}
-			}
 		}
 		return b, nil
 	}}
@@ -84,7 +81,7 @@ var testKEK = base64.StdEncoding.EncodeToString(make([]byte, 32))
 // s3Def is an s3 backing definition named "remote".
 func s3Def(secret string) config.BackingDefinition {
 	return config.BackingDefinition{Name: "remote", Backend: config.BackendS3, S3: &config.S3Definition{
-		Endpoint: "http://127.0.0.1:9000", Bucket: "data", Prefix: "gos3/", AccessKey: "ak", SecretKey: secret, EncryptionKey: testKEK,
+		Endpoint: "http://127.0.0.1:9000", HomeBucket: "data", HomePrefix: "gos3/", AccessKey: "ak", SecretKey: secret, EncryptionKey: testKEK,
 	}}
 }
 
@@ -153,11 +150,10 @@ func TestConfigureBackingsS3Connection(t *testing.T) {
 		t.Fatal("unchanged settings were reconfigured")
 	}
 
-	// Another bucket or prefix is another backing, which is in use.
+	// Another home bucket or prefix is another backing, which is in use.
 	for _, change := range []func(*config.S3Definition){
-		func(s *config.S3Definition) { s.Bucket = "other" },
-		func(s *config.S3Definition) { s.Prefix = "elsewhere/" },
-		func(s *config.S3Definition) { s.Gateway = true },
+		func(s *config.S3Definition) { s.HomeBucket = "other" },
+		func(s *config.S3Definition) { s.HomePrefix = "elsewhere/" },
 	} {
 		if _, err := r.ConfigureBackings(ctx, withS3(out, change)); !errors.Is(err, ErrConflict) {
 			t.Fatalf("identity change of a backing in use: %v", err)
@@ -201,11 +197,19 @@ func TestConfigureBackingsS3Connection(t *testing.T) {
 	}
 	f.prepareErr = nil
 	f.onCommit = nil
-	if _, err := r.ConfigureBackings(ctx, moved); err != nil {
+	if next, err = r.ConfigureBackings(ctx, moved); err != nil {
 		t.Fatal(err)
 	}
 	if _, c := f.counts(); c != 2 {
 		t.Fatalf("committed %d", c)
+	}
+
+	// The default bucket kind is not part of the identity either.
+	if _, err := r.ConfigureBackings(ctx, withS3(next, func(s *config.S3Definition) { s.DefaultKind = config.BucketKindNative })); err != nil {
+		t.Fatal(err)
+	}
+	if _, c := f.counts(); c != 3 || r.topology.Load().backings["remote"] != remote {
+		t.Fatalf("default kind change: committed %d, backing replaced: %v", c, r.topology.Load().backings["remote"] != remote)
 	}
 }
 

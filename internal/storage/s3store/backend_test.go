@@ -3,6 +3,7 @@ package s3store
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -259,20 +260,13 @@ func TestOrphanRecovery(t *testing.T) {
 	if _, err := w.Commit(ctx, storage.PartMeta{}); err != nil {
 		t.Fatal(err)
 	}
-	b.mu.RLock()
-	bid := b.st.buckets["bk"].id
-	b.mu.RUnlock()
-	put := func(key string) {
-		if _, err := v.client.PutObject(ctx, storeBucket, key, strings.NewReader("x"), 1, s3client.PutOptions{}); err != nil {
-			t.Fatal(err)
-		}
-	}
+	bid := bucketID(t, b, "bk")
 	strayData := b.dataKey(bid, randomID(16))
 	strayPart := b.partKey(randomID(24), 1, randomID(16))
 	pendingKey := b.dataKey(bid, randomID(16))
 	unrecognized := "p/data/not-ours"
 	for _, k := range []string{strayData, strayPart, pendingKey, unrecognized} {
-		put(k)
+		v.putTagged(k, b.Marker().BackingID)
 	}
 	b.pending.add(pendingKey)
 
@@ -436,35 +430,237 @@ func TestPrepareConnection(t *testing.T) {
 	}
 }
 
-func TestGatewayBacking(t *testing.T) {
+// putTagged writes a one-byte object, with the blob tag of backing id
+// unless id is "".
+func (v *benv) putTagged(key, id string) {
+	v.t.Helper()
+	var h http.Header
+	if id != "" {
+		h = http.Header{blobTagHeader: {id}}
+	}
+	if _, err := v.client.PutObject(context.Background(), storeBucket, key, strings.NewReader("x"), 1, s3client.PutOptions{Header: h}); err != nil {
+		v.t.Fatal(err)
+	}
+}
+
+// tagOf returns the blob tag of key.
+func (v *benv) tagOf(key string) string {
+	v.t.Helper()
+	attrs, err := v.client.HeadObject(context.Background(), storeBucket, key)
+	if err != nil {
+		v.t.Fatalf("HEAD %s: %v", key, err)
+	}
+	return blobTag(attrs)
+}
+
+// Every blob the backend writes carries its tag, and the recovery deletes
+// only old unreferenced blobs with that tag: never untagged objects or
+// those of another backing, whatever their names, in data/, parts/ or the
+// staged blobs of aux namespaces.
+func TestRecoveryDeletesOnlyTaggedBlobs(t *testing.T) {
 	v := newBenv(t)
-	opts := v.options("gw/")
-	opts.Gateway = true
+	opts := v.options("p/")
+	opts.OrphanRetention = time.Minute
 	b := v.ready(opts)
 	ctx := t.Context()
-	if err := b.CreateBucket(ctx, "bk", storage.CreateBucketOptions{Backing: "gw"}); err != nil {
+	id := b.Marker().BackingID
+	if len(id) != 32 || !b.Marker().BlobTags {
+		t.Fatalf("marker = %+v", b.Marker())
+	}
+	if err := b.CreateBucket(ctx, "bk", storage.CreateBucketOptions{}); err != nil {
 		t.Fatal(err)
 	}
-	if info, err := b.GetBucket(ctx, "bk"); err != nil || info.Backing != "gw" {
-		t.Fatalf("GetBucket = %+v, %v", info, err)
+	bid := bucketID(t, b, "bk")
+
+	// Blobs of every kind are tagged: data, parts, server-side compositions
+	// (of 5 MiB parts, and of a single part) and staged blobs.
+	putObject(t, b, "bk", "small", []byte("data"))
+	u, err := b.CreateMultipartUpload(ctx, "bk", "big", storage.ObjectMeta{}, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for n := 1; n <= 2; n++ {
+		w, _ := b.NewPartWriter(ctx, "bk", "big", u.UploadID, n)
+		_, _ = w.Write(bytes.Repeat([]byte{byte('0' + n)}, 5<<20))
+		if _, err := w.Commit(ctx, storage.PartMeta{}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, k := range v.list("p/parts/") {
+		if tag := v.tagOf(k); tag != id {
+			t.Errorf("part blob %s tag = %q, want %q", k, tag, id)
+		}
+	}
+	if _, err := b.CompleteMultipartUpload(ctx, "bk", "big", u.UploadID, []int{1, 2}, storage.ObjectMeta{}, storage.CommitOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	u, _ = b.CreateMultipartUpload(ctx, "bk", "one", storage.ObjectMeta{}, "")
+	w, _ := b.NewPartWriter(ctx, "bk", "one", u.UploadID, 1)
+	_, _ = w.Write([]byte("single part"))
+	if _, err := w.Commit(ctx, storage.PartMeta{}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := b.CompleteMultipartUpload(ctx, "bk", "one", u.UploadID, []int{1}, storage.ObjectMeta{}, storage.CommitOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	aux := b.AuxState("ns")
+	if err := aux.PutStaged(ctx, "up1-00001-AbC_d", strings.NewReader("staged"), 6); err != nil {
+		t.Fatal(err)
+	}
+	dataBlobs := v.list("p/data/")
+	if len(dataBlobs) != 3 {
+		t.Fatalf("data blobs = %v", dataBlobs)
+	}
+	stagedBlobs := v.list("p/gateway/parts/")
+	if len(stagedBlobs) != 1 {
+		t.Fatalf("staged blobs = %v", stagedBlobs)
+	}
+	for _, k := range append(slices.Clone(dataBlobs), stagedBlobs...) {
+		if tag := v.tagOf(k); tag != id {
+			t.Errorf("blob %s tag = %q, want %q", k, tag, id)
+		}
+	}
+
+	// Old orphans with generated names: own, untagged and foreign.
+	other := randomID(16)
+	type stray struct{ key, tag string }
+	var own, kept []stray
+	for _, tag := range []string{id, "", other} {
+		set := []stray{
+			{b.dataKey(bid, randomID(16)), tag},
+			{b.dataKey(randomID(16), randomID(16)), tag}, // of a deleted bucket
+			{b.partKey(randomID(24), 7, randomID(16)), tag},
+			{b.stagedKey("ns", "up9-00002-"+randomID(4)), tag},
+		}
+		if tag == id {
+			own = set
+		} else {
+			kept = append(kept, set...)
+		}
+	}
+	// Tagged as ours, but outside the generated names or namespaces.
+	kept = append(kept,
+		stray{"p/data/" + bid + "/" + randomID(8), id},
+		stray{"p/parts/" + randomID(16) + "/00001-" + randomID(16), id},
+		stray{b.stagedKey("unknown-ns", "up1-00001-x"), id},
+		stray{b.stagedKey("ns", "nested/name"), id},
+	)
+	for _, s := range append(slices.Clone(own), kept...) {
+		v.putTagged(s.key, s.tag)
+	}
+	b.now = func() time.Time { return time.Now().Add(time.Hour) }
+	st, err := b.recoverOrphans(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if st.deleted != len(own) || st.untagged != 4 || st.foreign != 4 || st.errors != 0 {
+		t.Fatalf("recovery stats = %+v, want %d deleted, 4 untagged and 4 foreign kept", st, len(own))
+	}
+	all := v.list("p/")
+	for _, s := range own {
+		if slices.Contains(all, s.key) {
+			t.Errorf("own orphan %s kept", s.key)
+		}
+	}
+	for _, s := range kept {
+		if !slices.Contains(all, s.key) {
+			t.Errorf("%s (tag %q) deleted", s.key, s.tag)
+		}
+	}
+	// Referenced blobs are untouched.
+	for _, k := range append(slices.Clone(dataBlobs), stagedBlobs...) {
+		if !slices.Contains(all, k) {
+			t.Errorf("referenced blob %s deleted", k)
+		}
+	}
+	if got := readObject(t, b, "bk", "big", ""); len(got) != 10<<20 {
+		t.Fatalf("composed object has %d bytes", len(got))
+	}
+
+	// Kept objects are remembered: the next pass sends no HEAD for them,
+	// until one changes.
+	var heads atomic.Int32
+	f := func(r *http.Request) int {
+		if r.Method == http.MethodHead {
+			heads.Add(1)
+		}
+		return 0
+	}
+	v.remote.Fail.Store(&f)
+	defer v.remote.Fail.Store(nil)
+	st, err = b.recoverOrphans(ctx)
+	if err != nil || st.deleted != 0 || st.untagged != 4 || st.foreign != 4 || heads.Load() != 0 {
+		t.Fatalf("second pass: %+v, %v, %d HEADs; want the kept objects counted without HEADs", st, err, heads.Load())
+	}
+	changed := kept[0].key
+	if _, err := v.client.PutObject(ctx, storeBucket, changed, strings.NewReader("xy"), 2, s3client.PutOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	st, err = b.recoverOrphans(ctx)
+	if err != nil || st.deleted != 0 || st.untagged != 4 || st.foreign != 4 || heads.Load() != 1 {
+		t.Fatalf("pass after a change: %+v, %v, %d HEADs; want one HEAD (of %s)", st, err, heads.Load(), changed)
+	}
+}
+
+// A recovery pass sends a bounded number of HEADs; later passes check the
+// rest.
+func TestRecoveryHeadLimit(t *testing.T) {
+	v := newBenv(t)
+	opts := v.options("p/")
+	opts.OrphanRetention = time.Minute
+	b := v.ready(opts)
+	ctx := t.Context()
+	if err := b.CreateBucket(ctx, "bk", storage.CreateBucketOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	bid := bucketID(t, b, "bk")
+	for range 5 {
+		v.putTagged(b.dataKey(bid, randomID(16)), b.Marker().BackingID)
+	}
+	b.recoveryHeads = 2
+	b.now = func() time.Time { return time.Now().Add(time.Hour) }
+	var heads atomic.Int32
+	f := func(r *http.Request) int {
+		if r.Method == http.MethodHead {
+			heads.Add(1)
+		}
+		return 0
+	}
+	v.remote.Fail.Store(&f)
+	defer v.remote.Fail.Store(nil)
+	for i, want := range []recoveryStats{{deleted: 2, deferred: 3}, {deleted: 2, deferred: 1}, {deleted: 1}} {
+		heads.Store(0)
+		st, err := b.recoverOrphans(ctx)
+		if err != nil || st != want || heads.Load() > 2 {
+			t.Fatalf("pass %d: %+v, %v, %d HEADs; want %+v with at most 2 HEADs", i+1, st, err, heads.Load(), want)
+		}
+	}
+	if got := v.list("p/data/"); len(got) != 0 {
+		t.Fatalf("orphans left: %v", got)
+	}
+}
+
+// AuxState is available on every backing: records and staged blobs are
+// journaled, snapshotted and survive reopening, next to buckets and
+// objects.
+func TestAuxState(t *testing.T) {
+	v := newBenv(t)
+	opts := v.options("home/")
+	opts.Role = RoleHome
+	b := v.ready(opts)
+	ctx := t.Context()
+	if b.Marker().Role != RoleHome {
+		t.Fatalf("marker = %+v", b.Marker())
+	}
+	if err := b.CreateBucket(ctx, "bk", storage.CreateBucketOptions{Backing: "gw"}); err != nil {
+		t.Fatal(err)
 	}
 	if err := b.PutBucketConfig(ctx, "bk", storage.ConfigTagging, []byte("<t/>")); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := b.NewObjectWriter(ctx, "bk", "k"); !errors.Is(err, storage.ErrNotSupported) {
-		t.Fatalf("NewObjectWriter = %v", err)
-	}
-	if _, err := b.CreateMultipartUpload(ctx, "bk", "k", storage.ObjectMeta{}, ""); !errors.Is(err, storage.ErrNotSupported) {
-		t.Fatalf("CreateMultipartUpload = %v", err)
-	}
-	if err := b.WalkObjects(ctx, "bk", "", "", func(storage.ObjectInfo) error { return nil }); !errors.Is(err, storage.ErrNotSupported) {
-		t.Fatalf("WalkObjects = %v", err)
-	}
-	if err := b.SetBucketVersioning(ctx, "bk", storage.VersioningEnabled); !errors.Is(err, storage.ErrNotSupported) {
-		t.Fatalf("SetBucketVersioning = %v", err)
-	}
+	putObject(t, b, "bk", "obj", []byte("object data"))
 
-	aux := b.AuxState("gw")
+	aux := b.AuxState("gateway")
 	for k, val := range map[string]string{"up/1": "a", "up/2": "b", "obj/x": "c"} {
 		if err := aux.PutRecord(ctx, k, []byte(val)); err != nil {
 			t.Fatal(err)
@@ -473,28 +669,39 @@ func TestGatewayBacking(t *testing.T) {
 	if err := aux.DeleteRecords(ctx, "up/"); err != nil {
 		t.Fatal(err)
 	}
+	if err := b.AuxState("account").PutRecord(ctx, "v", []byte(`{"schema":1}`)); err != nil {
+		t.Fatal(err)
+	}
 	staged := bytes.Repeat([]byte("staged"), 1000)
-	if err := aux.PutStaged(ctx, "u1/00001", bytes.NewReader(staged), int64(len(staged))); err != nil {
+	if err := aux.PutStaged(ctx, "u1-00001-a", bytes.NewReader(staged), int64(len(staged))); err != nil {
 		t.Fatal(err)
 	}
-	if err := aux.PutStaged(ctx, "u1/00002", bytes.NewReader([]byte("x")), 1); err != nil {
+	if err := aux.PutStaged(ctx, "u1-00002-b", bytes.NewReader([]byte("x")), 1); err != nil {
 		t.Fatal(err)
 	}
-	if err := aux.DeleteStaged(ctx, "u1/00002"); err != nil {
+	if err := aux.DeleteStaged(ctx, "u1-00002-b"); err != nil {
 		t.Fatal(err)
+	}
+	for _, ns := range []string{"", "a/b"} {
+		if err := b.AuxState(ns).PutRecord(ctx, "k", nil); !errors.Is(err, storage.ErrInvalidName) {
+			t.Fatalf("aux namespace %q: %v", ns, err)
+		}
 	}
 	check := func(b *Backend, what string) {
 		t.Helper()
-		aux := b.AuxState("gw")
+		aux := b.AuxState("gateway")
 		recs, err := aux.Records(ctx)
 		if err != nil || len(recs) != 1 || string(recs["obj/x"]) != "c" {
 			t.Fatalf("%s: records = %v, %v", what, recs, err)
 		}
+		if recs, err := b.AuxState("account").Records(ctx); err != nil || len(recs) != 1 || string(recs["v"]) != `{"schema":1}` {
+			t.Fatalf("%s: account records = %v, %v", what, recs, err)
+		}
 		names, err := aux.ListStaged(ctx)
-		if err != nil || !slices.Equal(names, []string{"u1/00001"}) {
+		if err != nil || !slices.Equal(names, []string{"u1-00001-a"}) {
 			t.Fatalf("%s: staged = %v, %v", what, names, err)
 		}
-		r, err := aux.OpenStaged(ctx, "u1/00001", int64(len(staged)))
+		r, err := aux.OpenStaged(ctx, "u1-00001-a", int64(len(staged)))
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -505,6 +712,9 @@ func TestGatewayBacking(t *testing.T) {
 		}
 		if data, err := b.GetBucketConfig(ctx, "bk", storage.ConfigTagging); err != nil || string(data) != "<t/>" {
 			t.Fatalf("%s: config = %q, %v", what, data, err)
+		}
+		if got := readObject(t, b, "bk", "obj", ""); string(got) != "object data" {
+			t.Fatalf("%s: object = %q", what, got)
 		}
 	}
 	check(b, "before reopen")
@@ -519,18 +729,283 @@ func TestGatewayBacking(t *testing.T) {
 	_ = b.Close()
 	b = v.ready(opts)
 	check(b, "after snapshot and reopen")
-	if got := v.list("gw/gateway/parts/"); !slices.Equal(got, []string{"gw/gateway/parts/gw/u1/00001"}) {
+	if got := v.list("home/gateway/parts/"); !slices.Equal(got, []string{"home/gateway/parts/gateway/u1-00001-a"}) {
 		t.Fatalf("staged blobs = %v", got)
 	}
-	// A regular backing refuses the gateway prefix.
-	opts.Gateway = false
 	_ = b.Close()
-	rb := v.open(opts)
-	waitFor(t, "refusal", func() bool { return errors.Is(rb.Status().Err, ErrMarkerMismatch) })
-	if err := b.AuxState("gw").PutRecord(ctx, "k", nil); !errors.Is(err, ErrClosed) {
+	if err := b.AuxState("gateway").PutRecord(ctx, "k", nil); !errors.Is(err, ErrClosed) {
 		t.Fatalf("closed backend: %v", err)
 	}
-	if err := rb.AuxState("gw").PutRecord(ctx, "k", nil); !errors.Is(err, storage.ErrNotSupported) {
-		t.Fatalf("aux on a regular backing: %v", err)
+}
+
+// CreateIfEmpty creates a backing only at a location without keys (a
+// folder placeholder aside), checked again right before the marker is
+// written; it opens only the marker it created (or the expected one).
+func TestCreateIfEmpty(t *testing.T) {
+	v := newBenv(t)
+	refused := func(b *Backend) {
+		t.Helper()
+		waitFor(t, "the refusal", func() bool { return b.Status().Err != nil })
+		if st := b.Status(); st.State != StateFailed || !errors.Is(st.Err, ErrPrefixNotEmpty) {
+			t.Fatalf("status = %+v, want ErrPrefixNotEmpty", st)
+		}
+		if _, err := b.ListBuckets(t.Context()); !errors.Is(err, ErrPrefixNotEmpty) || !errors.Is(err, storage.ErrBackingUnavailable) {
+			t.Fatalf("ListBuckets = %v", err)
+		}
+	}
+	empty := func(prefix string) Options {
+		o := v.options(prefix)
+		o.Create, o.Role = CreateIfEmpty, RoleContainer
+		return o
+	}
+
+	v.putTagged("full/user/file.txt", "")
+	b := v.open(empty("full/"))
+	refused(b)
+	if err := b.Status().Err; !strings.Contains(err.Error(), "full/user/file.txt") {
+		t.Fatalf("refusal %q does not name the key found", err)
+	}
+	_ = b.Close()
+	if got := v.list("full/"); !slices.Equal(got, []string{"full/user/file.txt"}) {
+		t.Fatalf("refused location now holds %v", got)
+	}
+
+	// A folder placeholder (and nothing else) is accepted.
+	if _, err := v.client.PutObject(t.Context(), storeBucket, "folder/", strings.NewReader(""), 0, s3client.PutOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	b = v.ready(empty("folder/"))
+	if mk := b.Marker(); mk.Role != RoleContainer || !mk.BlobTags {
+		t.Fatalf("marker = %+v", mk)
+	}
+	id := b.Marker().BackingID
+	// A reload after a fail-stop accepts the backing's own marker.
+	b.eng.failCurrent(errors.New("test"))
+	waitFor(t, "the reload", func() bool { return b.Status().State == StateServing && b.WaitReady(t.Context()) == nil })
+	if b.Marker().BackingID != id {
+		t.Fatal("reload opened another backing")
+	}
+	_ = b.Close()
+	// Another Backend did not create it: refused, unless expected.
+	b = v.open(empty("folder/"))
+	refused(b)
+	_ = b.Close()
+	o := empty("folder/")
+	o.ExpectBackingID = id
+	b = v.ready(o)
+	if b.Marker().BackingID != id {
+		t.Fatal("reopen created another backing")
+	}
+	_ = b.Close()
+	// A non-empty placeholder is a key like any other.
+	if _, err := v.client.PutObject(t.Context(), storeBucket, "nonempty/", strings.NewReader("x"), 1, s3client.PutOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	b = v.open(empty("nonempty/"))
+	refused(b)
+	_ = b.Close()
+
+	// A key appearing after the first check (during the probe) is found
+	// by the check right before the marker is written.
+	var once atomic.Bool
+	injected := make(chan error, 1)
+	f := func(r *http.Request) int {
+		if r.Method == http.MethodPut && strings.Contains(r.URL.Path, "/race/meta/probe-") && once.CompareAndSwap(false, true) {
+			// A request of its own, served while this one waits.
+			_, err := v.client.PutObject(context.Background(), storeBucket, "race/late.txt", strings.NewReader("x"), 1, s3client.PutOptions{})
+			injected <- err
+		}
+		return 0
+	}
+	v.remote.Fail.Store(&f)
+	b = v.open(empty("race/"))
+	refused(b)
+	_ = b.Close()
+	v.remote.Fail.Store(nil)
+	select {
+	case err := <-injected:
+		if err != nil {
+			t.Fatalf("injecting a key during the probe: %v", err)
+		}
+	default:
+		t.Fatal("the probe was not intercepted")
+	}
+	if got := v.list("race/"); !slices.Equal(got, []string{"race/late.txt"}) {
+		t.Fatalf("raced location holds %v, want only the late key (no marker)", got)
+	}
+
+	// A marker someone else creates right before this backing's own
+	// conditional PUT makes that PUT fail; the other marker is not
+	// adopted.
+	foreign := Marker{Format: markerFormat, Kind: markerKind, BackingID: strings.Repeat("f", 32), BlobTags: true,
+		Created: time.Now().UTC().Truncate(time.Second)}
+	raw, _ := json.Marshal(foreign)
+	var raced atomic.Bool
+	injected = make(chan error, 1)
+	f = func(r *http.Request) int {
+		if r.Method == http.MethodPut && strings.HasSuffix(r.URL.Path, "/race2/"+markerKey) && r.Header.Get("If-None-Match") == "*" &&
+			raced.CompareAndSwap(false, true) {
+			_, err := v.client.PutObject(context.Background(), storeBucket, "race2/"+markerKey, bytes.NewReader(raw), int64(len(raw)),
+				s3client.PutOptions{IfNoneMatch: true})
+			injected <- err
+		}
+		return 0
+	}
+	v.remote.Fail.Store(&f)
+	b = v.open(empty("race2/"))
+	refused(b)
+	_ = b.Close()
+	v.remote.Fail.Store(nil)
+	if err := <-injected; err != nil {
+		t.Fatalf("injecting a foreign marker: %v", err)
+	}
+	if m, _, err := ReadMarker(t.Context(), v.client, storeBucket, "race2/"); err != nil || m.BackingID != foreign.BackingID {
+		t.Fatalf("marker = %+v, %v; want the foreign one untouched", m, err)
+	}
+
+	// The answer to the backing's own marker PUT is lost: the marker read
+	// back is recognized as its own.
+	var lost atomic.Bool
+	after := func(r *http.Request) s3clienttest.Fault {
+		if r.Method == http.MethodPut && strings.HasSuffix(r.URL.Path, "/lost/"+markerKey) && r.Header.Get("If-None-Match") == "*" &&
+			lost.CompareAndSwap(false, true) {
+			return s3clienttest.Status500
+		}
+		return s3clienttest.Pass
+	}
+	v.remote.After.Store(&after)
+	b = v.ready(empty("lost/"))
+	v.remote.After.Store(nil)
+	if !lost.Load() {
+		t.Fatal("the marker PUT was not intercepted")
+	}
+	if m, _, err := ReadMarker(t.Context(), v.client, storeBucket, "lost/"); err != nil || m.BackingID != b.Marker().BackingID || m.Role != RoleContainer {
+		t.Fatalf("marker = %+v, %v; backend has %+v", m, err, b.Marker())
+	}
+}
+
+// MustExist and ExpectBackingID never create a backing and refuse another
+// one; the refusals are hard errors reported through Status.
+func TestOpenExistingBacking(t *testing.T) {
+	v := newBenv(t)
+	opts := v.options("c/")
+	opts.Create = MustExist
+	b := v.open(opts)
+	waitFor(t, "the refusal", func() bool { return b.Status().Err != nil })
+	if st := b.Status(); st.State != StateFailed || !errors.Is(st.Err, ErrMarkerMissing) {
+		t.Fatalf("status = %+v, want ErrMarkerMissing", st)
+	}
+	_ = b.Close()
+	if got := v.list("c/"); len(got) != 0 {
+		t.Fatalf("MustExist wrote %v", got)
+	}
+
+	b = v.ready(v.options("c/"))
+	id := b.Marker().BackingID
+	_ = b.Close()
+	b = v.ready(opts)
+	if b.Marker().BackingID != id {
+		t.Fatal("MustExist opened another backing")
+	}
+	_ = b.Close()
+
+	opts.ExpectBackingID = randomID(16)
+	b = v.open(opts)
+	waitFor(t, "the refusal", func() bool { return b.Status().Err != nil })
+	if st := b.Status(); st.State != StateFailed || !errors.Is(st.Err, ErrMarkerMismatch) || errors.Is(st.Err, ErrMarkerMissing) {
+		t.Fatalf("status = %+v, want ErrMarkerMismatch", st)
+	}
+	// PrepareConnection checks the expected ID before the first load.
+	if _, err := b.PrepareConnection(t.Context(), Connection{Client: v.client}); !errors.Is(err, ErrMarkerMismatch) {
+		t.Fatalf("PrepareConnection = %v", err)
+	}
+	_ = b.Close()
+	opts.ExpectBackingID = id
+	b = v.ready(opts)
+	if _, err := b.PrepareConnection(t.Context(), Connection{Client: v.client}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// A legacy gateway marker opens like any other; ClearLegacyGateway clears
+// the flag (once), and a backing of a build before blob tags gets BlobTags
+// at its first open.
+func TestLegacyMarker(t *testing.T) {
+	v := newBenv(t)
+	ctx := t.Context()
+	const legacyID = "0123456789abcdef0123456789abcdef"
+	legacy := `{"format":1,"kind":"s3","backingId":"` + legacyID + `","gateway":true,"created":"2026-01-02T03:04:05Z"}`
+	if _, err := v.client.PutObject(ctx, storeBucket, "gw/"+markerKey, strings.NewReader(legacy), int64(len(legacy)), s3client.PutOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	opts := v.options("gw/")
+	opts.Create = MustExist
+	b := v.ready(opts)
+	if mk := b.Marker(); !mk.Gateway || !mk.BlobTags || mk.BackingID != legacyID {
+		t.Fatalf("marker = %+v", mk)
+	}
+	stored := func() (Marker, string) {
+		t.Helper()
+		m, _, err := ReadMarker(ctx, v.client, storeBucket, "gw/")
+		if err != nil {
+			t.Fatal(err)
+		}
+		r, _, err := v.client.GetObject(ctx, storeBucket, "gw/"+markerKey, s3client.GetOptions{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer r.Close()
+		raw, err := io.ReadAll(r)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return m, string(raw)
+	}
+	if m, _ := stored(); !m.Gateway || !m.BlobTags {
+		t.Fatalf("stored marker = %+v, want gateway and BlobTags", m)
+	}
+	// The backing serves objects (and tags their blobs).
+	if err := b.CreateBucket(ctx, "bk", storage.CreateBucketOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	putObject(t, b, "bk", "k", []byte("v"))
+	if blobs := v.list("gw/data/"); len(blobs) != 1 || v.tagOf(blobs[0]) != legacyID {
+		t.Fatalf("data blobs = %v", blobs)
+	}
+
+	var markerPuts atomic.Int32
+	f := func(r *http.Request) int {
+		if r.Method == http.MethodPut && strings.HasSuffix(r.URL.Path, "/gw/"+markerKey) {
+			markerPuts.Add(1)
+		}
+		return 0
+	}
+	v.remote.Fail.Store(&f)
+	defer v.remote.Fail.Store(nil)
+	if err := b.ClearLegacyGateway(ctx); err != nil {
+		t.Fatal(err)
+	}
+	m, raw := stored()
+	if m.Gateway || !m.BlobTags || m.BackingID != legacyID || strings.Contains(raw, "gateway") {
+		t.Fatalf("stored marker after clearing = %s", raw)
+	}
+	if b.Marker().Gateway {
+		t.Fatal("Marker() still reports the gateway flag")
+	}
+	if err := b.ClearLegacyGateway(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if n := markerPuts.Load(); n != 1 {
+		t.Fatalf("marker writes = %d, want 1 (the second clear is a no-op)", n)
+	}
+	// Still serving; and a reopen finds the cleared marker.
+	putObject(t, b, "bk", "k2", []byte("v2"))
+	_ = b.Close()
+	b = v.ready(opts)
+	if mk := b.Marker(); mk.Gateway || !mk.BlobTags {
+		t.Fatalf("marker after reopen = %+v", mk)
+	}
+	if got := readObject(t, b, "bk", "k2", ""); string(got) != "v2" {
+		t.Fatalf("k2 = %q", got)
 	}
 }

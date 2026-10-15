@@ -24,15 +24,14 @@ import (
 // the bucket itself was copied) must survive a reload: their LSNs lie
 // between the snapshot's start and the highest chunk LSN.
 func TestSnapshotKeepsRecordsWrittenDuringIt(t *testing.T) {
-	for _, gateway := range []bool{false, true} {
+	for _, auxRecords := range []bool{false, true} {
 		name := "objects"
-		if gateway {
-			name = "gateway"
+		if auxRecords {
+			name = "aux"
 		}
 		t.Run(name, func(t *testing.T) {
 			v := newBenv(t)
 			opts := v.options("p/")
-			opts.Gateway = gateway
 			b := v.ready(opts)
 			ctx := t.Context()
 			for _, n := range []string{"a", "b", "c"} {
@@ -44,7 +43,7 @@ func TestSnapshotKeepsRecordsWrittenDuringIt(t *testing.T) {
 				}
 			}
 			aux := b.AuxState("gw")
-			if gateway {
+			if auxRecords {
 				if err := aux.PutRecord(ctx, "before", []byte("1")); err != nil {
 					t.Fatal(err)
 				}
@@ -58,7 +57,7 @@ func TestSnapshotKeepsRecordsWrittenDuringIt(t *testing.T) {
 				if err := b.PutBucketConfig(ctx, "a", storage.ConfigTagging, []byte("during")); err != nil {
 					t.Error(err)
 				}
-				if gateway {
+				if auxRecords {
 					if err := aux.PutRecord(ctx, "during", []byte("2")); err != nil {
 						t.Error(err)
 					}
@@ -81,7 +80,7 @@ func TestSnapshotKeepsRecordsWrittenDuringIt(t *testing.T) {
 			if data, err := b.GetBucketConfig(ctx, "b", storage.ConfigCORS); err != nil || string(data) != "x" {
 				t.Fatalf("config of b after reload = %q, %v", data, err)
 			}
-			if gateway {
+			if auxRecords {
 				recs, err := b.AuxState("gw").Records(ctx)
 				if err != nil || string(recs["during"]) != "2" || string(recs["before"]) != "1" {
 					t.Fatalf("aux records after reload = %v, %v", recs, err)
@@ -291,37 +290,53 @@ func TestClosingSnapshotSkipsRefusedMutations(t *testing.T) {
 	}
 }
 
-// PrepareConnection with a KEK on a backing without a KEK check records
-// the check, so a second, different KEK is refused; with key objects, the
-// KEK must open them.
+// PrepareConnection with a KEK on a backing without a KEK check writes
+// nothing (an abandoned change pins no KEK); the committed KEK's check is
+// recorded when it first wraps a key, so a second, different KEK is then
+// refused; with key objects, the KEK must open them.
 func TestPrepareConnectionRecordsKEK(t *testing.T) {
 	v := newBenv(t)
 	b := v.ready(v.options("p/"))
 	ctx := t.Context()
 	kek1, kek2 := bytes.Repeat([]byte{1}, 32), bytes.Repeat([]byte{2}, 32)
+	check := func(want string) {
+		t.Helper()
+		if m, _, err := ReadMarker(ctx, v.client, storeBucket, "p/"); err != nil || m.KEKCheck != want {
+			t.Fatalf("marker check = %q (%v), want %q", m.KEKCheck, err, want)
+		}
+	}
+	// Prepared, never committed: no trace, so another KEK can follow.
+	if _, err := b.PrepareConnection(ctx, Connection{Client: v.client, KEK: kek2}); err != nil {
+		t.Fatal(err)
+	}
+	check("")
 	commit, err := b.PrepareConnection(ctx, Connection{Client: v.client, KEK: kek1})
 	if err != nil {
 		t.Fatal(err)
 	}
+	check("")
 	commit()
-	if m, _, _ := ReadMarker(ctx, v.client, storeBucket, "p/"); m.KEKCheck != crypt.KeyCheck(kek1) {
-		t.Fatalf("marker check = %q", m.KEKCheck)
-	}
 	if b.Engine().KEKState() != KEKVerified {
 		t.Fatalf("KEKState = %v", b.Engine().KEKState())
 	}
-	if _, err := b.PrepareConnection(ctx, Connection{Client: v.client, KEK: kek2}); !errors.Is(err, ErrWrongKEK) {
-		t.Fatalf("second KEK = %v", err)
-	}
-
-	// Key objects wrapped with kek1 and the marker's check lost: kek2 is
-	// refused because it cannot open them, kek1 restores the check.
+	// The first key the KEK wraps records its check.
 	if err := b.CreateBucket(ctx, "bk", storage.CreateBucketOptions{}); err != nil {
 		t.Fatal(err)
 	}
 	if err := b.PrepareEncryption(ctx, "bk", storage.EncryptionAES256); err != nil {
 		t.Fatal(err)
 	}
+	check(crypt.KeyCheck(kek1))
+	if b.Marker().KEKCheck != crypt.KeyCheck(kek1) {
+		t.Fatalf("cached marker check = %q", b.Marker().KEKCheck)
+	}
+	if _, err := b.PrepareConnection(ctx, Connection{Client: v.client, KEK: kek2}); !errors.Is(err, ErrWrongKEK) {
+		t.Fatalf("second KEK = %v", err)
+	}
+
+	// Key objects wrapped with kek1 and the marker's check lost: kek2 is
+	// refused because it cannot open them; kek1 is accepted, and the next
+	// key it wraps restores the check.
 	m, _, _ := ReadMarker(ctx, v.client, storeBucket, "p/")
 	m.KEKCheck = ""
 	raw, _ := json.Marshal(m)
@@ -329,11 +344,53 @@ func TestPrepareConnectionRecordsKEK(t *testing.T) {
 	if _, err := b.PrepareConnection(ctx, Connection{Client: v.client, KEK: kek2}); !errors.Is(err, ErrWrongKEK) {
 		t.Fatalf("KEK that cannot open the keys = %v", err)
 	}
-	if _, err := b.PrepareConnection(ctx, Connection{Client: v.client, KEK: kek1}); err != nil {
+	commit, err = b.PrepareConnection(ctx, Connection{Client: v.client, KEK: kek1})
+	if err != nil {
 		t.Fatal(err)
 	}
-	if m, _, _ := ReadMarker(ctx, v.client, storeBucket, "p/"); m.KEKCheck != crypt.KeyCheck(kek1) {
-		t.Fatalf("marker check not restored: %q", m.KEKCheck)
+	commit()
+	check("")
+	if err := b.CreateBucket(ctx, "bk2", storage.CreateBucketOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	if err := b.PrepareEncryption(ctx, "bk2", storage.EncryptionAES256); err != nil {
+		t.Fatal(err)
+	}
+	check(crypt.KeyCheck(kek1))
+}
+
+// A KEK prepared but not committed leaves no trace: a different KEK can be
+// prepared and committed afterwards, and becomes the backing's.
+func TestPrepareConnectionWithoutCommitPinsNoKEK(t *testing.T) {
+	v := newBenv(t)
+	b := v.ready(v.options("p/"))
+	ctx := t.Context()
+	k1, k2 := bytes.Repeat([]byte{1}, 32), bytes.Repeat([]byte{2}, 32)
+	if _, err := b.PrepareConnection(ctx, Connection{Client: v.client, KEK: k1}); err != nil {
+		t.Fatal(err)
+	}
+	commit, err := b.PrepareConnection(ctx, Connection{Client: v.client, KEK: k2})
+	if err != nil {
+		t.Fatalf("second KEK after an abandoned prepare = %v", err)
+	}
+	commit()
+	if err := b.CreateBucket(ctx, "bk", storage.CreateBucketOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	writeWith(t, b, "bk", "k", []byte("secret"), aes)
+	if m, _, _ := ReadMarker(ctx, v.client, storeBucket, "p/"); m.KEKCheck != crypt.KeyCheck(k2) {
+		t.Fatalf("marker check = %q, want k2's", m.KEKCheck)
+	}
+	if _, err := b.PrepareConnection(ctx, Connection{Client: v.client, KEK: k1}); !errors.Is(err, ErrWrongKEK) {
+		t.Fatalf("k1 after k2 was used = %v", err)
+	}
+	// Reopened with k2, the object reads back.
+	_ = b.Close()
+	opts := v.options("p/")
+	opts.KEK = k2
+	b = v.ready(opts)
+	if got := readObject(t, b, "bk", "k", ""); string(got) != "secret" {
+		t.Fatalf("object = %q", got)
 	}
 }
 
@@ -387,9 +444,7 @@ func TestErrClosedIsUnavailable(t *testing.T) {
 // learns that the write happened.
 func TestCancelledCallerSeesDurableWrite(t *testing.T) {
 	v := newBenv(t)
-	opts := v.options("p/")
-	opts.Gateway = true
-	b := v.ready(opts)
+	b := v.ready(v.options("p/"))
 	if err := b.CreateBucket(t.Context(), "bk", storage.CreateBucketOptions{}); err != nil {
 		t.Fatal(err)
 	}

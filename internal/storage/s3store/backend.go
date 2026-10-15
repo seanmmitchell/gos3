@@ -66,6 +66,17 @@ type Backend struct {
 	bucketKeys map[string]*keyEntry // by bucket ID
 	restic     *restic.Runtime
 	recovery   recoveryStore
+	// auxNames holds the aux namespaces handed out by AuxState (string ->
+	// true), whose staged blobs the orphan recovery reclaims even before
+	// the state holds them.
+	auxNames sync.Map
+	// recoveryKept remembers, by key, the old unreferenced objects the
+	// recovery found untagged or tagged by another backing, so later
+	// passes skip them without a HEAD while they are unchanged.
+	recoveryMu   sync.Mutex
+	recoveryKept map[string]keptObject
+	// recoveryHeads caps the HEAD requests of one recovery pass.
+	recoveryHeads int
 
 	// snapHook, when set (tests), runs after each bucket was written to a
 	// snapshot.
@@ -179,20 +190,23 @@ func Open(opts Options) (*Backend, error) {
 	})
 	b.restic = &restic.Runtime{Log: opts.Logger, TempDir: opts.TempDir}
 	b.recovery.b = b
+	b.recoveryHeads = maxRecoveryHeads
 	eng, err := NewEngine(EngineOptions{
-		Client:         opts.Client,
-		Bucket:         opts.Bucket,
-		Prefix:         opts.Prefix,
-		Gateway:        opts.Gateway,
-		KEK:            opts.KEK,
-		LeaseInterval:  opts.LeaseInterval,
-		LeaseTTL:       opts.LeaseTTL,
-		StallTimeout:   opts.StallTimeout,
-		TempDir:        opts.TempDir,
-		Logger:         opts.Logger,
-		Load:           b.load,
-		Snapshot:       b.snapshot,
-		SnapshotPolicy: opts.SnapshotPolicy,
+		Client:          opts.Client,
+		Bucket:          opts.Bucket,
+		Prefix:          opts.Prefix,
+		Create:          opts.Create,
+		ExpectBackingID: opts.ExpectBackingID,
+		Role:            opts.Role,
+		KEK:             opts.KEK,
+		LeaseInterval:   opts.LeaseInterval,
+		LeaseTTL:        opts.LeaseTTL,
+		StallTimeout:    opts.StallTimeout,
+		TempDir:         opts.TempDir,
+		Logger:          opts.Logger,
+		Load:            b.load,
+		Snapshot:        b.snapshot,
+		SnapshotPolicy:  opts.SnapshotPolicy,
 		OnFail: func(err error) {
 			select {
 			case b.failCh <- err:
@@ -223,6 +237,20 @@ func (b *Backend) Status() Status { return b.eng.State() }
 
 // Engine returns the metadata engine (for diagnostics).
 func (b *Backend) Engine() *Engine { return b.eng }
+
+// Marker returns the backing's marker as last read or written (zero until
+// a load has read it, which happens before the backing serves).
+func (b *Backend) Marker() Marker { return b.eng.Marker() }
+
+// ClearLegacyGateway clears the legacy gateway flag (Marker.Gateway) of the
+// backing's marker with an If-Match rewrite, so concurrent marker updates
+// are kept; it writes nothing when the flag is not set. It needs the
+// marker to have been loaded (storage.ErrBackingUnavailable otherwise), and
+// the marker must still name that backing (ErrMarkerMismatch, or
+// ErrMarkerMissing). It is safe while the backing serves.
+func (b *Backend) ClearLegacyGateway(ctx context.Context) error {
+	return b.eng.clearLegacyGateway(ctx)
+}
 
 // Ready returns a channel closed once the backing was loaded for the first
 // time.
@@ -263,7 +291,7 @@ func (b *Backend) unavailableErr() error {
 
 // hardOpenError reports open failures that need an operator.
 func hardOpenError(err error) bool {
-	for _, h := range []error{ErrInUse, ErrWrongKEK, ErrNoConditionalWrites, ErrUnmanagedPrefix, ErrMarkerMismatch, ErrCorruptJournal} {
+	for _, h := range []error{ErrInUse, ErrWrongKEK, ErrNoConditionalWrites, ErrUnmanagedPrefix, ErrPrefixNotEmpty, ErrMarkerMismatch, ErrCorruptJournal} {
 		if errors.Is(err, h) {
 			return true
 		}
@@ -378,8 +406,14 @@ func (b *Backend) Close() error {
 }
 
 // PrepareConnection verifies that conn reaches the same backing (its marker
-// has this backing's ID) and, when it has a KEK, that the KEK matches the
-// backing's. commit makes the backend use conn for every later request.
+// has the ID of the loaded backing, or Options.ExpectBackingID before the
+// first load) and, when it has a KEK, that the KEK matches the backing's.
+// commit makes the backend use conn for every later request.
+//
+// Preparing has no persistent effect, so a change abandoned after it
+// leaves the backing as it was: a KEK for a backing whose marker has no
+// check value yet only has to open the key objects that exist; its check
+// value is recorded when it first wraps a new key (recordKEK).
 func (b *Backend) PrepareConnection(ctx context.Context, conn Connection) (commit func(), err error) {
 	client := conn.Client
 	if client == nil {
@@ -402,15 +436,16 @@ func (b *Backend) PrepareConnection(ctx context.Context, conn Connection) (commi
 	m, _, err := ReadMarker(ctx, client, b.opts.Bucket, b.opts.Prefix)
 	if err != nil {
 		if s3client.IsNotFound(err) {
-			return nil, fmt.Errorf("%w: no gos3.json at %s with the new connection", ErrMarkerMismatch, b.Location())
+			return nil, fmt.Errorf("%w (%s, with the new connection)", ErrMarkerMissing, b.Location())
 		}
 		return nil, err
 	}
-	if err := m.validate(b.opts.Gateway); err != nil {
-		return nil, err
+	want := b.opts.ExpectBackingID
+	if cur := b.eng.Marker(); cur.BackingID != "" {
+		want = cur.BackingID
 	}
-	if cur := b.eng.Marker(); cur.BackingID != "" && cur.BackingID != m.BackingID {
-		return nil, fmt.Errorf("%w: the new connection reaches backing %s, not %s", ErrMarkerMismatch, m.BackingID, cur.BackingID)
+	if err := m.validate(want); err != nil {
+		return nil, fmt.Errorf("%w (with the new connection)", err)
 	}
 	if len(conn.KEK) > 0 {
 		if _, err := m.CheckKEK(conn.KEK); err != nil {
@@ -418,12 +453,10 @@ func (b *Backend) PrepareConnection(ctx context.Context, conn Connection) (commi
 		}
 		if m.KEKCheck == "" {
 			// The backing has no check value yet: the KEK must open the
-			// keys it may already have wrapped, and then becomes the
-			// backing's KEK (recorded in the marker before it is used).
+			// keys it may already have wrapped. It becomes the backing's
+			// KEK once committed and recorded in the marker before it
+			// wraps a new key.
 			if err := b.verifyKEK(ctx, client, m.BackingID, conn.KEK); err != nil {
-				return nil, err
-			}
-			if m, err = recordKEKCheck(ctx, client, b.opts.Bucket, b.opts.Prefix, b.opts.Gateway, conn.KEK); err != nil {
 				return nil, err
 			}
 		}

@@ -70,7 +70,7 @@ func TestResticPlacementNeedsResticBackings(t *testing.T) {
 	if _, err := r.SetReplication(ctx, "arc", ModeActivePassive, []string{"m"}); !errors.Is(err, ErrInvalidPlacement) {
 		t.Fatalf("memory replica of a restic bucket: %v", err)
 	}
-	if _, err := r.Move(ctx, "arc", "", "m"); !errors.Is(err, ErrInvalidPlacement) {
+	if _, err := r.Move(ctx, "arc", "", "m", nil); !errors.Is(err, ErrInvalidPlacement) {
 		t.Fatalf("move of a restic bucket to memory: %v", err)
 	}
 	if _, err := r.SetReplication(ctx, "arc", ModeActivePassive, []string{"g"}); err != nil {
@@ -127,7 +127,7 @@ func TestResticPlacementOnLiveBackings(t *testing.T) {
 	if _, err := r.SetReplication(ctx, "arc", ModeActivePassive, []string{"live"}); !errors.Is(err, ErrInvalidPlacement) {
 		t.Fatalf("live memory replica of a restic bucket: %v", err)
 	}
-	if _, err := r.Move(ctx, "arc", "", "live"); !errors.Is(err, ErrInvalidPlacement) {
+	if _, err := r.Move(ctx, "arc", "", "live", nil); !errors.Is(err, ErrInvalidPlacement) {
 		t.Fatalf("move of a restic bucket to a live memory backing: %v", err)
 	}
 }

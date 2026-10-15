@@ -70,7 +70,7 @@ func TestDefaultExposeHeaders(t *testing.T) {
 	// The web UI reads these cross-origin: "*" covers x-amz-meta-* for
 	// requests without credentials, the explicit names cover credentialed ones.
 	for _, h := range []string{"*", "ETag", "x-amz-version-id", "x-amz-delete-marker", "x-amz-request-id",
-		"x-amz-checksum-sha256", "Content-Range", "Last-Modified"} {
+		"x-amz-checksum-sha256", "Content-Range", "Last-Modified", "x-gos3-backing", "x-gos3-bucket-kind"} {
 		if !slices.Contains(DefaultExposeHeaders, h) {
 			t.Errorf("DefaultExposeHeaders lacks %q", h)
 		}

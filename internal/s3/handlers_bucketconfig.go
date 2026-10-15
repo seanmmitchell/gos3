@@ -22,7 +22,6 @@ import (
 	"log/slog"
 	"net/http"
 	"strings"
-	"sync"
 
 	"github.com/seanmmitchell/gos3/internal/iam"
 	"github.com/seanmmitchell/gos3/internal/lifecycle"
@@ -40,18 +39,12 @@ const (
 
 // --- Shared helpers ---
 
-// bucketStateLocks serialize the read-check-write sequences that keep
-// related bucket settings consistent (versioning vs. object lock and
-// replication, bucket ACL vs. object ownership, policy vs. public access
-// block) within this process. Buckets hash onto a fixed set of mutexes.
-var bucketStateLocks [64]sync.Mutex
-
-// lockBucketState locks the state mutex of bucket and returns the unlock
-// function.
-func lockBucketState(bucket string) func() {
+// lockBucketState locks the state mutex of bucket (see
+// Server.bucketStateLocks) and returns the unlock function.
+func (s *Server) lockBucketState(bucket string) func() {
 	h := fnv.New32a()
 	_, _ = h.Write([]byte(bucket))
-	m := &bucketStateLocks[h.Sum32()%uint32(len(bucketStateLocks))]
+	m := &s.bucketStateLocks[h.Sum32()%uint32(len(s.bucketStateLocks))]
 	m.Lock()
 	return m.Unlock
 }
@@ -231,7 +224,7 @@ func (s *Server) handlePutBucketVersioning(w http.ResponseWriter, r *http.Reques
 		return s3err.ErrMalformedXML
 	}
 
-	unlock := lockBucketState(rc.bucket)
+	unlock := s.lockBucketState(rc.bucket)
 	defer unlock()
 	bi, err := s.lookupBucket(ctx, rc.bucket)
 	if err != nil {
@@ -401,7 +394,7 @@ func (s *Server) handlePutBucketPolicy(w http.ResponseWriter, r *http.Request, r
 	if err != nil {
 		return err
 	}
-	unlock := lockBucketState(rc.bucket)
+	unlock := s.lockBucketState(rc.bucket)
 	defer unlock()
 	pab, err := s.publicAccessBlock(ctx, rc.bucket)
 	if err != nil {

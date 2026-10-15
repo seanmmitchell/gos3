@@ -72,6 +72,23 @@ type Options struct {
 	// reason they are skipped. The subtest and everything under it is
 	// skipped.
 	Skip map[string]string
+	// NoControlKeys is for backends that keep keys in a remote S3 service,
+	// which refuses keys with characters XML cannot represent. Fixtures
+	// that use control characters only for their sort order get printable
+	// substitutes that keep it: every control character becomes '!'
+	// (0x21), so "a\x00b" becomes "a!b", which still sorts between "a" and
+	// "a-c". Subtests whose purpose is storing control-character keys
+	// verbatim (Objects/Keys) are skipped.
+	NoControlKeys bool
+	// OpaqueVersionIDs is for backends that pass through version IDs they
+	// do not generate (a remote S3 service's IDs). Version IDs must then
+	// satisfy the S3 layer's rule (1-1024 printable, non-space ASCII
+	// characters, never "null") instead of being at most 64 URL-safe
+	// characters. Such IDs carry no position, so a WalkVersions whose
+	// versionIDMarker names a deleted version may re-deliver the remaining
+	// versions of keyMarker that are newer than the deleted one, as the
+	// storage.Backend contract allows; skipping a version still fails.
+	OpaqueVersionIDs bool
 }
 
 // suite is the configuration shared by all subtests of one run.
@@ -79,6 +96,9 @@ type suite struct {
 	factory Factory
 	root    string // name of the test that called RunWithOptions
 	skip    map[string]string
+
+	noControlKeys    bool // Options.NoControlKeys
+	opaqueVersionIDs bool // Options.OpaqueVersionIDs
 }
 
 // skipListed skips t when Options.Skip lists it.
@@ -95,7 +115,13 @@ func RunWithOptions(t *testing.T, newBackend Factory, opts Options) {
 	if newBackend == nil {
 		t.Fatal("storagetest.Run: nil Factory")
 	}
-	s := &suite{factory: newBackend, root: t.Name(), skip: opts.Skip}
+	s := &suite{
+		factory:          newBackend,
+		root:             t.Name(),
+		skip:             opts.Skip,
+		noControlKeys:    opts.NoControlKeys,
+		opaqueVersionIDs: opts.OpaqueVersionIDs,
+	}
 	for _, g := range groups() {
 		t.Run(g.name, func(t *testing.T) {
 			s.skipListed(t)

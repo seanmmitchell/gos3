@@ -171,7 +171,7 @@ type AuthzRequest struct {
 	Bucket string
 	Key    string
 	// Resource is the resource of admin actions: AdminUserARN,
-	// AdminPolicyARN or AdminBucketARN of the target, or "" for
+	// AdminPolicyARN, AdminBucketARN or AdminBackingARN of the target, or "" for
 	// service-level admin actions, which match only the policy resources
 	// "*" and "arn:gos3:admin:::*". s3 actions ignore it. s3 ARNs never
 	// match admin resources and admin ARNs never match s3 resources.

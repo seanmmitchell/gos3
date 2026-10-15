@@ -5,7 +5,8 @@
 // (see docs/backings.md).
 //
 // CONTRACT: the exported names in this file are used by the server, the
-// multi router and the gateway variant; the implementation lives in the
+// multi router and the s3 account backend (internal/storage/s3account),
+// which opens one Backend per container; the implementation lives in the
 // other files of the package.
 //
 // Metadata is held in an in-memory index (internal/storage/index) loaded
@@ -49,10 +50,19 @@ type Options struct {
 	// KEK is the 32-byte key-encryption key wrapping the per-bucket master
 	// keys. Without it AES256 and restic are not offered.
 	KEK []byte
-	// Gateway opens the backing as the metadata store of a gateway backing:
-	// object and multipart operations answer storage.ErrNotSupported (the
-	// gateway's data store handles them) and AuxState is available.
-	Gateway bool
+	// Create says when Open may create a new backing at Bucket/Prefix
+	// (default CreateIfNoData). An existing marker is opened, except by
+	// CreateIfEmpty (see there).
+	Create CreateMode
+	// ExpectBackingID, when set, is the ID of the backing that must be at
+	// Bucket/Prefix: a marker with another ID is refused with
+	// ErrMarkerMismatch, and a missing marker with ErrMarkerMissing (none is
+	// ever created). Without it, a reload after a fail-stop still requires
+	// the backing loaded before.
+	ExpectBackingID string
+	// Role is stored in the marker of a backing this Open creates
+	// (informational, e.g. RoleHome or RoleContainer).
+	Role string
 	// TempDir holds spool and restic temporary files ("" = os.TempDir()).
 	TempDir string
 	// LeaseInterval and LeaseTTL tune ownership fencing (0 = defaults).
@@ -77,6 +87,56 @@ type Options struct {
 	retryMin time.Duration
 }
 
+// CreateMode says when Open creates a new backing, i.e. writes the
+// gos3.json marker at a location that has none (Options.Create).
+// CreateIfNoData and MustExist open an existing marker (see
+// Options.ExpectBackingID); CreateIfEmpty opens only the one it created.
+type CreateMode int
+
+const (
+	// CreateIfNoData creates the marker unless the location holds backing
+	// data without one (meta/, data/, parts/, keys/, restic/ or gateway/
+	// objects: ErrUnmanagedPrefix). Other keys under the prefix are
+	// tolerated. This is the default, used by legacy homes.
+	CreateIfNoData CreateMode = iota
+	// CreateIfEmpty creates the marker only when the location holds no key
+	// at all, ignoring a zero-byte folder placeholder whose key is the
+	// prefix itself (and leftovers of gos3's own conditional-write probe).
+	// Emptiness is checked when the marker is found missing and again right
+	// before the marker is written; a non-empty location is
+	// ErrPrefixNotEmpty. A marker the Backend did not create itself (found
+	// at the first read, or written by someone else while it created its
+	// own) also is ErrPrefixNotEmpty, unless it is the backing of
+	// Options.ExpectBackingID; reloads accept the Backend's own marker.
+	// Used for new containers.
+	CreateIfEmpty
+	// MustExist never creates a marker: a location without one is
+	// ErrMarkerMissing. Used for registered or attached containers.
+	MustExist
+)
+
+func (m CreateMode) String() string {
+	switch m {
+	case CreateIfNoData:
+		return "create-if-no-data"
+	case CreateIfEmpty:
+		return "create-if-empty"
+	case MustExist:
+		return "must-exist"
+	}
+	return fmt.Sprintf("CreateMode(%d)", int(m))
+}
+
+// Marker roles (Options.Role, Marker.Role). They are informational: Open
+// never compares them.
+const (
+	// RoleHome marks the home of an s3 backing (its records and shared
+	// container).
+	RoleHome = "home"
+	// RoleContainer marks a further container of an s3 backing.
+	RoleContainer = "container"
+)
+
 // DefaultOrphanRetention is the default of Options.OrphanRetention.
 const DefaultOrphanRetention = 24 * time.Hour
 
@@ -100,6 +160,13 @@ var (
 	// ErrNoConditionalWrites means the remote service ignores
 	// If-None-Match/If-Match on PUT, which the backend requires.
 	ErrNoConditionalWrites = errors.New("s3store: the S3 service does not support conditional writes")
+	// ErrMarkerMissing means the location has no gos3.json marker while one
+	// is required (MustExist, Options.ExpectBackingID, or a reload of a
+	// backing that was loaded before). It wraps ErrMarkerMismatch.
+	ErrMarkerMissing = fmt.Errorf("%w: no gos3.json at the location", ErrMarkerMismatch)
+	// ErrPrefixNotEmpty means CreateIfEmpty found keys at a location without
+	// a marker, so no backing is created there.
+	ErrPrefixNotEmpty = errors.New("s3store: the location is not empty")
 )
 
 // Connection is the part of the options that can change on a live backing

@@ -10,6 +10,7 @@ import (
 	"log/slog"
 	"net/http"
 	"path"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -20,6 +21,8 @@ import (
 	"github.com/seanmmitchell/gos3/internal/iam"
 	"github.com/seanmmitchell/gos3/internal/s3err"
 	"github.com/seanmmitchell/gos3/internal/storage"
+	"github.com/seanmmitchell/gos3/internal/storage/s3account"
+	"github.com/seanmmitchell/gos3/internal/storage/s3store"
 )
 
 // maxBodySize bounds JSON request bodies.
@@ -169,6 +172,7 @@ func (a *api) routes() []route {
 	user := pathTarget(iam.AdminUserARN, "name")
 	policy := pathTarget(iam.AdminPolicyARN, "name")
 	bucket := pathTarget(iam.AdminBucketARN, "name")
+	backing := pathTarget(iam.AdminBackingARN, "name")
 	keyOwner := target{resource: a.keyOwnerARN}
 	return []route{
 		// Identity
@@ -200,6 +204,7 @@ func (a *api) routes() []route {
 		{"GET", "/buckets", "ListBuckets", service, a.listBuckets},
 		{"GET", "/buckets/{name}", "GetBucket", bucket, a.getBucket},
 		{"DELETE", "/buckets/{name}", "ForceDeleteBucket", bucket, a.deleteBucket},
+		{"POST", "/buckets/{name}/release", "ReleaseBucket", bucket, a.releaseBucket},
 		// Storage backings and bucket placement
 		{"GET", "/backings", "ListBackings", service, a.listBackings},
 		{"GET", "/backings/config", "GetConfig", service, a.getBackingConfig},
@@ -215,6 +220,14 @@ func (a *api) routes() []route {
 		{"GET", "/buckets/{name}/compression", "GetBucketCompression", bucket, a.getBucketCompression},
 		{"PUT", "/buckets/{name}/compression", "PutBucketCompression", bucket, a.putBucketCompression},
 		{"DELETE", "/buckets/{name}/compression", "PutBucketCompression", bucket, a.deleteBucketCompression},
+		// Remote buckets and containers (s3 backings)
+		{"GET", "/backings/{name}/remote-buckets", "ListRemoteBuckets", backing, a.listRemoteBuckets},
+		{"POST", "/backings/{name}/remote-buckets", "CreateRemoteBucket", backing, a.createRemoteBucket},
+		{"GET", "/backings/{name}/containers", "ListRemoteBuckets", backing, a.listContainers},
+		{"POST", "/backings/{name}/containers", "ManageContainers", backing, a.addContainer}, // + CreateRemoteBucket or AdoptRemoteBucket
+		{"PUT", "/backings/{name}/containers/default", "ManageContainers", backing, a.setDefaultContainer},
+		{"DELETE", "/backings/{name}/containers/{id}", "ManageContainers", backing, a.removeContainer},
+		{"POST", "/backings/{name}/buckets", "CreateBucket", inHandler, a.createBucketOnBacking}, // bucket/<body bucket>, + backing actions
 		// Discovery
 		{"GET", "/discovery", "GetDiscovery", service, a.getDiscovery},
 		{"POST", "/discovery/probe", "ProbeNetwork", service, a.probe},
@@ -239,6 +252,12 @@ func (a *api) keyOwnerARN(rc *reqCtx) string {
 // register installs the routes on the mux. Every path additionally gets a
 // method-less pattern answering 405 with the Allow header (more specific
 // method patterns win), and Prefix+"/" catches unknown paths with a JSON 404.
+//
+// A path that refines another one (a literal segment where the other has
+// a wildcard, e.g. /backings/{name}/containers/default and
+// /backings/{name}/containers/{id}) cannot have a method-less pattern:
+// net/http refuses it as ambiguous with the other path's method patterns.
+// It gets a 405 pattern per method it does not allow instead.
 func (a *api) register(routes []route) {
 	allowed := map[string][]string{}
 	var order []string
@@ -251,22 +270,50 @@ func (a *api) register(routes []route) {
 	}
 	for _, p := range order {
 		methods := allowed[p]
-		for _, m := range methods {
-			if m == http.MethodGet {
-				methods = append(methods, http.MethodHead)
-				break
-			}
+		if slices.Contains(methods, http.MethodGet) {
+			methods = append(methods, http.MethodHead)
 		}
-		allow := strings.Join(append(methods, http.MethodOptions), ", ")
-		a.mux.HandleFunc(Prefix+p, func(w http.ResponseWriter, r *http.Request) {
+		allow := strings.Join(append(slices.Clone(methods), http.MethodOptions), ", ")
+		notAllowed := func(w http.ResponseWriter, r *http.Request) {
 			w.Header().Set("Allow", allow)
 			writeError(w, errorf(http.StatusMethodNotAllowed, codeMethodNotAllowed,
 				"method %s is not allowed on %s (allowed: %s)", r.Method, r.URL.Path, allow))
-		})
+		}
+		if !slices.ContainsFunc(order, func(q string) bool { return refinesPath(p, q) }) {
+			a.mux.HandleFunc(Prefix+p, notAllowed)
+			continue
+		}
+		for _, m := range []string{http.MethodGet, http.MethodPost, http.MethodPut, http.MethodPatch, http.MethodDelete} {
+			if !slices.Contains(methods, m) {
+				a.mux.HandleFunc(m+" "+Prefix+p, notAllowed)
+			}
+		}
 	}
 	a.mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		writeError(w, notFound("unknown admin API path %s", r.URL.Path))
 	})
+}
+
+// refinesPath reports whether the route path p matches a subset of the
+// paths q matches: the same segments, except for at least one literal in p
+// where q has a wildcard ({…}).
+func refinesPath(p, q string) bool {
+	ps, qs := strings.Split(p, "/"), strings.Split(q, "/")
+	if len(ps) != len(qs) {
+		return false
+	}
+	wild := func(seg string) bool { return strings.HasPrefix(seg, "{") }
+	refined := false
+	for i := range ps {
+		switch {
+		case wild(ps[i]) && wild(qs[i]), ps[i] == qs[i]:
+		case wild(qs[i]):
+			refined = true
+		default:
+			return false
+		}
+	}
+	return refined
 }
 
 // ServeHTTP implements http.Handler.
@@ -490,6 +537,7 @@ func (a *api) toAPIError(err error) *apiError {
 	msg := strings.TrimPrefix(err.Error(), "iam: ")
 	msg = strings.TrimPrefix(msg, "storage: ")
 	msg = strings.TrimPrefix(msg, "multi: ")
+	msg = strings.TrimPrefix(msg, "s3account: ")
 	if pe := placementError(err, msg); pe != nil {
 		return pe
 	}
@@ -508,14 +556,45 @@ func (a *api) toAPIError(err error) *apiError {
 	// storage
 	case errors.Is(err, storage.ErrBucketNotFound):
 		return errorf(http.StatusNotFound, codeNotFound, "%s", msg)
-	case errors.Is(err, storage.ErrBucketNotEmpty):
+	case errors.Is(err, storage.ErrInvalidBacking):
+		return errorf(http.StatusNotFound, codeNotFound, "%s", msg)
+	case errors.Is(err, storage.ErrRemoteBucketExists):
+		// Checked before ErrBucketExists, which it wraps: the remote bucket
+		// a native bucket would create exists, not the gos3 bucket.
+		return errorf(http.StatusConflict, codeConflict, "%s (adopt the existing remote bucket instead)", msg)
+	case errors.Is(err, storage.ErrBucketExists), errors.Is(err, storage.ErrBucketNotEmpty),
+		errors.Is(err, s3store.ErrInUse), errors.Is(err, s3store.ErrFenced):
+		// ErrInUse / ErrFenced: a container location held by another
+		// gos3 server.
+		return errorf(http.StatusConflict, codeConflict, "%s", msg)
+	case errors.Is(err, s3account.ErrClaimed):
+		// Checked before ErrInvalidTarget, which it wraps: the remote
+		// location is used by another bucket, container or backing, or
+		// holds a gos3 store.
 		return errorf(http.StatusConflict, codeConflict, "%s", msg)
 	case errors.Is(err, storage.ErrInvalidName):
 		return errorf(http.StatusBadRequest, codeInvalidName, "%s", msg)
 	case errors.Is(err, storage.ErrBackingUnavailable):
 		// A backing that cannot be reached (e.g. an s3 backing added live
-		// whose service does not answer).
+		// whose service does not answer), or one bucket's remote location
+		// (storage.ErrBucketUnavailable, e.g. a container still loading).
 		return errorf(http.StatusServiceUnavailable, codeInternalError, "%s", msg)
+	case errors.Is(err, storage.ErrInvalidTarget), errors.Is(err, storage.ErrNotSupported):
+		return errorf(http.StatusBadRequest, codeInvalidRequest, "%s", msg)
+	case errors.Is(err, storage.ErrRemoteDenied), errors.Is(err, storage.ErrRemoteRejected):
+		// The remote service refused what the backing's credentials asked
+		// for: not the caller's lack of rights (403), but a remote bucket or
+		// a setting the administrator can correct; the message carries the
+		// remote error.
+		return errorf(http.StatusBadRequest, codeInvalidRequest, "%s", msg)
+	case errors.Is(err, s3store.ErrPrefixNotEmpty), errors.Is(err, s3store.ErrMarkerMismatch),
+		errors.Is(err, s3store.ErrUnmanagedPrefix), errors.Is(err, s3store.ErrWrongKEK),
+		errors.Is(err, s3store.ErrNoConditionalWrites):
+		// A container location that cannot be used as asked (not empty,
+		// another store's marker or none, gos3 data without a marker, a
+		// store of another encryption key, a service without conditional
+		// writes).
+		return errorf(http.StatusBadRequest, codeInvalidRequest, "%s", msg)
 	case errors.Is(err, context.Canceled), errors.Is(err, context.DeadlineExceeded):
 		return errorf(http.StatusServiceUnavailable, codeInternalError, "request canceled or timed out: %s", msg)
 	}

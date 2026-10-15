@@ -21,6 +21,7 @@ func TestAuthorizeAdminResources(t *testing.T) {
 			"Condition":{"ForAllValues:StringEquals":{"admin:PolicyName":["readonly"]}}}]}`,
 		"pol":       `{"Statement":[{"Effect":"Allow","Action":"admin:PutPolicy","Resource":"arn:gos3:admin:::policy/app-*"}]}`,
 		"bkt":       `{"Statement":[{"Effect":"Allow","Action":"admin:GetBucket","Resource":"arn:gos3:admin:::bucket/logs"}]}`,
+		"backing":   `{"Statement":[{"Effect":"Allow","Action":"admin:ListRemoteBuckets","Resource":"arn:gos3:admin:::backing/cloud"}]}`,
 		"any-type":  `{"Statement":[{"Effect":"Allow","Action":"admin:Get*","Resource":"arn:gos3:admin:::*/shared"}]}`,
 		"s3-arns":   `{"Statement":[{"Effect":"Allow","Action":["admin:*","s3:*"],"Resource":["arn:aws:s3:::*","arn:aws:s3:::*/*","arn:*:*:::*"]}]}`,
 		"admin-arn": `{"Statement":[{"Effect":"Allow","Action":["admin:*","s3:*"],"Resource":"arn:gos3:admin:::*"}]}`,
@@ -65,6 +66,13 @@ func TestAuthorizeAdminResources(t *testing.T) {
 		{name: "bucket scoped in", user: "u-bkt", action: "admin:GetBucket", resource: AdminBucketARN("logs"), want: true},
 		{name: "bucket scoped out", user: "u-bkt", action: "admin:GetBucket", resource: AdminBucketARN("logs2")},
 		{name: "bucket admin ARN not s3", user: "u-bkt", action: "s3:ListBucket", bucket: "logs"},
+		{name: "backing scoped in", user: "u-backing", action: "admin:ListRemoteBuckets", resource: AdminBackingARN("cloud"), want: true},
+		{name: "backing scoped out", user: "u-backing", action: "admin:ListRemoteBuckets", resource: AdminBackingARN("cloud2")},
+		{name: "backing scoped other action", user: "u-backing", action: "admin:AdoptRemoteBucket", resource: AdminBackingARN("cloud")},
+		{name: "backing scoped service level", user: "u-backing", action: "admin:ListRemoteBuckets"},
+		{name: "backing scoped bucket type", user: "u-backing", action: "admin:ListRemoteBuckets", resource: AdminBucketARN("cloud")},
+		{name: "admin ARN grants backing", user: "u-admin-arn", action: "admin:ManageContainers", resource: AdminBackingARN("cloud"), want: true},
+		{name: "diagnostics no remote buckets", user: "dave", action: "admin:ListRemoteBuckets", resource: AdminBackingARN("cloud")},
 		{name: "any type", user: "u-any-type", action: "admin:GetPolicy", resource: AdminPolicyARN("shared"), want: true},
 		{name: "s3 ARNs never grant admin", user: "u-s3-arns", action: "admin:GetUser", resource: AdminUserARN("x")},
 		{name: "s3 ARNs never grant admin service", user: "u-s3-arns", action: "admin:ListUsers"},
@@ -99,6 +107,7 @@ func TestAdminResourceValidation(t *testing.T) {
 		"arn:gos3:admin:::*", "arn:gos3:admin:::user/alice", "arn:gos3:admin:::user/team-*",
 		"arn:gos3:admin:::policy/*", "arn:gos3:admin:::bucket/logs", "arn:gos3:admin:::*/x",
 		"arn:gos3:admin:::user/${aws:username}", "arn:gos3:admin:::**",
+		"arn:gos3:admin:::backing/cloud", "arn:gos3:admin:::backing/*", "arn:gos3:admin:::back*/c-?",
 	} {
 		doc := `{"Statement":[{"Effect":"Allow","Action":"admin:*","Resource":"` + r + `"}]}`
 		if _, err := ParsePolicy([]byte(doc)); err != nil {
@@ -108,6 +117,7 @@ func TestAdminResourceValidation(t *testing.T) {
 	m := newEvalManager(t)
 	for _, r := range []string{
 		"arn:gos3:admin:::users/alice", "arn:gos3:admin:::user/", "arn:gos3:admin:::alice",
+		"arn:gos3:admin:::backings/cloud", "arn:gos3:admin:::backing/",
 		"arn:gos3:admin:us-east-1::*", "arn:gos3:s3:::*",
 	} {
 		doc := `{"Statement":[{"Effect":"Deny","Action":"admin:*","NotResource":"` + r + `"}]}`
@@ -128,8 +138,9 @@ func TestAdminResourceValidation(t *testing.T) {
 	}
 
 	for r, want := range map[string]bool{
-		"": true, AdminUserARN("a"): true, AdminPolicyARN("p"): true, AdminBucketARN("b"): true,
-		"arn:gos3:admin:::*": false, "arn:gos3:admin:::user/": false, "arn:aws:s3:::b": false, "arn:gos3:admin:::key/x": false,
+		"": true, AdminUserARN("a"): true, AdminPolicyARN("p"): true, AdminBucketARN("b"): true, AdminBackingARN("cloud"): true,
+		"arn:gos3:admin:::backing/": false,
+		"arn:gos3:admin:::*":        false, "arn:gos3:admin:::user/": false, "arn:aws:s3:::b": false, "arn:gos3:admin:::key/x": false,
 	} {
 		if got := ValidAdminRequestResource(r); got != want {
 			t.Errorf("ValidAdminRequestResource(%q) = %v", r, got)

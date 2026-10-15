@@ -27,12 +27,14 @@ type BackingDefinition struct {
 type S3Definition struct {
 	Endpoint   string `json:"endpoint"`
 	Region     string `json:"region"`
-	Bucket     string `json:"bucket"`
-	Prefix     string `json:"prefix"`
-	Addressing string `json:"addressing"`
-	PartSize   int64  `json:"partSize,omitempty"`
-	Gateway    bool   `json:"gateway"`
-	AccessKey  string `json:"accessKey"`
+	HomeBucket string `json:"homeBucket"`
+	HomePrefix string `json:"homePrefix"`
+	// DefaultKind is "wrapped" or "native" ("" = the default for the home,
+	// filled in by Apply: wrapped with a home, native without).
+	DefaultKind string `json:"defaultKind"`
+	Addressing  string `json:"addressing"`
+	PartSize    int64  `json:"partSize,omitempty"`
+	AccessKey   string `json:"accessKey"`
 	// SecretKey and EncryptionKey are write-only (see S3Definition).
 	SecretKey     string `json:"secretKey,omitempty"`
 	EncryptionKey string `json:"encryptionKey,omitempty"`
@@ -51,6 +53,14 @@ type S3Definition struct {
 	// credentials included (read-only). Such values are not written to
 	// backings.json.
 	EnvFields []string `json:"envFields,omitempty"`
+	// LegacyBucket, LegacyPrefix and LegacyGateway are the deprecated keys
+	// bucket, prefix and gateway (see S3Config), accepted on input only
+	// (backings.json of earlier versions, API clients): Apply maps them to
+	// homeBucket, homePrefix and defaultKind native, and they are never
+	// written.
+	LegacyBucket  string `json:"bucket,omitempty"`
+	LegacyPrefix  string `json:"prefix,omitempty"`
+	LegacyGateway bool   `json:"gateway,omitempty"`
 }
 
 // SourceEnv is the S3Definition *Source value of settings taken from the
@@ -75,14 +85,17 @@ func (d BackingDefinition) Config() BackingConfig {
 		b.S3 = &S3Config{
 			Endpoint:      s.Endpoint,
 			Region:        s.Region,
-			Bucket:        s.Bucket,
-			Prefix:        s.Prefix,
+			HomeBucket:    s.HomeBucket,
+			HomePrefix:    s.HomePrefix,
 			Addressing:    s.Addressing,
 			PartSize:      s.PartSize,
 			AccessKey:     s.AccessKey,
 			SecretKey:     s.SecretKey,
 			EncryptionKey: s.EncryptionKey,
-			Gateway:       s.Gateway,
+			DefaultKind:   s.DefaultKind,
+			LegacyBucket:  s.LegacyBucket,
+			LegacyPrefix:  s.LegacyPrefix,
+			LegacyGateway: s.LegacyGateway,
 		}
 		for _, f := range s.EnvFields {
 			if slices.Contains(s3EnvFields, f) {
@@ -104,11 +117,11 @@ func DefinitionOf(b BackingConfig) BackingDefinition {
 		d.S3 = &S3Definition{
 			Endpoint:                s.Endpoint,
 			Region:                  s.Region,
-			Bucket:                  s.Bucket,
-			Prefix:                  s.Prefix,
+			HomeBucket:              s.HomeBucket,
+			HomePrefix:              s.HomePrefix,
+			DefaultKind:             s.DefaultKind,
 			Addressing:              s.Addressing,
 			PartSize:                s.PartSize,
-			Gateway:                 s.Gateway,
 			AccessKey:               s.AccessKey,
 			SecretKey:               s.SecretKey,
 			EncryptionKey:           s.EncryptionKey,
@@ -118,6 +131,9 @@ func DefinitionOf(b BackingConfig) BackingDefinition {
 			SecretKeySource:         source(s.isEnv("secret_key")),
 			EncryptionKeySource:     source(s.isEnv("encryption_key")),
 			EnvFields:               s.EnvFields(),
+			LegacyBucket:            s.LegacyBucket,
+			LegacyPrefix:            s.LegacyPrefix,
+			LegacyGateway:           s.LegacyGateway,
 		}
 	}
 	return d
@@ -132,18 +148,23 @@ func source(fromEnv bool) string {
 
 // Identity names the data a backing holds, so that two definitions with
 // the same identity open the same data: "fs:<absolute path>" for fs,
-// "memory:<name>" for memory and "s3:<bucket>/<prefix>" (plus "#gateway"
-// for a gateway backing) for s3. Connection settings (endpoint, region,
-// credentials, encryption key, addressing, part size) are not part of it.
+// "memory:<name>" for memory and, for s3, "s3:home:<home bucket,
+// lower-cased>/<home prefix>" with a home or "s3:local:<name>" for a
+// backing whose records live in the system directory. The default kind and
+// the connection settings (endpoint, region, credentials, encryption key,
+// addressing, part size) are not part of it: changing them reconfigures
+// the backing in place. Deprecated keys count as their replacements.
 func (d BackingDefinition) Identity() string {
 	switch d.Backend {
 	case BackendMemory:
 		return BackendMemory + ":" + d.Name
 	case BackendS3:
-		if d.S3 == nil {
-			return BackendS3 + ":"
+		var s S3Config
+		if d.S3 != nil {
+			s = *d.Config().S3
 		}
-		return BackendS3 + ":" + d.Config().S3.identity()
+		s.normalize()
+		return BackendS3 + ":" + s.identity(strings.TrimSpace(d.Name))
 	}
 	p, err := filepath.Abs(d.Path)
 	if err != nil {
@@ -153,7 +174,8 @@ func (d BackingDefinition) Identity() string {
 }
 
 // Equal reports whether d and o have the same settings, secrets included
-// (the read-only *Configured, *Source and EnvFields fields are ignored).
+// (the read-only *Configured, *Source and EnvFields fields are ignored;
+// deprecated keys count as their replacements).
 func (d BackingDefinition) Equal(o BackingDefinition) bool {
 	if d.Name != o.Name || d.Backend != o.Backend || d.Path != o.Path || (d.S3 == nil) != (o.S3 == nil) {
 		return false
@@ -162,7 +184,10 @@ func (d BackingDefinition) Equal(o BackingDefinition) bool {
 		return true
 	}
 	a, b := *d.Config().S3, *o.Config().S3
+	a.mapLegacy()
+	b.mapLegacy()
 	a.fromEnv, b.fromEnv = 0, 0
+	a.legacy, b.legacy = 0, 0
 	return a == b
 }
 
@@ -207,6 +232,10 @@ func (s BackingSettings) Public() BackingSettings {
 // environment when it was taken from there, or when it equals the
 // environment-sourced value stored in base (so that a definition read
 // from the API and sent back unchanged keeps following the environment).
+// Likewise a default kind equal to the stored one, when that is the
+// default for the stored home, is derived again from the (possibly new)
+// home. Deprecated keys (bucket, prefix, gateway) are mapped to their
+// replacements; one that conflicts with its replacement is an error.
 func (s BackingSettings) Apply(base StorageConfig) (StorageConfig, error) {
 	previous := map[string]*S3Config{}
 	for _, b := range base.Backings {
@@ -233,6 +262,10 @@ func (s BackingSettings) Apply(base StorageConfig) (StorageConfig, error) {
 					if old.isEnv(f) && c.fieldValue(f) == old.fieldValue(f) {
 						c.setEnv(f, true)
 					}
+				}
+				// The default kind follows the home unless it was chosen.
+				if !c.isEnv("default_kind") && c.DefaultKind == old.DefaultKind && old.DefaultKind == defaultKindFor(old.HomeBucket) {
+					c.DefaultKind = ""
 				}
 			}
 		}
@@ -290,8 +323,11 @@ func (c *Config) LoadBackings() error {
 
 // Save atomically persists backing settings (mode 0600: s3 secrets are
 // included). Values taken from the environment (EnvFields, *Source) are
-// left out, so that the environment keeps supplying them after a restart.
-// An empty path is memory only.
+// left out, so that the environment keeps supplying them after a restart,
+// and so is a default kind that is the default for the backing's home (it
+// is derived again on load). Only the current keys are written: deprecated
+// ones are mapped to their replacements first. An empty path is memory
+// only.
 func (s BackingSettings) Save(path string) error {
 	if path == "" {
 		return nil
@@ -300,10 +336,16 @@ func (s BackingSettings) Save(path string) error {
 	for i, d := range s.Backings {
 		if d.S3 != nil {
 			cfg := d.Config()
-			for _, f := range cfg.S3.EnvFields() {
-				cfg.S3.clearField(f)
+			c := cfg.S3
+			c.mapLegacy()
+			c.LegacyBucket, c.LegacyPrefix, c.LegacyGateway = "", "", false
+			if c.DefaultKind == defaultKindFor(c.HomeBucket) {
+				c.DefaultKind = ""
 			}
-			cfg.S3.fromEnv = 0
+			for _, f := range c.EnvFields() {
+				c.clearField(f)
+			}
+			c.fromEnv, c.legacy = 0, 0
 			cp := *DefinitionOf(cfg).S3
 			cp.SecretKeyConfigured, cp.EncryptionKeyConfigured = false, false
 			d.S3 = &cp

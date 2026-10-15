@@ -95,7 +95,7 @@ var DefaultExposeHeaders = []string{
 	"x-amz-server-side-encryption", "x-amz-object-lock-mode",
 	"x-amz-object-lock-retain-until-date", "x-amz-object-lock-legal-hold",
 	"x-amz-expiration", "x-amz-restore", "x-amz-website-redirect-location",
-	"x-amz-abort-date", "x-amz-abort-rule-id", "x-amz-bucket-region", "x-gos3-backing",
+	"x-amz-abort-date", "x-amz-abort-rule-id", "x-amz-bucket-region", "x-gos3-backing", "x-gos3-bucket-kind",
 }
 
 // DefaultSkipContentTypes are the media types stored uncompressed by

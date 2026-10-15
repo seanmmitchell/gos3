@@ -6,7 +6,6 @@
 // The file name starts with "-" so Nuxt does not register it as a component:
 //
 //   import { placementBusy } from '~/components/admin/-storage'
-import { isGatewayBacking } from '~/utils/backings'
 import type { Backing, MemberState, Placement, PlacementMember, PlacementSummary, ReplicationMode } from '~/types/admin'
 
 /** Poll interval of the Placement tab while copies run or a move is in progress. */
@@ -98,17 +97,36 @@ export interface BackingChoice {
   disabledReason?: string
 }
 
+/** Why native buckets can neither be replicated nor moved (Placement tab). */
+export const NATIVE_PLACEMENT_NOTE = 'Native buckets keep their data in their remote bucket; copy them with a copy job instead.'
+
 /**
- * Backings offered as replicas: every backing except the primary and
- * gateway backings. Unhealthy ones stay selectable (the copy starts once they
- * recover) but are marked.
+ * Why a backing cannot hold a copy of a bucket, or '' when it can. Copies on
+ * s3 backings are always wrapped buckets, so an s3 backing needs a container
+ * (it does not offer the wrapped kind without one). A move names the
+ * container of its copy; a replica goes to the default container, so the
+ * backing needs one (`purpose` replica).
+ */
+export function copyRefusal(b: Pick<Backing, 'kind' | 'kinds' | 'account'>, purpose: 'replica' | 'move' = 'move'): string {
+  if (b.kind !== 's3') return ''
+  const kinds = b.kinds ?? b.account?.kinds
+  if (kinds && !kinds.includes('wrapped')) return 'no container'
+  if (b.account && !b.account.containers?.length) return 'no container'
+  if (purpose === 'replica' && b.account && !b.account.defaultContainer) return 'no default container'
+  return ''
+}
+
+/**
+ * Backings offered as replicas: every backing except the primary and s3
+ * backings without a (default) container. Unhealthy ones stay selectable
+ * (the copy starts once they recover) but are marked.
  */
 export function replicaChoices(backings: readonly Backing[], p: Placement): BackingChoice[] {
   const names = new Set(backings.map(b => b.name))
   const current = new Set(replicaNames(p))
   const list: BackingChoice[] = backings
-    // Gateway backings cannot hold replicas (kept when one somehow is).
-    .filter(b => b.name !== p.primary && (!isGatewayBacking(b) || current.has(b.name)))
+    // Backings that cannot hold a copy are left out (kept when one somehow is a replica).
+    .filter(b => b.name !== p.primary && (!copyRefusal(b, 'replica') || current.has(b.name)))
     .map(b => ({ value: b.name, label: b.name, healthy: b.healthy }))
   // Replicas on backings the listing did not return (ListBackings denied, or a backing removed from the config).
   for (const m of p.members ?? []) {
@@ -141,13 +159,14 @@ export function replicationChanged(p: Placement, mode: ReplicationMode, replicas
 
 /**
  * Move targets: backings that hold no copy of the bucket (and are not a move
- * target already). Gateway backings are listed but disabled.
+ * target already). Backings that cannot hold a copy (s3 backings without a
+ * container) and unhealthy ones are listed but disabled.
  */
 export function moveTargets(backings: readonly Backing[], p: Placement): BackingChoice[] {
   const members = new Set((p.members ?? []).map(m => m.backing))
   return backings
     .filter(b => !members.has(b.name))
-    .map(b => ({ value: b.name, label: b.name, healthy: b.healthy, disabledReason: isGatewayBacking(b) ? 'gateway backing' : b.healthy ? undefined : 'unhealthy' }))
+    .map(b => ({ value: b.name, label: b.name, healthy: b.healthy, disabledReason: copyRefusal(b) || (b.healthy ? undefined : 'unhealthy') }))
     .sort((a, b) => a.label.localeCompare(b.label))
 }
 

@@ -314,6 +314,12 @@ func (r *Router) fullSync(ctx context.Context, ms *memberState) error {
 	bs := ms.bucket
 	r.mu.RLock()
 	src := bs.members[bs.rec.primary()].backing
+	// The target of a move is created where the move asked; replicas
+	// where their backing puts copies.
+	var target *storage.BucketTarget
+	if mv := bs.rec.Move; mv != nil && mv.To == ms.backing.Name {
+		target = cloneTarget(mv.Target) // records are immutable
+	}
 	r.mu.RUnlock()
 	if src == ms.backing {
 		return nil
@@ -322,7 +328,7 @@ func (r *Router) fullSync(ctx context.Context, ms *memberState) error {
 		return fmt.Errorf("primary backing %q is unhealthy", src.Name)
 	}
 	dst := ms.backing
-	if err := r.syncBucket(ctx, src, dst, bs.name); err != nil {
+	if err := r.syncBucket(ctx, src, dst, bs.name, target); err != nil {
 		return err
 	}
 	if err := abortUploads(ctx, dst, bs.name, r); err != nil {
@@ -402,8 +408,10 @@ func (r *Router) walkErr(b *backing, err error) error {
 }
 
 // syncBucket makes the bucket on dst match src: existence, versioning,
-// object lock and every configuration document.
-func (r *Router) syncBucket(ctx context.Context, src, dst *backing, bucket string) error {
+// object lock and every configuration document. A missing bucket is
+// created on dst to receive imported versions, with target (the kind and
+// location a move asked for; nil: the backing's choice for copies).
+func (r *Router) syncBucket(ctx context.Context, src, dst *backing, bucket string, target *storage.BucketTarget) error {
 	info, err := src.Backend.GetBucket(ctx, bucket)
 	if err != nil {
 		return r.observe(src, err)
@@ -412,6 +420,7 @@ func (r *Router) syncBucket(ctx context.Context, src, dst *backing, bucket strin
 	if errors.Is(err, storage.ErrBucketNotFound) {
 		err = dst.Backend.CreateBucket(ctx, bucket, storage.CreateBucketOptions{
 			Region: info.Region, ObjectLockEnabled: info.ObjectLockEnabled, Owner: info.Owner,
+			Import: true, Target: target,
 		})
 		if err != nil && !errors.Is(err, storage.ErrBucketExists) {
 			return r.observe(dst, fmt.Errorf("creating bucket %q on backing %q: %w", bucket, dst.Name, err))

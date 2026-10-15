@@ -125,3 +125,50 @@ func TestIgnoreConditionals(t *testing.T) {
 		t.Fatalf("GET with a stale If-Match: %v, want 412", err)
 	}
 }
+
+func TestStartWithWrap(t *testing.T) {
+	var wrapped atomic.Int64
+	r := s3clienttest.StartWith(t, s3clienttest.Options{Wrap: func(h http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+			wrapped.Add(1)
+			if req.URL.Query().Has("versioning") {
+				// A service without versioning.
+				w.WriteHeader(http.StatusNotImplemented)
+				return
+			}
+			h.ServeHTTP(w, req)
+		})
+	}})
+	r.CreateBucket(t, "bkt")
+	c := r.Client(t)
+	if _, err := c.GetBucketVersioning(t.Context(), "bkt"); !s3client.IsNotImplemented(err) {
+		t.Fatalf("GetBucketVersioning through the wrapper: %v, want 501", err)
+	}
+	if err := c.HeadBucket(t.Context(), "bkt"); err != nil {
+		t.Fatalf("HeadBucket through the wrapper: %v", err)
+	}
+	if wrapped.Load() != 2 || r.Requests.Load() != 2 {
+		t.Errorf("wrapper saw %d requests, remote served %d; want 2 and 2", wrapped.Load(), r.Requests.Load())
+	}
+}
+
+func TestStartWithStrictRegion(t *testing.T) {
+	for _, strict := range []bool{false, true} {
+		r := s3clienttest.StartWith(t, s3clienttest.Options{StrictRegion: strict})
+		r.CreateBucket(t, "bkt")
+		cfg := r.Config()
+		cfg.Region = "eu-west-1"
+		c, err := s3client.New(cfg)
+		if err != nil {
+			t.Fatal(err)
+		}
+		_, err = c.GetBucketVersioning(t.Context(), "bkt")
+		if strict {
+			if region, ok := s3client.IsWrongRegion(err); !ok || region != s3clienttest.Region {
+				t.Errorf("strict remote: %v, want a wrong region error naming %s", err, s3clienttest.Region)
+			}
+		} else if err != nil {
+			t.Errorf("lenient remote: %v", err)
+		}
+	}
+}

@@ -37,8 +37,9 @@ the internet.
 - **Discovery** (gos3 only): peers seen by each connected server, network
   scans, local discovery from the UI host, and one-click "add server".
 - **Storage** (gos3 only): the server's storage backings (directories,
-  memory and S3 services, configurable live), and per bucket its placement,
-  replication, moves and promotions (see
+  memory and S3 services, configurable live), for S3 backings the
+  account's remote buckets and the containers of wrapped buckets, and per
+  bucket its placement, replication, moves and promotions (see
   [Storage backings and placement](#storage-backings-and-placement)).
 
 Pages are shown according to the signed-in identity's permissions (from
@@ -85,12 +86,13 @@ policies and clears that option.
   disabled with the reason: native AES-256-GCM when an S3 backing holding
   the bucket has no encryption key (set one under the server's Storage
   settings), restic when it is not installed or a copy of the bucket is on a
-  memory backing or an S3 backing without an encryption key. Users without
+  memory backing or an S3 backing without an encryption key. Native buckets
+  of S3 backings offer neither: their objects are stored as they are. Users without
   those admin permissions, and servers without the endpoint, see a note there
   while default encryption keeps working. Restic repositories live on the
   bucket's backings, with nothing to configure: on a filesystem backing in
-  its data directory, on an S3 backing in that backing's bucket; replicas
-  and moves use the destination backing. Repository passwords are
+  its data directory, on an S3 backing in the container of the (wrapped)
+  bucket; replicas and moves use the destination backing. Repository passwords are
   server-managed. This encrypts new writes; older objects are unchanged. See
   [encryption.md](encryption.md).
 - **Compression.** The server settings page has a Compression section where
@@ -108,8 +110,10 @@ policies and clears that option.
   saving next to the size when compression saves space. See
   [operations.md](operations.md#compression).
 - **Policy editor and simulator.** Admin actions are evaluated against
-  `arn:gos3:admin:::user/<name>`, `arn:gos3:admin:::policy/<name>` and
-  `arn:gos3:admin:::bucket/<name>` (see [admin-api.md](admin-api.md));
+  `arn:gos3:admin:::user/<name>`, `arn:gos3:admin:::policy/<name>`,
+  `arn:gos3:admin:::bucket/<name>` and `arn:gos3:admin:::backing/<name>`
+  (the remote buckets and containers of an S3 backing; see
+  [admin-api.md](admin-api.md#resources-and-condition-keys));
   `*` and `arn:gos3:admin:::*` match all of them. The policy editor lists
   these forms and the `admin:PolicyName` condition key (the policies a
   CreateUser / UpdateUser request attaches), and the "Manage some users"
@@ -126,29 +130,66 @@ On servers with several storage backings (see
 and [backings.md](backings.md)):
 
 - **Storage** (sidebar, needs `admin:ListBackings`, whoami capability
-  `viewStorage`) shows every backing with its kind (Disk, Memory, Remote S3
-  or Remote S3 (gateway)), its path or, for S3 backings, its location
-  (`s3://bucket/prefix/`), health (the last error of an unhealthy one, for
-  example an unreachable S3 service), last check, bucket and replica counts
-  and, for disks, disk usage. It refreshes every 10 seconds.
+  `viewStorage`) shows every backing with its kind (Disk, Memory or Remote
+  S3), its path or, for S3 backings, its home (`s3://bucket/prefix/`, or
+  "No home: records kept on this server"), the kind of new buckets and the
+  number of native and wrapped buckets, health (the last error of an
+  unhealthy one, for example an unreachable S3 service), last check, bucket
+  and replica counts and, for disks, disk usage. It refreshes every 10
+  seconds. S3 backings have a **Manage** button leading to the backing's
+  page (below).
 - **Configure backings** on the Storage page (shown with the
   `manageConfig` capability, `admin:UpdateConfig`) adds, edits and removes additional backings and
   picks the default backing for new buckets (see
   [backings.md](backings.md#configuring-backings-live)). The backend is
   Filesystem (a directory on the server), Memory or **S3 service**. The S3
-  form asks for the endpoint, region, bucket, prefix, access key and secret
-  key, and has a **Gateway** switch (objects stored natively in remote
-  buckets named like the gos3 buckets; no versioning, object lock, replicas
-  or moves). **Advanced** holds the addressing style, the part size (MiB)
-  and the encryption key, with **Show** and **Generate** buttons and a
-  warning that the key is needed for AES256 and restic and that losing it
-  makes encrypted objects unreadable. Saved secrets are never shown: their
-  fields say "Saved – leave blank to keep", or name the
-  `GOS3_BACKING_<NAME>_*` variable they come from. A saved backing's name
-  is fixed; while it holds buckets or replicas its backend, directory,
-  bucket, prefix and gateway switch are locked too (the connection settings
-  and credentials stay editable) and it cannot be removed. A warning says when the server has no data directory, so changes
-  are lost on restart.
+  form asks for the endpoint, region, home bucket and prefix (leave the
+  bucket empty to keep the backing's records on the server; wrapped
+  buckets then need a container added later), the **default bucket kind**
+  (Automatic: wrapped with a home, else native; Wrapped; Native), the
+  access key and the secret key. **Advanced** holds the addressing style,
+  the part size (MiB) and the encryption key, with **Show** and
+  **Generate** buttons and a warning that the key is needed for AES256 and
+  restic and that losing it makes encrypted objects unreadable. Saved
+  secrets are never shown: their fields say "Saved – leave blank to keep",
+  or name the `GOS3_BACKING_<NAME>_*` variable they come from. A saved
+  backing's name is fixed; while it holds buckets or replicas its backend,
+  directory and home are locked too (the connection settings, credentials
+  and default bucket kind stay editable) and it cannot be removed. A
+  warning says when the server has no data directory, so changes are lost
+  on restart.
+- **The backing's page** (Storage → **Manage** on an S3 backing; also
+  `viewStorage`) has three sections, picked with chips (kept in `?tab=`):
+  - **Overview**: the home (or that records are kept on the server), the
+    default bucket kind, the kinds offered, the default container, health,
+    and the counts of native and wrapped buckets and containers. A backing
+    without any container says that its new buckets are native.
+  - **Remote buckets** (`admin:ListRemoteBuckets` on the backing, whoami
+    capability `browseRemote`): the account's buckets, page by page with a
+    name prefix filter, each with its status (Native bucket, Home,
+    Container, Used elsewhere, gos3 data, Inaccessible, Unmanaged; see
+    [backings.md](backings.md#remote-bucket-browser)) and its uses, linking
+    to the gos3 bucket of a native one. **Check for gos3 data** looks into
+    every unmanaged bucket (one request each). Depending on the status and
+    the identity's capabilities, a row offers **Open bucket** and
+    **Release…** (native), **Adopt as native bucket…**, **Use as
+    container…** and **Create wrapped bucket in it…** (unmanaged), or
+    **Attach as container…** (gos3 data). The toolbar has **Create remote
+    bucket…** (`createRemote`) and **Adopt by name…** (`adoptRemote`), which
+    also works when the credentials cannot list the account's buckets (the
+    list then says it is incomplete).
+  - **Containers**: the home and the added containers with their location,
+    role, state and number of wrapped buckets. With `manageContainers`
+    (plus `createRemote` or `adoptRemote`) **Add container…** adds a new
+    dedicated remote bucket or a prefix of an existing one (empty, unless
+    **Attach an existing gos3 store** is ticked), each container can be
+    made the default of new wrapped buckets, and an empty container other
+    than the home and the default can be removed (gos3 forgets it; its
+    remote data stays). The page refreshes by itself while a container is
+    loading.
+
+  Container labels are shown to everyone who can create buckets; do not
+  put secrets in them.
 - **Bucket settings → Placement** (also `viewStorage`) shows the replication
   mode and each member (primary, replicas, a move target) with its state
   (`in sync`, `syncing`, `lagging`, `degraded`, `offline`), pending changes,
@@ -158,15 +199,34 @@ and [backings.md](backings.md)):
 - With `admin:UpdateBucketPlacement` (capability `manageStorage`) the tab
   changes the mode (single, active-passive, active-active) and the replica
   backings (removing a replica asks first, because its copy is deleted),
-  moves the bucket (or one replica) to a backing without a copy, cancels a
+  moves the bucket (or one replica) to a backing without a copy (on an S3
+  backing, into a chosen container, the default one preselected: copies
+  there are wrapped buckets), cancels a
   move while it is copying, promotes a replica to primary and resyncs one or
   all replicas. "Force promote" is offered when the replica is not in sync
   or the primary is offline; it asks you to type the backing name, because
   changes not yet copied to the replica are lost. Without the capability the
-  tab is read-only.
+  tab is read-only. A native bucket's tab only explains that native buckets
+  can be neither replicated nor moved.
 - The *Create bucket* dialog offers the backings (for every user, from
-  `whoami`) when there is more than one, with the default preselected; on a
-  gateway backing it disables versioning and object lock.
+  `whoami`) when there is more than one, with the default preselected. On
+  an S3 backing it asks for the **bucket kind** (the backing's default
+  preselected): a **wrapped** bucket picks its container (the default
+  container preselected; a backing without containers says that an
+  administrator can add one), a **native** bucket the remote bucket to
+  create (the bucket name by default). Versioning and object lock of a
+  native bucket are set on its remote bucket, and the server refuses them
+  (Not Implemented) when that service cannot. Identities that may adopt
+  remote buckets (`adoptRemote`) also get **Adopt an existing remote
+  bucket…**, which opens the backing's Remote buckets section prefilled.
+- **Bucket settings** shows a native or wrapped bucket's kind next to its
+  backing (with its location on hover). The Versioning and Object lock tabs
+  of a bucket whose storage cannot keep versions (a native bucket on a
+  service without versioning) say so. A native bucket's **Danger zone**
+  explains that deleting removes the remote bucket only when gos3 created
+  it, warns that force delete deletes the objects in the remote bucket
+  (also for other tools using it), and offers **Release** (gos3 forgets the
+  bucket and its settings; the remote bucket and its objects stay).
 - The bucket list shows the primary backing, the mode with the number of
   copies (for example `AP ×2`) and `moving`, when the server reports
   placement and the buckets are not all on one backing.

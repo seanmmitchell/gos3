@@ -100,7 +100,7 @@ func TestResticInheritsReplicaAndMoveBackings(t *testing.T) {
 	}
 	repository(backings[0])
 	repository(backings[1])
-	if _, err := r.Move(ctx, "archive", "", "target"); err != nil {
+	if _, err := r.Move(ctx, "archive", "", "target", nil); err != nil {
 		t.Fatal(err)
 	}
 	wait("target")

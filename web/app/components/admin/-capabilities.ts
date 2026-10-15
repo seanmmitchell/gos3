@@ -27,7 +27,11 @@ export const NO_CAPS: Readonly<Capabilities> = Object.freeze({
   scan: false,
   probe: false,
   createOwnKeys: false,
-  manageCompression: false
+  manageCompression: false,
+  browseRemote: false,
+  createRemote: false,
+  adoptRemote: false,
+  manageContainers: false
 })
 
 /** True when the connection is gos3 and the identity has `cap`. */
@@ -152,6 +156,38 @@ export function canViewStorage(kind: ConnectionKind | undefined, caps: Capabilit
 /** Changing replication, moving, promoting and resyncing need admin:UpdateBucketPlacement. */
 export function canManageStorage(kind: ConnectionKind | undefined, caps: Capabilities | null | undefined): boolean {
   return hasCapability(kind, caps, 'manageStorage')
+}
+
+/**
+ * What the identity may do with the remote buckets and containers of an s3
+ * backing (actions on arn:gos3:admin:::backing/<name>). Servers without s3
+ * accounts do not report these capabilities, so a missing field means false.
+ */
+export interface RemoteAccess {
+  /** admin:ListRemoteBuckets: the remote bucket browser and the container list. */
+  browse: boolean
+  /** admin:CreateRemoteBucket: create remote buckets (also dedicated containers). */
+  create: boolean
+  /** admin:AdoptRemoteBucket: adopt remote buckets as native buckets, or use existing ones as containers. */
+  adopt: boolean
+  /** admin:ManageContainers: add, remove and choose the default container. */
+  containers: boolean
+  /**
+   * Forget a native bucket (admin:ReleaseBucket). It is evaluated per
+   * bucket and has no capability of its own, so it is offered to identities
+   * with any admin right; the server's 403 is shown otherwise.
+   */
+  release: boolean
+}
+
+export function remoteAccess(kind: ConnectionKind | undefined, caps: Capabilities | null | undefined): RemoteAccess {
+  return {
+    browse: hasCapability(kind, caps, 'browseRemote'),
+    create: hasCapability(kind, caps, 'createRemote'),
+    adopt: hasCapability(kind, caps, 'adoptRemote'),
+    containers: hasCapability(kind, caps, 'manageContainers'),
+    release: hasCapability(kind, caps, 'admin')
+  }
 }
 
 /**

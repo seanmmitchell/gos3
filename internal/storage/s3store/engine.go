@@ -71,8 +71,17 @@ type EngineOptions struct {
 	// Bucket and Prefix locate the backing ("" or ending with "/").
 	Bucket string
 	Prefix string
-	// Gateway must match the marker's gateway flag.
-	Gateway bool
+	// Create says when Open may create the marker (see CreateMode). With
+	// CreateIfEmpty, a marker the engine did not create is refused
+	// (ErrPrefixNotEmpty) unless it is ExpectBackingID's.
+	Create CreateMode
+	// ExpectBackingID, when set, refuses a marker with another backing ID
+	// (ErrMarkerMismatch) and a missing marker (ErrMarkerMissing). Without
+	// it, every Open after the first that read a marker expects that
+	// marker's backing.
+	ExpectBackingID string
+	// Role is stored in a marker this engine creates (Marker.Role).
+	Role string
 	// KEK is the key-encryption key (nil: none); see Marker.CheckKEK.
 	KEK []byte
 	// LeaseInterval is how often the lease is renewed; LeaseTTL is the age
@@ -231,6 +240,7 @@ type Engine struct {
 	err        error
 	marker     Marker
 	kek        KEKState
+	attempted  map[string]bool // backing IDs createMarker tried to create
 	sess       *session
 	token      leaseToken // the last lease held, for an immediate re-take
 	openCancel context.CancelFunc
@@ -254,6 +264,11 @@ func NewEngine(opts EngineOptions) (*Engine, error) {
 	}
 	if len(opts.KEK) != 0 && len(opts.KEK) != 32 {
 		return nil, fmt.Errorf("s3store: KEK has %d bytes, want 32", len(opts.KEK))
+	}
+	switch opts.Create {
+	case CreateIfNoData, CreateIfEmpty, MustExist:
+	default:
+		return nil, fmt.Errorf("s3store: invalid create mode %v", opts.Create)
 	}
 	if opts.LeaseInterval <= 0 {
 		opts.LeaseInterval = DefaultLeaseInterval
@@ -323,6 +338,9 @@ func OpenEngine(ctx context.Context, opts EngineOptions) (*Engine, error) {
 func (e *Engine) remote() remote       { return remote{c: e.client(), bucket: e.opts.Bucket} }
 func (e *Engine) logger() *slog.Logger { return e.opts.Logger }
 
+// location returns "s3://<bucket>/<prefix>" (errors).
+func (e *Engine) location() string { return "s3://" + e.opts.Bucket + "/" + e.opts.Prefix }
+
 // Marker returns the backing's marker (zero before the first Open got it).
 func (e *Engine) Marker() Marker {
 	e.mu.Lock()
@@ -378,9 +396,10 @@ func (e *Engine) LastLSN() uint64 {
 // a failed open leaves the engine in StateFailed.
 //
 // Hard errors: ErrInUse (another live server holds the lease),
-// ErrWrongKEK, ErrUnmanagedPrefix, ErrMarkerMismatch,
-// ErrNoConditionalWrites, ErrCorruptJournal and errors of Load. Remote
-// failures wrap storage.ErrBackingUnavailable.
+// ErrWrongKEK, ErrUnmanagedPrefix, ErrPrefixNotEmpty, ErrMarkerMismatch
+// (and ErrMarkerMissing, which wraps it), ErrNoConditionalWrites,
+// ErrCorruptJournal and errors of Load. Remote failures wrap
+// storage.ErrBackingUnavailable.
 func (e *Engine) Open(ctx context.Context) error {
 	e.openMu.Lock()
 	defer e.openMu.Unlock()

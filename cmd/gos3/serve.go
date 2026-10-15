@@ -286,7 +286,9 @@ func printBanner(w io.Writer, srv *server.Server, showSecret bool, credsFile str
 }
 
 // storageSummary describes the default backing for the banner: its
-// backend, where its data lives and where system state is kept.
+// backend, where its data lives and where system state is kept. For an s3
+// backing that is the service, its home (or, without one, the directory
+// holding its records) and the kind of new buckets.
 func storageSummary(backend, dataPath string, s3 *config.S3Config) string {
 	switch {
 	case backend == config.BackendFS:
@@ -294,9 +296,15 @@ func storageSummary(backend, dataPath string, s3 *config.S3Config) string {
 	case backend == config.BackendS3:
 		where := "s3"
 		if s3 != nil {
-			where = "s3 at " + s3.Endpoint + "/" + s3.Bucket + "/" + s3.Prefix
-			if s3.Gateway {
-				where += " [gateway]"
+			kind := "default kind " + s3.EffectiveDefaultKind()
+			switch {
+			case s3.HasHome():
+				where = "s3 at " + s3.Endpoint + " home " + s3.HomeBucket + "/" + s3.HomePrefix + " (" + kind + ")"
+			case dataPath != "":
+				dir := server.S3RecordsDir(filepath.Join(dataPath, config.SystemDirName), config.DefaultBackingName)
+				where = "s3 at " + s3.Endpoint + " (records in " + dir + "; " + kind + ")"
+			default:
+				where = "s3 at " + s3.Endpoint + " (" + kind + ")"
 			}
 		}
 		if dataPath != "" {

@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net/http"
 	"strconv"
 	"strings"
 	"sync"
@@ -17,12 +18,16 @@ import (
 
 // Blobs.
 //
-// Object data, multipart parts and the gateway's staged parts are immutable
-// remote objects ("blobs"):
+// Object data, multipart parts and the staged blobs of aux namespaces are
+// immutable remote objects ("blobs"):
 //
 //	data/<bucket-id>/<data-id>           object version data (as stored: compressed or not)
 //	parts/<upload-id>/<nnnnn>-<id>       multipart part data
-//	gateway/parts/<ns>/<name>            gateway staged parts (AuxStore)
+//	gateway/parts/<ns>/<name>            staged blobs of aux namespaces (AuxStore)
+//
+// Every blob is written with the user metadata x-amz-meta-gos3-store set to
+// the backing ID (blobTagHeader), so the orphan recovery can tell its own
+// blobs from foreign objects under the same names.
 //
 // A blob is uploaded before the journal record that references it, and
 // registered as pending meanwhile, so the orphan recovery pass leaves it
@@ -44,10 +49,27 @@ type blobRef struct {
 }
 
 const (
-	blobDataDir   = "data/"
-	blobPartsDir  = "parts/"
-	blobStagedDir = "gateway/parts/"
+	blobDataDir   = dataDir
+	blobPartsDir  = partsDir
+	blobStagedDir = gatewayDir + "parts/"
 )
+
+// blobTagHeader is the user metadata naming the backing that wrote a blob.
+const blobTagHeader = "X-Amz-Meta-Gos3-Store"
+
+// blobHeader returns the headers every new blob is written with: the tag
+// naming the backing.
+func (b *Backend) blobHeader() (http.Header, error) {
+	id := b.eng.Marker().BackingID
+	if id == "" {
+		// Blobs are only written by a loaded backing.
+		return nil, b.unavailableErr()
+	}
+	return http.Header{blobTagHeader: {id}}, nil
+}
+
+// blobTag returns the backing ID a blob's HEAD answer is tagged with.
+func blobTag(attrs s3client.ObjectAttrs) string { return attrs.Header.Get(blobTagHeader) }
 
 func (b *Backend) dataKey(bucketID, dataID string) string {
 	return b.keys.prefix + blobDataDir + bucketID + "/" + dataID
@@ -77,16 +99,7 @@ func parsePartName(s string) (int, string, bool) {
 
 // validHexID reports whether s looks like an ID this package generates.
 func validHexID(s string) bool {
-	if len(s) < 8 || len(s) > 64 {
-		return false
-	}
-	for i := 0; i < len(s); i++ {
-		c := s[i]
-		if !(c >= '0' && c <= '9' || c >= 'a' && c <= 'f') {
-			return false
-		}
-	}
-	return true
+	return len(s) >= 8 && len(s) <= 64 && isLowerHex(s)
 }
 
 // --- errors ---
@@ -331,10 +344,18 @@ func (b *Backend) pendingDeletes() int {
 
 // --- uploads ---
 
-// putBlob uploads r[0:size] as key. When the upload may have reached the
-// service anyway, the blob is deleted again (best effort).
+// putBlob uploads r[0:size] as key, tagged with the backing ID. When the
+// upload may have reached the service anyway, the blob is deleted again
+// (best effort).
 func (b *Backend) putBlob(ctx context.Context, key string, r io.ReaderAt, size int64) error {
-	_, _, err := b.client().Upload(ctx, b.opts.Bucket, key, r, size, s3client.UploadOptions{PartSize: b.conn.Load().partSize})
+	h, err := b.blobHeader()
+	if err != nil {
+		return err
+	}
+	_, _, err = b.client().Upload(ctx, b.opts.Bucket, key, r, size, s3client.UploadOptions{
+		PutOptions: s3client.PutOptions{Header: h},
+		PartSize:   b.conn.Load().partSize,
+	})
 	if err != nil {
 		if mayHaveLanded(err) {
 			b.deleteLater(key)
@@ -529,18 +550,22 @@ func composeRanges(keys []string, sizes []int64, numbers []int) ([]copyRange, bo
 	return out, len(out) > 0
 }
 
-// compose writes the concatenation of the source blobs to dst server-side:
-// one source is copied, more are composed with UploadPartCopy.
+// compose writes the concatenation of the source blobs to dst server-side
+// (tagged like every blob): one source is copied, more are composed with
+// UploadPartCopy.
 func (b *Backend) compose(ctx context.Context, dst string, keys []string, sizes []int64, numbers []int) error {
+	h, err := b.blobHeader()
+	if err != nil {
+		return err
+	}
 	c := b.client()
-	var err error
 	if len(keys) == 1 {
-		_, err = c.Copy(ctx, b.opts.Bucket, dst, keys[0], sizes[0], s3client.CopyOptions{})
+		_, err = c.Copy(ctx, b.opts.Bucket, dst, keys[0], sizes[0], s3client.CopyOptions{ReplaceMetadata: true, Header: h})
 		if s3client.IsNotFound(err) && !s3client.IsCode(err, "NoSuchBucket") {
 			return missingPart(numbers[0])(err)
 		}
 	} else if ranges, ok := composeRanges(keys, sizes, numbers); ok {
-		err = b.composeServerSide(ctx, c, dst, ranges)
+		err = b.composeServerSide(ctx, c, dst, ranges, h)
 	} else {
 		return errors.New("s3store: parts cannot be composed server-side")
 	}
@@ -556,8 +581,8 @@ func (b *Backend) compose(ctx context.Context, dst string, keys []string, sizes 
 	return nil
 }
 
-func (b *Backend) composeServerSide(ctx context.Context, c *s3client.Client, dst string, ranges []copyRange) error {
-	upID, err := c.CreateMultipartUpload(ctx, b.opts.Bucket, dst, nil)
+func (b *Backend) composeServerSide(ctx context.Context, c *s3client.Client, dst string, ranges []copyRange, header http.Header) error {
+	upID, err := c.CreateMultipartUpload(ctx, b.opts.Bucket, dst, header)
 	if err != nil {
 		return err
 	}

@@ -57,7 +57,7 @@ server:
   max_connections: 0
 
 storage:
-  # fs (files under path), memory (lost on exit) or s3 (a bucket of a
+  # fs (files under path), memory (lost on exit) or s3 (a connection to a
   # remote S3 service, configured by the s3 block below).
   backend: fs
   # Data directory. System state lives in <path>/.gos3 (iam.json with secret
@@ -65,26 +65,36 @@ storage:
   # keep it private. With the memory and s3 backends it holds system state
   # only: leave it empty for ephemeral system state.
   path: ./data
-  # With backend: s3, the remote service holding all data and metadata
-  # (one gos3 server per bucket and prefix). Credentials and the
-  # encryption key can come from GOS3_S3_ACCESS_KEY, GOS3_S3_SECRET_KEY and
-  # GOS3_S3_ENCRYPTION_KEY instead.
+  # With backend: s3, the remote service holding the buckets: native
+  # buckets (one remote bucket each, objects stored as-is) and wrapped
+  # buckets (gos3's format, many per container). home_bucket/home_prefix is
+  # where gos3 keeps the backing's records and its shared container (one
+  # gos3 server per home); without it the records live in <path>/.gos3/s3/
+  # and only native buckets can be created until a container is added.
+  # default_kind (wrapped or native) is the kind of new buckets: wrapped
+  # with a home, native without. The keys bucket, prefix and gateway of
+  # earlier versions are deprecated aliases of home_bucket, home_prefix and
+  # default_kind: native. Credentials and the encryption key can come from
+  # GOS3_S3_ACCESS_KEY, GOS3_S3_SECRET_KEY and GOS3_S3_ENCRYPTION_KEY
+  # instead.
   # s3:
   #   endpoint: https://s3.eu-central-1.amazonaws.com
   #   region: eu-central-1
-  #   bucket: acme-gos3
-  #   prefix: gos3/
+  #   home_bucket: acme-gos3
+  #   home_prefix: gos3/
+  #   default_kind: wrapped
   #   # base64 of 32 random bytes (openssl rand -base64 32): enables AES256
-  #   # and restic encryption. Back it up: without it encrypted data is lost.
+  #   # and restic encryption on wrapped buckets. Back it up: without it
+  #   # encrypted data is lost.
   #   encryption_key: ""
   # fsync object data before acknowledging writes (durable across power loss).
   fsync_data: true
   # Additional backings (this one is named "default"): fs directories,
-  # memory, or buckets of remote S3 services (backend: s3, no path; with
-  # gateway: true objects are stored natively in remote buckets named like
-  # the gos3 buckets, without versioning or object lock). New buckets go to
-  # default_backing unless CreateBucket names another with the
-  # x-gos3-backing header. See docs/configuration.md and docs/backings.md.
+  # memory, or remote S3 services (backend: s3, no path; same s3 block as
+  # above). New buckets go to default_backing unless CreateBucket names
+  # another with the x-gos3-backing header (and, on s3 backings, a kind with
+  # x-gos3-bucket-kind). Existing remote buckets are adopted through the
+  # admin API or the web UI. See docs/configuration.md and docs/backings.md.
   # backings:
   #   - name: hdd
   #     path: /mnt/hdd/gos3
@@ -93,10 +103,17 @@ storage:
   #     s3:
   #       endpoint: https://s3.eu-central-1.amazonaws.com
   #       region: eu-central-1
-  #       bucket: acme-gos3-cold
-  #       prefix: gos3/
+  #       home_bucket: acme-gos3-cold
+  #       home_prefix: gos3/
   #       # access_key / secret_key / encryption_key, or GOS3_BACKING_COLD_ACCESS_KEY,
   #       # GOS3_BACKING_COLD_SECRET_KEY and GOS3_BACKING_COLD_ENCRYPTION_KEY
+  #   - name: aws
+  #     backend: s3
+  #     s3:
+  #       # No home: records in <path>/.gos3/s3/aws, native buckets only.
+  #       endpoint: https://s3.eu-central-1.amazonaws.com
+  #       region: eu-central-1
+  #       default_kind: native
   backings: []
   default_backing: ""
 

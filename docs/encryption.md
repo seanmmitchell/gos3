@@ -7,8 +7,8 @@ provider even when default encryption is disabled.
 
 Storage follows placement. The bucket stores only its encryption provider.
 Each backing holding a copy of the bucket keeps that copy's keys and restic
-repository itself: an fs backing in its data directory, an s3 backing in its
-remote bucket. A replica or move target uses its own backing's keys and
+repository itself: an fs backing in its data directory, an s3 backing in the
+container of the (wrapped) bucket. A replica or move target uses its own backing's keys and
 repository; nothing secret replicates with the bucket configuration.
 
 Native encryption uses gos3's authenticated AES-256-GCM stream format
@@ -48,9 +48,9 @@ that holds a copy of it (primary, replicas and a move target):
 | Backing | Native AES256 | Restic repository |
 |---|---|---|
 | fs | master key in `<path>/.gos3/keys/<bucket-id>` | local, `<path>/.gos3/restic/<bucket-id>` |
-| s3 | master key in the remote bucket at `<prefix>keys/<bucket-id>.key`, wrapped with the backing's `encryption_key`; **unavailable without one** | restic's s3 backend in the backing's own bucket, `<prefix>restic/<bucket-id>`, with the backing's current endpoint, region and credentials; needs the `encryption_key` and the credentials; recovery record `<prefix>keys/<bucket-id>.restic.json` without the password, which derives from the wrapped master key |
+| s3, wrapped bucket | master key in the bucket's container at `<prefix>keys/<bucket-id>.key`, wrapped with the backing's `encryption_key`; **unavailable without one** | restic's s3 backend in the container's bucket, `<prefix>restic/<bucket-id>`, with the backing's current endpoint and credentials and the container's region; needs the `encryption_key` and the credentials; recovery record `<prefix>keys/<bucket-id>.restic.json` without the password, which derives from the wrapped master key |
+| s3, native bucket | not offered (objects are stored as they are) | not offered |
 | memory | recorded, data kept in memory as is | not offered |
-| s3 gateway | not offered (objects are stored as they are) | not offered |
 
 Restic needs the [restic](https://restic.readthedocs.io/en/stable/020_installation.html)
 executable, **0.17.1 or newer**, on the gos3 server's PATH. The gos3
@@ -65,7 +65,7 @@ the admin API's `available` list leaves them out. AES256 writes (and
 preparing AES256 for the bucket) are refused with `501 NotImplemented`
 while any copy of the bucket, a replica or move target included, is on a
 backing that cannot store AES256, such as an s3 backing without an
-encryption key. For the same reason a bucket that uses a provider (as its
+encryption key; on a native bucket AES256 writes are always refused. For the same reason a bucket that uses a provider (as its
 provider, through its default encryption, or because it holds versions
 encrypted with it) cannot be replicated or moved to a backing that cannot
 store it, for example restic data to a memory backing, or AES256 or restic
@@ -92,8 +92,9 @@ encryption key included, are read with `admin:GetConfig` and changed with
 
 ### The encryption key of s3 backings
 
-An s3 backing stores each bucket's random master key in its remote bucket,
-encrypted (AES-256-GCM) with the backing's **key-encryption key**:
+An s3 backing stores each wrapped bucket's random master key in the bucket's
+container, encrypted (AES-256-GCM) with the backing's **key-encryption key**
+(one per backing, used by all its containers):
 `encryption_key` in its `s3` settings, `GOS3_S3_ENCRYPTION_KEY` for the
 default backing or `GOS3_BACKING_<NAME>_ENCRYPTION_KEY` for others, or the
 **Encryption key** field (with **Generate**) under **Advanced** in the
@@ -103,7 +104,7 @@ Storage page's backing form. It is standard base64 of exactly 32 bytes:
 openssl rand -base64 32
 ```
 
-- The S3 service never sees a usable key; reading the remote bucket alone
+- The S3 service never sees a usable key; reading the remote buckets alone
   does not decrypt the data.
 - A backing without the key offers neither AES256 nor restic. The key can
   be added later (also live on the Storage page, where it is checked
@@ -112,7 +113,7 @@ openssl rand -base64 32
   longer be opened.
 - **Losing the key loses every encrypted object and restic archive of the
   backing.** gos3 never regenerates a missing key. Keep it outside the
-  remote bucket (a password manager or secret store), and back it up with
+  remote buckets (a password manager or secret store), and back it up with
   the rest of the server's secrets.
 
 See [backings.md](backings.md#encryption-on-s3-backings).
@@ -167,9 +168,10 @@ Back up metadata, keys and data/repositories together
   `.gos3/keys/<bucket-id>.restic.json`, local repositories
   `.gos3/restic/<bucket-id>`.
 - **s3 backings**: the wrapped keys (`<prefix>keys/`), recovery records
-  (without passwords) and repositories (`<prefix>restic/`) are in the
-  remote bucket with the data; back up the backing's prefix and, separately,
-  its **encryption key** (see [backings.md](backings.md#backups)).
+  (without passwords) and repositories (`<prefix>restic/`) of wrapped
+  buckets are in their container with the data; back up the home and
+  container prefixes and, separately, the backing's **encryption key** (see
+  [backings.md](backings.md#backups)).
 
 Keys, recovery records and repositories remain after the bucket is
 deleted. Repository snapshots retain object identity but do not replace
@@ -184,5 +186,7 @@ Server-managed keys allow unattended access; a party holding keys and ciphertext
 (for an s3 backing: its encryption key and the remote bucket) can decrypt
 data. This feature does not protect against a compromised gos3 process or a
 full copy of its keys and data. S3 metadata itself is not encrypted: on an
-s3 backing, bucket names, object keys, user metadata and tags are readable
-in the journal and snapshots by anyone who can read the remote bucket.
+s3 backing, bucket names, object keys, user metadata and tags of wrapped
+buckets are readable in their container's journal and snapshots by anyone
+who can read the container, and native buckets are not encrypted by gos3 at
+all.
