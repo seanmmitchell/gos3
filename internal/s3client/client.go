@@ -47,6 +47,7 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/seanmmitchell/gos3/internal/auth"
@@ -338,17 +339,27 @@ func (c *Client) send(ctx context.Context, req request) (*http.Response, error) 
 		// gzip-encoded.
 		r.Header.Set("Accept-Encoding", "identity")
 	}
+	// net/http may keep reading a request body after Do returns (when the
+	// server answers before reading it, the transport's writer can still
+	// be sending), and callers release the body's source (a Spool, a file)
+	// as soon as send returns. Track every body handed to the transport
+	// and wait until the transport closed them all: it always does, also
+	// on errors.
+	var bodies bodyTracker
 	if req.body != nil {
 		r.ContentLength = req.bodySize
 		if req.bodySize == 0 {
 			r.Body = http.NoBody
+		} else {
+			r.Body = bodies.wrap(body)
 		}
-		r.GetBody = func() (io.ReadCloser, error) { return io.NopCloser(req.body()), nil }
+		r.GetBody = func() (io.ReadCloser, error) { return bodies.wrap(req.body()), nil }
 	}
 	if err := auth.SignRequest(r, c.creds, c.region, "s3", payload, c.now()); err != nil {
 		return nil, &Error{Op: req.op, Err: err}
 	}
 	resp, err := c.hc.Do(r)
+	bodies.wait()
 	if err != nil {
 		return nil, &Error{Op: req.op, Err: err}
 	}
@@ -357,6 +368,32 @@ func (c *Client) send(ctx context.Context, req request) (*http.Response, error) 
 	}
 	defer resp.Body.Close()
 	return nil, parseError(req.op, resp)
+}
+
+// bodyTracker counts the request bodies of one request that the transport
+// has not closed yet (see send).
+type bodyTracker struct{ wg sync.WaitGroup }
+
+// wrap returns r as a request body counted by t.
+func (t *bodyTracker) wrap(r io.Reader) io.ReadCloser {
+	t.wg.Add(1)
+	return &trackedBody{r: r, t: t}
+}
+
+// wait blocks until every body returned by wrap has been closed.
+func (t *bodyTracker) wait() { t.wg.Wait() }
+
+type trackedBody struct {
+	r    io.Reader
+	t    *bodyTracker
+	once sync.Once
+}
+
+func (b *trackedBody) Read(p []byte) (int, error) { return b.r.Read(p) }
+
+func (b *trackedBody) Close() error {
+	b.once.Do(b.t.wg.Done)
+	return nil
 }
 
 // parseError turns an error answer into an *Error.
