@@ -124,8 +124,7 @@ func pathTarget(arn func(string) string, param string) target {
 
 // api is the admin API handler.
 type api struct {
-	// configLocks serializes encryption provider changes per bucket and
-	// restic storage changes per backing.
+	// configLocks serializes encryption provider changes per bucket.
 	configLocks keyedMutex
 	d           Deps
 	log         *slog.Logger
@@ -203,8 +202,6 @@ func (a *api) routes() []route {
 		{"DELETE", "/buckets/{name}", "ForceDeleteBucket", bucket, a.deleteBucket},
 		// Storage backings and bucket placement
 		{"GET", "/backings", "ListBackings", service, a.listBackings},
-		{"GET", "/backings/{name}/restic", "ListBackings", service, a.getBackingRestic},
-		{"PUT", "/backings/{name}/restic", "UpdateConfig", service, a.putBackingRestic},
 		{"GET", "/backings/config", "GetConfig", service, a.getBackingConfig},
 		{"PUT", "/backings/config", "UpdateConfig", service, a.putBackingConfig},
 		{"GET", "/buckets/{name}/placement", "GetBucketPlacement", bucket, a.getPlacement},
@@ -515,6 +512,10 @@ func (a *api) toAPIError(err error) *apiError {
 		return errorf(http.StatusConflict, codeConflict, "%s", msg)
 	case errors.Is(err, storage.ErrInvalidName):
 		return errorf(http.StatusBadRequest, codeInvalidName, "%s", msg)
+	case errors.Is(err, storage.ErrBackingUnavailable):
+		// A backing that cannot be reached (e.g. an s3 backing added live
+		// whose service does not answer).
+		return errorf(http.StatusServiceUnavailable, codeInternalError, "%s", msg)
 	case errors.Is(err, context.Canceled), errors.Is(err, context.DeadlineExceeded):
 		return errorf(http.StatusServiceUnavailable, codeInternalError, "request canceled or timed out: %s", msg)
 	}

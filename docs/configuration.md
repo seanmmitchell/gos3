@@ -145,10 +145,20 @@ changed while running.
 
 | YAML key | Env | Flag | Default | Description |
 |---|---|---|---|---|
-| `storage.backend` | `GOS3_STORAGE_BACKEND` | `--backend` | `fs` | `fs` (files under `path`) or `memory` (everything is lost on exit). |
-| `storage.path` | `GOS3_DATA` | `--data` | `./data` for `fs`, empty for `memory` | Data directory. With `fs` it holds the objects and the metadata database. With either backend it holds the system state in `<path>/.gos3/` (see [operations.md](operations.md#the-data-directory)). With `memory` and no path the server is fully ephemeral, including generated root credentials and IAM users. |
+| `storage.backend` | `GOS3_STORAGE_BACKEND` | `--backend` | `fs` | `fs` (files under `path`), `memory` (everything is lost on exit) or `s3` (a bucket of a remote S3 service, configured by `storage.s3`; see [backings.md](backings.md)). |
+| `storage.path` | `GOS3_DATA` | `--data` | `./data` for `fs`, empty for `memory` and `s3` | Data directory. With `fs` it holds the objects and the metadata database. With every backend it holds the system state in `<path>/.gos3/` (see [operations.md](operations.md#the-data-directory)). With `memory` or `s3` and no path the system state is ephemeral, including generated root credentials and IAM users (a warning is logged); with `memory` the whole server is. |
+| `storage.s3.endpoint` | `GOS3_S3_ENDPOINT` | | | `s3` backend: service URL, `http(s)://host[:port]` without a path. Required. |
+| `storage.s3.region` | `GOS3_S3_REGION` | | `us-east-1` | `s3` backend: signing region. |
+| `storage.s3.bucket` | `GOS3_S3_BUCKET` | | | `s3` backend: the remote bucket holding all data and metadata. Required; must exist. |
+| `storage.s3.prefix` | `GOS3_S3_PREFIX` | | | `s3` backend: key prefix inside the bucket. |
+| `storage.s3.addressing` | `GOS3_S3_ADDRESSING` | | `auto` | `s3` backend: `auto`, `path` or `virtual`. |
+| `storage.s3.part_size` | `GOS3_S3_PART_SIZE` | | `16MiB` | `s3` backend: upload part size and largest single PUT to the service, 5 MiB-5 GiB. |
+| `storage.s3.access_key`, `storage.s3.secret_key` | `GOS3_S3_ACCESS_KEY`, `GOS3_S3_SECRET_KEY` | | | `s3` backend: credentials. Required. The secret is redacted by `gos3 config print`. |
+| `storage.s3.encryption_key` | `GOS3_S3_ENCRYPTION_KEY` | | | `s3` backend: key-encryption key, base64 of exactly 32 bytes (`openssl rand -base64 32`). Enables native AES256 and restic; losing it loses the encrypted objects. Redacted by `gos3 config print`. |
+| `storage.s3.gateway` | `GOS3_S3_GATEWAY` | | `false` | `s3` backend: store objects natively in remote buckets named like the gos3 buckets (no versioning or object lock). |
 | `storage.fsync_data` | `GOS3_FSYNC` | `--fsync` | `true` | fsync object data before acknowledging a write (every fs backing). `--fsync=false` is faster but can lose recent writes on power loss. |
-| `storage.backings` | `GOS3_STORAGE_BACKINGS` | | none | Additional storage backings, see [below](#storage-backings). Env syntax: comma-separated `name=/path` (fs), `name=fs:/path` or `name=memory`. |
+| `storage.backings` | `GOS3_STORAGE_BACKINGS` | | none | Additional storage backings, see [below](#storage-backings). Env syntax: comma-separated `name=/path` (fs), `name=fs:/path`, `name=memory` or `name=s3` (configured by `GOS3_BACKING_<NAME>_*`). |
+| `storage.backings[].s3.*` | `GOS3_BACKING_<NAME>_<FIELD>` | | | Settings of an s3 backing, the same keys as `storage.s3`. The variables (`<NAME>` upper-cased with `-` as `_`; `<FIELD>` `ENDPOINT`, `REGION`, `BUCKET`, `PREFIX`, `ADDRESSING`, `PART_SIZE`, `ACCESS_KEY`, `SECRET_KEY`, `ENCRYPTION_KEY` or `GATEWAY`) only fill fields left empty by the file or `backings.json`. |
 | `storage.default_backing` | `GOS3_DEFAULT_BACKING` | | `default` | Backing new buckets are created on. |
 | `storage.replication.default_mode` | `GOS3_REPLICATION_MODE` | | `single` | Replication of new buckets: `single`, `active-passive` or `active-active` (`active-passive` when only `default_replicas` is set). |
 | `storage.replication.default_replicas` | `GOS3_REPLICATION_REPLICAS` | | none | Backings new buckets are replicated to (comma-separated in env). Must not include the default backing. |
@@ -159,33 +169,10 @@ changed while running.
 
 #### Storage backings
 
-Filesystem backings may also define `restic_s3` with `endpoint`, `bucket`,
-`prefix`, `region`, `access_key`, `secret_key`, and optional `session_token`.
-For the default backing use `storage.restic_s3`; for others use
-`storage.backings[].restic_s3`. Restic buckets derive repositories from their
-assigned backings. These settings can be managed on the server Storage page;
-persisted backing settings override startup values. See
-[encryption.md](encryption.md#backing-storage-for-restic) for examples and recovery.
-
-Backings can also be configured live in **Storage → Configure backings** in
-the web UI. Administrators can add filesystem or memory backings, edit or
-remove empty backings, and select the default for new buckets. Changes apply
-immediately and are saved in `<storage.path>/.gos3/backings.json`, which
-overrides `storage.backings` and `storage.default_backing` on subsequent
-starts while management is enabled. Without a storage path, changes last
-only until restart. The system backing named `default` and the replication
-defaults remain startup configuration.
-
-New backings added live must contain no existing buckets. Backings holding
-buckets, replicas, move targets, or pending cleanup cannot be edited or
-removed; move their buckets and remove replicas first. Changing the default
-does not move existing buckets. The selected default must not be one of the
-configured default replicas.
-
 A server can spread its buckets over several **backings**, for example one
-fs directory per disk. The backing configured by `storage.backend` and
-`storage.path` is named `default` and also holds the system state; each entry
-of `storage.backings` adds one more:
+fs directory per disk. The backing configured by `storage.backend`,
+`storage.path` and `storage.s3` is named `default`; `storage.path` also
+holds the system state. Each entry of `storage.backings` adds one more:
 
 ```yaml
 storage:
@@ -197,17 +184,61 @@ storage:
       path: /mnt/hdd/gos3
     - name: scratch
       backend: memory              # lost on restart
+    - name: cold
+      backend: s3                  # a remote S3 bucket; no path
+      s3:
+        endpoint: https://s3.eu-central-1.amazonaws.com
+        region: eu-central-1
+        bucket: acme-gos3-cold
+        prefix: gos3/
+        # access_key, secret_key, encryption_key: or GOS3_BACKING_COLD_*
   default_backing: nvme            # new buckets go here
   replication:
     default_mode: active-passive   # new buckets get a replica...
     default_replicas: [archive]    # ...on archive
 ```
 
-A backing can also live on a remote S3 service: `backend: s3` with an `s3:`
-block (`mode: blob` or `gateway`, `endpoint`, `bucket`, credentials, ...);
-its `path` holds the backing's local metadata. See [backings.md](backings.md).
-New buckets can be put on any backing with CreateBucket's `x-gos3-backing`
+An s3 backing keeps all of its data and metadata in the remote bucket under
+its prefix, and needs no local directory; `path` is not allowed on it. Its
+`s3` block takes the keys of `storage.s3` above, and every field can come
+from `GOS3_BACKING_<NAME>_<FIELD>` instead (filling only fields left empty).
+With the environment alone:
+
+```sh
+GOS3_STORAGE_BACKINGS=nvme=/mnt/nvme/gos3,cold=s3
+GOS3_BACKING_COLD_ENDPOINT=https://s3.eu-central-1.amazonaws.com
+GOS3_BACKING_COLD_BUCKET=acme-gos3-cold
+GOS3_BACKING_COLD_ACCESS_KEY=...
+GOS3_BACKING_COLD_SECRET_KEY=...
+```
+
+Two s3 backings of one server cannot use the same bucket with equal or
+nested prefixes, and a gateway backing cannot be a default replica. See
+[backings.md](backings.md) for the s3 backend, its requirements (one server
+per bucket and prefix, conditional writes) and the gateway option. New
+buckets can be put on any backing with CreateBucket's `x-gos3-backing`
 header or the web UI.
+
+Backings can also be configured live in **Storage → Configure backings** in
+the web UI. Administrators can add filesystem, memory or S3 backings, edit or
+remove empty backings, and select the default for new buckets. Changes apply
+immediately and are saved in `<storage.path>/.gos3/backings.json` (mode
+0600: it includes the s3 credentials and encryption keys entered there,
+except values taken from the environment), which overrides
+`storage.backings` and `storage.default_backing` on subsequent starts while
+management is enabled. Without a storage path, changes last only until
+restart. The system backing named `default` and the replication defaults
+remain startup configuration.
+
+New backings added live must contain no existing buckets. Backings holding
+buckets, replicas, move targets, or pending cleanup cannot be replaced or
+removed; move their buckets and remove replicas first. The connection
+settings of an s3 backing (endpoint, region, credentials, encryption key,
+addressing, part size) can be changed while it is in use (a gateway
+backing's only while it holds no buckets); its bucket, prefix and gateway
+switch cannot. Changing the default does not move
+existing buckets. The selected default must not be one of the configured
+default replicas. See [backings.md](backings.md#configuring-backings-live).
 
 Every bucket has a primary backing and optionally replicas; buckets can be
 moved between backings online. Placements are changed with the admin API or
@@ -232,7 +263,7 @@ start and stores it in `<data>/.gos3/root-credentials.json` (mode 0600; an
 owner-only ACL on Windows) for later starts. The secret key is never
 written to the log: the startup banner shows it only when standard error is
 a terminal, and otherwise names the file to read it from. Without a data
-directory (memory backend, no path) new keys are generated on every start;
+directory (memory or s3 backend, no path) new keys are generated on every start;
 without a terminal they are written to a private temporary file (named in
 the banner and the log) that is deleted on exit. `gos3 keygen` prints a
 random pair you can use instead. See
@@ -359,6 +390,15 @@ server:
 storage:
   backend: fs
   path: /srv/gos3
+  backings:
+    - name: offsite                # buckets that should live on S3
+      backend: s3
+      s3:
+        endpoint: https://s3.eu-central-1.amazonaws.com
+        region: eu-central-1
+        bucket: nas-gos3
+        # credentials and encryption key from GOS3_BACKING_OFFSITE_ACCESS_KEY,
+        # GOS3_BACKING_OFFSITE_SECRET_KEY and GOS3_BACKING_OFFSITE_ENCRYPTION_KEY
 cors:
   allowed_origins: ["https://console.example.com"]
 discovery:
@@ -370,9 +410,10 @@ metrics:
   public: true                   # scraped by Prometheus on a private network
 ```
 
-Keep the root keys out of files that are readable by others. Pass them as
-`GOS3_ROOT_ACCESS_KEY` / `GOS3_ROOT_SECRET_KEY`, or keep the YAML file at mode
-0600.
+Keep the root keys, and the `secret_key` and `encryption_key` of s3
+backings, out of files that are readable by others. Pass them as
+`GOS3_ROOT_ACCESS_KEY` / `GOS3_ROOT_SECRET_KEY`, `GOS3_S3_*` and
+`GOS3_BACKING_<NAME>_*`, or keep the YAML file at mode 0600.
 
 ## Runtime settings (`settings.json`)
 
@@ -434,7 +475,7 @@ codes are 0 (success), 1 (error) and 2 (usage error).
 | `--config FILE` | (`GOS3_CONFIG`) |
 | `--address [host]:port` | `server.address` |
 | `--data DIR` | `storage.path` |
-| `--backend fs\|memory` | `storage.backend` |
+| `--backend fs\|memory\|s3` | `storage.backend` (s3 is configured by `storage.s3` / `GOS3_S3_*`) |
 | `--name NAME` | `server.name` |
 | `--region REGION` | `server.region` |
 | `--public-url URL` | `server.public_url` |

@@ -29,7 +29,6 @@ async function refresh() {
 // -- auto refresh ------------------------------------------------------------------
 
 const autoRefresh = ref(true)
-const resticBacking = ref<string>()
 let timer: ReturnType<typeof setInterval> | undefined
 function stopTimer() {
   if (timer) clearInterval(timer)
@@ -131,13 +130,8 @@ watch([id, isGos3], ([, gos3]) => {
             description="The server reported no backings."
           />
           <section v-else aria-label="Storage backings" class="grid gap-4 md:grid-cols-2 xl:grid-cols-3">
-            <div v-for="b in list" :key="b.name" class="space-y-2">
-              <AdminBackingCard :backing="b" />
-              <UButton v-if="b.kind === 'fs'" :label="`Restic storage · ${b.name}`" color="neutral" variant="outline" icon="i-lucide-lock" @click="resticBacking = b.name" />
-            </div>
+            <AdminBackingCard v-for="b in list" :key="b.name" :backing="b" />
           </section>
-
-          <AdminResticBacking v-if="resticBacking" :key="resticBacking" :backing="resticBacking" @close="resticBacking = undefined" />
 
           <p v-if="can('manageStorage')" class="text-sm text-muted">
             To move a bucket to another backing or replicate it, open the bucket's settings and choose <span class="font-medium text-highlighted">Placement</span>.

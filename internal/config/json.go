@@ -36,6 +36,13 @@ func decodeFile(path string, data []byte, cfg *Config) error {
 // surprising in JSON. Check native JSON types against the shared schema
 // before decoding, including nested storage backings and duration strings.
 func checkJSONTypes(n *yaml.Node, typ reflect.Type, path string) error {
+	if typ.Kind() == reflect.Pointer {
+		// An optional block (e.g. "s3"): null leaves it unset.
+		if n.Tag == "!!null" {
+			return nil
+		}
+		return checkJSONTypes(n, typ.Elem(), path)
+	}
 	want := ""
 	if typ == reflect.TypeFor[time.Duration]() {
 		want = "!!str"

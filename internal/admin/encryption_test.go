@@ -13,8 +13,6 @@ import (
 
 	"github.com/seanmmitchell/gos3/internal/discovery"
 	"github.com/seanmmitchell/gos3/internal/storage"
-	storagefs "github.com/seanmmitchell/gos3/internal/storage/fs"
-	"github.com/seanmmitchell/gos3/internal/storage/multi"
 )
 
 type encryptionTestBackend struct {
@@ -139,7 +137,7 @@ func TestBucketEncryptionProviderAvailability(t *testing.T) {
 func TestBucketEncryptionProviderMemoryBacking(t *testing.T) {
 	e := newEnv(t)
 	e.createBucket("photos", storage.CreateBucketOptions{})
-	if msg := e.root("PUT", "/buckets/photos/encryption-provider", map[string]any{"provider": "restic"}).expectError(t, 400, codeInvalidRequest); !strings.Contains(msg, "filesystem backing") {
+	if msg := e.root("PUT", "/buckets/photos/encryption-provider", map[string]any{"provider": "restic"}).expectError(t, 400, codeInvalidRequest); !strings.Contains(msg, "filesystem or S3 backing") {
 		t.Fatalf("message %q", msg)
 	}
 	e.root("PUT", "/buckets/photos/encryption-provider", map[string]any{"provider": "AES256"}).expectStatus(t, 200)
@@ -235,18 +233,10 @@ func TestEmptyBucketKeepsEncryptionConfig(t *testing.T) {
 	e.root("DELETE", "/buckets/photos?force=true", nil).expectStatus(t, 204)
 }
 
-// Restic S3 storage on this server itself is refused, whether the endpoint
-// is an advertised URL or another name answering with this server's ID.
-func TestResticBackingRefusesThisServer(t *testing.T) {
-	b, err := storagefs.Open(t.TempDir(), storagefs.Options{})
-	if err != nil {
-		t.Fatal(err)
-	}
-	r, err := multi.Open(context.Background(), multi.Options{Backings: []multi.Backing{{Name: "default", Kind: "fs", Backend: b}}, HealthInterval: time.Hour})
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer r.Close()
+// An S3 endpoint that is this server is refused, whether it is an
+// advertised URL or another name answering with this server's ID; other
+// endpoints pass.
+func TestCheckNotSelf(t *testing.T) {
 	self := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
 		if req.URL.Path != discovery.InfoPath {
 			http.NotFound(w, req)
@@ -256,20 +246,17 @@ func TestResticBackingRefusesThisServer(t *testing.T) {
 		_, _ = fmt.Fprint(w, `{"service":"gos3","id":"0123456789abcdef","name":"gos3-test","apiVersion":"v1"}`)
 	}))
 	defer self.Close()
-	e := newEnv(t, func(d *Deps) { d.Backend = r })
-	body := func(endpoint string) map[string]any {
-		return map[string]any{"mode": "s3", "endpoint": endpoint, "bucket": "archives", "accessKey": "a", "secretKey": "s"}
-	}
+	other := httptest.NewServer(http.NotFoundHandler())
+	defer other.Close()
+	e := newEnv(t)
 	for _, endpoint := range []string{"http://127.0.0.1:9000", "HTTP://127.0.0.1:9000/", self.URL} {
-		msg := e.root("PUT", "/backings/default/restic", body(endpoint)).expectError(t, 400, codeInvalidRequest)
-		if !strings.Contains(msg, "this gos3 server") {
-			t.Fatalf("%s: message %q", endpoint, msg)
+		err := e.api.checkNotSelf(context.Background(), endpoint)
+		if err == nil || !strings.Contains(err.Error(), "this gos3 server") {
+			t.Fatalf("%s: %v", endpoint, err)
 		}
 	}
-	var doc resticBackingResponse
-	e.root("GET", "/backings/default/restic", nil).json(t, &doc)
-	if doc.Mode != "local" {
-		t.Fatalf("refused settings were stored: %+v", doc)
+	if err := e.api.checkNotSelf(context.Background(), other.URL); err != nil {
+		t.Fatalf("other endpoint: %v", err)
 	}
 }
 

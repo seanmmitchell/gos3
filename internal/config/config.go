@@ -20,7 +20,6 @@ import (
 	"time"
 
 	"github.com/seanmmitchell/gos3/internal/discovery"
-	"github.com/seanmmitchell/gos3/internal/storage"
 )
 
 // Config is the full static configuration.
@@ -86,19 +85,22 @@ type ServerConfig struct {
 
 // StorageConfig selects the backend.
 type StorageConfig struct {
-	ResticS3 *storage.ResticS3 `yaml:"restic_s3,omitempty"`
-	Backend  string            `yaml:"backend"` // "fs" (default) or "memory"
+	Backend string `yaml:"backend"` // "fs" (default), "memory" or "s3"
 	// Path is the data directory for the fs backend AND for system state
-	// (<path>/.gos3/{iam.json,settings.json,server-id}). Empty with the memory
-	// backend means fully ephemeral.
-	Path string `yaml:"path"` // default "./data" for fs, "" (ephemeral) for memory
+	// (<path>/.gos3/{iam.json,settings.json,server-id,placements.json,
+	// backings.json}). With the memory and s3 backends it holds system
+	// state only, and empty means that state is ephemeral.
+	Path string `yaml:"path"` // default "./data" for fs, "" (ephemeral) for memory and s3
+	// S3 configures the remote service of the s3 backend (required with
+	// storage.backend s3, not allowed otherwise; see S3Config).
+	S3 *S3Config `yaml:"s3,omitempty"`
 	// FsyncData controls fsync of object data files on commit (default true),
 	// for every fs backing.
 	FsyncData bool `yaml:"fsync_data"`
 	// Backings are additional named storage backings (e.g. one directory
-	// per disk). The backing configured by Backend and Path above is named
-	// DefaultBackingName. Every bucket lives on one backing and may be
-	// replicated to, or moved to, others (see internal/storage/multi).
+	// per disk). The backing configured by Backend, Path and S3 above is
+	// named DefaultBackingName. Every bucket lives on one backing and may
+	// be replicated to, or moved to, others (see internal/storage/multi).
 	Backings []BackingConfig `yaml:"backings"`
 	// DefaultBacking names the backing new buckets are created on
 	// ("" = DefaultBackingName).
@@ -109,19 +111,18 @@ type StorageConfig struct {
 
 // BackingConfig is one additional storage backing.
 type BackingConfig struct {
-	ResticS3 *storage.ResticS3 `yaml:"restic_s3,omitempty"`
 	// Name identifies the backing in placements and the admin API:
 	// 1-32 characters of [a-z0-9_-], starting with a letter or digit, not
 	// DefaultBackingName.
 	Name    string `yaml:"name"`
 	Backend string `yaml:"backend"` // "fs" (default), "memory" or "s3"
 	// Path is the data directory of an fs backing (required for fs; must
-	// differ from every other backing's path and from storage.path). An s3
-	// backing keeps its local metadata there (also required).
+	// differ from every other backing's path and from storage.path).
+	// Memory and s3 backings have no path.
 	Path string `yaml:"path"`
 	// S3 configures the remote service of an s3 backing (required for s3,
-	// see docs/backings.md and S3BackingConfig).
-	S3 *S3BackingConfig `yaml:"s3,omitempty"`
+	// not allowed otherwise; see S3Config and docs/backings.md).
+	S3 *S3Config `yaml:"s3,omitempty"`
 }
 
 // ReplicationConfig configures bucket replication between backings.

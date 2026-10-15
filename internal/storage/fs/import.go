@@ -103,7 +103,6 @@ type versionWriter struct {
 	bucket   string
 	bucketID string
 	key      string
-	rem      *remote // remote blob backing of the bucket (nil: local)
 
 	mu sync.Mutex
 	t  *tmpFile
@@ -135,16 +134,15 @@ func (b *Backend) NewVersionWriterWith(ctx context.Context, bucket, key string, 
 	if err := validKey(key); err != nil {
 		return nil, err
 	}
-	id, rem, err := b.bucketPlacement(ctx, bucket)
+	id, err := b.encryptionBucketID(ctx, bucket)
 	if err != nil {
 		return nil, err
 	}
-	w := &versionWriter{b: b, bucket: bucket, bucketID: id, key: key, rem: rem, encryption: opts.Encryption}
+	w := &versionWriter{b: b, bucket: bucket, bucketID: id, key: key, encryption: opts.Encryption}
 	if opts.Encryption == storage.EncryptionRestic {
 		if w.rw, err = b.newResticWriter(ctx, id, bucket, key); err != nil {
 			return nil, err
 		}
-		w.rw.rem = rem
 		w.t, w.w = b.newTemp(), w.rw
 		return w, nil
 	}
@@ -217,7 +215,7 @@ func (w *versionWriter) Commit(ctx context.Context, info storage.ObjectInfo) (st
 		if info.DeleteMarker && size > 0 {
 			return storage.ObjectInfo{}, fmt.Errorf("%w: delete marker %s/%.64s with data", storage.ErrInvalidName, w.bucket, w.key)
 		}
-		dataID, path, err = w.b.finishData(ctx, w.t, w.bucketID, w.rem)
+		dataID, path, err = w.b.finishData(w.t, w.bucketID)
 	}
 	if err != nil {
 		return storage.ObjectInfo{}, err
@@ -231,7 +229,6 @@ func (w *versionWriter) Commit(ctx context.Context, info storage.ObjectInfo) (st
 		meta.Encryption = w.encryption
 	}
 	return w.b.commitObject(commitReq{
-		rem:         w.rem,
 		bucket:      w.bucket,
 		bucketID:    w.bucketID,
 		key:         w.key,

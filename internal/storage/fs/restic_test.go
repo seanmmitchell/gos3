@@ -1,25 +1,37 @@
 package fs
 
 import (
-	"bytes"
-	"strings"
-	"testing"
+	"context"
+	"os/exec"
+
+	"github.com/seanmmitchell/gos3/internal/storage/restic"
 )
 
-func TestResticLongProgress(t *testing.T) {
-	var out snapshotOutput
-	progress := bytes.Repeat([]byte("{\"message_type\":\"status\",\"bytes_done\":12}\n"), 40000)
-	snapshot := strings.Repeat("a", 64)
-	progress = append(progress, []byte("{\"message_type\":\"summary\",\"snapshot_id\":\""+snapshot+"\"}")...)
-	// Feed chunk boundaries through the middle of JSON records.
-	for len(progress) > 0 {
-		n := min(317, len(progress))
-		if _, err := out.Write(progress[:n]); err != nil {
-			t.Fatal(err)
-		}
-		progress = progress[n:]
+// Helpers for tests that run restic against a bucket's repository directly.
+
+// resticSettings returns the recovery record form of how restic reaches the
+// repository of the bucket with ID id.
+func (b *Backend) resticSettings(id string) (resticRepository, error) {
+	loc, err := b.resticLocation(id)
+	if err != nil {
+		return resticRepository{}, err
 	}
-	if err := out.consume(); err != nil || out.snapshot != snapshot {
-		t.Fatalf("lost backup summary: %q %v", out.snapshot, err)
+	return resticRepository{Repository: loc.Repository, Password: loc.Password}, nil
+}
+
+// resticCommand returns a restic command with args for the repository of
+// the bucket with ID id.
+func (b *Backend) resticCommand(ctx context.Context, id string, args ...string) (*exec.Cmd, error) {
+	loc, err := b.resticLocation(id)
+	if err != nil {
+		return nil, err
 	}
+	return b.resticRuntime().Command(ctx, loc, args...)
+}
+
+// resticCommandFor returns a restic command with args for the repository
+// of the recovery record cfg, as an operator recovering an archive with
+// only that record would run it.
+func resticCommandFor(ctx context.Context, cfg resticRepository, args ...string) (*exec.Cmd, error) {
+	return new(restic.Runtime).Command(ctx, restic.Location{Repository: cfg.Repository, Password: cfg.Password}, args...)
 }

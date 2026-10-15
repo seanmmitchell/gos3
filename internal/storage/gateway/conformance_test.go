@@ -11,11 +11,11 @@ import (
 	"github.com/seanmmitchell/gos3/internal/storage/storagetest"
 )
 
-// newRouted returns a router whose default backing "gw" is a gateway
-// store over a fresh in-process remote.
+// newRouted returns a router over a memory primary and a gateway store on
+// a fresh in-process remote.
 func newRouted(t *testing.T, shared bool) storage.Backend {
 	r := s3clienttest.Start(t)
-	opts := gateway.Options{Name: "gw", Client: r.Client(t), StateDir: t.TempDir()}
+	opts := gateway.Options{Name: "gw", Client: r.Client(t), State: gateway.MemoryState()}
 	if shared {
 		r.CreateBucket(t, "shared")
 		opts.Bucket, opts.Prefix = "shared", "pfx/"
@@ -24,11 +24,7 @@ func newRouted(t *testing.T, shared bool) storage.Backend {
 	if err != nil {
 		t.Fatalf("gateway.Open: %v", err)
 	}
-	rb := routed.New(routed.Options{
-		Primary: memory.New(),
-		Stores:  map[string]routed.DataStore{"gw": st},
-		Default: "gw",
-	})
+	rb := routed.New(routed.Options{Primary: memory.New(), Store: st})
 	if shared {
 		return renamed{b: rb}
 	}

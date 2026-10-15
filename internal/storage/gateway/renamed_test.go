@@ -14,9 +14,7 @@ import (
 //     name, and the suite's names ("b", "u", ...) are not valid S3 bucket
 //     names, so every bucket name gets a prefix on the way in (and loses
 //     it on the way out).
-//   - The router records the default backing ("gw") in BucketInfo.Backing
-//     of buckets created without one, where the suite expects the "" it
-//     passed; it is cleared.
+//   - BucketInfo.Backing is cleared (the suite expects the "" it passes).
 type renamed struct {
 	b      storage.Backend
 	prefix string

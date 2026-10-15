@@ -93,8 +93,9 @@ type BucketInfo struct {
 	Versioning        VersioningStatus
 	ObjectLockEnabled bool
 	Owner             string // IAM user name that created the bucket ("" = root)
-	// Backing names the configured backing that stores the bucket's data
-	// ("" = the server's own storage). See docs/backings.md.
+	// Backing names the backing holding the bucket's primary copy. The
+	// multi-backing router (internal/storage/multi) sets it; the backends
+	// behind it report "" (or what they were given). See docs/backings.md.
 	Backing string
 }
 
@@ -103,10 +104,11 @@ type CreateBucketOptions struct {
 	Region            string
 	ObjectLockEnabled bool // implies Versioning = Enabled
 	Owner             string
-	// Backing names the configured backing for the bucket's data ("" = the
-	// server's own storage); persisted and reported in BucketInfo.Backing.
-	// The routing layer (internal/storage/routed) validates it and returns
-	// ErrInvalidBacking for unknown names; plain backends store it as is.
+	// Backing names the backing to create the bucket on (the
+	// x-gos3-backing header; "" = the default backing). The multi-backing
+	// router (internal/storage/multi) validates it, returning
+	// ErrInvalidBacking for unknown names, and passes "" to the backing it
+	// creates the bucket on; other backends ignore it.
 	Backing string
 }
 

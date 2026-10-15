@@ -177,7 +177,7 @@ async function submit() {
           />
           <p v-if="noVersioning" class="flex items-start gap-1.5 text-xs text-muted">
             <UIcon name="i-lucide-info" class="mt-0.5 size-3.5 shrink-0" aria-hidden="true" />
-            <span>Gateway backings store objects directly in the remote S3 service, so versioning and object lock are not available.</span>
+            <span>Gateway backings store objects natively in remote S3 buckets, so versioning and object lock are not available.</span>
           </p>
         </div>
 

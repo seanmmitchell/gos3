@@ -2,7 +2,6 @@ package fs
 
 import (
 	"bytes"
-	"cmp"
 	"context"
 	"errors"
 	"fmt"
@@ -43,8 +42,7 @@ func (b *Backend) ListBuckets(ctx context.Context) ([]storage.BucketInfo, error)
 
 // CreateBucket creates a bucket. Any non-empty, valid UTF-8 name of at most
 // 1024 bytes is accepted (validation is the S3 layer's job); other names
-// yield ErrInvalidName. An empty opts.Backing records
-// Options.DefaultBacking; other backings are recorded as given.
+// yield ErrInvalidName.
 func (b *Backend) CreateBucket(ctx context.Context, name string, opts storage.CreateBucketOptions) error {
 	if err := b.begin(ctx); err != nil {
 		return err
@@ -79,7 +77,6 @@ func (b *Backend) CreateBucket(ctx context.Context, name string, opts storage.Cr
 			Region:            opts.Region,
 			ObjectLockEnabled: opts.ObjectLockEnabled,
 			Owner:             opts.Owner,
-			Backing:           cmp.Or(opts.Backing, b.defaultBacking),
 		}
 		if opts.ObjectLockEnabled {
 			rec.Versioning = storage.VersioningEnabled
@@ -106,16 +103,15 @@ func (b *Backend) GetBucket(ctx context.Context, name string) (storage.BucketInf
 }
 
 // DeleteBucket removes an empty bucket, its configuration documents and its
-// data directory (or its remaining blobs on a remote backing). In-progress
-// multipart uploads do not count: they are aborted along with the bucket
-// and their part directories removed.
+// data directory. In-progress multipart uploads do not count: they are
+// aborted along with the bucket and their part directories removed.
 func (b *Backend) DeleteBucket(ctx context.Context, name string) error {
 	if err := b.begin(ctx); err != nil {
 		return err
 	}
 	var (
-		id, backing string
-		uploads     []string
+		id      string
+		uploads []string
 	)
 	err := b.update(func(tx *bbolt.Tx) error {
 		uploads = nil
@@ -135,7 +131,7 @@ func (b *Backend) DeleteBucket(ctx context.Context, name string) error {
 		}); err != nil {
 			return err
 		}
-		id, backing = rec.ID, rec.Backing
+		id = rec.ID
 		if err := tx.DeleteBucket(bucketDataName(rec.ID)); err != nil {
 			return err
 		}
@@ -145,15 +141,7 @@ func (b *Backend) DeleteBucket(ctx context.Context, name string) error {
 		return err
 	}
 	for _, u := range uploads {
-		b.removeUploadData(backing, u)
-	}
-	if backing != "" {
-		// Blobs left by indeterminate commits; those still held by readers
-		// of deleted versions are deleted when the readers close.
-		if r := b.remotes[backing]; r != nil {
-			b.purgeRemotePrefix(r, r.dataPrefix()+id+"/")
-		}
-		return nil
+		b.removeUploadDir(u)
 	}
 	if err := os.RemoveAll(b.bucketDataDir(id)); err != nil {
 		b.log.Warn("fs: remove bucket data directory", "bucket", name, "bucket_id", id, "err", err)

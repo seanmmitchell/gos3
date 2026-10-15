@@ -2,10 +2,7 @@ package fs
 
 import (
 	"context"
-	"crypto/hkdf"
 	"crypto/rand"
-	"crypto/sha256"
-	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
@@ -234,22 +231,8 @@ func (b *Backend) encryptedTemp(bucketID, mode string) (*tmpFile, error) {
 		return nil, err
 	}
 	t.cryptoID = randomHex(16)
-	t.key = objectDataKey(master, t.cryptoID)
+	t.key = crypt.ObjectDataKey(master, t.cryptoID)
 	return t, nil
-}
-
-// objectDataKey derives the stream key of the data file (or part file) with
-// the given ID from the bucket master key. Binding every stream to its
-// immutable data identity makes ciphertext substituted between two objects
-// of the same bucket fail authentication, and gives every stream its own
-// key (see package crypt).
-func objectDataKey(master []byte, id string) []byte {
-	key, err := hkdf.Key(sha256.New, master, nil, "gos3-object-data-v1/"+id, crypt.KeySize)
-	if err != nil {
-		// Only possible for lengths above 255*sha256.Size.
-		panic(err)
-	}
-	return key
 }
 
 // cryptReader is the reader over an encrypted file: a crypt.Reader, which
@@ -292,23 +275,9 @@ func (b *Backend) openEncrypted(f *os.File, bucketID, id string, size int64) (*c
 	if want := storage.EncryptedSize(size); st.Size() != want {
 		return nil, fmt.Errorf("%w: encrypted file has %d bytes, expected %d", errCorrupt, st.Size(), want)
 	}
-	return b.decryptStored(f, bucketID, id, size, f.Close)
-}
-
-// decryptStored returns a reader over the size bytes stored natively
-// encrypted in r (a data file or a remote blob) whose data ID is id. The
-// reader's Close runs close.
-func (b *Backend) decryptStored(r io.ReaderAt, bucketID, id string, size int64, close func() error) (*cryptReader, error) {
-	if !validDataID(id) {
-		return nil, fmt.Errorf("%w: invalid encryption identity", errCorrupt)
-	}
 	master, err := b.bucketKey(bucketID, false)
 	if err != nil {
 		return nil, err
 	}
-	return decryptFile(r, objectDataKey(master, id), size, close)
+	return decryptFile(f, crypt.ObjectDataKey(master, id), size, f.Close)
 }
-
-// resticPassword derives the password of a bucket's restic repository from
-// its master key.
-func resticPassword(key []byte) string { return hex.EncodeToString(key) }

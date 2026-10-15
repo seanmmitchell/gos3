@@ -16,6 +16,21 @@
 //     the 5 GiB limit of CopyObject.
 //   - Client.NewReader returns a lazy, seekable reader over an object that
 //     issues ranged GETs pinned to one ETag.
+//
+// # Retries and conditional writes
+//
+// Requests are retried (up to Config.MaxAttempts) after 5xx answers,
+// SlowDown and RequestTimeout, and idempotent requests also after transport
+// errors. Conditional writes (PutOptions.IfNoneMatch / IfMatch, and the
+// matching CompleteOptions) are not retried after transport errors, but
+// they ARE retried after a 5xx answer: the service may have applied the
+// write before failing, so the retry can then fail with 412 against the
+// caller's own first attempt. A 412 (IsPreconditionFailed) from a
+// conditional write is therefore ambiguous, as is any IsUnavailable error:
+// callers that need to know whether their write happened must read the
+// object back and compare it with what they wrote. PutOptions.NoRetry
+// (CompleteOptions.NoRetry) sends such a write once, so the first failure
+// is reported unchanged.
 package s3client
 
 import (
@@ -32,6 +47,7 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/seanmmitchell/gos3/internal/auth"
@@ -208,6 +224,8 @@ type request struct {
 	// retryTransport allows retrying after a transport error, i.e. when
 	// the request may have reached the server (idempotent requests only).
 	retryTransport bool
+	// noRetry sends the request exactly once.
+	noRetry bool
 }
 
 // url builds the request URL.
@@ -252,7 +270,7 @@ func (c *Client) do(ctx context.Context, req request) (*http.Response, error) {
 			return resp, nil
 		}
 		lastErr = err
-		if ctx.Err() != nil || !c.retryable(req, err) {
+		if req.noRetry || ctx.Err() != nil || !c.retryable(req, err) {
 			return nil, err
 		}
 	}
@@ -321,17 +339,27 @@ func (c *Client) send(ctx context.Context, req request) (*http.Response, error) 
 		// gzip-encoded.
 		r.Header.Set("Accept-Encoding", "identity")
 	}
+	// net/http may keep reading a request body after Do returns (when the
+	// server answers before reading it, the transport's writer can still
+	// be sending), and callers release the body's source (a Spool, a file)
+	// as soon as send returns. Track every body handed to the transport
+	// and wait until the transport closed them all: it always does, also
+	// on errors.
+	var bodies bodyTracker
 	if req.body != nil {
 		r.ContentLength = req.bodySize
 		if req.bodySize == 0 {
 			r.Body = http.NoBody
+		} else {
+			r.Body = bodies.wrap(body)
 		}
-		r.GetBody = func() (io.ReadCloser, error) { return io.NopCloser(req.body()), nil }
+		r.GetBody = func() (io.ReadCloser, error) { return bodies.wrap(req.body()), nil }
 	}
 	if err := auth.SignRequest(r, c.creds, c.region, "s3", payload, c.now()); err != nil {
 		return nil, &Error{Op: req.op, Err: err}
 	}
 	resp, err := c.hc.Do(r)
+	bodies.wait()
 	if err != nil {
 		return nil, &Error{Op: req.op, Err: err}
 	}
@@ -340,6 +368,32 @@ func (c *Client) send(ctx context.Context, req request) (*http.Response, error) 
 	}
 	defer resp.Body.Close()
 	return nil, parseError(req.op, resp)
+}
+
+// bodyTracker counts the request bodies of one request that the transport
+// has not closed yet (see send).
+type bodyTracker struct{ wg sync.WaitGroup }
+
+// wrap returns r as a request body counted by t.
+func (t *bodyTracker) wrap(r io.Reader) io.ReadCloser {
+	t.wg.Add(1)
+	return &trackedBody{r: r, t: t}
+}
+
+// wait blocks until every body returned by wrap has been closed.
+func (t *bodyTracker) wait() { t.wg.Wait() }
+
+type trackedBody struct {
+	r    io.Reader
+	t    *bodyTracker
+	once sync.Once
+}
+
+func (b *trackedBody) Read(p []byte) (int, error) { return b.r.Read(p) }
+
+func (b *trackedBody) Close() error {
+	b.once.Do(b.t.wg.Done)
+	return nil
 }
 
 // parseError turns an error answer into an *Error.

@@ -18,6 +18,9 @@ the settings to review before you expose a server.
       `server.public_info`.
 - [ ] Keep the data directory private (mode 0700) and back it up; it contains
       secrets.
+- [ ] For s3 backings: scope their credentials to their bucket, keep the
+      remote bucket private, and store each backing's encryption key
+      somewhere safe (see [s3 backings](#s3-backings)).
 - [ ] If metrics are public (`metrics.public`), restrict who can reach
       `/_gos3/metrics`.
 - [ ] Enable a standalone web UI's local discovery
@@ -55,7 +58,7 @@ policies.
 |---|---|
 | `GOS3_ROOT_ACCESS_KEY` + `GOS3_ROOT_SECRET_KEY` (or `auth.root_*` in YAML) | Used as given. The secret is never logged. A secret shorter than 16 characters is accepted with a warning. A published example secret (`change-me-now`, `gos3admin-secret`, `minioadmin`, the AWS documentation key, ...) is refused unless `auth.insecure_demo_credentials` / `GOS3_INSECURE_DEMO_CREDENTIALS=true` is set. |
 | Not set, with a data directory | Generated on first start with a random 20-character access key and 40-character secret, saved to `<data>/.gos3/root-credentials.json` (mode 0600) and reused on later starts. The secret is **never logged**: the startup banner shows it only when standard error is a terminal, otherwise it names the file. The log names the access key and the file. |
-| Not set, memory backend without a data path | New keys on every start. On a terminal the banner shows the secret; otherwise it is written to a private temporary file (named in the banner and the log) that is deleted on exit. |
+| Not set, memory or s3 backend without a data path | New keys on every start. On a terminal the banner shows the secret; otherwise it is written to a private temporary file (named in the banner and the log) that is deleted on exit. |
 
 Logs end up in systems (journald, `docker logs`, Kubernetes log stacks) that
 many more people can read than the data directory, so no secret is written
@@ -169,8 +172,9 @@ the holder give itself any permission:
   action at service level, even when it is otherwise scoped.
 - `admin:UpdateAccessKey`: reactivate an administrator key that was
   deactivated, for example after it leaked.
-- `admin:UpdateConfig`: change CORS, discovery and the public URL; treat it
-  like root access.
+- `admin:UpdateConfig`: change CORS, discovery and the public URL, and the
+  storage backings (including s3 endpoints, credentials and encryption
+  keys); treat it like root access.
 
 To delegate part of user or policy management, scope these actions with the
 per-target resources (see
@@ -264,11 +268,10 @@ The data directory (default `./data`, `/data` in the container) holds:
 | `.gos3/root-credentials.json` | generated root keys | **secret** (0600) |
 | `.gos3/iam.json` | IAM users, access **and secret** keys, policies | **secret** (0600) |
 | `.gos3/settings.json` | runtime settings | private (0600) |
-| `.gos3/backings.json` | backings configured in the web UI (names, backends, paths; no restic credentials) | private (0600) |
+| `.gos3/backings.json` | backings configured in the web UI (names, backends, paths, s3 settings **including s3 secret keys and encryption keys**, except values taken from the environment) | **secret** (0600) |
 | `.gos3/meta.db` | bucket and object metadata, bucket policies and configurations (fs backend) | private (0600) |
 | `.gos3/data/`, `.gos3/uploads/` | object and part data | your data (files 0600) |
 | `.gos3/keys/` | bucket encryption keys and restic repository passwords (fs backend) | **secret** (0600) |
-| `.gos3/restic-backing.json` | restic S3 storage settings, including credentials (fs backend) | **secret** (0600) |
 | `.gos3/restic/`, `.gos3/restic-cache/` | restic repositories and cache (fs backend) | encrypted by restic |
 | `.gos3/server-id` | random server ID | public |
 
@@ -295,6 +298,46 @@ Server-managed keys allow unattended access and must be backed up with
 metadata. They do not protect against a compromised server or a full copy of
 its data and keys. See [encryption.md](encryption.md).
 
+### s3 backings
+
+An [s3 backing](backings.md) keeps everything of its buckets in a remote
+bucket: the metadata journal and snapshots (bucket names, object keys, user
+metadata, tags, policies and other bucket configuration, unencrypted),
+object data, wrapped encryption keys and restic repositories. Anyone who
+can read that bucket can read the metadata and every unencrypted object;
+anyone who can write it can change or destroy the backing. Give the
+backing's credentials access to its bucket (and, for a gateway, to creating
+and using the remote buckets named like the gos3 buckets) and nothing
+else, and protect the bucket like the data directory.
+
+- **Encryption key (KEK).** The per-bucket master keys of an s3 backing
+  are stored in the remote bucket wrapped (AES-256-GCM) with the backing's
+  `encryption_key`, which is never stored there (only a check value, which
+  does not reveal it). The remote bucket alone therefore does not decrypt
+  AES256 or restic data. The KEK lives in the configuration file, the
+  environment (`GOS3_S3_ENCRYPTION_KEY`,
+  `GOS3_BACKING_<NAME>_ENCRYPTION_KEY`) or `backings.json`; keep a copy
+  elsewhere, because losing it loses the encrypted data.
+- **Where the secrets are.** The s3 `secret_key` and `encryption_key` come
+  from the configuration file, the environment, or the web UI (then saved
+  in `backings.json`, mode 0600, never with values that came from the
+  environment). Prefer the environment or a secret store for them, and
+  keep a configuration file that contains them at mode 0600.
+- **Redaction.** `gos3 config print` shows `secret_key` and
+  `encryption_key` redacted. The admin API never returns them: they are
+  write-only (`GET /backings/config` reports only `secretKeyConfigured`,
+  `encryptionKeyConfigured` and whether a value comes from the
+  environment), and the Storage page shows them as "Saved – leave blank to
+  keep". Backing status shows the location (`s3://bucket/prefix/`), not
+  credentials. Restic runs with the credentials in its environment, never
+  on its command line, and its diagnostics are redacted before they are
+  logged.
+- **Who can change them.** Reading the backing configuration needs
+  `admin:GetConfig` and changing it `admin:UpdateConfig` at service level;
+  an administrator who can change backings can point a backing at any
+  S3 service, so treat it like root. An endpoint that is this server
+  itself is refused.
+
 Compressed objects (see [operations.md](operations.md#compression)) are
 not protected by compression alone: without object encryption, anyone who
 can read the data files can inflate them. The stored size of a compressed object depends on its content, so it
@@ -307,7 +350,7 @@ keep compression off for them or do not grant those actions to the parties
 supplying the input.
 
 Only one gos3 process can use a data directory at a time: every backend,
-including the memory backend with a data path, takes an exclusive lock on
+including the memory and s3 backends with a data path, takes an exclusive lock on
 `<data>/.gos3/lock`, and a second process fails at startup with "is another
 gos3 using this data directory?". On platforms without `flock` or Windows
 file sharing the lock is a no-op.

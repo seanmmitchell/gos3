@@ -8,7 +8,7 @@ worker and upgrades.
 | Endpoint | Meaning | Response |
 |---|---|---|
 | `GET /_gos3/health` | Liveness: the process serves HTTP. | `200 {"status":"ok"}` |
-| `GET /_gos3/ready` | Readiness: storage answers (bucket listing within 5 s), and the server is not shutting down. | `200 {"status":"ok"}`, or `503 {"status":"unavailable","error":"storage unavailable"}` (`"shutting down"` during shutdown). The result is reused for 2 s; the storage error is logged when readiness changes, not returned. |
+| `GET /_gos3/ready` | Readiness: storage answers (bucket listing within 5 s), the default backing is healthy, and the server is not shutting down. An unavailable additional backing (for example an unreachable [s3 backing](backings.md)) leaves the server ready; an unavailable s3 default backing does not. | `200 {"status":"ok"}`, or `503 {"status":"unavailable","error":"storage unavailable"}` (`"shutting down"` during shutdown). The result is reused for 2 s; the storage error is logged when readiness changes, not returned. |
 
 Both are unauthenticated. `gos3 healthcheck [--ready] [--url URL]` wraps them
 and exits 0 when healthy; the container image uses it as its `HEALTHCHECK`.
@@ -106,13 +106,12 @@ gos3 logs to stderr with Go's `log/slog`, as `text` (default) or `json`
     │   └── <bucket-id>.restic.json  its restic repository location and password
     ├── restic/<bucket-id>/      local restic repositories (fs backend)
     ├── restic-cache/            restic's local repository cache (fs backend)
-    ├── restic-backing.json      restic S3 storage settings and credentials (fs backend) (secret)
     ├── lock                     held by the running server
     ├── iam.json                 IAM users, keys, policies        (secret)
     ├── root-credentials.json    generated root keys, if any      (secret)
     ├── settings.json            runtime settings, after the first change
     ├── placements.json          which backings hold which buckets
-    ├── backings.json            backings configured in the web UI, after the first change
+    ├── backings.json            backings configured in the web UI, after the first change (secret: s3 credentials)
     └── server-id                this server's discovery ID
 ```
 
@@ -120,12 +119,22 @@ Encrypted objects cannot be read without `keys/`, so back it up together
 with `meta.db` and the data (see
 [encryption.md](encryption.md#keys-and-recovery)). Keys, restic recovery
 records and local restic repositories stay after their bucket is deleted.
-Each additional fs backing has its own `keys/`, `restic/`, `restic-cache/`
-and `restic-backing.json`.
+Each additional fs backing has its own `keys/`, `restic/` and
+`restic-cache/`. Restic repositories are always local to an fs backing
+(`restic/<bucket-id>`).
 
 With the memory backend and a data path, only the system files (`iam.json`,
-`settings.json`, `server-id`, `root-credentials.json`) are kept; objects live in
-memory. Every backend takes an exclusive lock on `.gos3/lock` while it runs
+`settings.json`, `placements.json`, `backings.json`, `server-id`,
+`root-credentials.json`) are kept; objects live in memory. The same holds
+when the default backing is an [s3 backing](backings.md): its buckets,
+metadata, keys and restic repositories live in the remote bucket, and
+`storage.path` is optional and only holds the system files. Without it they
+are ephemeral (the server logs a warning): IAM users, settings, placements
+and live backing changes are lost on restart, and root credentials are
+generated anew unless configured. s3 backings need no local directory:
+each gets a temporary directory under the operating system's temporary
+directory (`gos3-<backing>-*`, removed at shutdown) for upload spool files,
+restic's cache and restores. Every backend takes an exclusive lock on `.gos3/lock` while it runs
 (and the fs backend also locks `meta.db`), so a second process using the same
 directory fails at startup with "is another gos3 using this data
 directory?". On platforms without `flock` or Windows file sharing the lock is
@@ -151,20 +160,23 @@ move `data/` and `uploads/` aside to start with an empty store.
 
 ## Multiple backings and replication
 
-Use **Storage → Configure backings** to add storage and choose the default
-for new buckets without restarting. You can edit or remove additional
-backings once their buckets and replicas have been moved or removed and
-background cleanup has finished. Backing definitions persist in
+Use **Storage → Configure backings** to add storage (a directory, memory or
+a bucket of an S3 service) and choose the default for new buckets without
+restarting. You can replace or remove additional backings once their
+buckets and replicas have been moved or removed and background cleanup has
+finished; the connection settings and credentials of an s3 backing can be
+changed at any time (of a gateway backing, only while it holds no buckets). Backing definitions persist in
 `backings.json` in the system directory; the UI indicates when the server
 has no persistent settings directory. The system backing named `default`
 is fixed at startup.
 
 A server can store buckets on several backings (see
 [configuration.md](configuration.md#storage-backings)), typically one fs
-directory per disk. Each backing directory has its own `.gos3/` with its own
-`meta.db`, data files and lock; the system state (`iam.json`,
-`settings.json`, `placements.json`, ...) stays in the default backing's data
-directory. Every bucket has a **placement**, managed in the web UI (bucket
+directory per disk, or a bucket of a remote S3 service
+([backings.md](backings.md)). Each fs backing directory has its own
+`.gos3/` with its own `meta.db`, data files and lock, and each s3 backing
+its own bucket and prefix; the system state (`iam.json`, `settings.json`,
+`placements.json`, ...) stays in `storage.path`. Every bucket has a **placement**, managed in the web UI (bucket
 settings, Placement tab, and the server's Storage page) or the admin API
 ([admin-api.md](admin-api.md#storage-backings-and-bucket-placement)):
 
@@ -220,8 +232,18 @@ Things to know:
   without an entry in `placements.json` is adopted where it is (that is how
   existing data directories keep working); a copy of a bucket that is placed
   elsewhere is ignored with a warning and never deleted automatically.
+- At startup the server waits up to 15 s for its s3 backings to load. One
+  whose service is unreachable does not stop the server: its buckets answer
+  `503 ServiceUnavailable` and the backing is unhealthy until the service
+  answers, then its buckets are served (and buckets found there without a
+  placement are adopted). Until it has been listed, unknown bucket names
+  answer `503` instead of `404` and new buckets cannot be created. An s3
+  backing that holds no placed bucket can be removed live even while it is
+  unreachable. See
+  [backings.md](backings.md#behaviour-when-the-remote-is-unreachable).
 - Backups: with several backings, back up every backing directory together
-  with the default data directory (one snapshot per file system).
+  with the default data directory (one snapshot per file system), and every
+  s3 backing as described in [backings.md](backings.md#backups).
 
 ## Backups
 
@@ -244,10 +266,9 @@ next start. Do
 not copy a live directory with `cp` or `rsync` without a snapshot: `meta.db`
 can end up inconsistent with the data files.
 
-The copy includes the encryption keys (`.gos3/keys/`), so protect it like
-the keys themselves. Restic repositories on a backing's S3 storage are
-outside the data directory: back them up at that S3 service, at the same
-time as the data directory (see [encryption.md](encryption.md#keys-and-recovery)).
+The copy includes the encryption keys (`.gos3/keys/`) and `backings.json`
+with the credentials and encryption keys of s3 backings configured in the
+web UI, so protect it like the keys themselves.
 
 Restore by stopping gos3, replacing the directory contents (keep the owner and
 mode 0700) and starting it again. The restored server keeps its server ID,
@@ -257,15 +278,16 @@ data, objects written after that backup are not destroyed: they land in
 expires. Never delete `meta.db` to get past a "locked by another process"
 error: stop the other process instead.
 
-Buckets on [remote backings](backings.md) keep their bytes on the remote
-service. For **blob** backings the remote blobs are useless without
-`meta.db`: back up `meta.db` (and the rest of the directory) as above and
-protect the remote bucket with the remote service's own means (versioning,
-replication). Unreferenced blobs, such as those written after the backup a
-restored `meta.db` came from, are deleted at a later start once older than 7
-days. **Gateway** buckets hold ordinary objects that any S3 tool can back
-up; gos3 keeps only their bucket configuration and in-progress multipart
-uploads.
+Buckets on [s3 backings](backings.md) live entirely in the remote bucket
+under the backing's prefix: metadata, data, wrapped keys and restic
+repositories. The data directory holds none of it. Protect the remote
+bucket with the service's own means (bucket versioning, replication), or
+copy the whole prefix while gos3 is stopped; see
+[backings.md](backings.md#backups). **Keep the encryption key** of each
+s3 backing (`encryption_key`, `GOS3_S3_ENCRYPTION_KEY` or
+`GOS3_BACKING_<NAME>_ENCRYPTION_KEY`) in a safe place of its own: without
+it the backing's encrypted objects and restic archives are lost. Gateway
+buckets hold ordinary objects that any S3 tool can back up.
 
 **2. Object-level copy (portable).** Mirror buckets with any S3 tool, for
 example `rclone sync gos3:bucket backup:bucket` or
@@ -292,7 +314,7 @@ The worker applies bucket lifecycle rules (`PutBucketLifecycleConfiguration`):
   mid-pass, so the walk reports more than one latest version) is skipped
   until the next pass.
 - Every lifecycle delete is conditional and atomic in the storage backend
-  (both built-in backends support this). A version is removed, or hidden
+  (every built-in backend supports this). A version is removed, or hidden
   behind a delete marker, only if at the moment of deletion it is still the
   version the pass examined (same version ID, `LastModified`, ETag and
   current/noncurrent state), still matches the rule (tags, size) and is not
@@ -411,6 +433,17 @@ usage counts that reach one of them fail for the whole bucket:
 
 Otherwise restore the backup. Runtime
 settings in `settings.json` and IAM data in `iam.json` are kept across upgrades.
+
+Development builds before the s3 backend kind configured remote storage
+differently: a `restic_s3` block on fs backings (restic repositories on an
+S3 service), a `.gos3/restic-backing.json` file, and s3 backings with
+`mode: blob` or `mode: gateway` and a local `path`. None of these were in a
+release, and none are read any more: restic repositories of fs backings are
+local, and an s3 backing is configured as described in
+[backings.md](backings.md) (a `mode` or `path` on an s3 backing, or a
+`restic_s3` key, is a configuration error). Data written by those builds to
+a remote bucket is not picked up; copy such buckets through S3 into a
+backing of the current version.
 `gos3 version` (or `GET /_gos3/info`) shows the running version.
 
 ## Troubleshooting
@@ -426,5 +459,9 @@ settings in `settings.json` and IAM data in `iam.json` are kept across upgrades.
 | Startup: `refusing to start with an empty index` | `meta.db` is missing or empty but object files exist; restore `meta.db` from a backup, or move `data/` and `uploads/` aside. |
 | Startup warning: `recovery moved unreferenced files to the quarantine` | Files no metadata references were moved to `.gos3/orphans/`; inspect them if objects are missing. |
 | Startup: `settings.json: …` | The runtime settings file is corrupt or invalid; fix or remove it. |
+| The buckets of one backing answer `503 ServiceUnavailable` | Its S3 service is unreachable, or the backing is still loading; the Storage page shows the last error. See [backings.md](backings.md#behaviour-when-the-remote-is-unreachable). |
+| s3 backing: `prefix in use by another server` | Another gos3 server runs on the same bucket and prefix. After a crash, the next start waits until the old lease is 30 s old. |
+| s3 backing: `the S3 service does not support conditional writes` | The service ignores `If-None-Match` / `If-Match` on PUT; gos3 cannot use it for an s3 backing. |
+| s3 backing: `encryption key does not match this backing` | The configured `encryption_key` differs from the one the backing's keys are wrapped with; configure the original key. |
 | Peers show `unverified` with a TLS error | The peer uses a certificate that this server does not trust. |
 | Configuration changes have no effect | `settings.json` overrides them for runtime keys; see [configuration.md](configuration.md#runtime-settings-settingsjson). |

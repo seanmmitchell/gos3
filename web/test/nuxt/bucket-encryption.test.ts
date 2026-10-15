@@ -102,7 +102,8 @@ describe('EncryptionTab', () => {
     await vm.saveProvider.run()
     expect(writes).toEqual([{ method: 'PUT', path: '/_gos3/admin/v1/buckets/photos/encryption-provider', body: '{"provider":"restic"}' }])
     await nextTick()
-    expect(w.text()).toContain('inherited from this bucket’s placement')
+    expect(w.text()).toContain('Restic repositories live on the bucket’s backing: on a filesystem backing in its data directory, on an S3 backing in that backing’s bucket.')
+    expect(w.text()).not.toContain('Storage settings')
     expect(w.find('input[type="password"]').exists()).toBe(false)
 
     writes.length = 0
@@ -141,10 +142,29 @@ describe('EncryptionTab', () => {
     fakeServer({ available: ['AES256'] })
     const w = await mountTab()
     await vi.waitFor(() => expect(w.find('[data-testid="encryption-provider"] form').exists()).toBe(true))
-    expect(w.text()).toContain('restic must be installed on the server')
+    expect(w.text()).toContain('restic must be installed on the server and every copy of the bucket must be on a filesystem backing or an S3 backing with an encryption key')
     const restic = w.findAll('[data-testid="encryption-provider"] input[type="radio"], [data-testid="encryption-provider"] button[role="radio"]')
       .find(el => el.attributes('value') === 'restic')
     expect(restic?.attributes('disabled')).toBeDefined()
+  })
+
+  it('disables native encryption when an S3 backing of the bucket has no encryption key', async () => {
+    fakeServer({ available: [] })
+    const w = await mountTab()
+    await vi.waitFor(() => expect(w.find('[data-testid="encryption-provider"] form').exists()).toBe(true))
+    expect(w.text()).toContain('Not available for this bucket: an S3 backing of this bucket has no encryption key.')
+    const radios = w.findAll('[data-testid="encryption-provider"] input[type="radio"], [data-testid="encryption-provider"] button[role="radio"]')
+    expect(radios.find(el => el.attributes('value') === 'AES256')?.attributes('disabled')).toBeDefined()
+    // The stored implementation is AES256: say why SSE-S3 cannot work.
+    expect(w.find('[data-testid="aes-unavailable"]').text()).toContain('Set an encryption key on that backing')
+  })
+
+  it('offers native encryption without a warning when the server reports it available', async () => {
+    fakeServer({ available: ['AES256'] })
+    const w = await mountTab()
+    await vi.waitFor(() => expect(w.find('[data-testid="encryption-provider"] form').exists()).toBe(true))
+    expect(w.text()).not.toContain('has no encryption key')
+    expect(w.find('[data-testid="aes-unavailable"]').exists()).toBe(false)
   })
 
   for (const [status, testid] of [[403, 'provider-denied'], [404, 'provider-unsupported']] as const) {
