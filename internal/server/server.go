@@ -48,6 +48,7 @@ import (
 	"github.com/seanmmitchell/gos3/internal/storage"
 	fsbackend "github.com/seanmmitchell/gos3/internal/storage/fs"
 	"github.com/seanmmitchell/gos3/internal/storage/memory"
+	"github.com/seanmmitchell/gos3/internal/storage/multi"
 	"github.com/seanmmitchell/gos3/internal/version"
 	"github.com/seanmmitchell/gos3/internal/webui"
 )
@@ -101,9 +102,10 @@ type Server struct {
 	logControl *LogControl
 	version    string
 
-	backend     storage.Backend
+	backend     storage.Backend // the multi-backing router over backings
+	backings    []multi.Backing // opened backings (owned by backend once it is set)
 	backendName string
-	dataPath    string // absolute data directory ("" when ephemeral)
+	dataPath    string // absolute data directory ("" when system state is ephemeral)
 	systemDir   string
 	iam         *iam.Manager
 	verifier    *auth.Verifier
@@ -122,6 +124,11 @@ type Server struct {
 	hosts       *hostPolicy   // which Host headers name this server
 	dirLock     *os.File      // exclusive lock on <systemDir>/lock (nil when ephemeral)
 
+	tempMu    sync.Mutex
+	tempTag   string         // server ID in temporary directory names ("" when unknown)
+	tempDirs  []string       // temporary directories of open s3 backings
+	s3Buckets map[string]int // remote bucket (lower case) -> open s3 backings on it
+
 	serverID    string
 	startedAt   time.Time
 	credsSource string
@@ -130,6 +137,9 @@ type Server struct {
 	serving  atomic.Bool
 	draining atomic.Bool
 	ready    chan struct{}
+	// limiter is the connection limiter while serving with
+	// server.max_connections (nil otherwise); tests inspect it.
+	limiter atomic.Pointer[connLimiter]
 
 	lifeCtx    context.Context // background work (discovery, lifecycle)
 	lifeCancel context.CancelFunc
@@ -164,6 +174,9 @@ func New(cfg config.Config, logger *slog.Logger, opts ...Option) (_ *Server, err
 		o.version = version.Short()
 	}
 	cfg.Normalize()
+	if err := cfg.LoadBackings(); err != nil {
+		return nil, fmt.Errorf("loading backing configuration: %w", err)
+	}
 	if err := cfg.Validate(); err != nil {
 		return nil, fmt.Errorf("invalid configuration: %w", err)
 	}
@@ -208,6 +221,7 @@ func New(cfg config.Config, logger *slog.Logger, opts ...Option) (_ *Server, err
 
 	// Storage first: the fs backend locks its directory, so a second
 	// process on the same data path fails before touching any state.
+	s.tempTag = peekServerID(s.systemDir)
 	if err := s.openBackend(); err != nil {
 		return nil, err
 	}
@@ -227,6 +241,10 @@ func New(cfg config.Config, logger *slog.Logger, opts ...Option) (_ *Server, err
 		if s.dirLock, err = lockSystemDir(s.systemDir); err != nil {
 			return nil, err
 		}
+		s.removeStaleTempDirs()
+	}
+	if err := s.openRouter(); err != nil {
+		return nil, err
 	}
 	if s.serverID, err = loadServerID(s.systemDir, logger); err != nil {
 		return nil, err
@@ -244,7 +262,7 @@ func New(cfg config.Config, logger *slog.Logger, opts ...Option) (_ *Server, err
 	}); err != nil {
 		return nil, fmt.Errorf("opening IAM: %w", err)
 	}
-	if s.settings, err = config.LoadStore(config.SettingsFrom(cfg), cfg.SettingsPath()); err != nil {
+	if s.settings, err = cfg.LoadSettings(); err != nil {
 		return nil, err
 	}
 	st := s.settings.Get()
@@ -273,20 +291,22 @@ func New(cfg config.Config, logger *slog.Logger, opts ...Option) (_ *Server, err
 		ClientIP:      s.clientIP,
 	})
 	s.disc = discovery.New(st.Discovery, s.Info, logger)
-	s.admin = s.instrumentAdmin(admin.NewHandler(admin.Deps{
-		Backend:     s.backend,
-		Verifier:    s.verifier,
-		IAM:         s.iam,
-		Metrics:     s.metrics,
-		Settings:    s.settings,
-		Discovery:   s.disc,
-		Info:        s.Info,
-		BackendName: s.backendName,
-		DataPath:    s.dataPath,
-		Logger:      logger,
+	if cfg.Admin.Enabled {
+		s.admin = s.instrumentAdmin(admin.NewHandler(admin.Deps{
+			Backend:     s.backend,
+			Verifier:    s.verifier,
+			IAM:         s.iam,
+			Metrics:     s.metrics,
+			Settings:    s.settings,
+			Discovery:   s.disc,
+			Info:        s.Info,
+			BackendName: s.backendName,
+			DataPath:    s.dataPath,
+			Logger:      logger,
 
-		TrustProxyHeaders: s.clientIP,
-	}))
+			TrustProxyHeaders: s.clientIP,
+		}))
+	}
 	s.lifecycle = lifecycle.NewWorker(s.backend, lifecycle.Options{
 		Interval: time.Duration(st.Lifecycle.IntervalSeconds) * time.Second,
 		Logger:   logger.With("component", "lifecycle"),
@@ -297,6 +317,9 @@ func New(cfg config.Config, logger *slog.Logger, opts ...Option) (_ *Server, err
 		fsys := o.uiFS
 		if fsys == nil {
 			fsys = webui.FS()
+		}
+		if fsys == nil {
+			return nil, fmt.Errorf("ui.enabled: this binary was built without UI assets; disable ui.enabled or use a build with the UI")
 		}
 		s.ui = webui.NewHandler(fsys)
 		s.uiBuilt = webui.IsBuilt(fsys)
@@ -309,27 +332,126 @@ func New(cfg config.Config, logger *slog.Logger, opts ...Option) (_ *Server, err
 	return s, nil
 }
 
-// openBackend opens the configured storage backend.
+// openBackend opens the configured storage backings: the default one
+// (storage.backend, storage.path or storage.s3) and storage.backings.
+// openRouter then puts the router in front of them.
 func (s *Server) openBackend() error {
-	switch s.cfg.Storage.Backend {
-	case config.BackendMemory:
-		s.backend, s.backendName = memory.New(), config.BackendMemory
-		if s.cfg.Storage.Path != "" {
-			abs, err := filepath.Abs(s.cfg.Storage.Path)
+	st := s.cfg.Storage
+	switch st.Backend {
+	case config.BackendMemory, config.BackendS3:
+		// storage.path holds system state only.
+		if st.Path != "" {
+			abs, err := filepath.Abs(st.Path)
 			if err != nil {
 				return fmt.Errorf("data path: %w", err)
 			}
 			s.dataPath = abs
 		}
-	default:
-		b, err := fsbackend.Open(s.cfg.Storage.Path, fsbackend.Options{
-			FsyncData: s.cfg.Storage.FsyncData,
-			Logger:    s.log.With("component", "storage"),
-		})
+		s.backendName = st.Backend
+		if st.Backend == config.BackendMemory {
+			s.backings = append(s.backings, multi.Backing{Name: config.DefaultBackingName, Kind: config.BackendMemory, Backend: memoryBackend()})
+			break
+		}
+		if st.S3 == nil {
+			return errors.New("opening storage: storage.s3 is required for the s3 backend")
+		}
+		b, err := s.openS3(config.DefaultBackingName, *st.S3)
 		if err != nil {
 			return fmt.Errorf("opening storage: %w", err)
 		}
-		s.backend, s.backendName, s.dataPath = b, config.BackendFS, b.Root()
+		s.backings = append(s.backings, b)
+		if s.systemDir == "" {
+			s.log.Warn("the default backing is s3 without storage.path: system state (IAM users and policies, settings, " +
+				"bucket placements, live backing configuration, generated root credentials) is ephemeral and lost on " +
+				"restart; the buckets survive in the remote bucket. Set storage.path (GOS3_DATA) to keep it")
+		}
+	default:
+		b, err := s.openFS(config.DefaultBackingName, st.Path)
+		if err != nil {
+			return fmt.Errorf("opening storage: %w", err)
+		}
+		s.backings = append(s.backings, b)
+		s.backendName, s.dataPath = config.BackendFS, b.Path
+	}
+	for _, bc := range st.Backings {
+		var (
+			b   multi.Backing
+			err error
+		)
+		switch bc.Backend {
+		case config.BackendMemory:
+			b = multi.Backing{Name: bc.Name, Kind: config.BackendMemory, Backend: memoryBackend()}
+		case config.BackendS3:
+			if bc.S3 == nil {
+				return fmt.Errorf("opening storage backing %q: s3 settings are required", bc.Name)
+			}
+			b, err = s.openS3(bc.Name, *bc.S3)
+		default:
+			b, err = s.openFS(bc.Name, bc.Path)
+		}
+		if err != nil {
+			return fmt.Errorf("opening storage backing %q: %w", bc.Name, err)
+		}
+		s.backings = append(s.backings, b)
+	}
+	s.waitS3Startup(s.backings)
+	return nil
+}
+
+// memoryBackend returns a new memory backend.
+func memoryBackend() storage.Backend { return memory.New() }
+
+// openFS opens the fs backing name on directory path.
+func (s *Server) openFS(name, path string) (multi.Backing, error) {
+	log := s.log.With("component", "storage")
+	if name != config.DefaultBackingName {
+		log = log.With("backing", name)
+	}
+	b, err := fsbackend.Open(path, fsbackend.Options{FsyncData: s.cfg.Storage.FsyncData, Logger: log})
+	if err != nil {
+		return multi.Backing{}, err
+	}
+	return multi.Backing{Name: name, Kind: config.BackendFS, Path: b.Root(), Backend: b}, nil
+}
+
+// PlacementsFileName is the file in the system directory holding the
+// bucket placements (which backings hold which buckets).
+const PlacementsFileName = "placements.json"
+
+// openRouter puts the multi-backing router in front of the backings.
+func (s *Server) openRouter() error {
+	st := s.cfg.Storage
+	state := ""
+	if s.systemDir != "" {
+		state = filepath.Join(s.systemDir, PlacementsFileName)
+	} else if len(st.Backings) > 0 {
+		s.log.Warn("bucket placements are not persisted without a data directory (memory or s3 default backend " +
+			"without storage.path): after a restart buckets are found where they are, but replication settings and " +
+			"moves in progress are lost, and backings added live are forgotten")
+	}
+	mode := multi.Mode(st.Replication.DefaultMode)
+	r, err := multi.Open(s.lifeCtx, multi.Options{
+		Backings:          s.backings,
+		Default:           st.DefaultBacking,
+		NewBucketMode:     mode,
+		NewBucketReplicas: st.Replication.DefaultReplicas,
+		StatePath:         state,
+		Workers:           st.Replication.Workers,
+		HealthInterval:    st.Replication.HealthInterval,
+		AutoFailover:      st.Replication.AutoFailover,
+		CutoverTimeout:    st.Replication.CutoverTimeout,
+		Logger:            s.log.With("component", "placement"),
+	})
+	s.backings = nil // closed by the router, also when Open fails
+	if err != nil {
+		return fmt.Errorf("opening storage: %w", err)
+	}
+	s.backend = r
+	if s.cfg.Admin.Enabled {
+		r.EnableBackingManagement(s.cfg.Storage, s.cfg.BackingsPath(), multi.BackingOpener{
+			Open:        s.openLiveBacking,
+			Reconfigure: s.reconfigureBacking,
+		})
 	}
 	return nil
 }
@@ -457,6 +579,12 @@ func (s *Server) Close() error {
 				errs = append(errs, fmt.Errorf("closing storage: %w", err))
 			}
 		}
+		for _, b := range s.backings { // opened, but the router never took them
+			if err := b.Backend.Close(); err != nil {
+				errs = append(errs, fmt.Errorf("closing storage backing %q: %w", b.Name, err))
+			}
+		}
+		s.removeTempDirs()
 		if s.iam != nil {
 			if err := s.iam.Close(); err != nil {
 				errs = append(errs, fmt.Errorf("closing IAM: %w", err))
@@ -548,10 +676,13 @@ func (s *Server) IAM() *iam.Manager { return s.iam }
 // Backend returns the storage backend.
 func (s *Server) Backend() storage.Backend { return s.backend }
 
-// BackendName returns "fs" or "memory".
+// BackendName returns the kind of the default backing: "fs", "memory" or
+// "s3".
 func (s *Server) BackendName() string { return s.backendName }
 
-// DataPath returns the absolute data directory ("" when fully ephemeral).
+// DataPath returns the absolute data directory: the fs default backing's
+// directory, or storage.path holding only system state for the memory and
+// s3 backends ("" when that state is ephemeral).
 func (s *Server) DataPath() string { return s.dataPath }
 
 // ServerID returns the server's discovery ID.

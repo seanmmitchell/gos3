@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
@@ -20,6 +21,7 @@ import (
 	"github.com/seanmmitchell/gos3/internal/iam"
 	"github.com/seanmmitchell/gos3/internal/s3"
 	"github.com/seanmmitchell/gos3/internal/s3err"
+	"github.com/seanmmitchell/gos3/internal/storage/multi"
 	"github.com/seanmmitchell/gos3/internal/webui"
 )
 
@@ -63,6 +65,22 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		s.s3.ServeHTTP(w, r)
 		return
 	}
+	// MinIO health aliases are anonymous probes only. Signed requests and
+	// virtual-host requests still address objects in a bucket named minio.
+	if r.Header.Get("Authorization") == "" && r.URL.RawQuery == "" &&
+		(r.URL.Path == "/minio/health/live" || r.URL.Path == "/minio/health/ready") {
+		w, r, done := s.guardBody(w, r)
+		defer done()
+		if !allowGet(w, r) {
+			return
+		}
+		if r.URL.Path == "/minio/health/ready" {
+			s.serveReady(w, r)
+		} else {
+			w.WriteHeader(http.StatusOK)
+		}
+		return
+	}
 	// 2. gos3's own endpoints.
 	if p := r.URL.Path; p == "/_gos3" || strings.HasPrefix(p, SystemPrefix) {
 		w, r, done := s.guardBody(w, r)
@@ -99,6 +117,11 @@ func (s *Server) serveSystem(w http.ResponseWriter, r *http.Request, st *config.
 	p := r.URL.Path
 	switch {
 	case p == admin.Prefix || strings.HasPrefix(p, admin.Prefix+"/"):
+		if s.admin == nil {
+			s.logSystem(r, http.StatusNotFound)
+			writeJSONError(w, http.StatusNotFound, "NotFound", "the management API is disabled on this server")
+			return
+		}
 		s.admin.ServeHTTP(w, r)
 	case p+"/" == webui.Prefix || strings.HasPrefix(p, webui.Prefix):
 		if s.ui == nil {
@@ -170,10 +193,16 @@ func (s *Server) serveReady(w http.ResponseWriter, r *http.Request) {
 }
 
 // backendReady reports whether the backend answered ListBuckets within
-// readyTimeout. The result is reused for readyCacheTTL, and concurrent
-// callers share one check, so polling /_gos3/ready (anonymous) costs at
-// most one backend call per readyCacheTTL. Failures are logged when the
-// state changes, not on every request.
+// readyTimeout and the default backing (config.DefaultBackingName:
+// storage.backend) is healthy. The router answers ListBuckets from cached
+// bucket descriptions while a backing is down, so the listing alone would
+// not notice an unavailable default backing (e.g. an s3 default backing
+// whose service is unreachable at startup); other backings being down
+// leaves the server ready, as their buckets are the only ones affected.
+// The result is reused for readyCacheTTL, and concurrent callers share one
+// check, so polling /_gos3/ready (anonymous) costs at most one backend call
+// per readyCacheTTL. Failures are logged when the state changes, not on
+// every request.
 func (s *Server) backendReady() bool {
 	s.readyMu.Lock()
 	defer s.readyMu.Unlock()
@@ -183,6 +212,13 @@ func (s *Server) backendReady() bool {
 	ctx, cancel := context.WithTimeout(s.lifeCtx, readyTimeout)
 	_, err := s.backend.ListBuckets(ctx)
 	cancel()
+	if r, ok := s.backend.(*multi.Router); ok && err == nil {
+		for _, b := range r.Backings() {
+			if b.Name == config.DefaultBackingName && !b.Healthy {
+				err = fmt.Errorf("the default backing is unhealthy: %s", b.LastError)
+			}
+		}
+	}
 	ok := err == nil
 	switch {
 	case !ok && (s.readyOK || s.readyAt.IsZero()):
@@ -336,12 +372,15 @@ func (s *Server) remoteIP(r *http.Request) string {
 
 // isVirtualHost reports whether host is "<bucket>.<domain>" for one of the
 // configured virtual-host domains (the same rule as the S3 handler: port
-// and trailing dot ignored, case-insensitive, IPv6 literals never match).
+// and trailing dot ignored, case-insensitive, IPv6 literals never match,
+// and a host that is itself a configured domain is never a virtual host,
+// even when it is a subdomain of another configured domain).
 func isVirtualHost(host string, domains []string) bool {
 	if len(domains) == 0 || host == "" {
 		return false
 	}
 	h := normalizeHost(host)
+	match := false
 	for _, d := range domains {
 		d = strings.TrimSpace(d)
 		if i := strings.Index(d, "://"); i >= 0 {
@@ -349,11 +388,17 @@ func isVirtualHost(host string, domains []string) bool {
 		}
 		d, _, _ = strings.Cut(d, "/")
 		d = normalizeHost(strings.TrimPrefix(d, "."))
-		if d != "" && len(h) > len(d)+1 && strings.HasSuffix(h, d) && h[len(h)-len(d)-1] == '.' {
-			return true
+		if d == "" {
+			continue
+		}
+		if h == d {
+			return false
+		}
+		if len(h) > len(d)+1 && strings.HasSuffix(h, d) && h[len(h)-len(d)-1] == '.' {
+			match = true
 		}
 	}
-	return false
+	return match
 }
 
 // normalizeHost lowercases host and strips a port and a trailing dot.

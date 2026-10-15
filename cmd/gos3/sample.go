@@ -10,7 +10,7 @@ const sampleConfig = `# gos3 configuration file.
 # command line flags. "gos3 config env" lists the variables, "gos3 config
 # print" shows the effective configuration. Settings marked (runtime) can also
 # be changed while running through the admin API / web UI; those changes are
-# stored in <data>/.gos3/settings.json and win over this file.
+# stored in <data>/.gos3/settings.json and win over this file when admin is enabled.
 
 server:
   # Listen address, [host]:port.
@@ -57,15 +57,48 @@ server:
   max_connections: 0
 
 storage:
-  # fs (files under path) or memory (lost on exit).
+  # fs (files under path), memory (lost on exit) or s3 (a bucket of a
+  # remote S3 service, configured by the s3 block below).
   backend: fs
   # Data directory. System state lives in <path>/.gos3 (iam.json with secret
   # keys, settings.json, server-id, root-credentials.json): back it up and
-  # keep it private. With the memory backend leave it empty for a fully
-  # ephemeral server.
+  # keep it private. With the memory and s3 backends it holds system state
+  # only: leave it empty for ephemeral system state.
   path: ./data
+  # With backend: s3, the remote service holding all data and metadata
+  # (one gos3 server per bucket and prefix). Credentials and the
+  # encryption key can come from GOS3_S3_ACCESS_KEY, GOS3_S3_SECRET_KEY and
+  # GOS3_S3_ENCRYPTION_KEY instead.
+  # s3:
+  #   endpoint: https://s3.eu-central-1.amazonaws.com
+  #   region: eu-central-1
+  #   bucket: acme-gos3
+  #   prefix: gos3/
+  #   # base64 of 32 random bytes (openssl rand -base64 32): enables AES256
+  #   # and restic encryption. Back it up: without it encrypted data is lost.
+  #   encryption_key: ""
   # fsync object data before acknowledging writes (durable across power loss).
   fsync_data: true
+  # Additional backings (this one is named "default"): fs directories,
+  # memory, or buckets of remote S3 services (backend: s3, no path; with
+  # gateway: true objects are stored natively in remote buckets named like
+  # the gos3 buckets, without versioning or object lock). New buckets go to
+  # default_backing unless CreateBucket names another with the
+  # x-gos3-backing header. See docs/configuration.md and docs/backings.md.
+  # backings:
+  #   - name: hdd
+  #     path: /mnt/hdd/gos3
+  #   - name: cold
+  #     backend: s3
+  #     s3:
+  #       endpoint: https://s3.eu-central-1.amazonaws.com
+  #       region: eu-central-1
+  #       bucket: acme-gos3-cold
+  #       prefix: gos3/
+  #       # access_key / secret_key / encryption_key, or GOS3_BACKING_COLD_ACCESS_KEY,
+  #       # GOS3_BACKING_COLD_SECRET_KEY and GOS3_BACKING_COLD_ENCRYPTION_KEY
+  backings: []
+  default_backing: ""
 
 auth:
   # Root credentials. Prefer the environment (GOS3_ROOT_ACCESS_KEY /
@@ -81,9 +114,14 @@ auth:
   # opened in a browser on this machine: throwaway local demos only.
   insecure_demo_credentials: false
 
+admin:
+  # Enable the management API and saved UI settings. False also disables UI.
+  enabled: true
+
 ui:
   # Serve the embedded web UI at /_gos3/ui/.
-  enabled: true
+  # Defaults to true, or false in builds with the noui tag.
+  # enabled: true
   # Redirect browsers opening / to the UI (runtime: uiRedirect).
   redirect_root: true
 
@@ -101,11 +139,11 @@ cors:
 discovery:
   # Find other gos3 servers and let them (and the UI) find this one
   # (runtime). See docs/discovery.md.
-  enabled: true
+  enabled: false
   # Announce this server (mDNS + beacon).
-  advertise: true
-  mdns: true
-  beacon: true
+  advertise: false
+  mdns: false
+  beacon: false
   beacon_group: 239.255.73.83:7373
   beacon_interval: 10s
   # Base URLs of known servers, e.g. ["http://nas:9000"].
@@ -114,7 +152,7 @@ discovery:
   dns_srv: []
   peer_ttl: 60s
   # Allow network scans through the admin API (admin:ScanNetwork).
-  allow_scan: true
+  allow_scan: false
   max_scan_hosts: 1024
 
 logging:
@@ -135,4 +173,43 @@ metrics:
   enabled: true
   # Without authentication (otherwise admin:GetStats is required) (runtime).
   public: false
+
+compression:
+  # Transparent compression of object data (runtime). optional: each
+  # bucket decides (admin API / web UI, off by default); enforced: every
+  # bucket compresses new objects; disabled: nothing new is compressed.
+  mode: optional
+  # DEFLATE level, 1 (fastest) to 9 (smallest).
+  level: 1
+  # Objects smaller than this (when their size is known) stay uncompressed.
+  min_size: 4096
+  # Media types stored uncompressed because they are compressed already
+  # ("video/*" and "prefix*" wildcards).
+  skip_content_types:
+    - image/jpeg
+    - image/png
+    - image/gif
+    - image/webp
+    - image/avif
+    - image/heic
+    - image/heif
+    - image/jxl
+    - video/*
+    - audio/*
+    - font/woff
+    - font/woff2
+    - application/zip
+    - application/gzip
+    - application/x-gzip
+    - application/zstd
+    - application/x-bzip2
+    - application/x-xz
+    - application/x-7z-compressed
+    - application/x-rar-compressed
+    - application/vnd.rar
+    - application/x-lz4
+    - application/java-archive
+    - application/epub+zip
+    - application/vnd.openxmlformats-officedocument.*
+    - application/vnd.oasis.opendocument.*
 `

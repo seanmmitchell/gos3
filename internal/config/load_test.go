@@ -42,8 +42,8 @@ func TestDefault(t *testing.T) {
 		{"backend", c.Storage.Backend == BackendFS},
 		{"path", c.Storage.Path == "./data"},
 		{"fsync", c.Storage.FsyncData},
-		{"ui", c.UI.Enabled && c.UI.RedirectRoot},
-		{"discovery", c.Discovery.Enabled && c.Discovery.BeaconGroup == discovery.DefaultBeaconGroup},
+		{"ui", c.UI.Enabled == defaultUIEnabled && c.UI.RedirectRoot},
+		{"discovery", !c.Discovery.Enabled && !c.Discovery.Advertise && !c.Discovery.MDNS && !c.Discovery.Beacon && !c.Discovery.AllowScan && c.Discovery.BeaconGroup == discovery.DefaultBeaconGroup},
 		{"logging", c.Logging == LoggingConfig{Level: "info", Format: "text", AccessLog: true}},
 		{"lifecycle", c.Lifecycle == LifecycleConfig{Enabled: true, Interval: time.Hour}},
 		{"metrics", c.Metrics == MetricsConfig{Enabled: true}},
@@ -148,7 +148,7 @@ lifecycle:
 		{"public info (env)", c.Server.PublicInfo, false},
 		{"max object size (env)", c.Server.MaxObjectSize, int64(1 << 30)},
 		{"trust proxy (env)", c.Server.TrustProxyHeaders, true},
-		{"ui (default)", c.UI.Enabled, true},
+		{"ui (default)", c.UI.Enabled, defaultUIEnabled},
 	}
 	for _, ck := range checks {
 		if ck.got != ck.want {
@@ -293,7 +293,8 @@ func TestConfigValidate(t *testing.T) {
 		{"max object size", func(c *Config) { c.Server.MaxObjectSize = -1 }, "server.max_object_size"},
 		{"max object size huge", func(c *Config) { c.Server.MaxObjectSize = 6 << 40 }, "server.max_object_size"},
 		{"shutdown", func(c *Config) { c.Server.ShutdownTimeout = -time.Second }, "server.shutdown_timeout"},
-		{"backend", func(c *Config) { c.Storage.Backend = "s3" }, "storage.backend"},
+		{"backend", func(c *Config) { c.Storage.Backend = "bogus" }, "storage.backend"},
+		{"s3 backend without s3", func(c *Config) { c.Storage.Backend = "s3" }, "storage.s3"},
 		{"fs path", func(c *Config) { c.Storage.Path = "" }, "storage.path"},
 		{"root pair", func(c *Config) { c.Auth.RootAccessKey = "admin" }, "must be set together"},
 		{"root access key", func(c *Config) { c.Auth.RootAccessKey, c.Auth.RootSecretKey = "a b", "secret123" }, "auth.root_access_key"},

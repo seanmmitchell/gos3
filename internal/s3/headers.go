@@ -32,8 +32,8 @@ const userMetaPrefix = "x-amz-meta-"
 //     InvalidTag);
 //   - x-amz-acl is validated as an object canned ACL, private => ""; grant
 //     headers (x-amz-grant-*) => NotImplemented;
-//   - x-amz-server-side-encryption AES256 / aws:kms / aws:kms:dsse and the
-//     KMS key ID are recorded; SSE-C headers => NotImplemented;
+//   - x-amz-server-side-encryption AES256 requests object encryption;
+//     AWS KMS and SSE-C headers => NotImplemented;
 //   - x-amz-object-lock-mode / -retain-until-date (both or neither, date in
 //     the future) / -legal-hold (ON|OFF) => InvalidArgument when invalid;
 //     whether the bucket has object lock is checked by requireObjectLock;
@@ -70,7 +70,7 @@ func (s *Server) objectMetaFromHeaders(h http.Header) (storage.ObjectMeta, error
 	if m.ACL, err = validateCannedACL(h.Get("X-Amz-Acl"), false); err != nil {
 		return m, err
 	}
-	if m.SSE, m.SSEKMSKeyID, err = sseFromHeaders(h); err != nil {
+	if m.SSE, err = sseFromHeaders(h); err != nil {
 		return m, err
 	}
 	if err := s.objectLockFromHeaders(h, &m); err != nil {
@@ -185,24 +185,38 @@ func checkGrantHeaders(h http.Header) error {
 	return nil
 }
 
-// sseFromHeaders validates the server-side encryption headers.
-func sseFromHeaders(h http.Header) (sse, kmsKeyID string, err error) {
+// msgKMSNotImplemented is the NotImplemented message for every request
+// for AWS KMS encryption (object headers and bucket default encryption).
+const msgKMSNotImplemented = "AWS KMS encryption is not implemented. Use SSE-S3 (AES256)."
+
+// errKMSNotImplemented is the error of a request for AWS KMS encryption.
+func errKMSNotImplemented() error { return s3err.ErrNotImplemented.WithMessage(msgKMSNotImplemented) }
+
+// isKMS reports whether algo is an AWS KMS algorithm (aws:kms,
+// aws:kms:dsse).
+func isKMS(algo string) bool { return algo == "aws:kms" || algo == "aws:kms:dsse" }
+
+// sseFromHeaders validates the server-side encryption headers and returns
+// the requested algorithm ("" or AES256). KMS algorithms are
+// NotImplemented; unknown algorithms and a KMS key ID InvalidArgument.
+func sseFromHeaders(h http.Header) (string, error) {
 	if err := checkSSECHeaders(h); err != nil {
-		return "", "", err
+		return "", err
 	}
-	sse = trimHeaderSpace(h.Get("X-Amz-Server-Side-Encryption"))
-	switch sse {
-	case "", "AES256", "aws:kms", "aws:kms:dsse":
+	sse := trimHeaderSpace(h.Get("X-Amz-Server-Side-Encryption"))
+	switch {
+	case sse == "", sse == "AES256":
+	case isKMS(sse):
+		return "", errKMSNotImplemented()
 	default:
-		return "", "", s3err.ErrInvalidArgument.WithMessage("The encryption method specified is not supported").
+		return "", s3err.ErrInvalidArgument.WithMessage("The encryption method specified is not supported").
 			With("ArgumentName", "x-amz-server-side-encryption").With("ArgumentValue", sse)
 	}
-	kmsKeyID = trimHeaderSpace(h.Get("X-Amz-Server-Side-Encryption-Aws-Kms-Key-Id"))
-	if kmsKeyID != "" && !strings.HasPrefix(sse, "aws:kms") {
-		return "", "", s3err.ErrInvalidArgument.WithMessage("Server Side Encryption with AWS KMS managed key requires HTTP header x-amz-server-side-encryption : aws:kms").
-			With("ArgumentName", "x-amz-server-side-encryption")
+	if trimHeaderSpace(h.Get("X-Amz-Server-Side-Encryption-Aws-Kms-Key-Id")) != "" {
+		return "", s3err.ErrInvalidArgument.WithMessage("x-amz-server-side-encryption-aws-kms-key-id applies only to AWS KMS encryption, which is not implemented. Use SSE-S3 (AES256) without a KMS key ID.").
+			With("ArgumentName", "x-amz-server-side-encryption-aws-kms-key-id")
 	}
-	return sse, kmsKeyID, nil
+	return sse, nil
 }
 
 // checkSSECHeaders rejects SSE-C (customer-provided key) headers, for the
@@ -275,7 +289,7 @@ func checksumModeEnabled(h http.Header) bool {
 // (binary/octet-stream when unset), Content-Encoding/-Disposition/-Language,
 // Cache-Control, Expires, x-amz-meta-*, x-amz-version-id (when versioned),
 // x-amz-tagging-count, x-amz-storage-class (omitted for STANDARD),
-// x-amz-server-side-encryption (+ KMS key ID), x-amz-object-lock-*,
+// x-amz-server-side-encryption, x-amz-object-lock-*,
 // x-amz-mp-parts-count (multipart objects), x-amz-website-redirect-location
 // and, when checksumMode, x-amz-checksum-<algo> + x-amz-checksum-type.
 func writeObjectHeaders(w http.ResponseWriter, info storage.ObjectInfo, versioned, checksumMode bool) {
@@ -323,10 +337,7 @@ func writeObjectHeaders(w http.ResponseWriter, info storage.ObjectInfo, versione
 	if info.StorageClass != "" && info.StorageClass != "STANDARD" {
 		h.Set("X-Amz-Storage-Class", info.StorageClass)
 	}
-	set("X-Amz-Server-Side-Encryption", info.SSE)
-	if strings.HasPrefix(info.SSE, "aws:kms") {
-		set("X-Amz-Server-Side-Encryption-Aws-Kms-Key-Id", info.SSEKMSKeyID)
-	}
+	setSSEHeaders(h, info.ObjectMeta)
 	if info.RetentionMode != "" && !info.RetainUntil.IsZero() {
 		h.Set("X-Amz-Object-Lock-Mode", info.RetentionMode)
 		h.Set("X-Amz-Object-Lock-Retain-Until-Date", formatXMLTime(info.RetainUntil))

@@ -618,7 +618,8 @@ func TestComputeBucketUsage(t *testing.T) {
 		t.Fatal(err)
 	}
 	// Current objects: a/1(3) a/2(1) c/x/y(1) c/z(1) e-1(3) e-2(1) 日/本(1); b and d are deleted.
-	want := storage.BucketUsage{Objects: 7, Bytes: 11, Versions: 13, VersionBytes: 20, DeleteMarkers: 2, PendingUploads: 3}
+	want := storage.BucketUsage{Objects: 7, Bytes: 11, StoredBytes: 11, Versions: 13, VersionBytes: 20, StoredVersionBytes: 20,
+		DeleteMarkers: 2, PendingUploads: 3}
 	if u != want {
 		t.Fatalf("usage = %+v, want %+v", u, want)
 	}

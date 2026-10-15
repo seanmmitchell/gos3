@@ -223,7 +223,7 @@ func (s *Server) handlePostObject(w http.ResponseWriter, r *http.Request, rc *re
 			With("ArgumentName", "key")
 	}
 	key = strings.ReplaceAll(key, "${filename}", form.filename)
-	if err := validateObjectKey(key); err != nil {
+	if err := validateNewObjectKey(key); err != nil {
 		return err
 	}
 	fields["key"] = key
@@ -293,14 +293,18 @@ func (s *Server) handlePostObject(w http.ResponseWriter, r *http.Request, rc *re
 		auth: &auth.Result{DecodedContentLength: -1, Trailer: func() http.Header { return http.Header{} }},
 	}
 	opts := payloadOptions{}
-	if max := postPolicyMaxSize(policy); max > 0 && max < s.maxObjectSize {
+	if max := postPolicyMaxSize(policy); max >= 0 && max < s.maxObjectSize {
 		opts.MaxSize = max
+		opts.MaxSizeSet = true
 	}
 	p, err := s.newObjectPayload(&http.Request{Header: hdr}, prc, opts)
 	if err != nil {
 		return err
 	}
-	info, err := s.storeObject(ctx, rc.bucket, key, p, meta, storage.CommitOptions{}, func(m *storage.ObjectMeta) error {
+	cond := storage.CommitOptions{BeforePublish: func(m, _ *storage.ObjectMeta, created time.Time, config func(string) []byte) error {
+		return publishObjectRetention(m, created, config, objOpts.retentionSet)
+	}}
+	info, err := s.storeObject(ctx, rc.bucket, key, p, -1, meta, cond, func(m *storage.ObjectMeta) error {
 		if err := auth.CheckPostPolicy(policy, pform, p.Size()); err != nil {
 			return err
 		}

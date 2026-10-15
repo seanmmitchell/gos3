@@ -19,6 +19,7 @@
 package storagetest
 
 import (
+	"strings"
 	"testing"
 
 	"github.com/seanmmitchell/gos3/internal/storage"
@@ -57,14 +58,51 @@ func groups() []group {
 // Run runs the full conformance suite against backends produced by newBackend.
 func Run(t *testing.T, newBackend Factory) {
 	t.Helper()
+	RunWithOptions(t, newBackend, Options{})
+}
+
+// Options adjust the suite for backends with documented limitations.
+//
+// Subtests that need versioning or object lock are skipped automatically
+// when the backend answers storage.ErrNotSupported; Options are for the
+// rest.
+type Options struct {
+	// Skip maps subtest names, relative to the suite and as printed by go
+	// test (e.g. "Objects/ReaderSurvivesOverwrite/Unversioned"), to the
+	// reason they are skipped. The subtest and everything under it is
+	// skipped.
+	Skip map[string]string
+}
+
+// suite is the configuration shared by all subtests of one run.
+type suite struct {
+	factory Factory
+	root    string // name of the test that called RunWithOptions
+	skip    map[string]string
+}
+
+// skipListed skips t when Options.Skip lists it.
+func (s *suite) skipListed(t *testing.T) {
+	t.Helper()
+	if reason, ok := s.skip[strings.TrimPrefix(t.Name(), s.root+"/")]; ok {
+		t.Skip(reason)
+	}
+}
+
+// RunWithOptions is Run with options.
+func RunWithOptions(t *testing.T, newBackend Factory, opts Options) {
+	t.Helper()
 	if newBackend == nil {
 		t.Fatal("storagetest.Run: nil Factory")
 	}
+	s := &suite{factory: newBackend, root: t.Name(), skip: opts.Skip}
 	for _, g := range groups() {
 		t.Run(g.name, func(t *testing.T) {
+			s.skipListed(t)
 			for _, tc := range g.tests {
 				t.Run(tc.name, func(t *testing.T) {
-					tc.fn(newEnv(t, newBackend))
+					s.skipListed(t)
+					tc.fn(newEnv(t, s))
 				})
 			}
 		})

@@ -124,11 +124,13 @@ func pathTarget(arn func(string) string, param string) target {
 
 // api is the admin API handler.
 type api struct {
-	d       Deps
-	log     *slog.Logger
-	mux     *http.ServeMux
-	started time.Time
-	now     func() time.Time
+	// configLocks serializes encryption provider changes per bucket.
+	configLocks keyedMutex
+	d           Deps
+	log         *slog.Logger
+	mux         *http.ServeMux
+	started     time.Time
+	now         func() time.Time
 
 	usage  *ttlCache[storage.BucketUsage] // per bucket
 	totals *ttlCache[storageTotals]       // key ""
@@ -198,6 +200,21 @@ func (a *api) routes() []route {
 		{"GET", "/buckets", "ListBuckets", service, a.listBuckets},
 		{"GET", "/buckets/{name}", "GetBucket", bucket, a.getBucket},
 		{"DELETE", "/buckets/{name}", "ForceDeleteBucket", bucket, a.deleteBucket},
+		// Storage backings and bucket placement
+		{"GET", "/backings", "ListBackings", service, a.listBackings},
+		{"GET", "/backings/config", "GetConfig", service, a.getBackingConfig},
+		{"PUT", "/backings/config", "UpdateConfig", service, a.putBackingConfig},
+		{"GET", "/buckets/{name}/placement", "GetBucketPlacement", bucket, a.getPlacement},
+		{"PUT", "/buckets/{name}/placement", "UpdateBucketPlacement", bucket, a.putPlacement},
+		{"POST", "/buckets/{name}/placement/move", "UpdateBucketPlacement", bucket, a.startMove},
+		{"DELETE", "/buckets/{name}/placement/move", "UpdateBucketPlacement", bucket, a.cancelMove},
+		{"POST", "/buckets/{name}/placement/promote", "UpdateBucketPlacement", bucket, a.promote},
+		{"POST", "/buckets/{name}/placement/resync", "UpdateBucketPlacement", bucket, a.resync},
+		{"GET", "/buckets/{name}/encryption-provider", "GetBucketEncryption", bucket, a.getBucketEncryption},
+		{"PUT", "/buckets/{name}/encryption-provider", "PutBucketEncryption", bucket, a.putBucketEncryption},
+		{"GET", "/buckets/{name}/compression", "GetBucketCompression", bucket, a.getBucketCompression},
+		{"PUT", "/buckets/{name}/compression", "PutBucketCompression", bucket, a.putBucketCompression},
+		{"DELETE", "/buckets/{name}/compression", "PutBucketCompression", bucket, a.deleteBucketCompression},
 		// Discovery
 		{"GET", "/discovery", "GetDiscovery", service, a.getDiscovery},
 		{"POST", "/discovery/probe", "ProbeNetwork", service, a.probe},
@@ -472,6 +489,10 @@ func (a *api) toAPIError(err error) *apiError {
 	}
 	msg := strings.TrimPrefix(err.Error(), "iam: ")
 	msg = strings.TrimPrefix(msg, "storage: ")
+	msg = strings.TrimPrefix(msg, "multi: ")
+	if pe := placementError(err, msg); pe != nil {
+		return pe
+	}
 	switch {
 	// iam (order matters: some errors wrap others)
 	case errors.Is(err, iam.ErrUserNotFound), errors.Is(err, iam.ErrKeyNotFound), errors.Is(err, iam.ErrPolicyNotFound):
@@ -491,6 +512,10 @@ func (a *api) toAPIError(err error) *apiError {
 		return errorf(http.StatusConflict, codeConflict, "%s", msg)
 	case errors.Is(err, storage.ErrInvalidName):
 		return errorf(http.StatusBadRequest, codeInvalidName, "%s", msg)
+	case errors.Is(err, storage.ErrBackingUnavailable):
+		// A backing that cannot be reached (e.g. an s3 backing added live
+		// whose service does not answer).
+		return errorf(http.StatusServiceUnavailable, codeInternalError, "%s", msg)
 	case errors.Is(err, context.Canceled), errors.Is(err, context.DeadlineExceeded):
 		return errorf(http.StatusServiceUnavailable, codeInternalError, "request canceled or timed out: %s", msg)
 	}

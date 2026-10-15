@@ -4,9 +4,11 @@ import (
 	"context"
 	"fmt"
 	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
 
+	"github.com/seanmmitchell/gos3/internal/auth"
 	"github.com/seanmmitchell/gos3/internal/iam"
 	"github.com/seanmmitchell/gos3/internal/storage"
 )
@@ -233,6 +235,31 @@ func TestAuthzRestrictPublicBuckets(t *testing.T) {
 	}
 }
 
+func TestBroadSourceIPPolicyBlocked(t *testing.T) {
+	e := newAuthzEnv(t)
+	e.createBucket("pub")
+	e.putObject("pub", "k", []byte("x"), storage.ObjectMeta{})
+	policy := `{"Statement":[{"Effect":"Allow","Principal":"*","Action":"s3:GetObject","Resource":"arn:aws:s3:::pub/*","Condition":{"IpAddress":{"aws:SourceIp":"124.0.0.0/6"}}}]}`
+	e.putBucketConfig("pub", storage.ConfigPolicy, policy)
+	read := func() int {
+		req := httptest.NewRequest(http.MethodGet, "http://example.com/pub/k", nil)
+		req.RemoteAddr = "124.0.0.1:1234"
+		w := httptest.NewRecorder()
+		e.server.ServeHTTP(w, req)
+		return w.Code
+	}
+	if got := read(); got != http.StatusOK {
+		t.Fatalf("before RestrictPublicBuckets: got %d, want 200", got)
+	}
+	e.putBucketConfig("pub", storage.ConfigPublicAccessBlock, `<PublicAccessBlockConfiguration><RestrictPublicBuckets>true</RestrictPublicBuckets><BlockPublicPolicy>true</BlockPublicPolicy></PublicAccessBlockConfiguration>`)
+	if got := read(); got != http.StatusForbidden {
+		t.Fatalf("after RestrictPublicBuckets: got %d, want 403", got)
+	}
+	if resp := e.signed(http.MethodPut, "/pub?policy", []byte(policy), nil); resp.StatusCode != http.StatusForbidden || resp.code() != "AccessDenied" {
+		t.Fatalf("BlockPublicPolicy: %d %s", resp.StatusCode, resp.Data)
+	}
+}
+
 func TestAuthorizeHelperSecondaryResource(t *testing.T) {
 	e := newAuthzEnv(t)
 	e.createBucket("src")
@@ -279,6 +306,25 @@ func TestAuthzStoredPolicyCorruptFailsClosed(t *testing.T) {
 	}
 }
 
+func TestAuthzStoredPolicyUserARNFailsClosed(t *testing.T) {
+	e := newAuthzEnv(t)
+	e.createBucket("bad")
+	e.putBucketConfig("bad", storage.ConfigPolicy, `{"Statement":[{"Effect":"Allow","Principal":{"AWS":"arn:aws:iam::123456789012:user/team/alice"},"Action":"s3:GetObject","Resource":"arn:aws:s3:::bad/*"}]}`)
+	if resp := e.anon("GET", "/bad/k", nil, nil); resp.StatusCode != http.StatusInternalServerError {
+		t.Fatalf("stored user ARN policy did not fail closed: %d %s", resp.StatusCode, resp.Data)
+	}
+	if resp := e.signed("GET", "/bad/k", nil, nil); resp.StatusCode != http.StatusOK {
+		t.Fatalf("root read blocked by policy: %d %s", resp.StatusCode, resp.Data)
+	}
+	fixed := `{"Statement":[{"Effect":"Allow","Principal":"*","Action":"s3:GetObject","Resource":"arn:aws:s3:::bad/*"}]}`
+	if resp := e.signed("PUT", "/bad?policy", []byte(fixed), nil); resp.StatusCode != http.StatusNoContent {
+		t.Fatalf("root cannot replace policy: %d %s", resp.StatusCode, resp.Data)
+	}
+	if resp := e.anon("GET", "/bad/k", nil, nil); resp.StatusCode != http.StatusOK {
+		t.Fatalf("repaired policy not applied: %d %s", resp.StatusCode, resp.Data)
+	}
+}
+
 func TestConfigCache(t *testing.T) {
 	c := newConfigCache(3)
 	parses := 0
@@ -314,5 +360,85 @@ func TestConfigCache(t *testing.T) {
 	c.invalidate("c")
 	if c.len() != 2 {
 		t.Fatalf("invalidate: %d", c.len())
+	}
+}
+
+// TestAuthzGetObjectAttributesRequiresObjectRead checks that
+// GetObjectAttributes, whose response reveals the content's ETag (its MD5)
+// and checksums, requires s3:GetObject (s3:GetObjectVersion with a
+// versionId) besides s3:GetObjectAttributes (s3:GetObjectVersionAttributes),
+// as on AWS: missing or denying either action yields AccessDenied.
+func TestAuthzGetObjectAttributesRequiresObjectRead(t *testing.T) {
+	e := newTestEnv(t)
+	requireAuthz(t, e)
+	e.createBucket("pub")
+	info := e.putObject("pub", "k", []byte("hunter2"), storage.ObjectMeta{})
+	e.putObject("pub", "acl", []byte("hunter2"), storage.ObjectMeta{ACL: "public-read"})
+	allow := func(name string, actions ...string) auth.Credentials {
+		t.Helper()
+		e.putPolicy(name, fmt.Sprintf(`{"Statement":[{"Effect":"Allow","Action":["%s"],"Resource":"arn:aws:s3:::pub/*"}]}`, strings.Join(actions, `","`)))
+		return e.createUser(name, name)
+	}
+	e.putPolicy("attrs-deny-get", `{"Statement":[
+		{"Effect":"Allow","Action":["s3:GetObjectAttributes","s3:GetObject"],"Resource":"arn:aws:s3:::pub/*"},
+		{"Effect":"Deny","Action":"s3:GetObject","Resource":"arn:aws:s3:::pub/*"}]}`)
+	denyGet := e.createUser("attrs-deny-get", "attrs-deny-get")
+	attrsOnly := allow("attrs-only", "s3:GetObjectAttributes")
+	both := allow("attrs-get", "s3:GetObjectAttributes", "s3:GetObject")
+	versionAttrsOnly := allow("vattrs-get", "s3:GetObjectVersionAttributes", "s3:GetObject")
+	versionBoth := allow("vattrs-getversion", "s3:GetObjectVersionAttributes", "s3:GetObjectVersion")
+
+	hdr := http.Header{"X-Amz-Object-Attributes": {"ETag,ObjectSize"}}
+	vpath := "/pub/k?attributes&versionId=" + info.VersionID
+	for _, tc := range []struct {
+		who    string
+		creds  auth.Credentials
+		path   string
+		status int
+	}{
+		{"attributes only", attrsOnly, "/pub/k?attributes", 403},
+		{"attributes, GetObject denied", denyGet, "/pub/k?attributes", 403},
+		{"attributes and GetObject", both, "/pub/k?attributes", 200},
+		{"version: GetObject but not GetObjectVersion", versionAttrsOnly, vpath, 403},
+		{"version: GetObjectAttributes but not GetObjectVersionAttributes", both, vpath, 403},
+		{"version: both version actions", versionBoth, vpath, 200},
+	} {
+		resp := e.signedAs(tc.creds, "GET", tc.path, nil, hdr)
+		if resp.StatusCode != tc.status {
+			t.Errorf("%s: GET %s = %d %s, want %d", tc.who, tc.path, resp.StatusCode, resp.Data, tc.status)
+			continue
+		}
+		if tc.status == 403 {
+			if resp.code() != "AccessDenied" {
+				t.Errorf("%s: code %s", tc.who, resp.code())
+			}
+			if strings.Contains(string(resp.Data), md5Hex([]byte("hunter2"))) {
+				t.Errorf("%s: ETag revealed: %s", tc.who, resp.Data)
+			}
+		}
+	}
+
+	// Anonymous callers: the bucket policy must grant both actions; the
+	// object's canned ACL can stand in for s3:GetObject.
+	e.putBucketConfig("pub", storage.ConfigPolicy, `{"Statement":[{"Effect":"Allow","Principal":"*","Action":"s3:GetObjectAttributes","Resource":"arn:aws:s3:::pub/*"}]}`)
+	if resp := e.anon("GET", "/pub/k?attributes", nil, hdr); resp.StatusCode != 403 {
+		t.Errorf("anonymous, attributes only: %d %s", resp.StatusCode, resp.Data)
+	}
+	if resp := e.anon("GET", "/pub/acl?attributes", nil, hdr); resp.StatusCode != 200 {
+		t.Errorf("anonymous, attributes + public-read object ACL: %d %s", resp.StatusCode, resp.Data)
+	}
+	e.putBucketConfig("pub", storage.ConfigPolicy, `{"Statement":[{"Effect":"Allow","Principal":"*","Action":["s3:GetObjectAttributes","s3:GetObject"],"Resource":"arn:aws:s3:::pub/*"}]}`)
+	if resp := e.anon("GET", "/pub/k?attributes", nil, hdr); resp.StatusCode != 200 {
+		t.Errorf("anonymous, both: %d %s", resp.StatusCode, resp.Data)
+	}
+	e.putBucketConfig("pub", storage.ConfigPolicy, `{"Statement":[
+		{"Effect":"Allow","Principal":"*","Action":["s3:GetObjectAttributes","s3:GetObject"],"Resource":"arn:aws:s3:::pub/*"},
+		{"Effect":"Deny","Principal":"*","Action":"s3:GetObject","Resource":"arn:aws:s3:::pub/*"}]}`)
+	if resp := e.anon("GET", "/pub/acl?attributes", nil, hdr); resp.StatusCode != 403 {
+		t.Errorf("anonymous, GetObject denied by the bucket policy: %d %s", resp.StatusCode, resp.Data)
+	}
+	// A bucket policy Deny of s3:GetObject also binds IAM users.
+	if resp := e.signedAs(both, "GET", "/pub/k?attributes", nil, hdr); resp.StatusCode != 403 {
+		t.Errorf("user, GetObject denied by the bucket policy: %d %s", resp.StatusCode, resp.Data)
 	}
 }

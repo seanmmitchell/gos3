@@ -103,7 +103,10 @@ func (s *Server) reauthorizeOp(ctx context.Context, r *http.Request, rc *reqCont
 		t.Bucket, t.Key = rc.bucket, rc.key
 	}
 	t.Conditions = s.requestTimeConditions(r, rc, t.ObjectAttrs)
-	return s.authorizeTarget(ctx, r, rc, t)
+	if err := s.authorizeTarget(ctx, r, rc, t); err != nil {
+		return err
+	}
+	return s.authorizeObjectRead(ctx, r, rc, t)
 }
 
 // requestTimeConditions returns the condition keys derived from the clock

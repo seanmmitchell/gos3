@@ -1,0 +1,191 @@
+package config
+
+import (
+	"errors"
+	"fmt"
+	"path/filepath"
+	"regexp"
+	"slices"
+	"strings"
+	"time"
+)
+
+// backingNameRe matches valid backing names.
+var backingNameRe = regexp.MustCompile(`^[a-z0-9][a-z0-9_-]{0,31}$`)
+
+// BackingNames returns the names of every backing: DefaultBackingName
+// first, then storage.backings in order.
+func (c Config) BackingNames() []string {
+	names := []string{DefaultBackingName}
+	for _, b := range c.Storage.Backings {
+		names = append(names, b.Name)
+	}
+	return names
+}
+
+// validateBackings checks storage.backings, storage.default_backing and
+// storage.replication.
+func (c Config) validateBackings() error {
+	if len(c.Storage.Backings) > MaxBackings {
+		return fmt.Errorf("storage.backings: at most %d backings allowed", MaxBackings)
+	}
+	paths := map[string]string{} // cleaned absolute path -> key naming it
+	if c.Storage.Path != "" {
+		if abs, err := filepath.Abs(c.Storage.Path); err == nil {
+			paths[abs] = "storage.path"
+		}
+	}
+	names := map[string]bool{DefaultBackingName: true}
+	var places []s3Place
+	gateways := map[string]bool{}
+	if c.Storage.Backend == BackendS3 && c.Storage.S3 != nil {
+		s := c.Storage.S3
+		places = append(places, s3Place{"storage.s3", s3Server(s.Endpoint), s.Bucket, s.Prefix})
+		gateways[DefaultBackingName] = s.Gateway
+	}
+	envNames := map[string]string{} // GOS3_BACKING_<NAME> part -> s3 backing name
+	for i, b := range c.Storage.Backings {
+		key := fmt.Sprintf("storage.backings[%d]", i)
+		switch {
+		case b.Name == DefaultBackingName:
+			return fmt.Errorf("%s.name: %q is reserved for the backing configured by storage.backend and storage.path", key, b.Name)
+		case !backingNameRe.MatchString(b.Name):
+			return fmt.Errorf("%s.name: %q must be 1-32 characters of a-z, 0-9, _ and -, starting with a letter or digit", key, b.Name)
+		case names[b.Name]:
+			return fmt.Errorf("%s.name: %q is used twice", key, b.Name)
+		}
+		names[b.Name] = true
+		if b.Backend != BackendS3 && b.S3 != nil {
+			return fmt.Errorf("%s.s3: only allowed with backend s3", key)
+		}
+		switch b.Backend {
+		case BackendS3:
+			if b.Path != "" {
+				return fmt.Errorf("%s.path: an s3 backing has no path (its data and metadata live in the remote bucket)", key)
+			}
+			if b.S3 == nil {
+				return fmt.Errorf("%s.s3: required for an s3 backing", key)
+			}
+			if err := validateS3(key+".s3", b.Name, *b.S3); err != nil {
+				return err
+			}
+			if other, dup := envNames[backingEnvName(b.Name)]; dup {
+				return fmt.Errorf("%s.name: %q and %q share the environment variables %s_*; rename one",
+					key, b.Name, other, strings.TrimSuffix(BackingEnv(b.Name, ""), "_"))
+			}
+			envNames[backingEnvName(b.Name)] = b.Name
+			places = append(places, s3Place{key + ".s3", s3Server(b.S3.Endpoint), b.S3.Bucket, b.S3.Prefix})
+			gateways[b.Name] = b.S3.Gateway
+		case BackendFS:
+			if b.Path == "" {
+				return fmt.Errorf("%s.path: required for an %s backing", key, b.Backend)
+			}
+			abs, err := filepath.Abs(b.Path)
+			if err != nil {
+				return fmt.Errorf("%s.path: %w", key, err)
+			}
+			if other, dup := paths[abs]; dup {
+				return fmt.Errorf("%s.path: %q is also used by %s; every backing needs its own directory", key, b.Path, other)
+			}
+			paths[abs] = key + ".path"
+		case BackendMemory:
+			if b.Path != "" {
+				return fmt.Errorf("%s.path: a memory backing has no path", key)
+			}
+		default:
+			return fmt.Errorf("%s.backend: %q is invalid (expected fs, memory or s3)", key, b.Backend)
+		}
+	}
+	if c.Storage.Backend == BackendS3 && c.Storage.S3 != nil {
+		if err := validateS3("storage.s3", DefaultBackingName, *c.Storage.S3); err != nil {
+			return err
+		}
+	}
+	if err := checkS3Overlap(places); err != nil {
+		return err
+	}
+	// No backing directory may contain another one's system directory
+	// (gos3 keeps its metadata in <path>/.gos3).
+	for p, k := range paths {
+		for q, kq := range paths {
+			if p != q && (q == filepath.Join(p, SystemDirName) || strings.HasPrefix(q, filepath.Join(p, SystemDirName)+string(filepath.Separator))) {
+				return fmt.Errorf("%s: %q is inside the system directory of %s", kq, q, k)
+			}
+		}
+	}
+
+	def := c.Storage.DefaultBacking
+	if def == "" {
+		def = DefaultBackingName
+	}
+	if !names[def] {
+		return fmt.Errorf("storage.default_backing: unknown backing %q (expected one of %s)", def, strings.Join(c.BackingNames(), ", "))
+	}
+	rp := c.Storage.Replication
+	switch rp.DefaultMode {
+	case "", ReplicationSingle, ReplicationActivePassive, ReplicationActiveActive:
+	default:
+		return fmt.Errorf("storage.replication.default_mode: %q is invalid (expected single, active-passive or active-active)", rp.DefaultMode)
+	}
+	for i, r := range rp.DefaultReplicas {
+		switch {
+		case !names[r]:
+			return fmt.Errorf("storage.replication.default_replicas[%d]: unknown backing %q", i, r)
+		case r == def:
+			return fmt.Errorf("storage.replication.default_replicas[%d]: %q is the default backing, where new buckets have their primary copy", i, r)
+		case slices.Contains(rp.DefaultReplicas[:i], r):
+			return fmt.Errorf("storage.replication.default_replicas[%d]: %q is listed twice", i, r)
+		case gateways[r]:
+			return fmt.Errorf("storage.replication.default_replicas[%d]: %q is an s3 gateway backing, which cannot hold replicas", i, r)
+		}
+	}
+	if gateways[def] && len(rp.DefaultReplicas) > 0 {
+		return fmt.Errorf("storage.replication.default_replicas: the default backing %q is an s3 gateway backing, whose buckets cannot be replicated; "+
+			"choose another storage.default_backing or remove the default replicas", def)
+	}
+	if rp.DefaultMode == ReplicationSingle && len(rp.DefaultReplicas) > 0 {
+		return errors.New("storage.replication.default_mode: single takes no default_replicas")
+	}
+	if (rp.DefaultMode == ReplicationActivePassive || rp.DefaultMode == ReplicationActiveActive) && len(rp.DefaultReplicas) == 0 {
+		return fmt.Errorf("storage.replication.default_mode: %s needs storage.replication.default_replicas", rp.DefaultMode)
+	}
+	// Zero values mean the defaults (filled in by Normalize).
+	if rp.Workers < 0 || rp.Workers > MaxReplicationWorkers {
+		return fmt.Errorf("storage.replication.workers: must be between 1 and %d (0 = default %d), got %d",
+			MaxReplicationWorkers, DefaultReplicationWorkers, rp.Workers)
+	}
+	if hi := rp.HealthInterval; hi != 0 && (hi < time.Second || hi > time.Hour) {
+		return fmt.Errorf("storage.replication.health_interval: must be between 1s and 1h, got %s", hi)
+	}
+	if ct := rp.CutoverTimeout; ct != 0 && (ct < time.Second || ct > time.Hour) {
+		return fmt.Errorf("storage.replication.cutover_timeout: must be between 1s and 1h, got %s", ct)
+	}
+	return nil
+}
+
+// backingsList parses GOS3_STORAGE_BACKINGS: comma-separated entries
+// "name=/path" (an fs backing), "name=fs:/path", "name=memory" or "name=s3"
+// (an s3 backing configured by its GOS3_BACKING_<NAME>_* variables, see
+// BackingEnv). An entry without "=" names an fs backing without a path
+// (refused by Validate).
+func backingsList(c *Config, v string) error {
+	var out []BackingConfig
+	for _, e := range SplitList(v) {
+		name, spec, _ := strings.Cut(e, "=")
+		b := BackingConfig{Name: strings.TrimSpace(name), Backend: BackendFS}
+		spec = strings.TrimSpace(spec)
+		switch {
+		case spec == BackendMemory:
+			b.Backend = BackendMemory
+		case spec == BackendS3:
+			b.Backend, b.S3 = BackendS3, &S3Config{}
+		case strings.HasPrefix(spec, BackendFS+":"):
+			b.Path = strings.TrimPrefix(spec, BackendFS+":")
+		default:
+			b.Path = spec
+		}
+		out = append(out, b)
+	}
+	c.Storage.Backings = out
+	return nil
+}

@@ -7,12 +7,11 @@ import (
 	"fmt"
 	"io"
 	"slices"
-	"sort"
-	"strings"
 	"sync"
-	"unicode/utf8"
 
 	"github.com/seanmmitchell/gos3/internal/storage"
+	"github.com/seanmmitchell/gos3/internal/storage/compress"
+	"github.com/seanmmitchell/gos3/internal/storage/index"
 )
 
 // errWriterDone is returned when writing to or committing a writer that was
@@ -22,14 +21,8 @@ var errWriterDone = errors.New("memory: writer already committed or aborted")
 // errReaderClosed is returned by reads on a closed object reader.
 var errReaderClosed = errors.New("memory: read on closed object reader")
 
-// validKey reports whether the backend can store key. S3 keys are non-empty
-// UTF-8; length limits are enforced by the S3 layer.
-func validKey(key string) error {
-	if key == "" || !utf8.ValidString(key) {
-		return fmt.Errorf("%w: object key %q", storage.ErrInvalidName, key)
-	}
-	return nil
-}
+// validKey reports whether the backend can store key.
+func validKey(key string) error { return index.ValidKey(key) }
 
 // --- writer ---
 
@@ -40,10 +33,31 @@ type objectWriter struct {
 	mu   sync.Mutex
 	buf  []byte
 	done bool
+	// zw compresses into buf when the version is stored compressed.
+	zw          *compress.Writer
+	compression string
+	encryption  string
 }
+
+// The optional storage interface implemented by NewObjectWriterWith and
+// CompleteMultipartUploadWith.
+var _ storage.CompressingBackend = (*Backend)(nil)
 
 // NewObjectWriter starts writing a new version of bucket/key.
 func (b *Backend) NewObjectWriter(ctx context.Context, bucketName, key string) (storage.ObjectWriter, error) {
+	return b.NewObjectWriterWith(ctx, bucketName, key, storage.WriteOptions{})
+}
+
+// NewObjectWriterWith is NewObjectWriter with write options: with
+// opts.Compression the data is kept in the compress package's format (see
+// storage.CompressingBackend).
+func (b *Backend) NewObjectWriterWith(ctx context.Context, bucketName, key string, opts storage.WriteOptions) (storage.ObjectWriter, error) {
+	if opts.Encryption != "" && opts.Encryption != storage.EncryptionAES256 {
+		return nil, errors.ErrUnsupported
+	}
+	if err := checkCompression(opts.Compression); err != nil {
+		return nil, err
+	}
 	if err := validKey(key); err != nil {
 		return nil, err
 	}
@@ -52,7 +66,14 @@ func (b *Backend) NewObjectWriter(ctx context.Context, bucketName, key string) (
 		return nil, err
 	}
 	bk.mu.RUnlock()
-	return &objectWriter{b: b, bk: bk, key: key}, nil
+	w := &objectWriter{b: b, bk: bk, key: key, encryption: opts.Encryption}
+	if opts.Compression.Enabled() {
+		w.compression = opts.Compression.Algorithm
+		if w.zw, err = compress.NewWriter((*appendWriter)(&w.buf), opts.Compression.Level); err != nil {
+			return nil, err
+		}
+	}
+	return w, nil
 }
 
 func (w *objectWriter) Write(p []byte) (int, error) {
@@ -61,8 +82,54 @@ func (w *objectWriter) Write(p []byte) (int, error) {
 	if w.done {
 		return 0, errWriterDone
 	}
+	if w.zw != nil {
+		return w.zw.Write(p)
+	}
 	w.buf = append(w.buf, p...)
 	return len(p), nil
+}
+
+// appendWriter is an io.Writer appending to a byte slice.
+type appendWriter []byte
+
+func (a *appendWriter) Write(p []byte) (int, error) {
+	*a = append(*a, p...)
+	return len(p), nil
+}
+
+// checkCompression validates c before any data is written.
+func checkCompression(c storage.Compression) error {
+	switch c.Algorithm {
+	case "":
+		return nil
+	case storage.CompressionDeflate:
+		if !compress.ValidLevel(c.Level) {
+			return fmt.Errorf("memory: invalid deflate level %d", c.Level)
+		}
+		return nil
+	default:
+		return fmt.Errorf("memory: unsupported compression algorithm %q", c.Algorithm)
+	}
+}
+
+// stored is how the data of a new version is kept: compressed (algorithm
+// set, size = content size) or as is (zero value).
+type stored struct {
+	compression string
+	size        int64
+}
+
+// content describes data, kept as enc says, for the index; nil data is
+// stored as an empty slice.
+func content(data []byte, enc stored) index.Content[[]byte] {
+	if data == nil {
+		data = []byte{}
+	}
+	c := index.Content[[]byte]{Data: data, Size: int64(len(data))}
+	if enc.compression != "" {
+		c.Compression, c.Size, c.StoredSize = enc.compression, enc.size, int64(len(data))
+	}
+	return c
 }
 
 func (w *objectWriter) Commit(ctx context.Context, meta storage.ObjectMeta, opts storage.CommitOptions) (storage.ObjectInfo, error) {
@@ -72,6 +139,17 @@ func (w *objectWriter) Commit(ctx context.Context, meta storage.ObjectMeta, opts
 		return storage.ObjectInfo{}, errWriterDone
 	}
 	w.done = true
+	var enc stored
+	if w.zw != nil {
+		if err := w.zw.Close(); err != nil {
+			w.buf = nil
+			w.mu.Unlock()
+			return storage.ObjectInfo{}, err
+		}
+		if w.zw.Size() > 0 {
+			enc = stored{compression: w.compression, size: w.zw.Size()}
+		}
+	}
 	data := slices.Clip(w.buf)
 	w.buf = nil
 	w.mu.Unlock()
@@ -80,100 +158,28 @@ func (w *objectWriter) Commit(ctx context.Context, meta storage.ObjectMeta, opts
 		return storage.ObjectInfo{}, err
 	}
 	defer w.bk.mu.Unlock()
-	return w.b.commitLocked(w.bk, w.key, data, meta, opts)
+	meta.Encryption = w.encryption
+	return w.b.commitLocked(w.bk, w.key, data, enc, meta, opts)
 }
 
 func (w *objectWriter) Abort() error {
 	w.mu.Lock()
 	defer w.mu.Unlock()
+	if !w.done && w.zw != nil {
+		w.zw.Abandon()
+	}
 	w.done = true
 	w.buf = nil
 	return nil
 }
 
-// etagMatches compares an If-Match value with a stored (unquoted) ETag. "*"
-// matches any current object; surrounding quotes are tolerated.
-func etagMatches(cond, etag string) bool {
-	cond = strings.TrimSpace(cond)
-	if cond == "*" {
-		return true
-	}
-	if len(cond) >= 2 && cond[0] == '"' && cond[len(cond)-1] == '"' {
-		cond = cond[1 : len(cond)-1]
-	}
-	return cond == etag
-}
-
-// checkPreconditions evaluates opts against the current latest version of
-// obj (nil when the key does not exist).
-func checkPreconditions(obj *object, opts storage.CommitOptions) error {
-	var cur *version
-	if obj != nil {
-		if l := obj.latest(); !l.deleteMarker {
-			cur = l
-		}
-	}
-	if opts.IfNoneMatch && cur != nil {
-		return fmt.Errorf("%w: object exists (If-None-Match)", storage.ErrPreconditionFailed)
-	}
-	if opts.IfMatch != "" && (cur == nil || !etagMatches(opts.IfMatch, cur.meta.ETag)) {
-		return fmt.Errorf("%w: ETag mismatch (If-Match)", storage.ErrPreconditionFailed)
-	}
-	return nil
-}
-
-// commitLocked publishes data as a new version of key in bk, applying
-// conditional checks and versioning semantics. bk must be write-locked; data
-// is taken over by the backend and must not be modified afterwards.
-func (b *Backend) commitLocked(bk *bucket, key string, data []byte, meta storage.ObjectMeta, opts storage.CommitOptions) (storage.ObjectInfo, error) {
-	obj, _ := bk.objects.Get(key)
-	if err := checkPreconditions(obj, opts); err != nil {
-		return storage.ObjectInfo{}, err
-	}
-	if data == nil {
-		data = []byte{}
-	}
-	v := &version{meta: cloneMeta(meta), data: data}
-	b.addVersionLocked(bk, key, obj, v)
-	return v.info(bk.info.Name, key, true), nil
-}
-
-// addVersionLocked stamps v, assigns its version ID per the bucket's
-// versioning status (replacing an existing null version when the new one is
-// null) and makes it the latest version of key. obj may be nil.
-func (b *Backend) addVersionLocked(bk *bucket, key string, obj *object, v *version) {
-	v.stamp, v.lastModified = b.nextStamp()
-	if bk.info.Versioning == storage.VersioningEnabled {
-		v.id = newVersionID(v.stamp)
-	} else {
-		v.id = storage.NullVersionID
-	}
-	if obj == nil {
-		obj = &object{}
-		bk.objects.Set(key, obj)
-	} else if v.id == storage.NullVersionID {
-		if i := obj.indexByID(storage.NullVersionID); i >= 0 {
-			obj.removeAt(i)
-		}
-	}
-	obj.versions = append(obj.versions, v)
-}
-
-// findVersion locates a version of key. versionID "" selects the latest.
-func findVersion(bk *bucket, key, versionID string) (*object, int, error) {
-	obj, ok := bk.objects.Get(key)
-	if versionID == "" {
-		if !ok {
-			return nil, -1, fmt.Errorf("%w: %s/%s", storage.ErrObjectNotFound, bk.info.Name, key)
-		}
-		return obj, len(obj.versions) - 1, nil
-	}
-	if ok {
-		if i := obj.indexByID(versionID); i >= 0 {
-			return obj, i, nil
-		}
-	}
-	return nil, -1, fmt.Errorf("%w: %s/%s version %q", storage.ErrVersionNotFound, bk.info.Name, key, versionID)
+// commitLocked publishes data (stored as enc says) as a new version of key
+// in bk, applying conditional checks and versioning semantics (see
+// index.Bucket.Commit). bk must be write-locked; data is taken over by the
+// backend and must not be modified afterwards.
+func (b *Backend) commitLocked(bk *bucket, key string, data []byte, enc stored, meta storage.ObjectMeta, opts storage.CommitOptions) (storage.ObjectInfo, error) {
+	info, _, err := bk.ix.Commit(key, content(data, enc), meta, opts)
+	return info, err
 }
 
 // GetObjectInfo returns metadata for a version ("" = latest, which may be a
@@ -185,11 +191,11 @@ func (b *Backend) GetObjectInfo(ctx context.Context, bucketName, key, versionID 
 		return storage.ObjectInfo{}, err
 	}
 	defer bk.mu.RUnlock()
-	obj, i, err := findVersion(bk, key, versionID)
+	v, latest, err := bk.ix.Find(key, versionID)
 	if err != nil {
 		return storage.ObjectInfo{}, err
 	}
-	return obj.versions[i].info(bk.info.Name, key, i == len(obj.versions)-1), nil
+	return v.Info(bk.ix.Info.Name, key, latest), nil
 }
 
 // objectReader is an immutable snapshot reader over one version's data.
@@ -258,16 +264,22 @@ func (b *Backend) OpenObject(ctx context.Context, bucketName, key, versionID str
 		return storage.ObjectInfo{}, nil, err
 	}
 	defer bk.mu.RUnlock()
-	obj, i, err := findVersion(bk, key, versionID)
+	v, latest, err := bk.ix.Find(key, versionID)
 	if err != nil {
 		return storage.ObjectInfo{}, nil, err
 	}
-	v := obj.versions[i]
-	info := v.info(bk.info.Name, key, i == len(obj.versions)-1)
-	if v.deleteMarker {
+	info := v.Info(bk.ix.Info.Name, key, latest)
+	if v.DeleteMarker {
 		return info, nil, nil
 	}
-	return info, newObjectReader(v.data), nil
+	if v.Compression != "" {
+		z, err := compress.NewReader(bytes.NewReader(v.Data), int64(len(v.Data)))
+		if err != nil {
+			return storage.ObjectInfo{}, nil, fmt.Errorf("memory: open %s/%s: %w", bucketName, key, err)
+		}
+		return info, z, nil
+	}
+	return info, newObjectReader(v.Data), nil
 }
 
 // UpdateObjectMeta atomically mutates the metadata of an existing version.
@@ -300,25 +312,8 @@ func (b *Backend) updateObjectMeta(ctx context.Context, bucketName, key, version
 		return storage.ObjectInfo{}, err
 	}
 	defer bk.mu.Unlock()
-	obj, i, err := findVersion(bk, key, versionID)
-	if err != nil {
-		return storage.ObjectInfo{}, err
-	}
-	v := obj.versions[i]
-	if v.deleteMarker {
-		return storage.ObjectInfo{}, fmt.Errorf("%w: %s/%s version %q is a delete marker", storage.ErrObjectNotFound, bk.info.Name, key, v.id)
-	}
-	if check != nil {
-		if err := check(v.info(bk.info.Name, key, i == len(obj.versions)-1)); err != nil {
-			return storage.ObjectInfo{}, err
-		}
-	}
-	m := cloneMeta(v.meta)
-	if err := fn(&m); err != nil {
-		return storage.ObjectInfo{}, err
-	}
-	v.meta = cloneMeta(m)
-	return v.info(bk.info.Name, key, i == len(obj.versions)-1), nil
+	info, _, err := bk.ix.UpdateMeta(key, versionID, check, fn)
+	return info, err
 }
 
 // DeleteObject deletes a version or creates a delete marker per S3 semantics
@@ -330,7 +325,8 @@ func (b *Backend) DeleteObject(ctx context.Context, bucketName, key, versionID s
 		return storage.DeleteResult{}, err
 	}
 	defer bk.mu.Unlock()
-	return b.deleteLocked(bk, key, versionID)
+	res, _, err := bk.ix.Delete(key, versionID)
+	return res, err
 }
 
 // DeleteObjectIf is DeleteObject made conditional on check, which is called
@@ -360,84 +356,22 @@ func (b *Backend) deleteChecked(ctx context.Context, bucketName, key, versionID 
 		return storage.DeleteResult{}, err
 	}
 	defer bk.mu.Unlock()
-	obj, i, err := findVersion(bk, key, versionID)
-	switch {
-	case err == nil:
-		err = check(obj.versions[i].info(bk.info.Name, key, i == len(obj.versions)-1), true)
-	case absentOK && versionID == "" && errors.Is(err, storage.ErrObjectNotFound):
-		err = check(storage.ObjectInfo{}, false)
-	}
-	if err != nil {
-		return storage.DeleteResult{}, err
-	}
-	return b.deleteLocked(bk, key, versionID)
-}
-
-// deleteLocked implements DeleteObject with the bucket's write lock held.
-func (b *Backend) deleteLocked(bk *bucket, key, versionID string) (storage.DeleteResult, error) {
-	if versionID != "" {
-		obj, i, err := findVersion(bk, key, versionID)
-		if err != nil {
-			return storage.DeleteResult{}, err
-		}
-		v := obj.removeAt(i)
-		if len(obj.versions) == 0 {
-			bk.objects.Delete(key)
-		}
-		return storage.DeleteResult{VersionID: v.id, DeleteMarker: v.deleteMarker}, nil
-	}
-
-	obj, _ := bk.objects.Get(key)
-	switch bk.info.Versioning {
-	case storage.VersioningUnversioned:
-		if obj != nil {
-			if i := obj.indexByID(storage.NullVersionID); i >= 0 {
-				obj.removeAt(i)
-				if len(obj.versions) == 0 {
-					bk.objects.Delete(key)
-				}
-			}
-		}
-		return storage.DeleteResult{}, nil
-	default: // Enabled or Suspended: add a delete marker.
-		if err := validKey(key); err != nil {
-			return storage.DeleteResult{}, err
-		}
-		dm := &version{deleteMarker: true}
-		b.addVersionLocked(bk, key, obj, dm)
-		return storage.DeleteResult{VersionID: dm.id, DeleteMarker: true}, nil
-	}
+	res, _, err := bk.ix.DeleteIf(key, versionID, check, absentOK)
+	return res, err
 }
 
 // --- walks ---
 
-const (
-	walkMinBatch = 16
-	walkMaxBatch = 1024
-)
-
-// nextBatch grows walk batches geometrically so that walks stopped early
-// (the list helpers stop after one item on every common prefix) copy little,
-// while long walks amortise locking.
-func nextBatch(n int) int {
-	if n*2 > walkMaxBatch {
-		return walkMaxBatch
-	}
-	return n * 2
-}
-
-// callWalk invokes fn for each item; it reports stop=true when fn asked to
-// stop (err nil) or failed (err non-nil).
-func callWalk(items []storage.ObjectInfo, fn func(storage.ObjectInfo) error) (bool, error) {
-	for _, it := range items {
-		if err := fn(it); err != nil {
-			if errors.Is(err, storage.ErrStopWalk) {
-				return true, nil
-			}
-			return true, err
+// walkAcquire returns the acquire function of the index walk helpers for
+// a bucket: each call looks the bucket up and read-locks it.
+func (b *Backend) walkAcquire(ctx context.Context, bucketName string) func() (*index.Bucket[[]byte], func(), error) {
+	return func() (*index.Bucket[[]byte], func(), error) {
+		bk, err := b.rlockBucket(ctx, bucketName)
+		if err != nil {
+			return nil, nil, err
 		}
+		return bk.ix, bk.mu.RUnlock, nil
 	}
-	return false, nil
 }
 
 // WalkObjects calls fn with the latest version of each key (skipping keys
@@ -448,52 +382,7 @@ func (b *Backend) WalkObjects(ctx context.Context, bucketName, prefix, after str
 	if fn == nil {
 		return errors.New("memory: nil walk function")
 	}
-	cursor := after
-	inclusive := false // seek > cursor, or >= prefix when cursor < prefix
-	if after < prefix {
-		cursor, inclusive = prefix, true
-	}
-	batch := walkMinBatch
-	for {
-		bk, err := b.rlockBucket(ctx, bucketName)
-		if err != nil {
-			return err
-		}
-		var n *slNode[*object]
-		if inclusive {
-			n = bk.objects.SeekGE(cursor)
-		} else {
-			n = bk.objects.SeekGT(cursor)
-		}
-		items := make([]storage.ObjectInfo, 0, batch)
-		scanned, done := 0, true
-		for ; n != nil; n = n.Next() {
-			if !strings.HasPrefix(n.key, prefix) {
-				break
-			}
-			if len(items) == batch || scanned == 4*batch {
-				done = false
-				break
-			}
-			scanned++
-			cursor, inclusive = n.key, false
-			if l := n.val.latest(); !l.deleteMarker {
-				items = append(items, l.info(bk.info.Name, n.key, true))
-			}
-		}
-		bk.mu.RUnlock()
-
-		if stop, err := callWalk(items, fn); stop || err != nil {
-			return err
-		}
-		if done {
-			return nil
-		}
-		if err := checkCtx(ctx); err != nil {
-			return err
-		}
-		batch = nextBatch(batch)
-	}
+	return index.WalkObjects(ctx, b.walkAcquire(ctx, bucketName), prefix, after, fn)
 }
 
 // WalkVersions calls fn for every version and delete marker of keys with the
@@ -501,111 +390,12 @@ func (b *Backend) WalkObjects(ctx context.Context, bucketName, prefix, after str
 // starting after (keyMarker, versionIDMarker) per S3 ListObjectVersions
 // semantics. If versionIDMarker is not a version of keyMarker, the walk
 // resumes at the position the ID would occupy when it is an ID generated by
-// this backend (e.g. a version deleted between pages), and otherwise after
-// all versions of keyMarker. fn runs with no lock held.
+// this backend (e.g. a version deleted between pages), with every version of
+// keyMarker when it is "null" (a deleted null version has no position), and
+// otherwise after all versions of keyMarker. fn runs with no lock held.
 func (b *Backend) WalkVersions(ctx context.Context, bucketName, prefix, keyMarker, versionIDMarker string, fn func(storage.ObjectInfo) error) error {
 	if fn == nil {
 		return errors.New("memory: nil walk function")
 	}
-	// Position: either strictly after all versions of key (below == 0) or
-	// at the versions of key whose stamp is < below. inclusive means "seek
-	// to the first key >= key" (initial position at the prefix).
-	//
-	// midKey is set when a batch ended inside the versions of key: the
-	// newest of them was already delivered, so none of the remaining ones
-	// is reported as latest even if newer versions were deleted meanwhile
-	// (IsLatest marks at most the first entry delivered for a key).
-	var (
-		key       string
-		below     uint64
-		inclusive bool
-		midKey    bool
-	)
-	switch {
-	case keyMarker == "" || keyMarker < prefix:
-		key, inclusive = prefix, true
-	case versionIDMarker == "":
-		key = keyMarker
-	default:
-		key = keyMarker
-		bk, err := b.rlockBucket(ctx, bucketName)
-		if err != nil {
-			return err
-		}
-		if obj, ok := bk.objects.Get(keyMarker); ok {
-			if i := obj.indexByID(versionIDMarker); i >= 0 {
-				below = obj.versions[i].stamp
-			}
-		}
-		bk.mu.RUnlock()
-		if below == 0 {
-			if s, ok := stampFromVersionID(versionIDMarker); ok {
-				below = s
-			}
-		}
-	}
-
-	batch := walkMinBatch
-	for {
-		bk, err := b.rlockBucket(ctx, bucketName)
-		if err != nil {
-			return err
-		}
-		items := make([]storage.ObjectInfo, 0, batch)
-		done := true
-		var n *slNode[*object]
-		switch {
-		case inclusive:
-			n = bk.objects.SeekGE(key)
-		case below != 0:
-			n = bk.objects.SeekGE(key)
-			if n != nil && n.key != key {
-				// key vanished; continue with the following keys.
-				below = 0
-			}
-		default:
-			n = bk.objects.SeekGT(key)
-		}
-	scan:
-		for ; n != nil; n = n.Next() {
-			if !strings.HasPrefix(n.key, prefix) {
-				break
-			}
-			if len(items) == batch {
-				// Resume at n: the current position (after the previous key,
-				// or within the marker key) is still accurate.
-				done = false
-				break
-			}
-			vs := n.val.versions
-			top := len(vs) - 1
-			continued := false
-			if below != 0 && n.key == key {
-				// Only versions strictly older than the marker.
-				top = sort.Search(len(vs), func(i int) bool { return vs[i].stamp >= below }) - 1
-				continued = midKey
-			}
-			for j := top; j >= 0; j-- {
-				items = append(items, vs[j].info(bk.info.Name, n.key, !continued && j == len(vs)-1))
-				if len(items) == batch && j > 0 {
-					key, below, inclusive, midKey = n.key, vs[j].stamp, false, true
-					done = false
-					break scan
-				}
-			}
-			key, below, inclusive, midKey = n.key, 0, false, false
-		}
-		bk.mu.RUnlock()
-
-		if stop, err := callWalk(items, fn); stop || err != nil {
-			return err
-		}
-		if done {
-			return nil
-		}
-		if err := checkCtx(ctx); err != nil {
-			return err
-		}
-		batch = nextBatch(batch)
-	}
+	return index.WalkVersions(ctx, b.walkAcquire(ctx, bucketName), prefix, keyMarker, versionIDMarker, fn)
 }

@@ -112,6 +112,56 @@ func preflight(e *testEnv, path, origin, method, headers string) *testResponse {
 	return e.anon("OPTIONS", path, nil, h)
 }
 
+func denseCORSConfig() string {
+	var b strings.Builder
+	b.WriteString("<CORSConfiguration>")
+	for range maxCORSRules {
+		b.WriteString("<CORSRule><AllowedOrigin>https://app.example.com</AllowedOrigin><AllowedMethod>GET</AllowedMethod>")
+		for range 12 {
+			b.WriteString("<AllowedHeader>x-b*</AllowedHeader>")
+		}
+		b.WriteString("<AllowedHeader>x-a*</AllowedHeader></CORSRule>")
+	}
+	b.WriteString("</CORSConfiguration>")
+	return b.String()
+}
+
+func TestPreflightHeaderWorkLimit(t *testing.T) {
+	e := newTestEnv(t)
+	e.createBucket("bkt")
+	e.putBucketConfig("bkt", storage.ConfigCORS, denseCORSConfig())
+	for _, tc := range []struct {
+		name, headers string
+		want          int
+	}{
+		{"large dense list", strings.Repeat("x-aa,", 180000) + "x-z", http.StatusBadRequest},
+		{"header bytes limit", strings.Repeat("x", maxCORSRequestHeadersSize+1), http.StatusBadRequest},
+		{"header count limit", strings.TrimSuffix(strings.Repeat("x-aa,", maxCORSRequestHeadersCount+1), ","), http.StatusBadRequest},
+		{"bounded list", strings.TrimSuffix(strings.Repeat("x-aa,", maxCORSRequestHeadersCount), ","), http.StatusOK},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			resp := preflight(e, "/bkt/k", "https://app.example.com", "GET", tc.headers)
+			if resp.StatusCode != tc.want {
+				t.Fatalf("status %d, want %d: %s", resp.StatusCode, tc.want, resp.Data)
+			}
+		})
+	}
+}
+
+func BenchmarkPreflightDenseHeaders(b *testing.B) {
+	e := newTestEnv(b)
+	e.createBucket("bkt")
+	e.putBucketConfig("bkt", storage.ConfigCORS, denseCORSConfig())
+	headers := strings.Repeat("x-aa,", 180000) + "x-z"
+	b.ResetTimer()
+	for range b.N {
+		resp := preflight(e, "/bkt/k", "https://app.example.com", "GET", headers)
+		if resp.StatusCode != http.StatusBadRequest {
+			b.Fatalf("status %d, want 400", resp.StatusCode)
+		}
+	}
+}
+
 func TestPreflightBucketConfig(t *testing.T) {
 	e := newTestEnv(t)
 	e.createBucket("bkt")

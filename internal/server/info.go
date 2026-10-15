@@ -24,11 +24,14 @@ func (s *Server) Info() discovery.Info {
 	}
 	base = strings.TrimSuffix(base, "/")
 
-	features := []string{"versioning", "object-lock", "multipart", "admin"}
+	features := []string{"versioning", "object-lock", "multipart"}
 	ep := discovery.Endpoints{
-		S3:    base,
-		Admin: base + admin.Prefix,
-		All:   all,
+		S3:  base,
+		All: all,
+	}
+	if s.cfg.Admin.Enabled {
+		ep.Admin = base + admin.Prefix
+		features = append(features, "admin")
 	}
 	if s.UIBuilt() {
 		ep.UI = base + webui.Prefix

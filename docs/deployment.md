@@ -1,7 +1,7 @@
 # Deployment
 
-gos3 is one static binary with the web UI built in. It needs a data directory
-and one TCP port (9000 by default). Discovery also uses UDP multicast
+gos3 is one static binary, available with or without the embedded web UI.
+It needs a data directory and one TCP port (9000 by default). Discovery uses UDP multicast
 (`239.255.73.83:7373`, mDNS `224.0.0.251:5353`) when it is enabled.
 
 Every gos3 server is **independent**: there is no replication or clustering.
@@ -17,8 +17,11 @@ load balancer.
 
 ## Binary
 
-Release archives for Linux, macOS and Windows (amd64 and arm64) contain the
-binary with the UI embedded, plus `checksums.txt`. From the first release
+Release archives for Linux, macOS and Windows (amd64 and arm64) come in two
+variants: `gos3_X.Y.Z_<os>_<arch>.tar.gz` with the UI embedded, and
+`gos3_X.Y.Z_<os>_<arch>-headless.tar.gz` with no UI assets compiled in
+(`.zip` on Windows). Both contain a `gos3` executable (`gos3.exe` on Windows).
+The release also includes `checksums.txt` covering both variants. From the first release
 after 0.1.0, every archive and image has a signed build provenance
 attestation; check it before installing (see
 [releasing.md](releasing.md#verifying-a-release)):
@@ -37,7 +40,17 @@ bin/gos3 serve --data /srv/gos3
 ```
 
 `make build-go` (or `go build ./cmd/gos3`) builds without rebuilding the UI;
-the binary then serves a placeholder at `/_gos3/ui/`.
+it embeds the current contents of `internal/webui/dist` (a placeholder in a
+fresh checkout). For a binary with no UI assets, only Go is needed:
+
+```sh
+make build-headless           # go build -tags noui, no Node or pnpm
+bin/gos3 serve --data /srv/gos3             # S3 + management API
+bin/gos3 serve --data /srv/gos3 --no-admin  # S3 only
+```
+
+Headless builds cannot enable the embedded UI at runtime. An ordinary build
+started with `--no-ui` still contains its compiled UI assets.
 
 On first start without configured root keys, gos3 generates an access key
 and secret key and stores them in `<data>/.gos3/root-credentials.json`
@@ -49,10 +62,30 @@ See [configuration.md](configuration.md) for all settings and
 
 ## Docker
 
-The image (`Dockerfile`) is built in three stages: the web UI with pnpm, a
+The default image (`Dockerfile`, target `embedded`) builds the web UI with pnpm, a
 static Go binary with the UI embedded (cross-compiled for the target
 architecture), and a `gcr.io/distroless/static-debian12:nonroot` runtime. That
-runtime has no shell, runs as uid/gid 65532, and is about 25 MB.
+runtime has no shell, runs as uid/gid 65532, and is about 25 MB plus the
+bundled [restic](encryption.md#where-keys-and-repositories-live) executable (about
+30 MB) at `/usr/local/bin/restic`, which buckets with the restic encryption
+provider use. It is the official restic release for the target
+architecture, pinned to one version and verified against the SHA-256 sums
+published with that release while the image is built; its license is in
+`/usr/share/doc/gos3/THIRD_PARTY_NOTICES`.
+
+The `headless` target builds with `-tags noui` and skips the Node/pnpm stage
+entirely. Both targets use the same runtime and support both architectures.
+Published headless tags append `-headless` to the regular tags:
+`X.Y.Z-headless`, `X.Y-headless`, `latest-headless` and `dev-headless`
+(also `X-headless` from 1.0.0 and `dev-<commit>-headless`). For a local build:
+
+```sh
+docker build --target headless -t gos3:headless .
+docker run -d --name gos3 -p 127.0.0.1:9000:9000 -v gos3-data:/data \
+  --env-file gos3.env gos3:headless serve --no-admin
+```
+
+Omit `--no-admin` to keep the management API enabled for a separate web UI.
 
 ```sh
 docker build -t gos3 .              # or: make docker (adds version build args)
@@ -109,6 +142,10 @@ Notes:
 - The image is built for `linux/amd64` and `linux/arm64`:
   `docker buildx build --platform linux/amd64,linux/arm64 -t <registry>/gos3 --push .`.
 - Build arguments: `VERSION`, `COMMIT` and `DATE` (shown by `gos3 version`).
+- restic is updated by hand: change `RESTIC_VERSION` and the per-architecture
+  SHA-256 sums in the `Dockerfile` (from the release's signed `SHA256SUMS`),
+  the same pins in `.github/actions/setup-restic/action.yml` (CI) and the
+  license URL in `internal/tools/notices`, then run `make notices`.
 - The base images (`node:22-bookworm-slim`, `golang:1.26-bookworm`,
   `gcr.io/distroless/static-debian12:nonroot`) and the Dockerfile frontend
   are pinned by digest, and the GitHub Actions in `.github/workflows` by
@@ -206,6 +243,10 @@ journalctl -u gos3 -f
   ```
 - `systemctl stop gos3` sends SIGTERM: in-flight requests get
   `server.shutdown_timeout` (30 s) to finish.
+- Buckets with the restic encryption provider need
+  [restic](encryption.md#where-keys-and-repositories-live) on the service's
+  `PATH`: install the release executable as `/usr/local/bin/restic`
+  (mode 0755). It runs as the service user with the same sandbox.
 
 ## Kubernetes
 
@@ -402,7 +443,10 @@ self-hosted setups use. For virtual-hosted style
    path-style for those.
 
 Requests to the bare domain stay path-style, and `/_gos3/*` on the bare domain
-reaches the admin API and UI. On a bucket host, every path is an object key.
+reaches the admin API and UI. This holds for every configured domain, even
+one that is a subdomain of another (with `example.com` and `s3.example.com`
+both configured, `s3.example.com` is path-style, not bucket `s3`). On a bucket
+host, every path is an object key.
 
 ## TLS
 

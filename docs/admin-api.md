@@ -1,5 +1,11 @@
 # gos3 admin API (v1)
 
+The API is enabled by default. Set `admin.enabled: false`,
+`GOS3_ADMIN_ENABLED=false`, or `--no-admin` to disable it and the embedded
+UI. Disabled API routes return 404, including signed requests and preflights.
+Enabling it requires a restart. `--no-ui` alone keeps the API available for
+a separately hosted UI.
+
 Base path: `/_gos3/admin/v1` on the S3 listener. JSON in/out
 (`Content-Type: application/json`). Timestamps are RFC3339. Go
 `time.Duration` fields (e.g. discovery `beaconInterval`, `peerTtl`, scan
@@ -26,7 +32,8 @@ Base path: `/_gos3/admin/v1` on the S3 listener. JSON in/out
   checked with `iam.Manager.Authorize` against the endpoint's resource (see
   [Resources and condition keys](#resources-and-condition-keys)). Root is
   always allowed; the built-in `admin` policy allows all; `diagnostics`
-  allows `ServerInfo`, `GetStats`, `GetDiscovery` (not `ProbeNetwork` or
+  allows `ServerInfo`, `GetStats`, `GetDiscovery`, `ListBackings`,
+  `GetBucketPlacement` (not `ProbeNetwork` or
   `ScanNetwork`).
 - Endpoints marked *any* only require a valid (non-anonymous) identity.
   `DELETE /whoami/keys/{accessKey}` is refused with 403 `AccessDenied` only
@@ -58,7 +65,7 @@ ARNs, policy variables such as `${aws:username}` included):
 |---|---|
 | `arn:gos3:admin:::user/<name>` | CreateUser (the new user's name), GetUser, UpdateUser, DeleteUser, CreateAccessKey (the target user; choosing the access key ID also needs it at service level), UpdateAccessKey / DeleteAccessKey (the key's owner; an unknown key is evaluated at service level) |
 | `arn:gos3:admin:::policy/<name>` | GetPolicy, PutPolicy, DeletePolicy |
-| `arn:gos3:admin:::bucket/<name>` | GetBucket, ForceDeleteBucket |
+| `arn:gos3:admin:::bucket/<name>` | GetBucket, ForceDeleteBucket, GetBucketCompression, PutBucketCompression, GetBucketEncryption, PutBucketEncryption, GetBucketPlacement, UpdateBucketPlacement |
 | service level | every other action (list actions, config, stats, discovery, simulate, self-service) |
 
 The policy resources `*` and `arn:gos3:admin:::*` match every admin
@@ -97,7 +104,7 @@ Non-2xx responses: `{"error": {"code": "<Code>", "message": "<text>"}}`.
 | 429 | `TooManyRequests` (`POST /discovery/scan`: 2 scans, or `POST /discovery/probe`: 4 probes, are already running on this server) |
 | 500 | `InternalError` |
 | 502 | `ProbeFailed` (`POST /discovery/probe`: the target did not answer as a gos3 server; the message ends in `unreachable`, `timed out`, `HTTP <status>` or `not a gos3 server`) |
-| 503 | `InternalError` (request canceled or timed out) |
+| 503 | `InternalError` (request canceled or timed out, or a storage backing that cannot be reached, e.g. an s3 backing whose service does not answer or that is still loading; also an unknown bucket name while a backing that could not be listed at startup is pending adoption) |
 
 ## Endpoints
 
@@ -125,12 +132,21 @@ Non-2xx responses: `{"error": {"code": "<Code>", "message": "<text>"}}`.
     "listUsers": false,       // admin:ListUsers (true for delegated user managers too)
     "managePolicies": false,  // admin:PutPolicy
     "manageBuckets": false,   // admin:ForceDeleteBucket
+    "viewStorage": false,     // admin:ListBackings
+    "manageStorage": false,   // admin:UpdateBucketPlacement
     "discovery": false,       // admin:GetDiscovery
     "scan": false,            // admin:ScanNetwork
     "probe": false,           // admin:ProbeNetwork
-    "createOwnKeys": false    // admin:CreateOwnAccessKey explicitly allowed (always false for root)
+    "createOwnKeys": false,   // admin:CreateOwnAccessKey explicitly allowed (always false for root)
+    "manageCompression": false // admin:PutBucketCompression
   },
-  "server": Info              // same as GET /_gos3/info
+  "server": Info,             // same as GET /_gos3/info
+  "backings": {               // storage backings a new bucket can be put on (x-gos3-backing),
+                              // shown to every caller; details: GET /backings
+    "default": "default",
+    "available": [ { "name": "default", "kind": "fs" }, { "name": "cold", "kind": "s3" },
+                   { "name": "shared", "kind": "s3", "mode": "gateway" } ]  // mode: gateway backings only
+  }
 }
 ```
 
@@ -145,7 +161,8 @@ Non-2xx responses: `{"error": {"code": "<Code>", "message": "<text>"}}`.
 ```jsonc
 // ServerInfo = Info (see docs/discovery.md) plus:
 { …Info,
-  "backend": "fs", "dataPath": "/data",
+  "backend": "fs",             // the default backing: "fs" | "memory" | "s3"
+  "dataPath": "/data",         // storage.path ("" when none, e.g. memory or s3 without a path)
   "goVersion": "go1.25.0", "os": "linux", "arch": "amd64", "numCPU": 8,
   "uptimeSeconds": 1234 }
 
@@ -153,7 +170,9 @@ Non-2xx responses: `{"error": {"code": "<Code>", "message": "<text>"}}`.
 {
   "metrics": metrics.Snapshot,          // see below
   "storage": { "buckets": 3, "objects": 1200, "bytes": 123456789,
+               "storedBytes": 61234567,  // bytes stored for "bytes" (less when compressed)
                "versions": 1300, "versionBytes": 133456789,
+               "storedVersionBytes": 71234567, "compressedVersions": 800,
                "deleteMarkers": 4, "pendingUploads": 1,
                "computedAt": "…" },     // cached up to 30s
   "runtime": { "goroutines": 42, "heapAllocBytes": 1234, "sysBytes": 5678, "gcPauseTotalNs": 1 },
@@ -195,7 +214,10 @@ requests out.
                  "allowScan": true, "maxScanHosts": 1024 },
   "logging": { "level": "info", "format": "text", "accessLog": true },
   "lifecycle": { "enabled": true, "intervalSeconds": 3600 },
-  "metricsPublic": false
+  "metricsPublic": false,
+  "compression": { "mode": "optional",   // optional | enforced | disabled
+                   "level": 1, "minSize": 4096,
+                   "skipContentTypes": ["image/jpeg", "video/*", "…"] }
 }
 ```
 
@@ -213,8 +235,13 @@ without scheme or port; CORS origins `*`, `scheme://host[:port]` or
 `peerTtl` 30 s–7 d; `seeds` http(s) base URLs without a path, or a bare
 `host[:port]` (meaning `http://`), at most 256; `dnsSrv` domain names, at
 most 64; `maxScanHosts` 1–65536; `logging.level` `debug|info|warn|error`;
-`logging.format` `text|json`; `lifecycle.intervalSeconds` 60–31536000; other
-lists at most 256 entries. Changes apply immediately and are persisted to
+`logging.format` `text|json`; `lifecycle.intervalSeconds` 60–31536000;
+`compression.mode` `optional|enforced|disabled`; `compression.level` 1–9;
+`compression.minSize` 0–5 TiB; `compression.skipContentTypes` entries
+`type/subtype`, `type/*` or a prefix ending in `*` (no parameters); other
+lists at most 256 entries. A document without `compression` (from a client
+that predates it) keeps the current compression settings, and fields missing
+from `compression` keep their current values. Changes apply immediately and are persisted to
 `<data>/.gos3/settings.json`, which from then on overrides the YAML file,
 environment and flags for these fields.
 
@@ -244,6 +271,9 @@ environment and flags for these fields.
 |---|---|---|---|
 | GET | `/buckets` | ListBuckets | `{"buckets": BucketSummary[]}`; `?usage=true` includes usage (cached 30s) |
 | GET | `/buckets/{name}` | GetBucket | `BucketSummary` with usage |
+| GET | `/buckets/{name}/compression` | GetBucketCompression | `BucketCompression` |
+| PUT | `/buckets/{name}/compression` | PutBucketCompression | body `{"enabled": bool}` → `BucketCompression`. 409 `Conflict` when it contradicts the server's `compression.mode` (`true` while `disabled`, `false` while `enforced`); 400 for any other body |
+| DELETE | `/buckets/{name}/compression` | PutBucketCompression | removes the bucket's setting (back to the server default) → 204; idempotent |
 | DELETE | `/buckets/{name}?force=true` | ForceDeleteBucket | deletes all versions, delete markers, uploads and configs, then the bucket → 204. Without `force` behaves like S3 DeleteBucket (409 if not empty; in-progress uploads alone do not make a bucket non-empty, they are aborted with it). Object lock is honoured: any version under legal hold or unexpired COMPLIANCE retention → 409 before anything is deleted; unexpired GOVERNANCE retention → 409 unless `bypassGovernanceRetention=true` is added (only with `force`, else 400), which also requires `s3:BypassGovernanceRetention` on each such object (identity policies; 403 otherwise). |
 
 ```jsonc
@@ -253,8 +283,199 @@ environment and flags for these fields.
   "configs": { "policy": true, "cors": false, "lifecycle": true, "tagging": false,
                "encryption": false, "website": false, "objectLock": false, "acl": "private" },
   "public": false,          // bucket policy grants anonymous access or ACL public-*
-  "usage": storage.BucketUsage | null }  // {"objects","bytes","versions","versionBytes","deleteMarkers","pendingUploads"}
+  "compression": { "enabled": false, "effective": false }, // see BucketCompression
+  "usage": storage.BucketUsage | null }  // {"objects","bytes","storedBytes","versions","versionBytes",
+                                         //  "storedVersionBytes","compressedVersions","deleteMarkers","pendingUploads"}
+
+// BucketCompression
+{ "enabled": true,          // the bucket's setting (false when none is stored)
+  "effective": true,        // new objects are stored compressed (subject to minSize and skipContentTypes)
+  "serverMode": "optional", // the administrator's compression.mode: optional (enabled decides), enforced, disabled
+  "algorithm": "deflate", "level": 1, "minSize": 4096 }
 ```
+
+Compression is transparent to S3 clients (same content, ETags, checksums
+and sizes); `storedBytes` and `storedVersionBytes` count what the backend
+stores. See [operations.md](operations.md#compression).
+
+### Object encryption providers
+
+| Method | Path | Action | Response |
+|---|---|---|---|
+| GET | `/buckets/{name}/encryption-provider` | GetBucketEncryption | `{"provider":"AES256"\|"restic", "available":["AES256","restic"], "backings":["default",…]}` |
+| PUT | `/buckets/{name}/encryption-provider` | PutBucketEncryption | body `{"provider":"AES256"\|"restic"}`; prepares the provider, then saves it and returns the GET document |
+
+The provider is the bucket's implementation of SSE-S3: it applies to bucket
+default encryption and to uploads that request `AES256`. Provider actions use
+`arn:gos3:admin:::bucket/<name>`. The body is decoded strictly: storage and
+secret fields are rejected (naming the field), since restic derives its
+repositories from each assigned backing.
+
+`available` lists the providers the bucket can use now, the ones every
+backing holding a copy of the bucket (primary, replicas and a move target)
+can store: `AES256` needs an encryption key on every s3 backing among them;
+`restic` needs the restic executable on the server and every copy on a
+filesystem backing or an s3 backing with an encryption key (not memory, not
+a gateway). See [encryption.md](encryption.md#where-keys-and-repositories-live).
+PUT refuses an unavailable provider with 400. Otherwise it validates the provider and prepares the
+bucket's keys or restic repository **before** saving the selection; if that
+fails it returns 400 and the previous provider stays in effect. A missing
+bucket is 404; a stored provider document that is not valid makes GET fail
+with 500 until a PUT replaces it. Changes are serialized per bucket.
+GET reports the saved selection and the assigned backings, not repository
+health. Provider selection alone does not enable S3 bucket-default encryption;
+use PutBucketEncryption with AES256 (also for restic), or an AES256 upload
+header. Force-deleting a bucket removes its encryption documents only together
+with the bucket.
+
+Restic repositories follow the bucket's backings and have no settings of
+their own: an fs backing keeps them in its data directory, an s3 backing in
+its remote bucket.
+
+### Storage backings and bucket placement
+
+A server can store buckets on several **backings** (storage backends such as
+an fs directory per disk or a bucket of a remote S3 service; see
+[configuration.md](configuration.md#storage-backings) and
+[backings.md](backings.md)). Every bucket has a
+**placement**: the backing that holds its primary copy and, optionally,
+replicas on other backings. See [operations.md](operations.md#multiple-backings-and-replication)
+for the semantics.
+
+| Method | Path | Action | Response |
+|---|---|---|---|
+| GET | `/backings` | ListBackings | `{"defaultBacking": "default", "autoFailover": false, "backings": Backing[]}` |
+| GET | `/backings/config` | GetConfig | `BackingConfiguration` (404 when live configuration is unavailable) |
+| PUT | `/backings/config` | UpdateConfig | full `BackingConfiguration` → updated configuration, applied live and persisted before success |
+| GET | `/buckets/{name}/placement` | GetBucketPlacement | `Placement` |
+| PUT | `/buckets/{name}/placement` | UpdateBucketPlacement | body `{"mode": "single" \| "active-passive" \| "active-active", "replicas": ["fast", …]}` → `Placement`. Sets the replication mode and the replica backings (the primary stays). `single` needs an empty `replicas`, the other modes at least one. New replicas start a full copy (`state` `syncing`); removed replicas lose their copy (deleted in the background). 400 `InvalidRequest` for an unknown backing, the primary listed as a replica, or a duplicate; 409 `Conflict` while a move is in progress or while the bucket's copy on a backing being added is still being deleted |
+| POST | `/buckets/{name}/placement/move` | UpdateBucketPlacement | body `{"to": "archive", "from"?: "<backing>"}` → 202 `Placement`. Moves the copy on `from` (default: the primary) to `to`, online: `to` is filled in the background while the bucket stays readable and writable, then a short cutover (writes to the bucket wait, at most 60 s, for in-flight writes to finish) makes `to` take `from`'s place and `from`'s copy is deleted. In-progress multipart uploads are not moved: after a move of the primary they fail with `NoSuchUpload`. 400 for an unknown backing or a `from` that is not a member; 409 when a move is already in progress or `to` already holds a copy |
+| DELETE | `/buckets/{name}/placement/move` | UpdateBucketPlacement | cancels the move in progress → `Placement` (the partial copy on `to` is deleted); 409 when there is none or its cutover already started |
+| POST | `/buckets/{name}/placement/promote` | UpdateBucketPlacement | body `{"backing": "fast", "force"?: false}` → `Placement`. Makes a replica the primary (the old primary becomes a replica). Without `force` the replica must have finished its initial copy, and pending changes are copied to it during a cutover (as for a move) before the switch, so nothing is lost. `force: true` switches immediately, e.g. when the primary's backing is down: changes not yet copied to the replica are lost (the old primary is re-copied from the new one). 400 when `backing` is not a replica; 409 when it has not finished its initial copy (without `force`) or a move is in progress |
+| POST | `/buckets/{name}/placement/resync` | UpdateBucketPlacement | body `{"backing"?: "fast"}` (default: every replica) → 202 `Placement`. Compares the replica(s) with the primary and copies every difference (versions, metadata, bucket configuration) |
+
+`UpdateBucketPlacement` and `GetBucketPlacement` are evaluated against
+`arn:gos3:admin:::bucket/<name>`, `ListBackings` at service level. The
+built-in `diagnostics` policy allows `ListBackings` and `GetBucketPlacement`.
+404 `NotFound` for an unknown bucket.
+
+`BackingConfiguration` is `{"backings": BackingDefinition[], "defaultBacking": "default", "revision": "<opaque token>", "persistent": true}`.
+`backings` contains only additional backings; the system backing named
+`default` cannot be replaced or removed. Send the revision from the last GET to
+prevent overwriting concurrent changes; stale revisions return 409
+`Conflict`. `persistent` is informational and ignored on PUT. Without a
+system data directory, changes apply live but are lost at restart.
+
+```jsonc
+// BackingDefinition
+{ "name": "archive",
+  "backend": "fs" | "memory" | "s3",
+  "path": "/mnt/archive",      // fs: directory (required); "" for memory and s3
+  "s3": {                      // s3 only (omitted otherwise); see backings.md
+    "endpoint": "https://s3.eu-central-1.amazonaws.com",  // required, no path
+    "region": "eu-central-1",  // "" = us-east-1
+    "bucket": "acme-gos3-cold",// required; must exist
+    "prefix": "gos3/",
+    "addressing": "",          // "" (auto) | "path" | "virtual"
+    "partSize": 16777216,      // bytes, 5 MiB-5 GiB; omitted/0 = default
+    "gateway": false,
+    "accessKey": "AKIA…",
+    "secretKey": "…",          // write-only: never returned
+    "encryptionKey": "…",      // write-only: base64 of 32 bytes, never returned
+    "secretKeyConfigured": true,      // read-only
+    "encryptionKeyConfigured": true,  // read-only
+    "accessKeySource": "env",         // read-only: "env" when the value comes from
+    "secretKeySource": "env",         //   GOS3_BACKING_<NAME>_* (omitted otherwise)
+    "encryptionKeySource": "env",
+    "envFields": ["endpoint", "secret_key"] } } // read-only: fields filled from GOS3_BACKING_<NAME>_*
+```
+
+The secret key and the encryption key are **write-only**. GET returns them
+blank, with `secretKeyConfigured` / `encryptionKeyConfigured` set; on PUT a
+blank value keeps the value stored for the backing of the same name, and a
+non-blank one replaces it. Fields still empty are then filled from the
+`GOS3_BACKING_<NAME>_*` environment variables; such values (any field) are
+listed in `envFields` (the keys also report source `env`) and never written
+to `backings.json`. The read-only fields
+are ignored on PUT. `backings.json` (mode 0600) stores the other secrets.
+
+A backing is matched to its current definition by name. Unchanged
+definitions are left alone. A change of an s3 backing's connection settings
+(endpoint, region, credentials, encryption key, addressing, part size) is
+applied in place, also while it holds buckets: gos3 connects with the new
+settings and verifies the backing's marker and encryption key before
+switching; on failure the backing keeps running unchanged. A **gateway**
+backing's connection settings can change this way only while it holds no
+buckets (409 `Conflict` otherwise: change them in the configuration and
+restart). Any other change (an fs path; an s3 bucket, prefix or gateway
+switch; the backend) replaces the backing, which needs it unused and empty.
+An s3 backing that holds no placed bucket can be removed or replaced even
+while its service is unreachable (the remote data is left untouched).
+A new or replaced s3 backing must load within 30 seconds.
+
+Opening or reconfiguring an s3 backing fails with 409 `Conflict` when its
+prefix is in use by another gos3 server, and with 400 `InvalidRequest` for
+settings that are wrong: an encryption key that does not match the backing,
+a `gos3.json` marker that does not match (another backing, or the other
+gateway setting), a prefix holding gos3 data without a marker, a service
+without conditional writes, and credentials, bucket or region the service
+refuses (`AccessDenied`, `InvalidAccessKeyId`, `SignatureDoesNotMatch`,
+`NoSuchBucket`, `AuthorizationHeaderMalformed`, `PermanentRedirect`,
+`InvalidBucketName`). A service that does not answer within the 30 seconds
+gives 503.
+
+Invalid names, duplicate directories, overlapping s3 bucket prefixes,
+invalid s3 settings (errors name the field) and invalid defaults return 400
+`InvalidRequest`, as does an s3 endpoint that is this server itself (one of
+its advertised URLs, or a URL whose `/_gos3/info` reports this server's ID).
+Replacing or removing a backing holding a bucket, replica, move target,
+pending cleanup, or untracked bucket returns 409 `Conflict`. New backings
+must have no existing buckets (409). A failed open or save leaves the
+running configuration unchanged. `GetConfig` and `UpdateConfig` are
+evaluated at service level. The saved `backings.json` overrides static
+backing definitions on restart, like the runtime settings overlay.
+
+```jsonc
+// Backing
+{ "name": "fast",              // "default" is the backing configured by storage.backend / storage.path
+  "kind": "fs" | "memory" | "s3",
+  "mode": "gateway",           // s3 gateway backings only (omitted otherwise; see backings.md)
+  "location": "s3://acme-gos3-cold/gos3/", // s3 backings: remote bucket and prefix (no endpoint, no secrets)
+  "path": "/mnt/nvme/gos3",    // fs directory; "" for memory and s3
+  "default": false,            // new buckets are created here
+  "healthy": true,             // last health check or operation succeeded (false while an
+                               // s3 backing's service is unreachable or it is still loading)
+  "lastError": "",             // last error that marked it unhealthy ("" when healthy)
+  "checkedAt": "…",            // last health check (RFC3339; omitted before the first)
+  "buckets": 3,                // buckets whose primary copy is here
+  "replicas": 1,               // replica copies (and move targets) of other buckets here
+  "disk": { "path": "/mnt/nvme/gos3", "totalBytes": 1, "freeBytes": 1, "usedBytes": 1 } | null } // fs only
+
+// Placement
+{ "bucket": "photos",
+  "mode": "single" | "active-passive" | "active-active",
+  "primary": "default",
+  "members": [                 // primary first, then replicas, then a move target
+    { "backing": "default",
+      "role": "primary" | "replica" | "move-target",
+      "state": "in-sync" | "syncing" | "lagging" | "degraded" | "offline",
+      "healthy": true,         // the backing's health
+      "pending": 0,            // changed keys not yet copied to this member
+      "progress": { "keys": 120, "versions": 130, "bytes": 1048576 } | null, // running full copy
+      "lastSyncAt": "…",       // last completed full copy (omitted when none)
+      "lastError": "" } ],
+  "move": { "from": "default", "to": "archive", "startedAt": "…",
+            "phase": "copying" | "cutover" } | null }
+```
+
+Member states: `in-sync` (an active-active replica receiving every write
+synchronously, a replica with no pending changes, or the primary); `syncing`
+(initial or requested full copy running); `lagging` (changes are pending,
+copied in the background); `degraded` (copying failed; retried with
+back-off, see `lastError`); `offline` (the backing is unhealthy).
+
+`BucketSummary` (`GET /buckets`, `GET /buckets/{name}`) also has
+`"placement": {"mode": "single", "primary": "default", "replicas": [], "moving": false}`.
 
 ### Discovery
 | Method | Path | Action | Response |

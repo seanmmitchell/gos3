@@ -107,6 +107,36 @@ func validateObjectKey(key string) error {
 	return nil
 }
 
+// validateNewObjectKey is validateObjectKey for a key an object is created
+// at (PutObject, CopyObject, multipart uploads, POST form uploads). The key
+// must also consist of XML 1.0 characters only: encoding/xml writes any
+// other character (C0 controls but tab, newline and carriage return; U+FFFE
+// and U+FFFF) as U+FFFD, so listings and error responses would report a
+// key that does not address the object. Reads and deletes use
+// validateObjectKey alone, so objects stored before this rule remain
+// reachable and removable.
+func validateNewObjectKey(key string) error {
+	if err := validateObjectKey(key); err != nil {
+		return err
+	}
+	for _, c := range key {
+		if !isXMLChar(c) {
+			return s3err.ErrInvalidArgument.WithMessage("Object key contains a character that cannot be represented in XML.").
+				With("ArgumentName", "key")
+		}
+	}
+	return nil
+}
+
+// isXMLChar reports whether c matches the XML 1.0 Char production:
+// #x9 | #xA | #xD | [#x20-#xD7FF] | [#xE000-#xFFFD] | [#x10000-#x10FFFF].
+func isXMLChar(c rune) bool {
+	return c == 0x09 || c == 0x0A || c == 0x0D ||
+		(c >= 0x20 && c <= 0xD7FF) ||
+		(c >= 0xE000 && c <= 0xFFFD) ||
+		(c >= 0x10000 && c <= 0x10FFFF)
+}
+
 // trimHeaderSpace removes the spaces and tabs around a header value (the
 // optional whitespace of HTTP, which net/http already strips from HTTP/1
 // headers). Other whitespace, such as U+00A0, is kept, so a value carrying

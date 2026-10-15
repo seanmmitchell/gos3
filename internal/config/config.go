@@ -1,7 +1,7 @@
 // Package config holds gos3 configuration: static configuration loaded from
-// defaults < YAML file < environment (GOS3_*) < CLI flags, plus a runtime
+// defaults < JSON/YAML file < environment (GOS3_*) < CLI flags, plus a runtime
 // Settings overlay that the admin API can change and that is persisted to
-// <data>/.gos3/settings.json (it wins over static config for its fields).
+// <data>/.gos3/settings.json (it wins over static config when admin is enabled).
 //
 // Entry points: Load (CLI flags passed as Overrides) then Config.Validate;
 // ResolveRootCredentials fills in generated root credentials; SettingsFrom
@@ -24,15 +24,17 @@ import (
 
 // Config is the full static configuration.
 type Config struct {
-	Server    ServerConfig     `yaml:"server"`
-	Storage   StorageConfig    `yaml:"storage"`
-	Auth      AuthConfig       `yaml:"auth"`
-	UI        UIConfig         `yaml:"ui"`
-	CORS      CORSConfig       `yaml:"cors"`
-	Discovery discovery.Config `yaml:"discovery"`
-	Logging   LoggingConfig    `yaml:"logging"`
-	Lifecycle LifecycleConfig  `yaml:"lifecycle"`
-	Metrics   MetricsConfig    `yaml:"metrics"`
+	Server      ServerConfig      `yaml:"server"`
+	Storage     StorageConfig     `yaml:"storage"`
+	Auth        AuthConfig        `yaml:"auth"`
+	UI          UIConfig          `yaml:"ui"`
+	Admin       AdminConfig       `yaml:"admin"`
+	CORS        CORSConfig        `yaml:"cors"`
+	Discovery   discovery.Config  `yaml:"discovery"`
+	Logging     LoggingConfig     `yaml:"logging"`
+	Lifecycle   LifecycleConfig   `yaml:"lifecycle"`
+	Metrics     MetricsConfig     `yaml:"metrics"`
+	Compression CompressionConfig `yaml:"compression"`
 }
 
 // ServerConfig configures the HTTP listener and identity.
@@ -83,13 +85,65 @@ type ServerConfig struct {
 
 // StorageConfig selects the backend.
 type StorageConfig struct {
-	Backend string `yaml:"backend"` // "fs" (default) or "memory"
+	Backend string `yaml:"backend"` // "fs" (default), "memory" or "s3"
 	// Path is the data directory for the fs backend AND for system state
-	// (<path>/.gos3/{iam.json,settings.json,server-id}). Empty with the memory
-	// backend means fully ephemeral.
-	Path string `yaml:"path"` // default "./data" for fs, "" (ephemeral) for memory
-	// FsyncData controls fsync of object data files on commit (default true).
+	// (<path>/.gos3/{iam.json,settings.json,server-id,placements.json,
+	// backings.json}). With the memory and s3 backends it holds system
+	// state only, and empty means that state is ephemeral.
+	Path string `yaml:"path"` // default "./data" for fs, "" (ephemeral) for memory and s3
+	// S3 configures the remote service of the s3 backend (required with
+	// storage.backend s3, not allowed otherwise; see S3Config).
+	S3 *S3Config `yaml:"s3,omitempty"`
+	// FsyncData controls fsync of object data files on commit (default true),
+	// for every fs backing.
 	FsyncData bool `yaml:"fsync_data"`
+	// Backings are additional named storage backings (e.g. one directory
+	// per disk). The backing configured by Backend, Path and S3 above is
+	// named DefaultBackingName. Every bucket lives on one backing and may
+	// be replicated to, or moved to, others (see internal/storage/multi).
+	Backings []BackingConfig `yaml:"backings"`
+	// DefaultBacking names the backing new buckets are created on
+	// ("" = DefaultBackingName).
+	DefaultBacking string `yaml:"default_backing"`
+	// Replication configures bucket replication between backings.
+	Replication ReplicationConfig `yaml:"replication"`
+}
+
+// BackingConfig is one additional storage backing.
+type BackingConfig struct {
+	// Name identifies the backing in placements and the admin API:
+	// 1-32 characters of [a-z0-9_-], starting with a letter or digit, not
+	// DefaultBackingName.
+	Name    string `yaml:"name"`
+	Backend string `yaml:"backend"` // "fs" (default), "memory" or "s3"
+	// Path is the data directory of an fs backing (required for fs; must
+	// differ from every other backing's path and from storage.path).
+	// Memory and s3 backings have no path.
+	Path string `yaml:"path"`
+	// S3 configures the remote service of an s3 backing (required for s3,
+	// not allowed otherwise; see S3Config and docs/backings.md).
+	S3 *S3Config `yaml:"s3,omitempty"`
+}
+
+// ReplicationConfig configures bucket replication between backings.
+type ReplicationConfig struct {
+	// DefaultMode is the replication mode of new buckets: "single"
+	// (default; "active-passive" when DefaultReplicas is set),
+	// "active-passive" or "active-active".
+	DefaultMode string `yaml:"default_mode"`
+	// DefaultReplicas are the backings new buckets are replicated to.
+	DefaultReplicas []string `yaml:"default_replicas"`
+	// AutoFailover promotes a synced replica of an active-passive bucket
+	// when the primary's backing fails (changes not yet copied are lost).
+	// Active-active buckets always fail over. Default false.
+	AutoFailover bool `yaml:"auto_failover"`
+	// Workers is the number of buckets copied concurrently (default 2).
+	Workers int `yaml:"workers"`
+	// HealthInterval is how often every backing is checked (default 10s).
+	HealthInterval time.Duration `yaml:"health_interval"`
+	// CutoverTimeout bounds how long a move's or promotion's cutover waits
+	// for writes in flight on the bucket (default 60s).
+	CutoverTimeout time.Duration `yaml:"cutover_timeout"`
 }
 
 // AuthConfig holds root credentials and signature options.
@@ -109,9 +163,14 @@ type AuthConfig struct {
 	InsecureDemoCredentials bool `yaml:"insecure_demo_credentials"`
 }
 
+// AdminConfig controls the management API and persisted runtime settings.
+type AdminConfig struct {
+	Enabled bool `yaml:"enabled"` // default true; false also disables the UI
+}
+
 // UIConfig configures the embedded web UI served at /_gos3/ui/.
 type UIConfig struct {
-	Enabled bool `yaml:"enabled"` // default true
+	Enabled bool `yaml:"enabled"` // default true; false in noui builds
 	// RedirectRoot redirects anonymous browser GET / (Accept: text/html) to the UI.
 	RedirectRoot bool `yaml:"redirect_root"` // default true
 }
@@ -145,20 +204,64 @@ type MetricsConfig struct {
 	Public bool `yaml:"public"`
 }
 
+// Compression modes (CompressionConfig.Mode): the server-wide policy that
+// decides whether new object data is stored compressed.
+const (
+	// CompressionOptional lets each bucket's compression setting decide
+	// (off unless enabled for the bucket). The default.
+	CompressionOptional = "optional"
+	// CompressionEnforced compresses new objects in every bucket; buckets
+	// cannot opt out.
+	CompressionEnforced = "enforced"
+	// CompressionDisabled compresses nothing new and buckets cannot enable
+	// compression. Objects already stored compressed stay readable.
+	CompressionDisabled = "disabled"
+)
+
+// CompressionConfig is the server-wide compression policy set by the
+// server administrator (runtime-editable as Settings.Compression).
+// Compression is transparent to clients: objects read back byte for byte,
+// with the same ETags, checksums and sizes.
+type CompressionConfig struct {
+	// Mode is CompressionOptional (default), CompressionEnforced or
+	// CompressionDisabled.
+	Mode string `yaml:"mode"`
+	// Level is the DEFLATE level, 1 (fastest, the default) to 9 (smallest).
+	Level int `yaml:"level"`
+	// MinSize is the object size in bytes below which objects whose size
+	// is known up front are stored uncompressed (default 4096).
+	MinSize int64 `yaml:"min_size"`
+	// SkipContentTypes lists media types that are stored uncompressed
+	// because they are compressed already: "type/subtype", "type/*" or a
+	// prefix ending in "*" (case-insensitive; parameters are ignored).
+	// Default DefaultSkipContentTypes. Objects with a Content-Encoding
+	// such as gzip are never compressed again.
+	SkipContentTypes []string `yaml:"skip_content_types"`
+}
+
 // Settings is the runtime-editable subset of configuration, exposed via the
 // admin API (GET/PUT /_gos3/admin/v1/config) and persisted to settings.json.
 type Settings struct {
-	Name          string            `json:"name"`
-	Region        string            `json:"region"`
-	PublicURL     string            `json:"publicUrl"`
-	Domains       []string          `json:"domains"`
-	PublicInfo    bool              `json:"publicInfo"`
-	UIRedirect    bool              `json:"uiRedirect"`
-	CORS          CORSConfig        `json:"cors"`
-	Discovery     discovery.Config  `json:"discovery"`
-	Logging       LoggingConfig     `json:"logging"`
-	Lifecycle     LifecycleSettings `json:"lifecycle"`
-	MetricsPublic bool              `json:"metricsPublic"`
+	Name          string              `json:"name"`
+	Region        string              `json:"region"`
+	PublicURL     string              `json:"publicUrl"`
+	Domains       []string            `json:"domains"`
+	PublicInfo    bool                `json:"publicInfo"`
+	UIRedirect    bool                `json:"uiRedirect"`
+	CORS          CORSConfig          `json:"cors"`
+	Discovery     discovery.Config    `json:"discovery"`
+	Logging       LoggingConfig       `json:"logging"`
+	Lifecycle     LifecycleSettings   `json:"lifecycle"`
+	MetricsPublic bool                `json:"metricsPublic"`
+	Compression   CompressionSettings `json:"compression"`
+}
+
+// CompressionSettings is the runtime-editable form of CompressionConfig.
+type CompressionSettings struct {
+	Mode             string   `json:"mode"`
+	Level            int      `json:"level"`
+	MinSize          int64    `json:"minSize"`
+	SkipContentTypes []string `json:"skipContentTypes"`
 }
 
 // LifecycleSettings is the runtime-editable part of LifecycleConfig.
@@ -246,6 +349,7 @@ func cloneSettings(in Settings) Settings {
 	out.CORS = cloneCORS(in.CORS)
 	out.Discovery.Seeds = slices.Clone(in.Discovery.Seeds)
 	out.Discovery.DNSSRV = slices.Clone(in.Discovery.DNSSRV)
+	out.Compression.SkipContentTypes = slices.Clone(in.Compression.SkipContentTypes)
 	return out
 }
 

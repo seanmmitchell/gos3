@@ -109,7 +109,10 @@ func plausibleBucketName(b string) bool {
 }
 
 // virtualHostBucket returns the bucket named by host for virtual-hosted-style
-// requests, or "" when host is not "<bucket>.<domain>" for any domain.
+// requests, or "" when host is not "<bucket>.<domain>" for any domain. A
+// host that is itself one of the domains is always path-style, even when
+// it is also a subdomain of another one (with "example.com" and
+// "s3.example.com" configured, "s3.example.com" is not bucket "s3").
 func virtualHostBucket(host string, domains []string) string {
 	if len(domains) == 0 || host == "" {
 		return ""
@@ -123,10 +126,13 @@ func virtualHostBucket(host string, domains []string) string {
 		}
 		d, _, _ = strings.Cut(d, "/")
 		d = normalizeHost(strings.TrimPrefix(d, "."))
-		if d == "" || len(d) <= len(best) {
+		if d == "" {
 			continue
 		}
-		if len(h) > len(d)+1 && strings.HasSuffix(h, d) && h[len(h)-len(d)-1] == '.' {
+		if h == d {
+			return ""
+		}
+		if len(d) > len(best) && len(h) > len(d)+1 && strings.HasSuffix(h, d) && h[len(h)-len(d)-1] == '.' {
 			best = d
 		}
 	}

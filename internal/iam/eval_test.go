@@ -218,7 +218,7 @@ func TestAuthorizeBucketPolicyAndACL(t *testing.T) {
 	publicRead := mustBucketPolicy(t, "pub", `{"Version":"2012-10-17","Statement":[
 		{"Sid":"PublicRead","Effect":"Allow","Principal":"*","Action":"s3:GetObject","Resource":"arn:aws:s3:::pub/*"}]}`)
 	shared := mustBucketPolicy(t, "shared", `{"Statement":[
-		{"Sid":"Bob","Effect":"Allow","Principal":{"AWS":["arn:aws:iam::123456789012:user/bob"]},"Action":["s3:PutObject","s3:GetObject"],"Resource":"arn:aws:s3:::shared/*"},
+		{"Sid":"Bob","Effect":"Allow","Principal":{"AWS":["bob"]},"Action":["s3:PutObject","s3:GetObject"],"Resource":"arn:aws:s3:::shared/*"},
 		{"Sid":"Key","Effect":"Allow","Principal":{"AWS":"AKNOBODY"},"Action":"s3:GetObject","Resource":"arn:aws:s3:::shared/*"},
 		{"Sid":"Name","Effect":"Allow","Principal":{"AWS":"writer"},"Action":"s3:GetObject","Resource":"arn:aws:s3:::shared/w/*"},
 		{"Sid":"CanonicalNobody","Effect":"Allow","Principal":{"CanonicalUser":"nobody"},"Action":"s3:ListBucket","Resource":"arn:aws:s3:::shared"},
@@ -240,8 +240,8 @@ func TestAuthorizeBucketPolicyAndACL(t *testing.T) {
 		{name: "anon other action", id: anon, action: "s3:PutObject", bucket: "pub", key: "img.png", bp: publicRead, want: false},
 		{name: "anon bucket level", id: anon, action: "s3:ListBucket", bucket: "pub", bp: publicRead, want: false},
 		{name: "user also allowed by star", id: user("nobody"), action: "s3:GetObject", bucket: "pub", key: "x", bp: publicRead, want: true},
-		{name: "arn user principal", id: user("bob"), action: "s3:PutObject", bucket: "shared", key: "x", bp: shared, want: true, wantReason: "Sid=Bob"},
-		{name: "arn user principal other user", id: user("eve"), action: "s3:PutObject", bucket: "shared", key: "x", bp: shared, want: false},
+		{name: "named user principal", id: user("bob"), action: "s3:PutObject", bucket: "shared", key: "x", bp: shared, want: true, wantReason: "Sid=Bob"},
+		{name: "named user principal other user", id: user("eve"), action: "s3:PutObject", bucket: "shared", key: "x", bp: shared, want: false},
 		{name: "access key principal", id: user("nobody"), action: "s3:GetObject", bucket: "shared", key: "x", bp: shared, want: true, wantReason: "Sid=Key"},
 		{name: "name principal", id: user("writer"), action: "s3:GetObject", bucket: "shared", key: "w/x", bp: shared, want: true},
 		{name: "name principal wrong resource", id: user("writer"), action: "s3:GetObject", bucket: "shared", key: "x", bp: shared, want: false},
@@ -322,8 +322,14 @@ func TestAuthorizeBucketPolicyRootPrincipal(t *testing.T) {
 	if anonCtx.principalMatches(&Principal{AWS: StringOrSlice{"arn:aws:iam::123:root", "123456789012"}}, true) {
 		t.Fatal("account principal matched anonymous")
 	}
-	if !c.principalMatches(&Principal{AWS: StringOrSlice{"arn:aws:iam::1:user/team/alice"}}, false) {
-		t.Fatal("user ARN with path did not match")
+	for _, arn := range []string{
+		"arn:aws:iam::1:user/alice",
+		"arn:aws:iam::123456789012:user/team/alice",
+		"arn:aws-us-gov:iam::1:user/alice",
+	} {
+		if c.principalMatches(&Principal{AWS: StringOrSlice{arn}}, false) {
+			t.Fatalf("unsupported user ARN matched: %s", arn)
+		}
 	}
 	if c.principalMatches(&Principal{AWS: StringOrSlice{"arn:aws:iam::1:group/alice", "arn:aws:s3:::alice", "arn:short"}}, true) {
 		t.Fatal("non-user ARNs matched")
@@ -372,7 +378,7 @@ func TestAuthorizeAccountPrincipal(t *testing.T) {
 		if d := m.Authorize(ctx, AuthzRequest{Identity: alice, Action: "s3:GetObject", Bucket: "b", Key: "k", BucketPolicy: notDeny}); d.Allowed {
 			t.Fatalf("%s: Deny NotPrincipal account exempted alice: %+v", acct, d)
 		}
-		notDenyAlice := mustBucketPolicy(t, "b", `{"Statement":[{"Effect":"Deny","NotPrincipal":{"AWS":[`+acct+`,"arn:aws:iam::123456789012:user/alice"]},"Action":"s3:*","Resource":"arn:aws:s3:::b/*"},
+		notDenyAlice := mustBucketPolicy(t, "b", `{"Statement":[{"Effect":"Deny","NotPrincipal":{"AWS":[`+acct+`,"alice"]},"Action":"s3:*","Resource":"arn:aws:s3:::b/*"},
 			{"Effect":"Allow","Principal":"*","Action":"s3:GetObject","Resource":"arn:aws:s3:::b/*"}]}`)
 		if d := m.Authorize(ctx, AuthzRequest{Identity: alice, Action: "s3:GetObject", Bucket: "b", Key: "k", BucketPolicy: notDenyAlice}); !d.Allowed {
 			t.Fatalf("%s: Deny NotPrincipal [account, alice] denied alice: %+v", acct, d)

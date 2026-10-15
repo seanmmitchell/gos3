@@ -525,13 +525,11 @@ type bucketEncryptDefault struct {
 	KMSMasterKeyID string `xml:"KMSMasterKeyID,omitempty"`
 }
 
-// maxKMSKeyIDLength bounds KMSMasterKeyID values (key ARNs/aliases).
-const maxKMSKeyIDLength = 2048
-
 // validate checks the configuration: exactly one rule with
-// ApplyServerSideEncryptionByDefault (MalformedXML otherwise), SSEAlgorithm
-// AES256, aws:kms or aws:kms:dsse (MalformedXML), and a KMSMasterKeyID
-// only with the KMS algorithms (InvalidArgument).
+// ApplyServerSideEncryptionByDefault (MalformedXML otherwise) and
+// SSEAlgorithm AES256 without a KMSMasterKeyID (InvalidArgument). The KMS
+// algorithms aws:kms and aws:kms:dsse are NotImplemented, other algorithms
+// MalformedXML.
 func (c *bucketEncryptionConfig) validate() error {
 	if len(c.Rules) != 1 {
 		return s3err.ErrMalformedXML
@@ -549,9 +547,7 @@ func (c *bucketEncryptionConfig) validate() error {
 				With("ArgumentName", "ApplyServerSideEncryptionByDefault")
 		}
 	case "aws:kms", "aws:kms:dsse":
-		if len(d.KMSMasterKeyID) > maxKMSKeyIDLength {
-			return s3err.ErrInvalidArgument.WithMessage("The KMSMasterKeyID is too long.").With("ArgumentName", "KMSMasterKeyID")
-		}
+		return errKMSNotImplemented()
 	default:
 		return s3err.ErrMalformedXML
 	}
@@ -575,9 +571,8 @@ func (s *Server) handleGetBucketEncryption(w http.ResponseWriter, r *http.Reques
 }
 
 // handlePutBucketEncryption implements PutBucketEncryption (see
-// bucketEncryptionConfig.validate). gos3 does not encrypt data; the
-// default algorithm is recorded on new objects and reported back
-// (x-amz-server-side-encryption), as with explicit SSE headers.
+// bucketEncryptionConfig.validate). Verify the selected provider before
+// enabling encryption for new objects; existing versions remain unchanged.
 func (s *Server) handlePutBucketEncryption(w http.ResponseWriter, r *http.Request, rc *reqContext) error {
 	ctx := r.Context()
 	if _, err := s.bucketInfo(ctx, rc); err != nil {
@@ -591,6 +586,9 @@ func (s *Server) handlePutBucketEncryption(w http.ResponseWriter, r *http.Reques
 		return err
 	}
 	c.XMLNS = s3Namespace
+	if err := s.prepareEncryption(ctx, rc.bucket, &storage.ObjectMeta{SSE: "AES256"}, ""); err != nil {
+		return err
+	}
 	if err := s.storeBucketConfig(ctx, rc, storage.ConfigEncryption, c); err != nil {
 		return err
 	}

@@ -117,12 +117,12 @@ func hasPrefixFold(s, prefix string) bool {
 	return len(s) >= len(prefix) && strings.EqualFold(s[:len(prefix)], prefix)
 }
 
-// lookup returns the values of a condition key (exact match first, then
-// case-insensitive). present is false when the key is missing or empty.
+// lookup returns the values of a condition key, case-insensitively. This
+// includes tag-qualified keys: stored tags preserve case, but IAM condition
+// key names do not. Always use the folded index so an exact spelling cannot
+// hide values from another tag whose key differs only in case.
+// present is false when the key is missing or empty.
 func (c *evalCtx) lookup(key string) ([]string, bool) {
-	if v, ok := c.raw[key]; ok && len(v) > 0 {
-		return v, true
-	}
 	if c.lower == nil {
 		c.buildLower()
 	}
@@ -250,8 +250,8 @@ func (c *evalCtx) principalMatches(p *Principal, broad bool) bool {
 }
 
 // principalEntryMatches matches one principal entry: "*", a user name, an
-// access key ID (key, "" for none), arn:<p>:iam::<any>:user/[path/]<name>,
-// or an account principal arn:<p>:iam::<any>:root / 12-digit account ID
+// access key ID (key, "" for none), or an account principal
+// arn:<p>:iam::<any>:root / 12-digit account ID
 // (the root identity, or with broad every authenticated identity; see
 // principalMatches). A 12-digit entry is only ever the account principal:
 // it is never compared with user names or access key IDs.
@@ -270,14 +270,9 @@ func principalEntryMatches(v string, id auth.Identity, key string, broad bool) b
 		if parts[5] == "root" {
 			return id.IsRoot || broad
 		}
-		name, ok := strings.CutPrefix(parts[5], "user/")
-		if !ok || id.IsRoot {
-			return false
-		}
-		if i := strings.LastIndexByte(name, '/'); i >= 0 {
-			name = name[i+1:]
-		}
-		return name != "" && name == id.User
+		// There is no local account ID or IAM path to compare with a user
+		// ARN. Never reduce an external ARN to its final user name.
+		return false
 	}
 	if isAccountID(v) {
 		return id.IsRoot || broad

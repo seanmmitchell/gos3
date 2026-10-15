@@ -15,6 +15,11 @@ import type {
   AccessKey,
   AccessKeyStatus,
   AdminErrorCode,
+  BackingList,
+  BackingConfiguration,
+  BucketCompression,
+  BucketEncryptionProvider,
+  BucketEncryptionProviderInput,
   BucketSummary,
   CreateAccessKeyRequest,
   CreateUserRequest,
@@ -25,7 +30,9 @@ import type {
   Info,
   NamedPolicy,
   Peer,
+  Placement,
   PutPolicyRequest,
+  ReplicationMode,
   ScanRequest,
   ScanResult,
   ServerInfo,
@@ -470,6 +477,86 @@ export class AdminClient {
       },
       expect: 'none'
     })
+  }
+
+  // Storage backings & bucket placement ------------------------------------
+
+  getBackingConfiguration(): Promise<BackingConfiguration> {
+    return this.request('GET', '/backings/config')
+  }
+
+  putBackingConfiguration(body: BackingConfiguration): Promise<BackingConfiguration> {
+    return this.request('PUT', '/backings/config', { body })
+  }
+
+  /** GET /backings (admin:ListBackings); `backings` is never null. */
+  async listBackings(signal?: AbortSignal): Promise<BackingList> {
+    const r = await this.request<BackingList>('GET', '/backings', { signal })
+    return { ...r, backings: r.backings ?? [] }
+  }
+
+  /** GET /buckets/{name}/placement (admin:GetBucketPlacement). */
+  getBucketPlacement(name: string, signal?: AbortSignal): Promise<Placement> {
+    return this.request('GET', `/buckets/${enc(name)}/placement`, { signal })
+  }
+
+  /**
+   * Sets the replication mode and the replica backings (the primary stays).
+   * `single` needs an empty `replicas`, the other modes at least one. New
+   * replicas start a full copy; removed replicas lose their copy.
+   */
+  updateBucketPlacement(name: string, mode: ReplicationMode, replicas: string[]): Promise<Placement> {
+    return this.request('PUT', `/buckets/${enc(name)}/placement`, { body: { mode, replicas } })
+  }
+
+  /** Moves the copy on `from` (default: the primary) to `to`, online (202). */
+  moveBucket(name: string, to: string, from?: string): Promise<Placement> {
+    return this.request('POST', `/buckets/${enc(name)}/placement/move`, { body: from ? { to, from } : { to } })
+  }
+
+  /** Cancels the move in progress (409 once its cutover started). */
+  cancelBucketMove(name: string): Promise<Placement> {
+    return this.request('DELETE', `/buckets/${enc(name)}/placement/move`)
+  }
+
+  /**
+   * Makes a replica the primary. `force` switches immediately, losing the
+   * changes not yet copied to the replica.
+   */
+  promoteReplica(name: string, backing: string, force = false): Promise<Placement> {
+    return this.request('POST', `/buckets/${enc(name)}/placement/promote`, { body: force ? { backing, force: true } : { backing } })
+  }
+
+  /** Compares the replica (default: every replica) with the primary and copies every difference (202). */
+  resyncBucket(name: string, backing?: string): Promise<Placement> {
+    return this.request('POST', `/buckets/${enc(name)}/placement/resync`, { body: backing ? { backing } : {} })
+  }
+
+  /** The bucket's compression setting, its effect and the server's policy. */
+  getBucketCompression(name: string): Promise<BucketCompression> {
+    return this.request('GET', `/buckets/${enc(name)}/compression`)
+  }
+
+  /**
+   * Sets the bucket's compression. 409 Conflict when it contradicts the
+   * administrator's compression.mode (enabling while "disabled",
+   * disabling while "enforced").
+   */
+  putBucketCompression(name: string, enabled: boolean): Promise<BucketCompression> {
+    return this.request('PUT', `/buckets/${enc(name)}/compression`, { body: { enabled } })
+  }
+
+  /** Removes the bucket's setting: back to the server default (204, idempotent). */
+  deleteBucketCompression(name: string): Promise<void> {
+    return this.request('DELETE', `/buckets/${enc(name)}/compression`, { expect: 'none' })
+  }
+
+  getBucketEncryptionProvider(name: string): Promise<BucketEncryptionProvider> {
+    return this.request('GET', `/buckets/${enc(name)}/encryption-provider`)
+  }
+
+  putBucketEncryptionProvider(name: string, body: BucketEncryptionProviderInput): Promise<BucketEncryptionProvider> {
+    return this.request('PUT', `/buckets/${enc(name)}/encryption-provider`, { body })
   }
 
   // Discovery --------------------------------------------------------------

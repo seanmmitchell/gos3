@@ -18,6 +18,9 @@ the settings to review before you expose a server.
       `server.public_info`.
 - [ ] Keep the data directory private (mode 0700) and back it up; it contains
       secrets.
+- [ ] For s3 backings: scope their credentials to their bucket, keep the
+      remote bucket private, and store each backing's encryption key
+      somewhere safe (see [s3 backings](#s3-backings)).
 - [ ] If metrics are public (`metrics.public`), restrict who can reach
       `/_gos3/metrics`.
 - [ ] Enable a standalone web UI's local discovery
@@ -55,7 +58,7 @@ policies.
 |---|---|
 | `GOS3_ROOT_ACCESS_KEY` + `GOS3_ROOT_SECRET_KEY` (or `auth.root_*` in YAML) | Used as given. The secret is never logged. A secret shorter than 16 characters is accepted with a warning. A published example secret (`change-me-now`, `gos3admin-secret`, `minioadmin`, the AWS documentation key, ...) is refused unless `auth.insecure_demo_credentials` / `GOS3_INSECURE_DEMO_CREDENTIALS=true` is set. |
 | Not set, with a data directory | Generated on first start with a random 20-character access key and 40-character secret, saved to `<data>/.gos3/root-credentials.json` (mode 0600) and reused on later starts. The secret is **never logged**: the startup banner shows it only when standard error is a terminal, otherwise it names the file. The log names the access key and the file. |
-| Not set, memory backend without a data path | New keys on every start. On a terminal the banner shows the secret; otherwise it is written to a private temporary file (named in the banner and the log) that is deleted on exit. |
+| Not set, memory or s3 backend without a data path | New keys on every start. On a terminal the banner shows the secret; otherwise it is written to a private temporary file (named in the banner and the log) that is deleted on exit. |
 
 Logs end up in systems (journald, `docker logs`, Kubernetes log stacks) that
 many more people can read than the data directory, so no secret is written
@@ -124,6 +127,13 @@ namespaces are kept apart: a key ID cannot equal a user name, `root`,
 a 12-digit account ID, and a bare 12-digit principal only ever names the
 account. Keys in an older `iam.json` that break this rule are refused at
 authentication and logged at startup and on first use; replace them.
+
+Bucket policies must name local users by bare name, not by an AWS IAM user
+ARN: gos3 cannot verify an ARN's account or path. Before upgrading, replace
+user ARNs in `Principal` and `NotPrincipal` with the intended local names.
+Existing policies that still contain user ARNs fail closed for non-root
+requests until root updates them.
+
 Choosing a key's ID (`"accessKey"` in `POST /users/{name}/keys`) needs
 `admin:CreateAccessKey` at service level, so a delegated administrator can
 only create keys with generated IDs. Principals, `arn:gos3:admin:::user/…`
@@ -162,16 +172,18 @@ the holder give itself any permission:
   action at service level, even when it is otherwise scoped.
 - `admin:UpdateAccessKey`: reactivate an administrator key that was
   deactivated, for example after it leaked.
-- `admin:UpdateConfig`: change CORS, discovery and the public URL; treat it
-  like root access.
+- `admin:UpdateConfig`: change CORS, discovery and the public URL, and the
+  storage backings (including s3 endpoints, credentials and encryption
+  keys); treat it like root access.
 
 To delegate part of user or policy management, scope these actions with the
 per-target resources (see
 [admin-api.md](admin-api.md#resources-and-condition-keys)):
 `arn:gos3:admin:::user/<name>` for user and key actions (a key is evaluated
 as its owner), `arn:gos3:admin:::policy/<name>` for policy actions and
-`arn:gos3:admin:::bucket/<name>` for `admin:GetBucket` and
-`admin:ForceDeleteBucket`, with wildcards, and limit which policies may be
+`arn:gos3:admin:::bucket/<name>` for `admin:GetBucket`,
+`admin:ForceDeleteBucket`, `admin:GetBucketCompression` and
+`admin:PutBucketCompression`, with wildcards, and limit which policies may be
 attached with the multi-valued condition key `admin:PolicyName`. For
 example, this help-desk policy manages only `team-*` users, which cannot
 include the help-desk user itself, and may attach only `readonly`:
@@ -256,8 +268,11 @@ The data directory (default `./data`, `/data` in the container) holds:
 | `.gos3/root-credentials.json` | generated root keys | **secret** (0600) |
 | `.gos3/iam.json` | IAM users, access **and secret** keys, policies | **secret** (0600) |
 | `.gos3/settings.json` | runtime settings | private (0600) |
+| `.gos3/backings.json` | backings configured in the web UI (names, backends, paths, s3 settings **including s3 secret keys and encryption keys**, except values taken from the environment) | **secret** (0600) |
 | `.gos3/meta.db` | bucket and object metadata, bucket policies and configurations (fs backend) | private (0600) |
 | `.gos3/data/`, `.gos3/uploads/` | object and part data | your data (files 0600) |
+| `.gos3/keys/` | bucket encryption keys and restic repository passwords (fs backend) | **secret** (0600) |
+| `.gos3/restic/`, `.gos3/restic-cache/` | restic repositories and cache (fs backend) | encrypted by restic |
 | `.gos3/server-id` | random server ID | public |
 
 Keep the directory owned by the gos3 user with mode 0700, and treat backups as
@@ -271,16 +286,71 @@ the modes above do not apply; instead gos3 gives `.gos3` a protected ACL
 (no inherited entries) that grants access only to the account running gos3,
 SYSTEM and Administrators, inherited by everything inside, and writes the
 secret files with the same ACL. If that fails (for example on a file system
-without ACLs) it logs a warning: then put the data directory somewhere only
-the gos3 account (and administrators) can read, not in a shared location
-such as `C:\ProgramData` with default permissions. Object data outside
-`.gos3` keeps the data directory's ACL. **gos3 does not encrypt objects.** Bucket default encryption and
-`x-amz-server-side-encryption` headers are accepted and reported for client
-compatibility only. Use full-disk or file system encryption if you need
-encryption at rest. SSE-C is rejected (`NotImplemented`).
+without ACLs), gos3 logs a warning and starts anyway. The fs backend's
+`.gos3/keys/` directory (encryption keys and restic recovery records) is
+handled the same way at startup, and is also made private before a new key
+is written there; if that fails, creating the key (and so enabling
+encryption for the bucket) fails. Object data outside
+`.gos3` keeps the data directory's ACL. SSE-S3 (`AES256`) encrypts new object
+data using native AES-256-GCM or the bucket’s restic provider. Existing legacy
+objects require rewriting; AWS KMS and SSE-C return `NotImplemented`.
+Server-managed keys allow unattended access and must be backed up with
+metadata. They do not protect against a compromised server or a full copy of
+its data and keys. See [encryption.md](encryption.md).
+
+### s3 backings
+
+An [s3 backing](backings.md) keeps everything of its buckets in a remote
+bucket: the metadata journal and snapshots (bucket names, object keys, user
+metadata, tags, policies and other bucket configuration, unencrypted),
+object data, wrapped encryption keys and restic repositories. Anyone who
+can read that bucket can read the metadata and every unencrypted object;
+anyone who can write it can change or destroy the backing. Give the
+backing's credentials access to its bucket (and, for a gateway, to creating
+and using the remote buckets named like the gos3 buckets) and nothing
+else, and protect the bucket like the data directory.
+
+- **Encryption key (KEK).** The per-bucket master keys of an s3 backing
+  are stored in the remote bucket wrapped (AES-256-GCM) with the backing's
+  `encryption_key`, which is never stored there (only a check value, which
+  does not reveal it). The remote bucket alone therefore does not decrypt
+  AES256 or restic data. The KEK lives in the configuration file, the
+  environment (`GOS3_S3_ENCRYPTION_KEY`,
+  `GOS3_BACKING_<NAME>_ENCRYPTION_KEY`) or `backings.json`; keep a copy
+  elsewhere, because losing it loses the encrypted data.
+- **Where the secrets are.** The s3 `secret_key` and `encryption_key` come
+  from the configuration file, the environment, or the web UI (then saved
+  in `backings.json`, mode 0600, never with values that came from the
+  environment). Prefer the environment or a secret store for them, and
+  keep a configuration file that contains them at mode 0600.
+- **Redaction.** `gos3 config print` shows `secret_key` and
+  `encryption_key` redacted. The admin API never returns them: they are
+  write-only (`GET /backings/config` reports only `secretKeyConfigured`,
+  `encryptionKeyConfigured` and whether a value comes from the
+  environment), and the Storage page shows them as "Saved – leave blank to
+  keep". Backing status shows the location (`s3://bucket/prefix/`), not
+  credentials. Restic runs with the credentials in its environment, never
+  on its command line, and its diagnostics are redacted before they are
+  logged.
+- **Who can change them.** Reading the backing configuration needs
+  `admin:GetConfig` and changing it `admin:UpdateConfig` at service level;
+  an administrator who can change backings can point a backing at any
+  S3 service, so treat it like root. An endpoint that is this server
+  itself is refused.
+
+Compressed objects (see [operations.md](operations.md#compression)) are
+not protected by compression alone: without object encryption, anyone who
+can read the data files can inflate them. The stored size of a compressed object depends on its content, so it
+can leak how well data that an attacker partly controls compresses together
+with a secret in the same object (the idea behind CRIME/BREACH). Stored sizes
+are only reported by the admin API's bucket usage and stats
+(`admin:GetBucket`, `admin:ListBuckets`, `admin:GetStats`), as totals per
+bucket; if your buckets mix untrusted input with secrets in single objects,
+keep compression off for them or do not grant those actions to the parties
+supplying the input.
 
 Only one gos3 process can use a data directory at a time: every backend,
-including the memory backend with a data path, takes an exclusive lock on
+including the memory and s3 backends with a data path, takes an exclusive lock on
 `<data>/.gos3/lock`, and a second process fails at startup with "is another
 gos3 using this data directory?". On platforms without `flock` or Windows
 file sharing the lock is a no-op.
@@ -435,6 +505,9 @@ already has a secret key. Under the global `*` rule:
 - Preflights are approved only when `Access-Control-Request-Headers`
   includes `authorization` or the URL is presigned; otherwise the answer is
   `403 AccessForbidden`.
+- A preflight's `Access-Control-Request-Headers` is limited to 8 KiB and 64
+  requested headers before matching bucket CORS rules; larger lists get
+  `400 BadRequest`.
 - Browser POST-policy uploads (PostObject) never count as signed, even when
   they come with an `Authorization` header or `X-Amz-*` query parameters:
   PostObject authenticates from its form fields and accepts forms without a
@@ -515,9 +588,10 @@ and `ForAllValues:` conditions never count as restricting; `ForAllValues:`
 conditions hold when the key is missing, as it is for anonymous callers.
 
 Allow statements for everyone that are restricted only by `aws:SourceIp`
-are judged together: the union of their ranges across the whole policy may
-cover at most four IPv4 /8 networks and four IPv6 /32 networks, so splitting
-a wide range across statements does not hide it. Overlapping or repeated
+are judged together: each IPv4 range must be /8 or narrower and each IPv6
+range /32 or narrower. The union across the whole policy may cover at most
+four IPv4 /8 networks and four IPv6 /32 networks, so splitting a wide range
+across statements does not hide it. Overlapping or repeated
 ranges are merged, not counted twice, and `::ffff:a.b.c.d/96+n` counts as
 the IPv4 /n. Wider allow-lists, such as `fd00::/8` or many large ranges,
 count as public. Statements that also carry another restricting key

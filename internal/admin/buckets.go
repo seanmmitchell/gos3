@@ -13,8 +13,10 @@ import (
 	"time"
 
 	"github.com/seanmmitchell/gos3/internal/auth"
+	"github.com/seanmmitchell/gos3/internal/compression"
 	"github.com/seanmmitchell/gos3/internal/iam"
 	"github.com/seanmmitchell/gos3/internal/storage"
+	"github.com/seanmmitchell/gos3/internal/storage/multi"
 )
 
 // aclPrivate is the default canned ACL.
@@ -22,15 +24,21 @@ const aclPrivate = "private"
 
 // bucketSummary is the BucketSummary document of docs/admin-api.md.
 type bucketSummary struct {
-	Name       string           `json:"name"`
-	CreatedAt  time.Time        `json:"createdAt"`
-	Region     string           `json:"region"`
-	Versioning string           `json:"versioning"`
-	ObjectLock bool             `json:"objectLock"`
-	Owner      string           `json:"owner"`
-	Configs    bucketConfigs    `json:"configs"`
-	Public     bool             `json:"public"`
-	Usage      *bucketUsageJSON `json:"usage"`
+	Name       string        `json:"name"`
+	CreatedAt  time.Time     `json:"createdAt"`
+	Region     string        `json:"region"`
+	Versioning string        `json:"versioning"`
+	ObjectLock bool          `json:"objectLock"`
+	Owner      string        `json:"owner"`
+	Configs    bucketConfigs `json:"configs"`
+	Public     bool          `json:"public"`
+	// Compression is the bucket's compression setting and whether new
+	// objects are compressed under the server's policy.
+	Compression bucketCompressionSummary `json:"compression"`
+	Usage       *bucketUsageJSON         `json:"usage"`
+	// Placement is where the bucket is stored (nil without the
+	// multi-backing router).
+	Placement *multi.PlacementSummary `json:"placement,omitempty"`
 }
 
 // bucketConfigs flags which configuration documents a bucket has.
@@ -43,16 +51,6 @@ type bucketConfigs struct {
 	Website    bool   `json:"website"`
 	ObjectLock bool   `json:"objectLock"`
 	ACL        string `json:"acl"`
-}
-
-// allConfigKeys are every bucket configuration document key (deleted by a
-// forced bucket delete).
-var allConfigKeys = []string{
-	storage.ConfigPolicy, storage.ConfigCORS, storage.ConfigLifecycle, storage.ConfigTagging,
-	storage.ConfigEncryption, storage.ConfigObjectLock, storage.ConfigACL, storage.ConfigWebsite,
-	storage.ConfigOwnership, storage.ConfigNotification, storage.ConfigLogging,
-	storage.ConfigPublicAccessBlock, storage.ConfigReplication, storage.ConfigAccelerate,
-	storage.ConfigRequestPayment,
 }
 
 // listUsageConcurrency bounds parallel usage computations for GET /buckets.
@@ -121,6 +119,11 @@ func (a *api) summarize(rc *reqCtx, info storage.BucketInfo, withUsage bool) (*b
 	if s.Owner == "" {
 		s.Owner = auth.RootUser
 	}
+	if r, ok := a.d.Backend.(*multi.Router); ok {
+		if p, err := r.Summary(info.Name); err == nil {
+			s.Placement = &p
+		}
+	}
 	has := func(key string) (bool, error) {
 		_, err := a.d.Backend.GetBucketConfig(rc.ctx, info.Name, key)
 		switch {
@@ -160,6 +163,14 @@ func (a *api) summarize(rc *reqCtx, info storage.BucketInfo, withUsage bool) (*b
 		return nil, err
 	}
 	s.Public = iam.IsPublicPolicy(pol) || iam.IsPublicACL(acl)
+	cs, err := compression.Load(rc.ctx, a.d.Backend, info.Name)
+	if err != nil {
+		return nil, err
+	}
+	s.Compression = bucketCompressionSummary{
+		Enabled:   cs.Enabled,
+		Effective: compression.Effective(a.d.Settings.Get().Compression, cs),
+	}
 	if withUsage {
 		u, at, err := a.bucketUsage(rc.ctx, info.Name)
 		switch {
@@ -326,7 +337,8 @@ func (a *api) forceDeleteBucket(rc *reqCtx, name string, bypass bool) error {
 		"bucket %q kept receiving new objects while being deleted (%d attempts): %v", name, forceDeleteAttempts, lastErr)
 }
 
-// emptyBucket deletes all versions, uploads and configuration documents.
+// emptyBucket deletes all versions, uploads and configuration documents
+// (except the encryption ones, see keepUntilBucketDeleted).
 // Each version is deleted only if guard allows it, atomically with the
 // delete when the backend is a storage.ConditionalDeleter (both built-in
 // backends are), so a lock applied after lockGuard's scan still holds.
@@ -384,12 +396,25 @@ func (a *api) emptyBucket(ctx context.Context, name string, guard *lockGuard) er
 			return fmt.Errorf("aborting upload %q of %q: %w", u.UploadID, u.Key, err)
 		}
 	}
-	for _, key := range allConfigKeys {
+	for _, key := range storage.AllConfigKeys {
+		if keepUntilBucketDeleted(key) {
+			continue
+		}
 		if err := b.DeleteBucketConfig(ctx, name, key); err != nil && !errors.Is(err, storage.ErrConfigNotFound) {
 			return fmt.Errorf("deleting %s configuration: %w", key, err)
 		}
 	}
 	return nil
+}
+
+// keepUntilBucketDeleted reports whether emptyBucket leaves the
+// configuration document key for DeleteBucket to remove with the bucket.
+// The encryption documents decide how writes are stored and how restic
+// objects are read: if DeleteBucket then fails (a concurrent writer), the
+// surviving bucket must neither store new objects in plaintext nor lose
+// the provider of its archived objects.
+func keepUntilBucketDeleted(key string) bool {
+	return key == storage.ConfigEncryption || key == storage.ConfigEncryptionProvider
 }
 
 // deleteVersionIf permanently deletes one version if check allows it,

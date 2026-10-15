@@ -27,6 +27,20 @@ Run `gos3 serve`, point the AWS CLI, an SDK, `mc` or rclone at it, and open
   of current and noncurrent versions, delete markers and stale multipart uploads.
 - **Checksums**: CRC32, CRC32C, CRC64NVME, SHA-1 and SHA-256, as headers or
   trailers, full-object or composite for multipart uploads, plus MD5/ETag.
+- **Multiple backings**: spread buckets over several disks or directories,
+  move buckets between them online, and replicate a bucket to other backings
+  in active-passive or active-active mode with automatic failover. See
+  [docs/operations.md](docs/operations.md#multiple-backings-and-replication).
+- **Compression**: transparent, seekable DEFLATE compression of object data,
+  enabled per bucket, or enforced or disabled server-wide by the
+  administrator. Already-compressed media types are skipped. See
+  [docs/operations.md](docs/operations.md#compression).
+- **S3 as a storage backend**: keep a whole server, or individual buckets,
+  in a bucket of AWS S3, MinIO, R2 or another S3 service that supports
+  conditional writes, with every gos3 feature and no local data directory;
+  or use the gateway option to store native objects other tools can read.
+  S3 backings can be added and edited live from the web UI. See
+  [docs/backings.md](docs/backings.md).
 - **Web UI**: embedded in the binary or run standalone to manage many gos3
   and other S3 servers. It has an object browser with uploads, versions,
   metadata and share links, bucket settings, users and policies, server
@@ -34,7 +48,7 @@ Run `gos3 serve`, point the AWS CLI, an SDK, `mc` or rclone at it, and open
 - **Discovery**: servers announce themselves through mDNS and a UDP multicast
   beacon, and find each other through static seeds, DNS SRV records and
   on-demand network scans. The UI merges what every server sees.
-- **Simple to run**: one static binary or a ~25 MB distroless image. YAML,
+- **Simple to run**: one static binary or a distroless image. JSON, YAML,
   environment variables or flags, runtime settings without restarts,
   Prometheus metrics, health and readiness endpoints, and graceful shutdown.
 
@@ -80,8 +94,9 @@ build provenance:
 `gh attestation verify oci://ghcr.io/seanmmitchell/gos3:X.Y.Z --repo seanmmitchell/gos3 --source-ref refs/heads/main`.
 
 To build the image yourself, run `docker build -t gos3 .` or `make docker`.
-The image runs as a non-root user (uid 65532), keeps its data in `/data`, and
-has a health check.
+The image runs as a non-root user (uid 65532), keeps its data in `/data`, has
+a health check, and includes the restic executable that restic-encrypted
+buckets use.
 
 ### Docker Compose: two nodes with discovery
 
@@ -115,11 +130,38 @@ then they only answer when the UI is opened via an IP address or `localhost`
 
 ## Configuration
 
-Settings come from defaults, then a YAML file (`--config` or `GOS3_CONFIG`), then
+Choose how the server is managed:
+
+```sh
+gos3 serve --no-admin                 # S3 only, static configuration
+gos3 serve --no-ui                    # S3 + management API for a separate UI
+gos3 serve                            # S3 + management API + embedded UI (default)
+gos3 serve --config gos3.json          # JSON or YAML configuration
+make build-headless                   # no UI assets, Node or pnpm required
+```
+
+The release and dev workflows also publish binaries and images without UI
+assets compiled in. Choose `gos3_X.Y.Z_linux_amd64-headless.tar.gz` (or the
+matching OS/architecture archive, `.zip` on Windows), and image tags
+`ghcr.io/seanmmitchell/gos3:X.Y.Z-headless`, `latest-headless` or `dev-headless`.
+These builds retain the management API; use `serve --no-admin` for S3 only.
+Build the image locally with `docker build --target headless -t gos3:headless .`.
+The ordinary archives and image tags continue to include the UI.
+
+Discovery, advertising, mDNS, beacons and scans all default to off.
+Set the discovery switches explicitly to enable them. To replace a basic
+MinIO startup command, use `gos3 server /data --address :9000 --no-admin`;
+`MINIO_ROOT_USER` and `MINIO_ROOT_PASSWORD` are accepted as credential
+aliases. See [server modes and MinIO compatibility](docs/configuration.md#server-modes)
+for JSON examples, precedence, health probes and migration limits.
+
+Settings come from defaults, then a JSON or YAML file (`--config` or `GOS3_CONFIG`), then
 `GOS3_*` environment variables, then flags. Each layer overrides the one before.
 
 ```sh
 gos3 config init -o gos3.yaml   # commented sample configuration
+gos3 config init -o gos3.json   # all settings as JSON
+gos3 config print --json        # effective JSON, secrets redacted
 gos3 config env                 # every GOS3_* variable
 gos3 config print               # effective configuration, secrets redacted
 ```
@@ -130,20 +172,24 @@ Frequently used settings:
 |---|---|---|
 | Listen address | `--address` / `GOS3_ADDRESS` | `:9000` |
 | Data directory | `--data` / `GOS3_DATA` | `./data` |
-| Backend | `--backend fs\|memory` / `GOS3_STORAGE_BACKEND` | `fs` |
+| Backend | `--backend fs\|memory\|s3` / `GOS3_STORAGE_BACKEND` (s3: `GOS3_S3_*`) | `fs` |
 | Root keys | `GOS3_ROOT_ACCESS_KEY`, `GOS3_ROOT_SECRET_KEY` | generated |
 | Region | `--region` / `GOS3_REGION` | `us-east-1` |
 | Public URL | `--public-url` / `GOS3_PUBLIC_URL` | derived |
 | Virtual-host domains | `--domain` / `GOS3_DOMAINS` | none (path-style) |
 | TLS | `--tls-cert`, `--tls-key` / `GOS3_TLS_CERT`, `GOS3_TLS_KEY` | off |
 | CORS origins | `--cors-origin` / `GOS3_CORS_ORIGINS` | `*` |
-| Discovery | `--no-discovery`, `--seed` / `GOS3_DISCOVERY_*` | on |
+| Discovery | `--no-discovery`, `--seed` / `GOS3_DISCOVERY_*` | off (opt-in) |
 
-Runtime settings (name, region, CORS, domains, discovery, logging, lifecycle,
+When management is enabled, runtime settings (name, region, CORS, domains, discovery, logging, lifecycle,
 public metrics) can also be changed from the UI or the admin API without a
 restart. They are then stored in `<data>/.gos3/settings.json` and take
 precedence over the file, environment and flags. Every key is listed in
 [docs/configuration.md](docs/configuration.md).
+
+With `--no-admin`, the server ignores saved UI settings and uses only
+defaults, the config file, environment and flags. Existing saved settings
+are preserved for a later managed startup.
 
 ## Using gos3 with S3 clients
 
@@ -313,14 +359,18 @@ specified in [docs/discovery.md](docs/discovery.md).
   other websites cannot read anonymously accessible data through a visitor's
   browser. Narrow it to your UI origins in production, and use a bucket CORS
   configuration to serve a public bucket to scripts on other sites.
-- **Discovery and scans**: servers announce their name, version and URLs on
-  the LAN. Turn this off with `discovery.advertise: false` or
-  `--no-discovery`. Network scans need `admin:ScanNetwork` and can be disabled
-  with `discovery.allow_scan: false`. The standalone UI's Node server performs
+- **Discovery and scans**: all switches default to off. Explicitly enabled
+  advertising announces the server's name, version and URLs on the LAN.
+  Network scans require `discovery.allow_scan: true` and `admin:ScanNetwork`.
+  The standalone UI's Node server performs
   local discovery only when `GOS3_UI_LOCAL_DISCOVERY=true`, and then for
   anyone who can reach it.
-- **No encryption at rest**: server-side encryption headers are accepted for
-  compatibility only. Use disk encryption.
+- **Object encryption**: SSE-S3 encrypts new object data using server-managed
+  keys. Per-bucket restic repositories provide encrypted archival on the
+  bucket's backing, a local directory or an S3 backing's bucket (restic is
+  bundled in the container images; install it next to a release binary).
+  On S3 backings the keys are wrapped with a key-encryption key you keep. Existing objects require rewriting to
+  encrypt them; back up the protected keys and metadata. See [encryption](docs/encryption.md).
 
 More in [docs/security.md](docs/security.md).
 
@@ -330,6 +380,8 @@ More in [docs/security.md](docs/security.md).
 |---|---|
 | [docs/configuration.md](docs/configuration.md) | every YAML key, environment variable and flag |
 | [docs/deployment.md](docs/deployment.md) | Docker, Compose, systemd, Kubernetes, reverse proxies, TLS |
+| [docs/backings.md](docs/backings.md) | storage backings: S3 as a backend (whole server or per bucket), the gateway option, live configuration |
+| [docs/encryption.md](docs/encryption.md) | native AES256 and restic encryption, keys and recovery |
 | [docs/operations.md](docs/operations.md) | health checks, metrics, logs, backups, lifecycle, upgrades |
 | [docs/security.md](docs/security.md) | authentication, stored secrets, exposure checklist |
 | [docs/s3-compatibility.md](docs/s3-compatibility.md) | supported S3 operations and differences from AWS |
@@ -385,7 +437,9 @@ docs/                documentation
 
 CI (`.github/workflows/ci.yml`) runs gofmt, vet, govulncheck, the Go unit and
 e2e tests with `-race`, the web typecheck, tests and builds, the Playwright suites, the
-compatibility suite, and the Docker builds.
+compatibility suite, and the Docker builds. The Go tests run on Linux, macOS and
+Windows with a pinned restic installed (`.github/actions/setup-restic`), so the
+restic repository tests run instead of skipping.
 
 Pull requests target `dev`, the default branch; `main` only receives release
 merges from `dev`. Every push to `dev` publishes `ghcr.io/seanmmitchell/gos3:dev`,
@@ -395,9 +449,10 @@ archives and image. Branch rules, versioning and the release steps are in
 
 ## Limitations
 
-- **Single node.** No replication, erasure coding or clustering. Discovery
-  finds servers but does not combine them. Use backups (see
-  [docs/operations.md](docs/operations.md#backups)) for durability.
+- **Single node.** Buckets can be replicated between the backings (disks)
+  of one server, but not between servers; there is no erasure coding or
+  clustering. Discovery finds servers but does not combine them. Use backups
+  (see [docs/operations.md](docs/operations.md#backups)) for durability.
 - One account: IAM users share the bucket namespace, and there is no STS and
   no session tokens.
 - Not implemented: SigV2, SigV4A, SSE-C, ACL grants beyond canned ACLs,
@@ -405,7 +460,8 @@ archives and image. Branch rules, versioning and the release steps are in
   configurations. Lifecycle transitions, website, notification, logging and
   replication configurations are stored but not acted on. Details are in
   [docs/s3-compatibility.md](docs/s3-compatibility.md).
-- Objects are not encrypted at rest by gos3.
+- AWS KMS encryption is not implemented. Native AES256 and restic encrypt
+  new objects when requested or enabled as the bucket default.
 - TLS certificates are loaded at startup; restart after renewal.
 
 ## License

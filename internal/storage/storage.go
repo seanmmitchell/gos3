@@ -33,6 +33,16 @@ var (
 	ErrConfigNotFound     = errors.New("storage: bucket config not found")
 	ErrPreconditionFailed = errors.New("storage: precondition failed")
 	ErrInvalidName        = errors.New("storage: invalid name")
+	// ErrInvalidBacking is returned by CreateBucket for a backing name that
+	// is not configured.
+	ErrInvalidBacking = errors.New("storage: unknown backing")
+	// ErrBackingUnavailable is returned (wrapped) when the backing that
+	// holds a bucket's data is not configured any more or cannot be
+	// reached (network failure or a 5xx answer from a remote S3 service).
+	ErrBackingUnavailable = errors.New("storage: backing unavailable")
+	// ErrNotSupported is returned when the bucket's backing cannot perform
+	// an operation (e.g. versioning on a gateway backing).
+	ErrNotSupported = errors.New("storage: not supported by the bucket's backing")
 	// ErrStopWalk may be returned by a Walk callback to stop iteration early;
 	// the Walk method then returns nil.
 	ErrStopWalk = errors.New("storage: stop walk")
@@ -70,6 +80,9 @@ const (
 	ConfigReplication       = "replication"
 	ConfigAccelerate        = "accelerate"
 	ConfigRequestPayment    = "request-payment"
+	// ConfigCompression is the gos3 bucket compression setting (JSON, see
+	// the admin API), not an S3 configuration.
+	ConfigCompression = "compression"
 )
 
 // BucketInfo describes a bucket.
@@ -80,6 +93,10 @@ type BucketInfo struct {
 	Versioning        VersioningStatus
 	ObjectLockEnabled bool
 	Owner             string // IAM user name that created the bucket ("" = root)
+	// Backing names the backing holding the bucket's primary copy. The
+	// multi-backing router (internal/storage/multi) sets it; the backends
+	// behind it report "" (or what they were given). See docs/backings.md.
+	Backing string
 }
 
 // CreateBucketOptions are passed to CreateBucket.
@@ -87,6 +104,12 @@ type CreateBucketOptions struct {
 	Region            string
 	ObjectLockEnabled bool // implies Versioning = Enabled
 	Owner             string
+	// Backing names the backing to create the bucket on (the
+	// x-gos3-backing header; "" = the default backing). The multi-backing
+	// router (internal/storage/multi) validates it, returning
+	// ErrInvalidBacking for unknown names, and passes "" to the backing it
+	// creates the bucket on; other backends ignore it.
+	Backing string
 }
 
 // ObjectMeta is the metadata supplied by the S3 layer when committing an
@@ -111,7 +134,10 @@ type ObjectMeta struct {
 	// PartChecksums holds per-part checksums for multipart objects (same order
 	// as PartSizes) for GetObjectAttributes / GetObject?partNumber.
 	PartChecksums []map[string]string
-	// Server-side encryption as reported back to clients (gos3 records it).
+	// Encryption records the actual storage implementation. Empty on legacy
+	// objects whose SSE fields were only recorded, without encryption.
+	Encryption string
+	// Server-side encryption requested by the client.
 	SSE         string // "AES256", "aws:kms" or ""
 	SSEKMSKeyID string
 	// Object Lock
@@ -119,6 +145,11 @@ type ObjectMeta struct {
 	RetainUntil     time.Time // zero = none
 	LegalHold       bool
 	WebsiteRedirect string // x-amz-website-redirect-location
+	// MultipartRetentionSource is set only on an in-progress upload. "default"
+	// means its retention must be calculated when the version is published;
+	// "explicit" means the caller supplied the retention headers. It is
+	// cleared before the completed object's metadata is stored.
+	MultipartRetentionSource string
 }
 
 // ObjectInfo describes one object version (or delete marker).
@@ -131,6 +162,34 @@ type ObjectInfo struct {
 	DeleteMarker bool
 	Size         int64
 	LastModified time.Time
+	// Compression is the algorithm the backend stored the data with (see
+	// CompressingBackend; "" = stored as is). It is set by the backend
+	// and transparent to readers: Size and OpenObject are always about
+	// the uncompressed content.
+	Compression string
+	// StoredSize is the number of bytes the backend stores for the data
+	// when Compression is set (0 otherwise; see PhysicalSize).
+	StoredSize int64
+}
+
+// PhysicalSize is the number of data bytes the backend stores for the
+// version: the content's size, less when it is compressed, plus the
+// overhead of native encryption (EncryptionAES256; an empty object stores
+// nothing). Restic versions count their content size: their data lives in
+// a repository whose packs are deduplicated, compressed and shared between
+// snapshots, so it cannot be attributed to single versions (and the small
+// local snapshot reference is not counted). Usage figures therefore never
+// report restic data as compression savings. The memory backend keeps
+// AES256 data as is, so for it the encryption overhead is notional.
+func (o ObjectInfo) PhysicalSize() int64 {
+	n := o.Size
+	if o.Compression != "" && o.Encryption != EncryptionRestic {
+		n = o.StoredSize
+	}
+	if o.Encryption == EncryptionAES256 && n > 0 {
+		return EncryptedSize(n)
+	}
+	return n
 }
 
 // CommitOptions are atomic preconditions evaluated against the current latest
@@ -148,6 +207,12 @@ type CommitOptions struct {
 	// part was replaced after the caller validated it. The check is atomic
 	// with the commit.
 	PartETags []string
+	// BeforePublish runs after any data copy, under the backend's atomic
+	// bucket commit lock/transaction, with the current object's metadata (nil
+	// if absent or a delete marker), the new version's actual creation time,
+	// and current bucket configurations. It may update meta or refuse the
+	// commit. The callback must not call the same backend.
+	BeforePublish func(meta, current *ObjectMeta, created time.Time, config func(key string) []byte) error
 }
 
 // ObjectWriter streams the data of a new object version. Nothing becomes
@@ -278,6 +343,14 @@ type Backend interface {
 	//   - versionIDMarker == "": start strictly after all versions of keyMarker.
 	//   - otherwise: start with the version immediately following
 	//     versionIDMarker (older than it) within keyMarker.
+	// A versionIDMarker whose version was deleted (e.g. between pages) must
+	// not make the walk skip the remaining versions of keyMarker: an ID that
+	// encodes its position (as generated IDs may) resumes at that position;
+	// NullVersionID carries none, so a "null" marker of a key without a null
+	// version starts with the newest remaining version of keyMarker.
+	// Re-delivering a version the caller has already seen is acceptable;
+	// silently skipping one is not. Other IDs that are not versions of
+	// keyMarker start after all of its versions.
 	// A walk is not a snapshot when keys change concurrently, but IsLatest
 	// is only ever set on the first entry delivered for a key (and only if
 	// it was the newest version when read), never on a later entry of the

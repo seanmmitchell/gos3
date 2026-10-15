@@ -23,11 +23,14 @@ import (
 	"encoding/xml"
 	"errors"
 	"io"
+	"maps"
 	"net/http"
 	"net/url"
 	"strconv"
 	"strings"
+	"time"
 
+	"github.com/seanmmitchell/gos3/internal/iam"
 	"github.com/seanmmitchell/gos3/internal/s3err"
 	"github.com/seanmmitchell/gos3/internal/storage"
 )
@@ -175,6 +178,10 @@ func (s *Server) handleCreateMultipartUpload(w http.ResponseWriter, r *http.Requ
 	if err != nil {
 		return err
 	}
+	retentionSource := "default"
+	if meta.RetentionMode != "" {
+		retentionSource = "explicit"
+	}
 	algo, typ, err := parseUploadChecksum(h)
 	if err != nil {
 		return err
@@ -182,6 +189,7 @@ func (s *Server) handleCreateMultipartUpload(w http.ResponseWriter, r *http.Requ
 	if err := s.prepareNewObject(ctx, r, rc, bi, rc.key, &meta, headerObjectOpts(h)); err != nil {
 		return err
 	}
+	meta.MultipartRetentionSource = retentionSource
 	meta.Checksums, meta.ChecksumType = nil, ""
 	if algo != "" {
 		meta.Checksums = map[string]string{algo: ""}
@@ -260,7 +268,7 @@ func (s *Server) handleUploadPart(w http.ResponseWriter, r *http.Request, rc *re
 	if v := part.Checksums[report]; report != "" && v != "" {
 		hdr.Set(checksumHeader(report), v)
 	}
-	setSSEHeaders(hdr, up.Meta)
+	setUploadSSEHeaders(hdr, up.Meta)
 	writeEmpty(w, http.StatusOK)
 	return nil
 }
@@ -402,7 +410,7 @@ func (s *Server) handleUploadPartCopy(w http.ResponseWriter, r *http.Request, rc
 	if srcBucket.Versioning != storage.VersioningUnversioned {
 		early.Set("X-Amz-Copy-Source-Version-Id", info.VersionID)
 	}
-	setSSEHeaders(early, up.Meta)
+	setUploadSSEHeaders(early, up.Meta)
 	bucket, key, uploadID := rc.bucket, rc.key, up.UploadID
 	return s.respondWithKeepAlive(w, r, rc, early, nil, func() longResult {
 		pw, err := s.backend.NewPartWriter(ctx, bucket, key, uploadID, partNumber)
@@ -418,6 +426,24 @@ func (s *Server) handleUploadPartCopy(w http.ResponseWriter, r *http.Request, rc
 		if err != nil {
 			_ = pw.Abort()
 			return longResult{err: mapStorageError(err)}
+		}
+		// A source read may take a long time. Check the caller and both sides
+		// again before a copied part becomes available to a later completion.
+		if err := s.checkCredentialsCurrent(rc); err != nil {
+			_ = pw.Abort()
+			return longResult{err: err}
+		}
+		if err := s.reauthorizeOp(ctx, r, rc, nil); err != nil {
+			_ = pw.Abort()
+			return longResult{err: err}
+		}
+		if err := s.authorizeTarget(ctx, r, rc, authzTarget{
+			Action: objectReadAction(src.VersionID), Bucket: src.Bucket, Key: src.Key,
+			VersionID: src.VersionID, ObjectRead: true,
+			Conditions: s.requestTimeConditions(r, rc, nil),
+		}); err != nil {
+			_ = pw.Abort()
+			return longResult{err: err}
 		}
 		sums := map[string]string{sumAlgo: base64.StdEncoding.EncodeToString(hasher.sum.Sum(nil))}
 		part, err := pw.Commit(ctx, storage.PartMeta{ETag: hex.EncodeToString(hasher.md5.Sum(nil)), Checksums: sums})
@@ -794,6 +820,129 @@ func (s *Server) completedObjectACL(ctx context.Context, bucket, acl string) (st
 	return acl, nil
 }
 
+// finalizeMultipartObject runs inside the backend's atomic publish step.
+// Configurations passed here are from that same bucket snapshot; the callback
+// deliberately avoids calling the backend while it holds its commit lock.
+func (s *Server) finalizeMultipartObject(ctx context.Context, r *http.Request, rc *reqContext,
+	meta, current *storage.ObjectMeta, created time.Time, config func(string) []byte) error {
+	if err := s.checkCredentialsCurrent(rc); err != nil {
+		return err
+	}
+	retentionSource := meta.MultipartRetentionSource
+	if meta.ACL != "" {
+		if aclsDisabledByOwnership(config(storage.ConfigOwnership)) {
+			meta.ACL = ""
+		} else if isPublicCannedACL(meta.ACL) {
+			if raw := config(storage.ConfigPublicAccessBlock); raw != nil {
+				pab, err := parsePublicAccessBlock(raw)
+				if err != nil || pab.BlockPublicAcls {
+					return s3err.ErrAccessDenied
+				}
+			}
+		}
+	}
+	if meta.MultipartRetentionSource == "default" ||
+		(meta.MultipartRetentionSource == "" && meta.RetentionMode == "") {
+		meta.RetentionMode, meta.RetainUntil = "", time.Time{}
+		if raw := config(storage.ConfigObjectLock); raw != nil {
+			d, err := parseLockDefaults(raw)
+			if err != nil {
+				return s3err.ErrInternalError
+			}
+			meta.RetentionMode, meta.RetainUntil = d.retentionAt(created)
+		}
+	} else if meta.MultipartRetentionSource == "explicit" && !meta.RetainUntil.After(created) {
+		return s3err.ErrInvalidArgument.WithMessage("The retain until date must be in the future!")
+	}
+	if err := s.authorizeObjectPublication(ctx, r, rc, meta, current, retentionSource, config); err != nil {
+		return err
+	}
+	meta.MultipartRetentionSource = ""
+	return nil
+}
+
+// authorizeObjectPublication evaluates the current caller's permissions
+// against IAM and the bucket configuration in the backend's commit snapshot.
+// It does not read the storage backend, which is locked by the caller.
+func (s *Server) authorizeObjectPublication(ctx context.Context, r *http.Request, rc *reqContext,
+	meta, current *storage.ObjectMeta, retentionSource string, config func(string) []byte) error {
+	id := rc.identity
+	if id.IsRoot && !id.IsAnonymous {
+		return nil
+	}
+	if s.iam == nil {
+		return s3err.ErrAccessDenied
+	}
+	var policy *iam.PolicyDocument
+	if raw := config(storage.ConfigPolicy); raw != nil {
+		var err error
+		policy, err = iam.ParseBucketPolicy(raw, rc.bucket)
+		if err != nil {
+			return s3err.ErrInternalError
+		}
+	}
+	var pab PublicAccessBlockConfiguration
+	if raw := config(storage.ConfigPublicAccessBlock); raw != nil {
+		parsed, err := parsePublicAccessBlock(raw)
+		if err != nil {
+			return s3err.ErrAccessDenied
+		}
+		pab = *parsed
+	}
+	if id.IsAnonymous && pab.RestrictPublicBuckets && iam.IsPublicPolicy(policy) {
+		denyOnly := &iam.PolicyDocument{Version: policy.Version, ID: policy.ID}
+		for _, st := range policy.Statement {
+			if st.Effect == "Deny" {
+				denyOnly.Statement = append(denyOnly.Statement, st)
+			}
+		}
+		policy = denyOnly
+	}
+	acl := ""
+	if !aclsDisabledByOwnership(config(storage.ConfigOwnership)) {
+		acl = effectiveACL(cannedACLFromConfig(config(storage.ConfigACL)), pab)
+	}
+	attrs := objectAttrConditions(*meta, meta.ACL != "", meta.LegalHold, len(meta.Tags) > 0, rc.start)
+	conds := s.requestTimeConditions(r, rc, attrs)
+	actions := []string{"s3:PutObject"}
+	if retentionSource == "explicit" || (retentionSource == "" && meta.RetentionMode != "") {
+		actions = append(actions, "s3:PutObjectRetention")
+	}
+	if meta.LegalHold {
+		actions = append(actions, "s3:PutObjectLegalHold")
+	}
+	if meta.ACL != "" {
+		actions = append(actions, "s3:PutObjectAcl")
+	}
+	if len(meta.Tags) > 0 {
+		actions = append(actions, "s3:PutObjectTagging")
+	}
+	for _, action := range actions {
+		extra := conds
+		if action == "s3:PutObjectTagging" {
+			extra = requestTagConditions(meta.Tags)
+			maps.Copy(extra, conds)
+		}
+		conditions := s.conditionContext(r, rc, authzTarget{
+			Action: action, Bucket: rc.bucket, Key: rc.key, ObjectAttrs: attrs, Conditions: extra,
+		})
+		if current != nil {
+			for key, value := range current.Tags {
+				conditions["s3:ExistingObjectTag/"+key] = []string{value}
+			}
+		}
+		decision := s.iam.Authorize(ctx, iam.AuthzRequest{
+			Identity: id, Action: action, Bucket: rc.bucket, Key: rc.key,
+			BucketPolicy: policy, ACL: acl, Conditions: conditions,
+		})
+		rc.authzReason = decision.Reason
+		if !decision.Allowed {
+			return s3err.ErrAccessDenied
+		}
+	}
+	return nil
+}
+
 // handleCompleteMultipartUpload implements CompleteMultipartUpload: the
 // listed parts (strictly ascending, existing, matching ETags, all but the
 // last at least 5 MiB, optional per-part checksums matching) are
@@ -852,15 +1001,36 @@ func (s *Server) handleCompleteMultipartUpload(w http.ResponseWriter, r *http.Re
 	if err := s.revalidateWrite(rc, func() error { return s.reauthorizeOp(ctx, r, rc, nil) }); err != nil {
 		return err
 	}
+	// The upload's metadata is supplied by its initiator, who need not be
+	// the principal completing it. Check every permission needed to publish
+	// those attributes against the completing principal and current policy.
+	attrs := objectAttrConditions(plan.meta, plan.meta.ACL != "", plan.meta.LegalHold, len(plan.meta.Tags) > 0, rc.start)
+	opts := newObjectOpts{
+		acl:          plan.meta.ACL,
+		aclSet:       plan.meta.ACL != "",
+		tagsSet:      len(plan.meta.Tags) > 0,
+		legalHoldSet: plan.meta.LegalHold,
+		retentionSet: plan.meta.MultipartRetentionSource == "explicit" ||
+			(plan.meta.MultipartRetentionSource == "" && plan.meta.RetentionMode != ""),
+		attrs: attrs,
+	}
+	if err := s.authorizeNewObject(ctx, r, rc, rc.bucket, rc.key, plan.meta.Tags, opts,
+		s.requestTimeConditions(r, rc, attrs)); err != nil {
+		return err
+	}
 
 	// The backend re-checks the part ETags atomically with the commit, so a
 	// part replaced after the checks above gives InvalidPart instead of an
 	// object whose data does not match its ETag and checksums.
 	cond.PartETags = plan.partETags
+	workCtx := context.WithoutCancel(ctx)
+	cond.BeforePublish = func(meta, current *storage.ObjectMeta, created time.Time, config func(string) []byte) error {
+		return s.finalizeMultipartObject(workCtx, r, rc, meta, current, created, config)
+	}
 
 	versioned := bi.Versioning != storage.VersioningUnversioned
 	early := http.Header{}
-	setSSEHeaders(early, plan.meta)
+	setUploadSSEHeaders(early, plan.meta)
 	var trailers []string
 	if versioned {
 		trailers = []string{"X-Amz-Version-Id"}
@@ -874,9 +1044,8 @@ func (s *Server) handleCompleteMultipartUpload(w http.ResponseWriter, r *http.Re
 	bucket, key := rc.bucket, rc.key
 	// Completion continues when the client goes away, like in S3: the
 	// backend commit is atomic and the upload is gone afterwards.
-	workCtx := context.WithoutCancel(ctx)
 	return s.respondWithKeepAlive(w, r, rc, early, trailers, func() longResult {
-		info, err := s.backend.CompleteMultipartUpload(workCtx, bucket, key, up.UploadID, plan.partNumbers, plan.meta, cond)
+		info, err := s.completeMultipartUpload(workCtx, bucket, key, up.UploadID, plan.partNumbers, plan.meta, cond)
 		if err != nil {
 			if errors.Is(err, storage.ErrPreconditionFailed) {
 				return longResult{err: s.commitError(workCtx, err, bucket, key, cond)}

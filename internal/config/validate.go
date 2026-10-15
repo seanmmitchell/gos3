@@ -13,6 +13,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/seanmmitchell/gos3/internal/discovery"
+	"github.com/seanmmitchell/gos3/internal/storage/compress"
 )
 
 // Settings validation limits (shared by Store.Update, Config.Validate and the
@@ -113,7 +114,62 @@ func validateSettings(s *Settings) *FieldError {
 		return fieldErr("lifecycle.intervalSeconds", "must be between %d and %d, got %d",
 			MinLifecycleSeconds, MaxLifecycleSeconds, s.Lifecycle.IntervalSeconds)
 	}
+	if err := validateCompression(&s.Compression); err != nil {
+		err.Field = "compression." + err.Field
+		return err
+	}
 	return nil
+}
+
+func validateCompression(c *CompressionSettings) *FieldError {
+	switch c.Mode {
+	case CompressionOptional, CompressionEnforced, CompressionDisabled:
+	default:
+		return fieldErr("mode", "%q is invalid (expected %s, %s or %s)", c.Mode,
+			CompressionOptional, CompressionEnforced, CompressionDisabled)
+	}
+	if !compress.ValidLevel(c.Level) {
+		return fieldErr("level", "must be between %d and %d, got %d", compress.MinLevel, compress.MaxLevel, c.Level)
+	}
+	if c.MinSize < 0 || c.MinSize > MaxMaxObjectSize {
+		return fieldErr("minSize", "must be between 0 and %d bytes, got %d", MaxMaxObjectSize, c.MinSize)
+	}
+	if len(c.SkipContentTypes) > MaxListEntries {
+		return fieldErr("skipContentTypes", "at most %d entries allowed", MaxListEntries)
+	}
+	for i, t := range c.SkipContentTypes {
+		if !mediaTypePatternRe.MatchString(t) {
+			return fieldErr(fmt.Sprintf("skipContentTypes[%d]", i),
+				"%q is not a media type pattern (\"type/subtype\", \"type/*\" or a prefix ending in \"*\")", t)
+		}
+	}
+	return nil
+}
+
+// mediaTypePatternRe matches the compression.skipContentTypes patterns: a
+// media type ("text/csv"), all subtypes of a type ("video/*") or a prefix
+// ("application/vnd.oasis.opendocument.*").
+var mediaTypePatternRe = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9!#$&^_.+-]*/(\*|[A-Za-z0-9][A-Za-z0-9!#$&^_.+-]*\*?)$`)
+
+// MatchContentType reports whether the Content-Type value ct (parameters
+// allowed) matches one of the compression.skipContentTypes patterns.
+func MatchContentType(patterns []string, ct string) bool {
+	ct, _, _ = strings.Cut(ct, ";")
+	ct = strings.ToLower(strings.TrimSpace(ct))
+	if ct == "" {
+		return false
+	}
+	for _, p := range patterns {
+		p = strings.ToLower(p)
+		if prefix, ok := strings.CutSuffix(p, "*"); ok {
+			if strings.HasPrefix(ct, prefix) {
+				return true
+			}
+		} else if ct == p {
+			return true
+		}
+	}
+	return false
 }
 
 func validateCORS(c *CORSConfig) *FieldError {

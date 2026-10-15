@@ -8,6 +8,7 @@ import (
 	"io"
 	"log/slog"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"text/tabwriter"
@@ -43,7 +44,7 @@ func (l *listFlag) Set(v string) error {
 // addConfigFlags registers the configuration flags on fs.
 func addConfigFlags(fs *flag.FlagSet) *configFlags {
 	c := &configFlags{fs: fs, keys: map[string]string{}, values: map[string]func() (string, bool){}}
-	fs.StringVar(&c.configPath, "config", "", "YAML configuration file (env GOS3_CONFIG)")
+	fs.StringVar(&c.configPath, "config", "", "JSON or YAML configuration file (env GOS3_CONFIG)")
 
 	str := func(name, key, usage string) {
 		p := fs.String(name, "", usage)
@@ -63,8 +64,8 @@ func addConfigFlags(fs *flag.FlagSet) *configFlags {
 	}
 
 	str("address", "server.address", "listen address [host]:port (default \":9000\")")
-	str("data", "storage.path", "data directory (default \"./data\"; memory backend: none = ephemeral)")
-	str("backend", "storage.backend", "storage backend: fs or memory (default fs)")
+	str("data", "storage.path", "data directory (default \"./data\"; memory and s3 backends: system state only, none = ephemeral)")
+	str("backend", "storage.backend", "storage backend: fs, memory or s3 (default fs; s3 is configured by storage.s3 / GOS3_S3_*)")
 	str("name", "server.name", "server name shown in the UI and discovery (default: host name)")
 	str("region", "server.region", "region reported to clients (default us-east-1)")
 	str("public-url", "server.public_url", "externally reachable base URL, e.g. https://s3.example.com")
@@ -75,6 +76,7 @@ func addConfigFlags(fs *flag.FlagSet) *configFlags {
 	list("cors-origin", "cors.allowed_origins", "allowed CORS origin (repeatable; default \"*\")")
 	list("seed", "discovery.seeds", "discovery seed base URL (repeatable), e.g. http://nas:9000")
 	boolean("no-ui", "ui.enabled", true, "disable the embedded web UI")
+	boolean("no-admin", "admin.enabled", true, "disable the management API, embedded UI, and saved UI settings")
 	boolean("no-discovery", "discovery.enabled", true, "disable discovery (mDNS, beacon, seeds, DNS SRV)")
 	str("log-level", "logging.level", "log level: debug, info, warn or error (default info)")
 	str("log-format", "logging.format", "log format: text or json (default text)")
@@ -110,14 +112,37 @@ func (c *configFlags) load() (config.Config, error) {
 var onServerReady func(*server.Server)
 
 func cmdServe(ctx context.Context, args []string, stdout, stderr io.Writer) error {
-	fs := newFlagSet("serve", "gos3 serve [flags]", stderr)
+	fs := newFlagSet("serve", "gos3 [serve|server] [flags] [data]", stderr)
 	cf := addConfigFlags(fs)
+	quiet := fs.Bool("quiet", false, "suppress the startup banner")
+	jsonLog := fs.Bool("json", false, "use JSON logging (alias for --log-format json)")
+	certsDir := fs.String("certs-dir", "", "TLS directory containing public.crt and private.key")
+	consoleAddress := fs.String("console-address", "", "unsupported: UI uses the S3 listener at /_gos3/ui/")
 	fs.Usage = func() {
-		fmt.Fprint(stderr, "Usage: gos3 [serve] [flags]\n\nRuns the S3 server. Flags override the config file and GOS3_* variables\n(see \"gos3 config env\"); root credentials are only read from the\nenvironment or the config file.\n\nFlags:\n")
+		fmt.Fprint(stderr, "Usage: gos3 [serve|server] [flags] [data]\n\nRuns the S3 server. Flags override the JSON/YAML config file and GOS3_* variables\n(see \"gos3 config env\"); root credentials are only read from the\nenvironment or the config file.\n\nFlags:\n")
 		fs.PrintDefaults()
 	}
-	if err := parseFlags(fs, args); err != nil {
+	if err := parseServerFlags(fs, args); err != nil {
 		return err
+	}
+	if *consoleAddress != "" {
+		return fmt.Errorf("--console-address is not supported: gos3 serves the UI on --address at /_gos3/ui/; remove this flag or use --no-ui")
+	}
+	if *jsonLog {
+		if err := fs.Set("log-format", "json"); err != nil {
+			return err
+		}
+	}
+	if *certsDir != "" {
+		if fs.Lookup("tls-cert").Value.String() != "" || fs.Lookup("tls-key").Value.String() != "" {
+			return fmt.Errorf("use either --certs-dir or --tls-cert/--tls-key, not both")
+		}
+		if err := fs.Set("tls-cert", filepath.Join(*certsDir, "public.crt")); err != nil {
+			return err
+		}
+		if err := fs.Set("tls-key", filepath.Join(*certsDir, "private.key")); err != nil {
+			return err
+		}
 	}
 	cfg, err := cf.load()
 	if err != nil {
@@ -157,7 +182,7 @@ func cmdServe(ctx context.Context, args []string, stdout, stderr io.Writer) erro
 			logger.Info("gos3 ready", "url", srv.URL(), "endpoints", info.Endpoints.All, "ui", info.Endpoints.UI,
 				"backend", srv.BackendName(), "data", srv.DataPath(), "credentials", srv.CredentialsSource(),
 				"credentialsFile", credsFile)
-		} else {
+		} else if !*quiet {
 			printBanner(stderr, srv, showSecret, credsFile)
 		}
 		if onServerReady != nil {
@@ -229,16 +254,11 @@ func printBanner(w io.Writer, srv *server.Server, showSecret bool, credsFile str
 	} else {
 		fmt.Fprintf(tw, "  Web UI\tdisabled\n")
 	}
-	fmt.Fprintf(tw, "  Admin API\t%s/_gos3/admin/v1\n", local)
-	fmt.Fprintf(tw, "  Region\t%s\n", info.Region)
-	switch {
-	case srv.BackendName() == config.BackendFS:
-		fmt.Fprintf(tw, "  Storage\tfs at %s\n", srv.DataPath())
-	case srv.DataPath() != "":
-		fmt.Fprintf(tw, "  Storage\tmemory (ephemeral objects; system state in %s)\n", srv.DataPath())
-	default:
-		fmt.Fprintf(tw, "  Storage\tmemory (ephemeral: everything is lost on exit)\n")
+	if info.Endpoints.Admin != "" {
+		fmt.Fprintf(tw, "  Admin API\t%s/_gos3/admin/v1\n", local)
 	}
+	fmt.Fprintf(tw, "  Region\t%s\n", info.Region)
+	fmt.Fprintf(tw, "  Storage\t%s\n", storageSummary(srv.BackendName(), srv.DataPath(), srv.Config().Storage.S3))
 	fmt.Fprintf(tw, "  Access key\t%s\n", ak)
 	switch srv.CredentialsSource() {
 	case config.CredentialsConfigured:
@@ -263,4 +283,29 @@ func printBanner(w io.Writer, srv *server.Server, showSecret bool, credsFile str
 	_ = tw.Flush()
 	b.WriteString("\n  Press Ctrl-C to stop.\n\n")
 	_, _ = io.WriteString(w, b.String())
+}
+
+// storageSummary describes the default backing for the banner: its
+// backend, where its data lives and where system state is kept.
+func storageSummary(backend, dataPath string, s3 *config.S3Config) string {
+	switch {
+	case backend == config.BackendFS:
+		return "fs at " + dataPath
+	case backend == config.BackendS3:
+		where := "s3"
+		if s3 != nil {
+			where = "s3 at " + s3.Endpoint + "/" + s3.Bucket + "/" + s3.Prefix
+			if s3.Gateway {
+				where += " [gateway]"
+			}
+		}
+		if dataPath != "" {
+			return where + "; system state in " + dataPath
+		}
+		return where + "; system state ephemeral (IAM users, settings, placements and live backings are lost on exit)"
+	case dataPath != "":
+		return "memory (ephemeral objects; system state in " + dataPath + ")"
+	default:
+		return "memory (ephemeral: everything is lost on exit)"
+	}
 }

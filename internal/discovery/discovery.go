@@ -106,17 +106,18 @@ type Config struct {
 	MaxScanHosts int `json:"maxScanHosts" yaml:"max_scan_hosts"`
 }
 
-// DefaultConfig returns the default discovery configuration.
+// DefaultConfig returns an opt-in discovery configuration. All network
+// mechanisms, advertising and scans are disabled until explicitly enabled.
 func DefaultConfig() Config {
 	return Config{
-		Enabled:        true,
-		Advertise:      true,
-		MDNS:           true,
-		Beacon:         true,
+		Enabled:        false,
+		Advertise:      false,
+		MDNS:           false,
+		Beacon:         false,
 		BeaconGroup:    DefaultBeaconGroup,
 		BeaconInterval: DefaultBeaconInterval,
 		PeerTTL:        60 * time.Second,
-		AllowScan:      true,
+		AllowScan:      false,
 		MaxScanHosts:   1024,
 	}
 }
@@ -276,10 +277,12 @@ func (s *Service) Peers() []Peer {
 // ctx the probe times out after 5 s. Probing this server itself returns its
 // peer view without adding it to the table, and so does probing a URL that
 // claims the ID of a verified peer still answering at its known addresses
-// (the claim is recorded as a conflict). Errors wrap ErrInvalidURL,
-// ErrNotGos3, ErrBlockedAddress (a cloud metadata, unspecified, multicast or
-// broadcast address, checked after DNS resolution) or the transport error;
-// ProbeErrorText turns them into a fixed category.
+// (the claim is recorded as a conflict) or whose known addresses could not
+// all be re-checked before ctx ended (nothing is recorded). Errors wrap
+// ErrInvalidURL, ErrNotGos3, ErrBlockedAddress (a cloud metadata,
+// unspecified, multicast or broadcast address, checked after DNS
+// resolution) or the transport error; ProbeErrorText turns them into a
+// fixed category.
 func (s *Service) Probe(ctx context.Context, baseURL string) (Peer, error) {
 	if ctx == nil {
 		ctx = context.Background()

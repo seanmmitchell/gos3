@@ -94,7 +94,7 @@ import {
   parseVersioning
 } from './parsers'
 import { buildS3Url, encodeKey, encodeRfc3986, hasDotSegment, isUnaddressableBucket, normalizeEndpoint, type Query } from './url'
-import { tryParseXml, unquoteETag } from './xml'
+import { hasXmlIllegalChars, tryParseXml, unquoteETag } from './xml'
 
 export { S3Error } from './errors'
 
@@ -531,7 +531,9 @@ export class S3Client {
       headers: {
         'Content-Type': body ? 'application/xml' : undefined,
         'x-amz-bucket-object-lock-enabled': opts.objectLock ? 'true' : undefined,
-        'x-amz-acl': opts.acl
+        'x-amz-acl': opts.acl,
+        // Signed like every other header passed to aws4fetch.
+        'x-gos3-backing': opts.backing || undefined
       }
     })
   }
@@ -540,10 +542,17 @@ export class S3Client {
     await this.send({ method: 'DELETE', bucket: name })
   }
 
-  /** HeadBucket; resolves with the bucket region when the server reports it. */
-  async headBucket(name: string, signal?: AbortSignal): Promise<{ region?: string }> {
+  /**
+   * HeadBucket; resolves with the bucket region when the server reports it,
+   * and on gos3 with the bucket's storage backing (x-gos3-backing, "local"
+   * for the server's own storage).
+   */
+  async headBucket(name: string, signal?: AbortSignal): Promise<{ region?: string, backing?: string }> {
     const { response } = await this.send({ method: 'HEAD', bucket: name, signal })
-    return { region: response.headers.get('x-amz-bucket-region') ?? undefined }
+    return {
+      region: response.headers.get('x-amz-bucket-region') ?? undefined,
+      backing: response.headers.get('x-gos3-backing') || undefined
+    }
   }
 
   /** True if the bucket exists (and is accessible); false on 404. */
@@ -777,6 +786,11 @@ export class S3Client {
       const d = r.deleted[0]
       return { versionId: d?.deleteMarkerVersionId ?? d?.versionId, deleteMarker: d?.deleteMarker || undefined }
     }
+    return this.deleteObjectByUrl(bucket, key, versionId, opts)
+  }
+
+  /** DeleteObject with the key in the request URL (no dot-segment fallback). */
+  private async deleteObjectByUrl(bucket: string, key: string, versionId: string | undefined, opts: { bypassGovernanceRetention?: boolean, signal?: AbortSignal }): Promise<DeleteObjectResult> {
     const { response } = await this.send({
       method: 'DELETE',
       bucket,
@@ -791,11 +805,39 @@ export class S3Client {
     }
   }
 
-  /** DeleteObjects in batches of 1000; per-key failures are returned in errors. */
+  /**
+   * DeleteObjects in batches of 1000; per-key failures are returned in errors.
+   *
+   * Keys with characters XML cannot carry (e.g. U+0001, see
+   * hasXmlIllegalChars) would make the server reject a whole batch as
+   * MalformedXML; they are deleted one by one with DeleteObject instead, and
+   * their S3 errors are reported in `errors` like those of a batch.
+   */
   async deleteObjects(bucket: string, objects: ObjectIdentifier[], opts: { quiet?: boolean, bypassGovernanceRetention?: boolean, signal?: AbortSignal } = {}): Promise<DeleteObjectsResult> {
     const result: DeleteObjectsResult = { deleted: [], errors: [] }
-    for (let i = 0; i < objects.length; i += MAX_DELETE_BATCH) {
-      const batch = objects.slice(i, i + MAX_DELETE_BATCH)
+    const inXml: ObjectIdentifier[] = []
+    const single: ObjectIdentifier[] = []
+    for (const o of objects) (hasXmlIllegalChars(o.key) ? single : inXml).push(o)
+    for (const o of single) {
+      try {
+        const r = await this.deleteObjectByUrl(bucket, o.key, o.versionId, opts)
+        if (opts.quiet) continue
+        // Map the DeleteObject headers onto a DeleteObjects <Deleted> entry.
+        result.deleted.push({
+          key: o.key,
+          versionId: o.versionId,
+          deleteMarker: r.deleteMarker,
+          deleteMarkerVersionId: r.deleteMarker ? (o.versionId ?? r.versionId) : undefined
+        })
+      } catch (e) {
+        // Aborts and unreachable servers end the whole operation, as they
+        // do for a batch.
+        if (!(e instanceof S3Error) || isAbortError(e) || e.code === 'NetworkError') throw e
+        result.errors.push({ key: o.key, versionId: o.versionId, code: e.code, message: e.message })
+      }
+    }
+    for (let i = 0; i < inXml.length; i += MAX_DELETE_BATCH) {
+      const batch = inXml.slice(i, i + MAX_DELETE_BATCH)
       const { body } = await this.send({
         method: 'POST',
         bucket,

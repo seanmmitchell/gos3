@@ -37,6 +37,7 @@ x-gos3-env: &gos3-env
   GOS3_ROOT_ACCESS_KEY: ${GOS3_ROOT_ACCESS_KEY:?set GOS3_ROOT_ACCESS_KEY and GOS3_ROOT_SECRET_KEY (make demo writes random ones to .env)}
   GOS3_ROOT_SECRET_KEY: ${GOS3_ROOT_SECRET_KEY:?set GOS3_ROOT_ACCESS_KEY and GOS3_ROOT_SECRET_KEY (make demo writes random ones to .env)}
   GOS3_DISCOVERY_ENABLED: "true"
+  GOS3_DISCOVERY_ADVERTISE: "true"
   GOS3_DISCOVERY_BEACON: "true"
   # mDNS works too, but the beacon is enough on one bridge network.
   GOS3_DISCOVERY_MDNS: "false"

@@ -164,12 +164,19 @@ func fullVersionRecord() versionRecord {
 }
 
 func TestRecordEncoding(t *testing.T) {
-	for _, rec := range []versionRecord{fullVersionRecord(), {VersionID: "null", DeleteMarker: true}, {}} {
+	compressed := fullVersionRecord()
+	compressed.Compression, compressed.StoredSize = storage.CompressionDeflate, 12345
+	for _, rec := range []versionRecord{fullVersionRecord(), {VersionID: "null", DeleteMarker: true}, {}, compressed} {
 		data, err := encodeRecord(&rec)
 		if err != nil {
 			t.Fatal(err)
 		}
-		eq(t, "format", data[0], recordFormatVersionV1)
+		// Only compressed versions need the newer format.
+		wantFormat := recordFormatVersionV1
+		if rec.Compression != "" {
+			wantFormat = recordFormatVersionV2
+		}
+		eq(t, "format", data[0], wantFormat)
 		var got versionRecord
 		if err := decodeRecord(data, &got); err != nil {
 			t.Fatal(err)
@@ -225,23 +232,49 @@ func TestRecordEncoding(t *testing.T) {
 
 func FuzzDecodeVersionRecord(f *testing.F) {
 	full := fullVersionRecord()
-	f.Add(encodeVersionRecord(&full)[1:])
-	f.Add([]byte{})
-	f.Add([]byte{0, 0, 0xff, 0xff, 0xff, 0xff, 0x0f})
-	f.Fuzz(func(t *testing.T, data []byte) {
+	f.Add(encodeVersionRecord(&full)[1:], recordFormatVersionV1)
+	full.Compression, full.StoredSize = storage.CompressionDeflate, 99
+	f.Add(encodeVersionRecord(&full)[1:], recordFormatVersionV2)
+	full.Meta.Encryption = storage.EncryptionAES256
+	f.Add(encodeVersionRecord(&full)[1:], recordFormatVersionV3)
+	full.Compression, full.StoredSize, full.Meta.Encryption = "", 0, storage.EncryptionRestic
+	f.Add(encodeVersionRecord(&full)[1:], recordFormatVersionV3)
+	f.Add([]byte{}, recordFormatVersionV1)
+	f.Add([]byte{0, 0, 0xff, 0xff, 0xff, 0xff, 0x0f}, recordFormatVersionV2)
+	f.Fuzz(func(t *testing.T, data []byte, format byte) {
 		var r versionRecord
-		if err := decodeVersionRecord(data, &r); err != nil {
+		if err := decodeVersionRecord(data, &r, format); err != nil {
 			return
 		}
 		// Whatever decodes must re-encode to an equivalent record.
 		var r2 versionRecord
-		if err := decodeVersionRecord(encodeVersionRecord(&r)[1:], &r2); err != nil {
+		enc := encodeVersionRecord(&r)
+		if err := decodeVersionRecord(enc[1:], &r2, enc[0]); err != nil {
 			t.Fatalf("re-decode: %v", err)
 		}
 		if !reflect.DeepEqual(r, r2) {
 			t.Fatalf("unstable round trip")
 		}
 	})
+}
+
+// TestDecodeVersionRecordFormat checks that the payload is parsed as the
+// format byte says: format 5 fields are not accepted in an older format and
+// other format bytes are rejected.
+func TestDecodeVersionRecordFormat(t *testing.T) {
+	rec := fullVersionRecord()
+	rec.Meta.Encryption = storage.EncryptionAES256
+	enc := encodeVersionRecord(&rec)
+	eq(t, "format", enc[0], recordFormatVersionV3)
+	var got versionRecord
+	if err := decodeVersionRecord(enc[1:], &got, recordFormatVersionV3); err != nil || !reflect.DeepEqual(got, rec) {
+		t.Fatalf("format 5: %v\n got %#v\nwant %#v", err, got, rec)
+	}
+	for _, format := range []byte{recordFormatVersionV1, recordFormatVersionV2, recordFormatJSON, 6} {
+		if err := decodeVersionRecord(enc[1:], &got, format); err == nil {
+			t.Errorf("format %d accepted a format 5 payload", format)
+		}
+	}
 }
 
 func TestEtagMatches(t *testing.T) {

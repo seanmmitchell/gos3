@@ -24,6 +24,7 @@ const serverItems = computed<NavigationMenuItem[]>(() => {
     if (usersPageMode(c.kind, caps) === 'manage') items.push({ label: 'Users', icon: 'i-lucide-users', to: appRoutes.users(c.id) })
     if (caps.managePolicies) items.push({ label: 'Policies', icon: 'i-lucide-shield-check', to: appRoutes.policies(c.id) })
     if (caps.manageConfig) items.push({ label: 'Settings', icon: 'i-lucide-settings', to: appRoutes.settings(c.id) })
+    if (caps.viewStorage) items.push({ label: 'Storage', icon: 'i-lucide-hard-drive', to: appRoutes.storage(c.id) })
     if (caps.discovery) items.push({ label: 'Discovery', icon: 'i-lucide-radar', to: appRoutes.discovery(c.id) })
   }
   return items
@@ -39,6 +40,7 @@ const SECTION_LABELS: Record<string, string> = {
   users: 'Users',
   policies: 'Policies',
   settings: 'Settings',
+  storage: 'Storage',
   discovery: 'Discovery'
 }
 

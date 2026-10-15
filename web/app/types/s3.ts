@@ -485,6 +485,12 @@ export interface CreateBucketOptions {
   /** x-amz-bucket-object-lock-enabled: true */
   objectLock?: boolean
   acl?: CannedACL
+  /**
+   * gos3 only: storage backing for the new bucket (x-gos3-backing), "local"
+   * or a backing name from WhoAmI.backings. Omitted = the server's default.
+   * Never set it for generic S3 servers.
+   */
+  backing?: string
 }
 
 export interface PresignOptions {

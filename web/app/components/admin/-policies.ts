@@ -82,6 +82,16 @@ export function validatePolicyDocument(value: unknown, kind: 'identity' | 'bucke
     const hasPrincipal = st.Principal !== undefined || st.NotPrincipal !== undefined
     if (kind === 'identity' && hasPrincipal) return `${where}: identity policies cannot contain Principal`
     if (kind === 'bucket' && !hasPrincipal) return `${where}: missing required field Principal`
+    if (kind === 'bucket') {
+      const principal = st.Principal ?? st.NotPrincipal
+      if (principal && typeof principal === 'object' && !Array.isArray(principal)) {
+        const entries = principal as Record<string, unknown>
+        const names = [...asList(entries.AWS), ...asList(entries.CanonicalUser)]
+        if (names.some(v => typeof v === 'string' && /^arn:[^:]+:iam::[^:]+:user\//.test(v))) {
+          return `${where}: IAM user ARNs are unsupported; use the local user name`
+        }
+      }
+    }
     if (st.Condition !== undefined && (typeof st.Condition !== 'object' || st.Condition === null || Array.isArray(st.Condition))) {
       return `${where}: Condition must be an object`
     }
@@ -162,7 +172,7 @@ export const ADMIN_RESOURCE_FORMS: readonly { type: AdminResourceType | 'service
   { type: 'service', arn: ADMIN_SERVICE_ARN, description: 'Every admin action and target' },
   { type: 'user', arn: adminArn('user', '<name>'), description: 'CreateUser, GetUser, UpdateUser, DeleteUser; CreateAccessKey (target user); UpdateAccessKey / DeleteAccessKey (the key\'s owner)' },
   { type: 'policy', arn: adminArn('policy', '<name>'), description: 'GetPolicy, PutPolicy, DeletePolicy' },
-  { type: 'bucket', arn: adminArn('bucket', '<name>'), description: 'GetBucket, ForceDeleteBucket' }
+  { type: 'bucket', arn: adminArn('bucket', '<name>'), description: 'GetBucket, ForceDeleteBucket, GetBucketCompression, PutBucketCompression, GetBucketEncryption, PutBucketEncryption' }
 ]
 
 /** Every admin action (IAM action "admin:<Action>"), see docs/admin-api.md. */
@@ -189,6 +199,10 @@ export const ADMIN_ACTIONS: readonly string[] = [
   'admin:ListBuckets',
   'admin:GetBucket',
   'admin:ForceDeleteBucket',
+  'admin:GetBucketCompression',
+  'admin:PutBucketCompression',
+  'admin:GetBucketEncryption',
+  'admin:PutBucketEncryption',
   'admin:GetDiscovery',
   'admin:ProbeNetwork',
   'admin:ScanNetwork'
@@ -206,7 +220,11 @@ const ADMIN_RESOURCE_TYPES: Readonly<Record<string, AdminResourceType>> = {
   'admin:putpolicy': 'policy',
   'admin:deletepolicy': 'policy',
   'admin:getbucket': 'bucket',
-  'admin:forcedeletebucket': 'bucket'
+  'admin:forcedeletebucket': 'bucket',
+  'admin:getbucketcompression': 'bucket',
+  'admin:putbucketcompression': 'bucket',
+  'admin:getbucketencryption': 'bucket',
+  'admin:putbucketencryption': 'bucket'
 }
 
 /** True for admin:* actions (case-insensitive prefix). */

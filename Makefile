@@ -42,6 +42,10 @@ build: ui build-go ## build the web UI and the gos3 binary with the UI embedded 
 build-go: ## build bin/gos3 with whatever is in internal/webui/dist (placeholder or UI build)
 	CGO_ENABLED=0 $(GO) build -trimpath -ldflags '$(LDFLAGS)' -o $(BIN) ./cmd/gos3
 
+.PHONY: build-headless
+build-headless: ## build bin/gos3 without UI assets or Node/pnpm (management API remains configurable)
+	CGO_ENABLED=0 $(GO) build -tags noui -trimpath -ldflags '$(LDFLAGS)' -o $(BIN) ./cmd/gos3
+
 # The embedded UI replaces the contents of internal/webui/dist. This
 # overwrites the committed placeholder index.html: run `make ui-clean` before
 # committing to restore it (built assets are git-ignored).

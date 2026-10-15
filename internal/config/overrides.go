@@ -57,6 +57,10 @@ var settingFields = []settingField{
 	{"lifecycle.enabled", func(s *Settings) any { return s.Lifecycle.Enabled }},
 	{"lifecycle.interval", func(s *Settings) any { return time.Duration(s.Lifecycle.IntervalSeconds) * time.Second }},
 	{"metrics.public", func(s *Settings) any { return s.MetricsPublic }},
+	{"compression.mode", func(s *Settings) any { return s.Compression.Mode }},
+	{"compression.level", func(s *Settings) any { return s.Compression.Level }},
+	{"compression.min_size", func(s *Settings) any { return s.Compression.MinSize }},
+	{"compression.skip_content_types", func(s *Settings) any { return s.Compression.SkipContentTypes }},
 }
 
 // PersistedOverrides lists the runtime settings whose value in persisted
@@ -119,4 +123,10 @@ func ApplySettings(c *Config, s Settings) {
 	c.Lifecycle.Enabled = s.Lifecycle.Enabled
 	c.Lifecycle.Interval = time.Duration(s.Lifecycle.IntervalSeconds) * time.Second
 	c.Metrics.Public = s.MetricsPublic
+	c.Compression = CompressionConfig{
+		Mode:             s.Compression.Mode,
+		Level:            s.Compression.Level,
+		MinSize:          s.Compression.MinSize,
+		SkipContentTypes: s.Compression.SkipContentTypes,
+	}
 }

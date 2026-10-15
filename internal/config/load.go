@@ -21,6 +21,7 @@ import (
 
 	"github.com/seanmmitchell/gos3/internal/clientip"
 	"github.com/seanmmitchell/gos3/internal/discovery"
+	"github.com/seanmmitchell/gos3/internal/storage/compress"
 )
 
 // Defaults that are not obvious from Default().
@@ -36,14 +37,39 @@ const (
 	// DefaultMaxConnections is the default server.max_connections (no
 	// limit: the process's file descriptor limit applies).
 	DefaultMaxConnections = 0
+	// DefaultCompressionLevel is the default compression.level (DEFLATE
+	// level 1: fastest, still about 3x on source code and text).
+	DefaultCompressionLevel = compress.DefaultLevel
+	// DefaultCompressionMinSize is the default compression.min_size: the
+	// smallest object that can save a file system block.
+	DefaultCompressionMinSize = 4096
 	// MinRootSecretLen is the root secret key length below which gos3
 	// warns at startup (a short secret can be brute-forced offline from a
 	// single captured signed request).
 	MinRootSecretLen = 16
 
-	// BackendFS and BackendMemory are the StorageConfig.Backend values.
+	// BackendFS, BackendMemory and BackendS3 (a bucket of a remote S3
+	// service, see S3Config and docs/backings.md) are the values of
+	// StorageConfig.Backend and BackingConfig.Backend.
 	BackendFS     = "fs"
 	BackendMemory = "memory"
+	BackendS3     = "s3"
+
+	// DefaultBackingName names the backing configured by storage.backend
+	// and storage.path.
+	DefaultBackingName = "default"
+	// Replication defaults and limits (storage.replication).
+	DefaultReplicationWorkers = 2
+	MaxReplicationWorkers     = 64
+	DefaultHealthInterval     = 10 * time.Second
+	DefaultCutoverTimeout     = 60 * time.Second
+	// MaxBackings bounds storage.backings.
+	MaxBackings = 64
+
+	// Replication modes (storage.replication.default_mode).
+	ReplicationSingle        = "single"
+	ReplicationActivePassive = "active-passive"
+	ReplicationActiveActive  = "active-active"
 
 	// SystemDirName is the directory under the data path holding system
 	// state (iam.json, settings.json, server-id, root-credentials.json and
@@ -69,7 +95,19 @@ var DefaultExposeHeaders = []string{
 	"x-amz-server-side-encryption", "x-amz-object-lock-mode",
 	"x-amz-object-lock-retain-until-date", "x-amz-object-lock-legal-hold",
 	"x-amz-expiration", "x-amz-restore", "x-amz-website-redirect-location",
-	"x-amz-abort-date", "x-amz-abort-rule-id",
+	"x-amz-abort-date", "x-amz-abort-rule-id", "x-amz-bucket-region", "x-gos3-backing",
+}
+
+// DefaultSkipContentTypes are the media types stored uncompressed by
+// default (compression.skip_content_types): formats that are compressed
+// already, where DEFLATE would spend CPU for nothing.
+var DefaultSkipContentTypes = []string{
+	"image/jpeg", "image/png", "image/gif", "image/webp", "image/avif", "image/heic", "image/heif", "image/jxl",
+	"video/*", "audio/*", "font/woff", "font/woff2",
+	"application/zip", "application/gzip", "application/x-gzip", "application/zstd", "application/x-bzip2",
+	"application/x-xz", "application/x-7z-compressed", "application/x-rar-compressed", "application/vnd.rar",
+	"application/x-lz4", "application/java-archive", "application/epub+zip",
+	"application/vnd.openxmlformats-officedocument.*", "application/vnd.oasis.opendocument.*",
 }
 
 // Default returns the default configuration. Name defaults to the host name
@@ -95,8 +133,14 @@ func Default() Config {
 			Backend:   BackendFS,
 			Path:      DefaultDataPath,
 			FsyncData: true,
+			Replication: ReplicationConfig{
+				Workers:        DefaultReplicationWorkers,
+				HealthInterval: DefaultHealthInterval,
+				CutoverTimeout: DefaultCutoverTimeout,
+			},
 		},
-		UI: UIConfig{Enabled: true, RedirectRoot: true},
+		UI:    UIConfig{Enabled: defaultUIEnabled, RedirectRoot: true},
+		Admin: AdminConfig{Enabled: true},
 		CORS: CORSConfig{
 			AllowedOrigins: []string{"*"},
 			AllowedHeaders: []string{"*"},
@@ -107,6 +151,12 @@ func Default() Config {
 		Logging:   LoggingConfig{Level: "info", Format: "text", AccessLog: true},
 		Lifecycle: LifecycleConfig{Enabled: true, Interval: DefaultLifecycleEvery},
 		Metrics:   MetricsConfig{Enabled: true},
+		Compression: CompressionConfig{
+			Mode:             CompressionOptional,
+			Level:            DefaultCompressionLevel,
+			MinSize:          DefaultCompressionMinSize,
+			SkipContentTypes: slices.Clone(DefaultSkipContentTypes),
+		},
 	}
 }
 
@@ -118,14 +168,19 @@ type Override struct {
 	Value string
 }
 
-// Load returns the configuration from defaults < YAML file < environment
-// (GOS3_*) < overrides (CLI flags). path is the YAML file ("" =
-// $GOS3_CONFIG, and no file when that is unset too). Unknown YAML fields are
+// Load returns the configuration from defaults < JSON/YAML file < environment
+// (GOS3_*, with MinIO aliases) < overrides (CLI flags). path is the config file ("" =
+// $GOS3_CONFIG, and no file when that is unset too). Unknown fields are
 // rejected. The result is normalized (see Normalize) but not validated:
 // call Validate before using it.
 //
 // storage.path defaults to DefaultDataPath for the fs backend only; with the
-// memory backend it stays empty (fully ephemeral) unless set explicitly.
+// memory and s3 backends it stays empty (system state is ephemeral) unless
+// set explicitly.
+//
+// After the overrides, the empty fields of every s3 backing in
+// storage.backings are filled from its GOS3_BACKING_<NAME>_* variables
+// (see BackingEnv).
 func Load(path string, overrides ...Override) (Config, error) {
 	return load(path, os.LookupEnv, overrides)
 }
@@ -142,7 +197,7 @@ func load(path string, lookup func(string) (string, bool), overrides []Override)
 		if err != nil {
 			return Config{}, fmt.Errorf("config: %w", err)
 		}
-		if err := decodeYAML(data, &cfg); err != nil {
+		if err := decodeFile(path, data, &cfg); err != nil {
 			return Config{}, fmt.Errorf("config: %s: %w", path, err)
 		}
 	}
@@ -153,6 +208,9 @@ func load(path string, lookup func(string) (string, bool), overrides []Override)
 		if err := cfg.Set(o.Key, o.Value); err != nil {
 			return Config{}, fmt.Errorf("config: %w", err)
 		}
+	}
+	if err := cfg.Storage.applyBackingEnv(lookup); err != nil {
+		return Config{}, fmt.Errorf("config: %w", err)
 	}
 	cfg.Normalize()
 	return cfg, nil
@@ -190,15 +248,20 @@ var unknownFieldRe = regexp.MustCompile(`field (\S+) not found in type (\S+)`)
 
 // yamlSections maps the Go types of Config sections to their YAML keys.
 var yamlSections = map[string]string{
-	"config.ServerConfig":    "server",
-	"config.StorageConfig":   "storage",
-	"config.AuthConfig":      "auth",
-	"config.UIConfig":        "ui",
-	"config.CORSConfig":      "cors",
-	"discovery.Config":       "discovery",
-	"config.LoggingConfig":   "logging",
-	"config.LifecycleConfig": "lifecycle",
-	"config.MetricsConfig":   "metrics",
+	"config.AdminConfig":       "admin",
+	"config.ServerConfig":      "server",
+	"config.StorageConfig":     "storage",
+	"config.BackingConfig":     "storage.backings",
+	"config.S3Config":          "s3",
+	"config.ReplicationConfig": "storage.replication",
+	"config.AuthConfig":        "auth",
+	"config.UIConfig":          "ui",
+	"config.CORSConfig":        "cors",
+	"discovery.Config":         "discovery",
+	"config.LoggingConfig":     "logging",
+	"config.LifecycleConfig":   "lifecycle",
+	"config.MetricsConfig":     "metrics",
+	"config.CompressionConfig": "compression",
 }
 
 // describeUnknownField rewrites an unknown-field message in terms of YAML
@@ -209,7 +272,7 @@ func describeUnknownField(m string) string {
 		return fmt.Sprintf("unknown key %q in section %q", sub[1], sec)
 	}
 	if sub[2] == "config.Config" {
-		return fmt.Sprintf("unknown top-level key %q (expected server, storage, auth, ui, cors, discovery, logging, lifecycle or metrics)", sub[1])
+		return fmt.Sprintf("unknown top-level key %q (expected server, storage, auth, ui, admin, cors, discovery, logging, lifecycle, metrics or compression)", sub[1])
 	}
 	return fmt.Sprintf("unknown key %q", sub[1])
 }
@@ -218,12 +281,37 @@ func describeUnknownField(m string) string {
 // address, region and maximum object size when empty or zero), lower-cases
 // enumerations and trims list entries, dropping empty ones.
 func (c *Config) Normalize() {
+	if !c.Admin.Enabled {
+		c.UI.Enabled = false
+	}
 	c.Storage.Backend = strings.ToLower(strings.TrimSpace(c.Storage.Backend))
 	if c.Storage.Backend == "" {
 		c.Storage.Backend = BackendFS
 	}
 	if c.Storage.Backend == BackendFS && c.Storage.Path == "" {
 		c.Storage.Path = DefaultDataPath
+	}
+	for i := range c.Storage.Backings {
+		b := &c.Storage.Backings[i]
+		b.Name = strings.TrimSpace(b.Name)
+		b.Backend = strings.ToLower(strings.TrimSpace(b.Backend))
+		if b.Backend == "" {
+			b.Backend = BackendFS
+		}
+	}
+	c.Storage.DefaultBacking = strings.TrimSpace(c.Storage.DefaultBacking)
+	c.normalizeS3()
+	rp := &c.Storage.Replication
+	rp.DefaultMode = strings.ToLower(strings.TrimSpace(rp.DefaultMode))
+	rp.DefaultReplicas = trimList(rp.DefaultReplicas)
+	if rp.Workers == 0 {
+		rp.Workers = DefaultReplicationWorkers
+	}
+	if rp.HealthInterval == 0 {
+		rp.HealthInterval = DefaultHealthInterval
+	}
+	if rp.CutoverTimeout == 0 {
+		rp.CutoverTimeout = DefaultCutoverTimeout
 	}
 	if c.Server.Region == "" {
 		c.Server.Region = DefaultRegion
@@ -247,6 +335,14 @@ func (c *Config) Normalize() {
 	c.Discovery.DNSSRV = trimList(c.Discovery.DNSSRV)
 	c.Logging.Level = strings.ToLower(strings.TrimSpace(c.Logging.Level))
 	c.Logging.Format = strings.ToLower(strings.TrimSpace(c.Logging.Format))
+	c.Compression.Mode = strings.ToLower(strings.TrimSpace(c.Compression.Mode))
+	if c.Compression.Mode == "" {
+		c.Compression.Mode = CompressionOptional
+	}
+	if c.Compression.Level == 0 {
+		c.Compression.Level = DefaultCompressionLevel
+	}
+	c.Compression.SkipContentTypes = trimList(c.Compression.SkipContentTypes)
 }
 
 func trimList(in []string) []string {
@@ -307,8 +403,18 @@ func (c Config) Validate() error {
 			return errors.New("storage.path: required for the fs backend")
 		}
 	case BackendMemory:
+	case BackendS3:
+		if c.Storage.S3 == nil {
+			return errNoS3
+		}
 	default:
-		return fmt.Errorf("storage.backend: %q is invalid (expected fs or memory)", c.Storage.Backend)
+		return fmt.Errorf("storage.backend: %q is invalid (expected fs, memory or s3)", c.Storage.Backend)
+	}
+	if c.Storage.Backend != BackendS3 && c.Storage.S3 != nil && !c.Storage.S3.IsZero() {
+		return fmt.Errorf("storage.s3: only used with storage.backend s3 (storage.backend is %q)", c.Storage.Backend)
+	}
+	if err := c.validateBackings(); err != nil {
+		return err
 	}
 	if err := validateRootCredentials(c.Auth.RootAccessKey, c.Auth.RootSecretKey); err != nil {
 		return err
@@ -338,20 +444,22 @@ func (c Config) Validate() error {
 // Config fields they are derived from (see SettingsFrom). Paths that are the
 // same in both forms (e.g. "logging.level", "discovery.seeds") are absent.
 var settingsYAMLKeys = map[string]string{
-	"name":                      "server.name",
-	"region":                    "server.region",
-	"publicUrl":                 "server.public_url",
-	"domains":                   "server.domains",
-	"cors.allowedOrigins":       "cors.allowed_origins",
-	"cors.allowedHeaders":       "cors.allowed_headers",
-	"cors.exposeHeaders":        "cors.expose_headers",
-	"cors.maxAgeSeconds":        "cors.max_age_seconds",
-	"discovery.beaconGroup":     "discovery.beacon_group",
-	"discovery.beaconInterval":  "discovery.beacon_interval",
-	"discovery.peerTtl":         "discovery.peer_ttl",
-	"discovery.dnsSrv":          "discovery.dns_srv",
-	"discovery.maxScanHosts":    "discovery.max_scan_hosts",
-	"lifecycle.intervalSeconds": "lifecycle.interval",
+	"name":                         "server.name",
+	"region":                       "server.region",
+	"publicUrl":                    "server.public_url",
+	"domains":                      "server.domains",
+	"cors.allowedOrigins":          "cors.allowed_origins",
+	"cors.allowedHeaders":          "cors.allowed_headers",
+	"cors.exposeHeaders":           "cors.expose_headers",
+	"cors.maxAgeSeconds":           "cors.max_age_seconds",
+	"discovery.beaconGroup":        "discovery.beacon_group",
+	"discovery.beaconInterval":     "discovery.beacon_interval",
+	"discovery.peerTtl":            "discovery.peer_ttl",
+	"discovery.dnsSrv":             "discovery.dns_srv",
+	"discovery.maxScanHosts":       "discovery.max_scan_hosts",
+	"lifecycle.intervalSeconds":    "lifecycle.interval",
+	"compression.minSize":          "compression.min_size",
+	"compression.skipContentTypes": "compression.skip_content_types",
 }
 
 // yamlField translates a FieldError path ("cors.allowedOrigins[2]") to the
@@ -469,6 +577,18 @@ func SettingsFrom(c Config) Settings {
 	if region == "" {
 		region = DefaultRegion
 	}
+	comp := CompressionSettings{
+		Mode:             c.Compression.Mode,
+		Level:            c.Compression.Level,
+		MinSize:          c.Compression.MinSize,
+		SkipContentTypes: c.Compression.SkipContentTypes,
+	}
+	if comp.Mode == "" {
+		comp.Mode = CompressionOptional
+	}
+	if comp.Level == 0 {
+		comp.Level = DefaultCompressionLevel
+	}
 	s := Settings{
 		Name:          c.Server.Name,
 		Region:        region,
@@ -481,6 +601,7 @@ func SettingsFrom(c Config) Settings {
 		Logging:       c.Logging,
 		Lifecycle:     LifecycleSettings{Enabled: c.Lifecycle.Enabled, IntervalSeconds: int64(interval / time.Second)},
 		MetricsPublic: c.Metrics.Public,
+		Compression:   comp,
 	}
 	return normalizeSettings(cloneSettings(s))
 }
@@ -500,11 +621,13 @@ func normalizeSettings(s Settings) Settings {
 	s.CORS.ExposeHeaders = nn(s.CORS.ExposeHeaders)
 	s.Discovery.Seeds = nn(s.Discovery.Seeds)
 	s.Discovery.DNSSRV = nn(s.Discovery.DNSSRV)
+	s.Compression.SkipContentTypes = nn(s.Compression.SkipContentTypes)
 	return s
 }
 
 // SystemDir returns the system state directory (<data>/.gos3), or "" when the
-// configuration is fully ephemeral (memory backend without a data path).
+// configuration is fully ephemeral (memory or s3 backend without a data
+// path).
 func (c Config) SystemDir() string {
 	if c.Storage.Path == "" {
 		return ""
@@ -537,12 +660,19 @@ func (c Config) TLSEnabled() bool { return c.Server.TLSCert != "" }
 // RedactedValue is the placeholder Config.Redacted substitutes for secrets.
 const RedactedValue = "<redacted>"
 
-// Redacted returns a deep copy with secrets (the root secret key) replaced
-// by "<redacted>", for printing and logging.
+// Redacted returns a deep copy with secrets (the root secret key and the
+// secret and encryption keys of s3 backings) replaced by "<redacted>", for
+// printing and logging.
 func (c Config) Redacted() Config {
 	if c.Auth.RootSecretKey != "" {
 		c.Auth.RootSecretKey = RedactedValue
 	}
+	c.Storage.S3 = c.Storage.S3.redacted()
+	c.Storage.Backings = slices.Clone(c.Storage.Backings)
+	for i := range c.Storage.Backings {
+		c.Storage.Backings[i].S3 = c.Storage.Backings[i].S3.redacted()
+	}
+	c.Storage.Replication.DefaultReplicas = slices.Clone(c.Storage.Replication.DefaultReplicas)
 	c.Server.Domains = slices.Clone(c.Server.Domains)
 	c.Server.TrustedProxies = slices.Clone(c.Server.TrustedProxies)
 	c.Server.AllowedHosts = slices.Clone(c.Server.AllowedHosts)

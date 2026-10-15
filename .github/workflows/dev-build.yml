@@ -2,7 +2,8 @@ name: Dev build
 
 # Every push to dev builds what the next release would ship: archives for all
 # platforms (bin-<os>-<arch> artifacts of this run, kept 30 days) and the
-# multi-arch image ghcr.io/<owner>/<repo>:dev, also tagged dev-<commit>. The
+# multi-arch image ghcr.io/<owner>/<repo>:dev, also tagged dev-<commit>.
+# Headless archives and image tags append -headless. The
 # version is the next patch release as a prerelease, e.g.
 # v0.1.1-dev.42+0123456789ab. Nothing is published on the Releases page. See
 # docs/releasing.md.

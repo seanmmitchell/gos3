@@ -27,6 +27,10 @@ func validSettings() Settings {
 		Discovery: discovery.DefaultConfig(),
 		Logging:   LoggingConfig{Level: "info", Format: "text", AccessLog: true},
 		Lifecycle: LifecycleSettings{Enabled: true, IntervalSeconds: 3600},
+		Compression: CompressionSettings{
+			Mode: CompressionOptional, Level: 1, MinSize: 4096,
+			SkipContentTypes: []string{"image/jpeg", "video/*", "application/vnd.oasis.opendocument.*"},
+		},
 	}
 }
 
@@ -74,6 +78,14 @@ func TestValidateSettings(t *testing.T) {
 		{"seed path", func(s *Settings) { s.Discovery.Seeds = []string{"http://h:9000/x"} }, "discovery.seeds[0]"},
 		{"seed scheme", func(s *Settings) { s.Discovery.Seeds = []string{"ftp://h"} }, "discovery.seeds[0]"},
 		{"dns srv", func(s *Settings) { s.Discovery.DNSSRV = []string{"-bad.example"} }, "discovery.dnsSrv[0]"},
+		{"compression mode", func(s *Settings) { s.Compression.Mode = "always" }, "compression.mode"},
+		{"compression mode empty", func(s *Settings) { s.Compression.Mode = "" }, "compression.mode"},
+		{"compression level zero", func(s *Settings) { s.Compression.Level = 0 }, "compression.level"},
+		{"compression level high", func(s *Settings) { s.Compression.Level = 10 }, "compression.level"},
+		{"compression min size", func(s *Settings) { s.Compression.MinSize = -1 }, "compression.minSize"},
+		{"compression skip type", func(s *Settings) { s.Compression.SkipContentTypes = []string{"video/*", "jpeg"} }, "compression.skipContentTypes[1]"},
+		{"compression skip wildcard", func(s *Settings) { s.Compression.SkipContentTypes = []string{"*/*"} }, "compression.skipContentTypes[0]"},
+		{"compression skip params", func(s *Settings) { s.Compression.SkipContentTypes = []string{"text/plain; charset=utf-8"} }, "compression.skipContentTypes[0]"},
 		{"dns srv too many", func(s *Settings) { s.Discovery.DNSSRV = make([]string, discovery.MaxDNSSRV+1) }, "discovery.dnsSrv"},
 		{"max scan hosts low", func(s *Settings) { s.Discovery.MaxScanHosts = 0 }, "discovery.maxScanHosts"},
 		{"max scan hosts high", func(s *Settings) { s.Discovery.MaxScanHosts = 65537 }, "discovery.maxScanHosts"},
@@ -212,5 +224,32 @@ func TestSettingsFrom(t *testing.T) {
 	s.Domains[0] = "changed"
 	if c.Server.Domains[0] != "s3.example.com" {
 		t.Error("SettingsFrom aliases Domains")
+	}
+}
+
+func TestMatchContentType(t *testing.T) {
+	patterns := []string{"image/jpeg", "Video/*", "application/vnd.oasis.opendocument.*"}
+	for ct, want := range map[string]bool{
+		"image/jpeg":      true,
+		"IMAGE/JPEG; q=1": true,
+		" image/jpeg ":    true,
+		"image/jpegx":     false,
+		"image/png":       false,
+		"video/mp4":       true,
+		"video/":          true,
+		"videos/mp4":      false,
+		"application/vnd.oasis.opendocument.text": true,
+		"application/vnd.oasis":                   false,
+		"":                                        false,
+		"text/plain":                              false,
+	} {
+		if got := MatchContentType(patterns, ct); got != want {
+			t.Errorf("MatchContentType(%q) = %v, want %v", ct, got, want)
+		}
+	}
+	for i, p := range DefaultSkipContentTypes {
+		if !mediaTypePatternRe.MatchString(p) {
+			t.Errorf("DefaultSkipContentTypes[%d] = %q is not a valid pattern", i, p)
+		}
 	}
 }

@@ -21,7 +21,8 @@ the internet.
 
 - **Dashboard** of all configured servers with status, version and usage.
 - **Buckets**: create and delete; versioning, policy editor with templates,
-  CORS, lifecycle, tags, object lock, default encryption and ACL settings.
+  CORS, lifecycle, tags, object lock, default encryption and ACL settings,
+  and (gos3 only) compression and restic encryption providers.
 - **Object browser**: folders, drag-and-drop uploads (multipart with parallel
   parts and progress), downloads, delete, rename and copy, metadata and tag
   editors, versions, and presigned share links.
@@ -29,8 +30,16 @@ the internet.
 - **Server overview and settings** (gos3 only): version, request metrics,
   storage and disk usage, and every runtime setting from
   [configuration.md](configuration.md#runtime-settings-settingsjson).
+  Server and bucket settings show one section at a time, picked with the
+  chips under the page header (kept in the URL as `?tab=`); on the server
+  settings page one Save covers every section, and the chips mark sections
+  with unsaved changes or invalid fields.
 - **Discovery** (gos3 only): peers seen by each connected server, network
   scans, local discovery from the UI host, and one-click "add server".
+- **Storage** (gos3 only): the server's storage backings (directories,
+  memory and S3 services, configurable live), and per bucket its placement,
+  replication, moves and promotions (see
+  [Storage backings and placement](#storage-backings-and-placement)).
 
 Pages are shown according to the signed-in identity's permissions (from
 `GET /_gos3/admin/v1/whoami`). For example, Users appears only with
@@ -64,6 +73,40 @@ policies and clears that option.
   with "Bypass governance retention" (Danger zone checkbox, or the follow-up
   confirmation on the bucket list), which sends
   `bypassGovernanceRetention=true` and needs `s3:BypassGovernanceRetention`.
+- **Encryption.** The bucket's Encryption tab has two independently saved
+  cards. *Default encryption* (S3 API, every server) chooses whether uploads
+  without encryption headers are encrypted: None or SSE-S3, plus SSE-KMS with a
+  key ID and bucket key on generic S3. On gos3 an AWS KMS default stored by an
+  older version is flagged; gos3 applies it as SSE-S3, and the card pre-selects
+  SSE-S3 so saving replaces it. *SSE-S3 implementation* (gos3 admin API,
+  `admin:GetBucketEncryption` / `admin:PutBucketEncryption`) chooses native
+  AES-256-GCM or restic for default encryption and for uploads requesting
+  AES256. An implementation the server reports unavailable for the bucket is
+  disabled with the reason: native AES-256-GCM when an S3 backing holding
+  the bucket has no encryption key (set one under the server's Storage
+  settings), restic when it is not installed or a copy of the bucket is on a
+  memory backing or an S3 backing without an encryption key. Users without
+  those admin permissions, and servers without the endpoint, see a note there
+  while default encryption keeps working. Restic repositories live on the
+  bucket's backings, with nothing to configure: on a filesystem backing in
+  its data directory, on an S3 backing in that backing's bucket; replicas
+  and moves use the destination backing. Repository passwords are
+  server-managed. This encrypts new writes; older objects are unchanged. See
+  [encryption.md](encryption.md).
+- **Compression.** The server settings page has a Compression section where
+  the administrator chooses the mode (Optional, Enforced, Disabled), the
+  DEFLATE level, the minimum size and the media types to skip. A bucket's
+  Compression tab (gos3 servers that report the `manageCompression`
+  capability) shows whether new objects are compressed, the bucket's own
+  setting and the server mode; while the administrator enforces or disables
+  compression the switch is locked in the direction the server would refuse
+  (409), and "Reset to server default" removes the bucket's setting. The tab
+  is shown to everyone on such servers, since a grant of
+  `admin:PutBucketCompression` scoped to some buckets does not show in the
+  capabilities; a refused change shows the server's 403. Bucket lists, the
+  bucket overview and the server overview show the stored size and the
+  saving next to the size when compression saves space. See
+  [operations.md](operations.md#compression).
 - **Policy editor and simulator.** Admin actions are evaluated against
   `arn:gos3:admin:::user/<name>`, `arn:gos3:admin:::policy/<name>` and
   `arn:gos3:admin:::bucket/<name>` (see [admin-api.md](admin-api.md));
@@ -75,6 +118,60 @@ policies and clears that option.
   (it lists all users; actions on users outside the pattern are refused by
   the server and shown as errors). For an admin action the simulator asks for an admin
   resource instead of a bucket and key (empty = service level).
+
+### Storage backings and placement
+
+On servers with several storage backings (see
+[admin-api.md](admin-api.md#storage-backings-and-bucket-placement)
+and [backings.md](backings.md)):
+
+- **Storage** (sidebar, needs `admin:ListBackings`, whoami capability
+  `viewStorage`) shows every backing with its kind (Disk, Memory, Remote S3
+  or Remote S3 (gateway)), its path or, for S3 backings, its location
+  (`s3://bucket/prefix/`), health (the last error of an unhealthy one, for
+  example an unreachable S3 service), last check, bucket and replica counts
+  and, for disks, disk usage. It refreshes every 10 seconds.
+- **Configure backings** on the Storage page (shown with the
+  `manageConfig` capability, `admin:UpdateConfig`) adds, edits and removes additional backings and
+  picks the default backing for new buckets (see
+  [backings.md](backings.md#configuring-backings-live)). The backend is
+  Filesystem (a directory on the server), Memory or **S3 service**. The S3
+  form asks for the endpoint, region, bucket, prefix, access key and secret
+  key, and has a **Gateway** switch (objects stored natively in remote
+  buckets named like the gos3 buckets; no versioning, object lock, replicas
+  or moves). **Advanced** holds the addressing style, the part size (MiB)
+  and the encryption key, with **Show** and **Generate** buttons and a
+  warning that the key is needed for AES256 and restic and that losing it
+  makes encrypted objects unreadable. Saved secrets are never shown: their
+  fields say "Saved – leave blank to keep", or name the
+  `GOS3_BACKING_<NAME>_*` variable they come from. A saved backing's name
+  is fixed; while it holds buckets or replicas its backend, directory,
+  bucket, prefix and gateway switch are locked too (the connection settings
+  and credentials stay editable) and it cannot be removed. A warning says when the server has no data directory, so changes
+  are lost on restart.
+- **Bucket settings → Placement** (also `viewStorage`) shows the replication
+  mode and each member (primary, replicas, a move target) with its state
+  (`in sync`, `syncing`, `lagging`, `degraded`, `offline`), pending changes,
+  copy progress, last full sync and last error, and a banner while the
+  bucket moves. The tab polls every 3 seconds while a copy runs, changes are
+  pending or a move is in progress.
+- With `admin:UpdateBucketPlacement` (capability `manageStorage`) the tab
+  changes the mode (single, active-passive, active-active) and the replica
+  backings (removing a replica asks first, because its copy is deleted),
+  moves the bucket (or one replica) to a backing without a copy, cancels a
+  move while it is copying, promotes a replica to primary and resyncs one or
+  all replicas. "Force promote" is offered when the replica is not in sync
+  or the primary is offline; it asks you to type the backing name, because
+  changes not yet copied to the replica are lost. Without the capability the
+  tab is read-only.
+- The *Create bucket* dialog offers the backings (for every user, from
+  `whoami`) when there is more than one, with the default preselected; on a
+  gateway backing it disables versioning and object lock.
+- The bucket list shows the primary backing, the mode with the number of
+  copies (for example `AP ×2`) and `moving`, when the server reports
+  placement and the buckets are not all on one backing.
+- Servers that do not report `viewStorage` (older versions) show neither the
+  page nor the tab.
 
 ### Object browser notes
 

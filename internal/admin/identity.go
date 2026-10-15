@@ -16,6 +16,8 @@ type whoAmI struct {
 	Policies     []string       `json:"policies"`
 	Capabilities capabilities   `json:"capabilities"`
 	Server       discovery.Info `json:"server"`
+	// Backings lets every caller pick a backing when creating a bucket.
+	Backings backingChoices `json:"backings"`
 }
 
 // capabilities are derived by evaluating admin actions for the caller at
@@ -30,10 +32,15 @@ type capabilities struct {
 	ListUsers      bool `json:"listUsers"`      // admin:ListUsers (also granted to delegated user managers)
 	ManagePolicies bool `json:"managePolicies"` // admin:PutPolicy
 	ManageBuckets  bool `json:"manageBuckets"`  // admin:ForceDeleteBucket
+	ViewStorage    bool `json:"viewStorage"`    // admin:ListBackings
+	ManageStorage  bool `json:"manageStorage"`  // admin:UpdateBucketPlacement
 	Discovery      bool `json:"discovery"`      // admin:GetDiscovery
 	Scan           bool `json:"scan"`           // admin:ScanNetwork
 	Probe          bool `json:"probe"`          // admin:ProbeNetwork
 	CreateOwnKeys  bool `json:"createOwnKeys"`  // admin:CreateOwnAccessKey (never root)
+	// ManageCompression: admin:PutBucketCompression (bucket compression
+	// settings).
+	ManageCompression bool `json:"manageCompression"`
 }
 
 // adminActions are every admin:* action used by the API; "admin" in
@@ -43,7 +50,9 @@ var adminActions = []string{
 	"ListUsers", "CreateUser", "GetUser", "UpdateUser", "DeleteUser",
 	"CreateAccessKey", "UpdateAccessKey", "DeleteAccessKey",
 	"ListPolicies", "GetPolicy", "PutPolicy", "DeletePolicy", "SimulatePolicy",
-	"ListBuckets", "GetBucket", "ForceDeleteBucket",
+	"ListBuckets", "GetBucket", "ForceDeleteBucket", "GetBucketCompression", "PutBucketCompression",
+	"GetBucketEncryption", "PutBucketEncryption",
+	"ListBackings", "GetBucketPlacement", "UpdateBucketPlacement",
 	"GetDiscovery", "ScanNetwork", "ProbeNetwork",
 }
 
@@ -73,21 +82,25 @@ func (a *api) whoami(rc *reqCtx) (int, any, error) {
 		IsRoot:    rc.id.IsRoot,
 		Policies:  names,
 		Capabilities: capabilities{
-			Admin:          anyAllowed,
-			ViewInfo:       allowed["ServerInfo"],
-			ViewStats:      allowed["GetStats"],
-			ManageConfig:   allowed["UpdateConfig"],
-			ManageUsers:    allowed["CreateUser"],
-			ListUsers:      allowed["ListUsers"],
-			ManagePolicies: allowed["PutPolicy"],
-			ManageBuckets:  allowed["ForceDeleteBucket"],
-			Discovery:      allowed["GetDiscovery"],
-			Scan:           allowed["ScanNetwork"],
-			Probe:          allowed["ProbeNetwork"],
+			Admin:             anyAllowed,
+			ViewInfo:          allowed["ServerInfo"],
+			ViewStats:         allowed["GetStats"],
+			ManageConfig:      allowed["UpdateConfig"],
+			ManageUsers:       allowed["CreateUser"],
+			ListUsers:         allowed["ListUsers"],
+			ManagePolicies:    allowed["PutPolicy"],
+			ManageBuckets:     allowed["ForceDeleteBucket"],
+			ViewStorage:       allowed["ListBackings"],
+			ManageStorage:     allowed["UpdateBucketPlacement"],
+			Discovery:         allowed["GetDiscovery"],
+			Scan:              allowed["ScanNetwork"],
+			Probe:             allowed["ProbeNetwork"],
+			ManageCompression: allowed["PutBucketCompression"],
 			// Root has no IAM keys to manage (POST /whoami/keys answers 400).
 			CreateOwnKeys: !rc.id.IsRoot && a.authorize(rc, actionCreateOwnKey, "", nil).Allowed,
 		},
-		Server: a.info(),
+		Server:   a.info(),
+		Backings: a.backingChoices(),
 	}, nil
 }
 
