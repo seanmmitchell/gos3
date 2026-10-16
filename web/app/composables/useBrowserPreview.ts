@@ -108,10 +108,48 @@ function inline(escaped: string): string {
   return s.replace(/\u0000(\d+)\u0000/g, (_m, i: string) => codes[Number(i)] ?? '')
 }
 
+/** A horizontal rule: three or more '-', '*' or '_'. */
+const HR = /^\s*([-*_])(\s*\1){2,}\s*$/
+
+type CellAlign = 'left' | 'center' | 'right' | undefined
+
+/**
+ * Splits a GFM table row into raw cell texts: one optional leading and
+ * trailing '|' is dropped, cells split on unescaped '|' and '\|' becomes a
+ * literal pipe.
+ */
+function tableCells(line: string): string[] {
+  let s = line.trim()
+  if (s.startsWith('|')) s = s.slice(1)
+  if (s.endsWith('|') && !s.endsWith('\\|')) s = s.slice(0, -1)
+  return s.split(/(?<!\\)\|/).map(c => c.replace(/\\\|/g, '|').trim())
+}
+
+/** Column alignments of a GFM delimiter row ('| :-- | :-: | --: |'), or null if it is not one. */
+function tableDelimiter(line: string): CellAlign[] | null {
+  // Checked cell by cell: one regex over the whole row backtracks badly on
+  // long runs of spaces.
+  const cells = tableCells(line)
+  if (!cells.every(c => /^:?-+:?$/.test(c))) return null
+  return cells.map((c) => {
+    const left = c.startsWith(':')
+    const right = c.endsWith(':')
+    return left && right ? 'center' : right ? 'right' : left ? 'left' : undefined
+  })
+}
+
+function tableRow(tag: 'th' | 'td', cells: string[], aligns: CellAlign[]): string {
+  // Rows are padded or cut to the header's width, as in GFM.
+  return `<tr>${aligns.map((a, i) => {
+    const style = a ? ` style="text-align:${a}"` : ''
+    return `<${tag}${style}>${inline(previewEscapeHtml(cells[i] ?? ''))}</${tag}>`
+  }).join('')}</tr>`
+}
+
 /**
  * Renders a practical Markdown subset (headings, paragraphs, emphasis, code
- * spans and fenced blocks, block quotes, lists, horizontal rules, links) to
- * safe HTML. Block quotes nest at most MARKDOWN_MAX_QUOTE_DEPTH levels;
+ * spans and fenced blocks, block quotes, lists, GFM tables, horizontal rules,
+ * links) to safe HTML. Block quotes nest at most MARKDOWN_MAX_QUOTE_DEPTH levels;
  * deeper quote markers are kept as text (a line of thousands of '>' would
  * otherwise recurse once per marker and overflow the stack).
  */
@@ -171,7 +209,24 @@ export function renderMarkdown(src: string, depth = 0): string {
       out.push(`<h${level}>${inline(previewEscapeHtml(h[2]!))}</h${level}>`)
       continue
     }
-    if (/^\s*([-*_])(\s*\1){2,}\s*$/.test(line)) {
+    // GFM table: a header row, then a delimiter row with as many cells; at
+    // least one of them needs a '|' (so 'text' over '---' stays a rule).
+    const aligns = i + 1 < lines.length ? tableDelimiter(lines[i + 1]!) : null
+    if (aligns && (line.includes('|') || lines[i + 1]!.includes('|')) && tableCells(line).length === aligns.length) {
+      flushAll()
+      const head = tableRow('th', tableCells(line), aligns)
+      const body: string[] = []
+      i += 2
+      // Body rows run until a blank line or the start of another block.
+      while (i < lines.length && lines[i]!.trim() && !/^\s*(>|#{1,6}\s|```|~~~)/.test(lines[i]!) && !HR.test(lines[i]!)) {
+        body.push(tableRow('td', tableCells(lines[i]!), aligns))
+        i++
+      }
+      i--
+      out.push(`<table><thead>${head}</thead>${body.length ? `<tbody>${body.join('')}</tbody>` : ''}</table>`)
+      continue
+    }
+    if (HR.test(line)) {
       flushAll()
       out.push('<hr>')
       continue

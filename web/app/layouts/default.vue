@@ -114,13 +114,28 @@ watch(() => connection.value?.id, (id) => {
       v-model:collapsed="collapsed"
       collapsible
       resizable
-      :min-size="14"
+      :min-size="12"
       :default-size="16"
-      :max-size="24"
+      :max-size="32"
       :collapsed-size="4.25"
-      class="bg-elevated/25"
+      class="peer bg-elevated/25"
       :ui="{ footer: 'lg:border-t lg:border-default' }"
     >
+      <!-- Nuxt UI's handle is an invisible 0px line; this one shows itself on
+           hover and while dragging, and has a wider grab area. -->
+      <template #resize-handle="{ onMouseDown, onTouchStart, onDoubleClick, ui }">
+        <UDashboardResizeHandle
+          aria-controls="gos3-dashboard-sidebar-main"
+          aria-label="Resize sidebar"
+          title="Drag to resize · double-click to reset"
+          data-slot="handle"
+          :class="ui.handle({ class: 'z-10 before:-left-2 before:-right-2 after:absolute after:inset-y-0 after:-left-px after:w-0.5 after:transition-colors hover:after:bg-primary/50 peer-data-[dragging=true]:after:bg-primary' })"
+          @mousedown="onMouseDown"
+          @touchstart="onTouchStart"
+          @dblclick="onDoubleClick"
+        />
+      </template>
+
       <template #header="{ collapsed: isCollapsed }">
         <LayoutAppLogo :collapsed="isCollapsed" :class="isCollapsed ? 'mx-auto' : ''" />
       </template>
