@@ -28,10 +28,13 @@ Required checks on both branches: `Go (fmt, vet, test, e2e)`,
 `Go tests (macos-latest)`, `Go tests (windows-latest)`,
 `Web UI (typecheck, test, build)`, `Playwright (mocked, real server, standalone)`,
 `Compatibility (boto3, AWS CLI)`, `Docker images` (all from `ci.yml`),
+`No DO NOT MERGE label` (from `do-not-merge.yml`),
 `Socket Security: Pull Request Alerts` and `GitGuardian Security Checks`.
-A required check is matched by name: after renaming a CI job, update both
-JSON files and apply them again, or pull requests wait for a check that
-never reports.
+`No DO NOT MERGE label` fails while the pull request has the `DO NOT MERGE`
+label and passes again when the label is removed, so the label blocks a
+merge into either branch. A required check is matched by name: after
+renaming a CI job, update both JSON files and apply them again, or pull
+requests wait for a check that never reports.
 
 Notes:
 
