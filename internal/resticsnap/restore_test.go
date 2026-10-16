@@ -6,7 +6,9 @@ import (
 	"errors"
 	"io"
 	"maps"
+	"strings"
 	"testing"
+	"time"
 
 	"github.com/seanmmitchell/gos3/internal/jobs"
 	"github.com/seanmmitchell/gos3/internal/storage"
@@ -174,5 +176,40 @@ func TestRestoreValidation(t *testing.T) {
 	}
 	if data, _ := e.read("src", "k"); data != "v" {
 		t.Fatalf("restored %q", data)
+	}
+}
+
+// A merge restore never replaces a target version under object lock: a
+// snapshot's null version of a key must not overwrite the target's locked
+// null version (H-05).
+func TestRestoreMergeKeepsLockedVersions(t *testing.T) {
+	e := newEnv(t, "mem", Options{Incremental: true})
+	ctx := context.Background()
+	e.createBucket("src", "", "")
+	e.put("src", "k", "attacker", storage.ObjectMeta{})
+	e.put("src", "free", "restored", storage.ObjectMeta{})
+	e.configure("src", `{"enabled":false,"target":{"kind":"backing","backing":"disk"}}`)
+	st := e.snapshot("src")
+
+	e.createBucket("vault", "", "")
+	until := time.Now().Add(time.Hour)
+	locked := e.put("vault", "k", "kept", storage.ObjectMeta{RetentionMode: "COMPLIANCE", RetainUntil: until})
+	if err := e.router.SetBucketVersioning(ctx, "vault", storage.VersioningEnabled); err != nil {
+		t.Fatal(err)
+	}
+	j := e.restore("src", st.Snapshot, `{"target":{"bucket":"vault"},"onExisting":"merge","configs":"none"}`)
+	if j.State != jobs.StateSucceeded {
+		t.Fatalf("merge restore: %s: %s", j.State, j.LastError)
+	}
+	data, oi := e.read("vault", "k")
+	if data != "kept" || oi.VersionID != locked.VersionID || oi.RetentionMode != "COMPLIANCE" {
+		t.Fatalf("locked version after the restore: %q %+v", data, oi)
+	}
+	if data, _ := e.read("vault", "free"); data != "restored" {
+		t.Fatalf("unlocked key not restored: %q", data)
+	}
+	var rs jobStatus
+	if err := json.Unmarshal(j.Status, &rs); err != nil || len(rs.Warnings) != 1 || !strings.Contains(rs.Warnings[0], "COMPLIANCE") {
+		t.Fatalf("restore status %s (%v)", j.Status, err)
 	}
 }

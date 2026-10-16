@@ -27,6 +27,9 @@ var (
 // fakeSnapshots is the SnapshotService of the admin tests.
 type fakeSnapshots struct {
 	repo restic.RepositoryInfo
+	// resolvedOn, when set, is the backing Credentials reports it resolved
+	// the repository on, whatever the configuration says.
+	resolvedOn string
 
 	mu       sync.Mutex
 	configs  map[string]json.RawMessage
@@ -188,6 +191,20 @@ func (f *fakeSnapshots) Credentials(ctx context.Context, bucket string) (restic.
 	if repo == nil {
 		return restic.Location{}, nil, storage.ErrConfigNotFound
 	}
+	// The backing the configuration names, as the real service resolves it.
+	raw, _ := f.Config(ctx, bucket)
+	var cfg struct {
+		Target struct {
+			Backing string `json:"backing"`
+		} `json:"target"`
+	}
+	_ = json.Unmarshal(raw, &cfg)
+	repo.Backing = cfg.Target.Backing
+	f.mu.Lock()
+	if f.resolvedOn != "" {
+		repo.Backing = f.resolvedOn
+	}
+	f.mu.Unlock()
 	return restic.Location{Repository: repo.Repository, Password: testResticPassword, Env: []string{"RESTIC_CACHE_DIR=/tmp/c"}}, repo, nil
 }
 

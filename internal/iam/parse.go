@@ -181,6 +181,9 @@ func validateNewIdentityPolicy(doc *PolicyDocument) string {
 	if reason := validateIdentityPolicy(doc); reason != "" {
 		return reason
 	}
+	if reason := validateVarRefs(doc); reason != "" {
+		return reason
+	}
 	for i := range doc.Statement {
 		for _, r := range resourcesOf(&doc.Statement[i]) {
 			if strings.HasPrefix(r, "arn:gos3:") && !validAdminResource(r) {
@@ -188,6 +191,32 @@ func validateNewIdentityPolicy(doc *PolicyDocument) string {
 					AdminResourceARN + ", " + adminARNPrefix + "user/<name>, " +
 					adminARNPrefix + "policy/<name>, " + adminARNPrefix + "bucket/<name> and " +
 					adminARNPrefix + "backing/<name>)"
+			}
+		}
+	}
+	return ""
+}
+
+// validateVarRefs refuses Resource and Condition values with more than
+// maxVarRefs policy variable references, which evaluation would deny on
+// anyway (see budget). Only new identity policies are checked, so a stored
+// one still loads from iam.json; a stored bucket policy failing it is
+// treated as invalid, which denies its requests just the same.
+func validateVarRefs(doc *PolicyDocument) string {
+	for i := range doc.Statement {
+		st := &doc.Statement[i]
+		for _, r := range resourcesOf(st) {
+			if strings.Count(r, "${") > maxVarRefs {
+				return fmt.Sprintf("Policy has more than %d policy variables in a resource", maxVarRefs)
+			}
+		}
+		for opName, kv := range st.Condition {
+			for key, vals := range kv {
+				for _, v := range vals {
+					if strings.Count(v, "${") > maxVarRefs {
+						return fmt.Sprintf("Policy has more than %d policy variables in a Condition value for %s %s", maxVarRefs, opName, key)
+					}
+				}
 			}
 		}
 	}
@@ -222,6 +251,9 @@ func validAdminResource(r string) bool {
 // validateBucketPolicy validates a bucket policy for bucket.
 func validateBucketPolicy(doc *PolicyDocument, bucket string) string {
 	if reason := validateCommon(doc); reason != "" {
+		return reason
+	}
+	if reason := validateVarRefs(doc); reason != "" {
 		return reason
 	}
 	for i := range doc.Statement {

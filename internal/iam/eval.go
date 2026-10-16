@@ -95,6 +95,10 @@ type evalCtx struct {
 	// match: id.AccessKey, or "" when that ID is ambiguous (see
 	// usablePrincipalKey).
 	principalKey string
+
+	// budget limits the work of this decision; once it is exceeded the
+	// request is denied.
+	budget *budget
 }
 
 func newEvalCtx(req *AuthzRequest, now time.Time) *evalCtx {
@@ -107,6 +111,7 @@ func newEvalCtx(req *AuthzRequest, now time.Time) *evalCtx {
 		now:     now,
 
 		principalKey: req.Identity.AccessKey,
+		budget:       newBudget(),
 	}
 	switch {
 	case c.isAdmin:
@@ -184,7 +189,7 @@ func (c *evalCtx) lookupVar(name string) (string, bool) {
 // (case-insensitive, with wildcards).
 func (c *evalCtx) actionMatches(patterns []string) bool {
 	for _, p := range patterns {
-		if globMatch(p, c.action, true, false) {
+		if globMatchBudget(p, c.action, true, false, c.budget) {
 			return true
 		}
 	}
@@ -214,7 +219,7 @@ func (c *evalCtx) resourceMatches(patterns []string) bool {
 			}
 			continue
 		}
-		if matchPattern(p, c.resource, false, c.lookupVar) {
+		if matchPattern(p, c.resource, false, c.lookupVar, c.budget) {
 			return true
 		}
 	}
@@ -437,6 +442,14 @@ func IsPublicACL(acl string) bool {
 	return false
 }
 
+// limitDecision is the decision for a request whose evaluation exceeded
+// the work limits (see budget) at the statement where: whether that
+// statement applies is unknown, so the request is denied outright rather
+// than letting an Allow match or a Deny be skipped.
+func limitDecision(where string) Decision {
+	return Decision{ExplicitDeny: true, Reason: "policy evaluation limit exceeded at " + where}
+}
+
 // authorize implements Manager.Authorize.
 func (m *Manager) authorize(req AuthzRequest) Decision {
 	id := req.Identity
@@ -475,7 +488,14 @@ func (m *Manager) authorize(req AuthzRequest) Decision {
 			if st.Effect == "Allow" && allowReason != "" {
 				continue // already allowed; only Deny statements matter now
 			}
-			if (st.Effect != "Allow" && st.Effect != "Deny") || !c.statementApplies(st, false) {
+			if st.Effect != "Allow" && st.Effect != "Deny" {
+				continue
+			}
+			applies := c.statementApplies(st, false)
+			if c.budget.exceeded {
+				return limitDecision("policy " + p.Name + " statement " + stmtLabel(st, i))
+			}
+			if !applies {
 				continue
 			}
 			if st.Effect == "Deny" {
@@ -490,7 +510,14 @@ func (m *Manager) authorize(req AuthzRequest) Decision {
 			if st.Effect == "Allow" && allowReason != "" {
 				continue
 			}
-			if (st.Effect != "Allow" && st.Effect != "Deny") || !c.statementApplies(st, true) {
+			if st.Effect != "Allow" && st.Effect != "Deny" {
+				continue
+			}
+			applies := c.statementApplies(st, true)
+			if c.budget.exceeded {
+				return limitDecision("bucket policy statement " + stmtLabel(st, i))
+			}
+			if !applies {
 				continue
 			}
 			if st.Effect == "Deny" {

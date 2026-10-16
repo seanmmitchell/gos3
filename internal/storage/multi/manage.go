@@ -310,7 +310,7 @@ func (r *Router) SetReplication(ctx context.Context, bucket string, mode Mode, r
 	}
 	for _, ms := range removed {
 		delete(bs.members, ms.backing.Name)
-		r.addPurgeLocked(bucket, ms.backing.Name)
+		r.addPurgeLocked(bucket, ms.backing.Name, rec.Members[rec.member(ms.backing.Name)].Diverged)
 	}
 	if mode != ModeActiveActive {
 		for _, ms := range bs.members {
@@ -424,7 +424,7 @@ func (r *Router) CancelMove(ctx context.Context, bucket string) (PlacementStatus
 	bs.movePh = ""
 	ms := bs.members[mv.To]
 	delete(bs.members, mv.To)
-	r.addPurgeLocked(bucket, mv.To)
+	r.addPurgeLocked(bucket, mv.To, false)
 	r.mu.Unlock()
 	if ms != nil {
 		r.cancelMember(ms)

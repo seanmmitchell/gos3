@@ -179,7 +179,9 @@ func (s *Store) DeleteVersionIf(ctx context.Context, bucket, key, vid string, li
 		win   []storage.ObjectInfo // the last limit versions before vid, newest first
 		found bool
 	)
-	err = s.WalkVersions(ctx, bucket, key, "", "", func(o storage.ObjectInfo) error {
+	// The walk may prune the key's overlays; it must not take the lock
+	// held here again.
+	err = s.walkVersionInfos(ctx, t, key, "", "", key, func(o storage.ObjectInfo) error {
 		if o.Key != key {
 			return storage.ErrStopWalk // keys extending key sort after it
 		}

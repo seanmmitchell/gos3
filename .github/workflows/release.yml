@@ -41,6 +41,7 @@ jobs:
       contents: read
     outputs:
       tag: ${{ steps.tag.outputs.tag }}
+      commit: ${{ steps.tag.outputs.commit }}
     steps:
       - name: Releases are cut from main
         if: github.ref != 'refs/heads/main'
@@ -85,7 +86,16 @@ jobs:
             git push origin "refs/tags/$tag"
             echo "Tagged $(git rev-parse --short=12 HEAD) as $tag."
           fi
+          # The build checks out this full commit SHA, never the tag's bare
+          # name: actions/checkout prefers a branch over a tag of the same
+          # name, so a pushed v* branch would otherwise be built instead.
+          commit="$(git rev-parse --verify "refs/tags/$tag^{commit}")"
+          if [ "$commit" != "$(git rev-parse HEAD)" ]; then
+            echo "::error::$tag tags $commit, not main's head $(git rev-parse HEAD)."
+            exit 1
+          fi
           echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "commit=$commit" >> "$GITHUB_OUTPUT"
 
   build:
     name: Build
@@ -99,7 +109,7 @@ jobs:
       attestations: write
     uses: ./.github/workflows/build.yml
     with:
-      ref: ${{ needs.version.outputs.tag }}
+      ref: ${{ needs.version.outputs.commit }}
       version: ${{ needs.version.outputs.tag }}
       # No floating major tag before 1.0.0: 0.x minor releases may break.
       image-tags: |

@@ -69,8 +69,14 @@ func (s *syncer) conflict(versionID, reason string) {
 	s.res.Conflicts = append(s.res.Conflicts, Conflict{Key: s.p.SrcKey, Target: s.p.DstKey, VersionID: versionID, Reason: reason})
 }
 
-// lockReason says why version oi must not be deleted or replaced: it is
-// under a legal hold or unexpired retention ("" when neither).
+// LockReason says why version oi must not be deleted or replaced at now:
+// it is under a legal hold or unexpired retention ("" when neither, and
+// always for delete markers). Code that deletes or replaces versions
+// below the S3 layer, which enforces object lock for clients, uses it to
+// honour the lock too.
+func LockReason(oi storage.ObjectInfo, now time.Time) string { return lockReason(oi, now) }
+
+// lockReason implements LockReason.
 func lockReason(oi storage.ObjectInfo, now time.Time) string {
 	switch {
 	case oi.DeleteMarker:

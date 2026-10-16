@@ -188,8 +188,12 @@ func (r *Router) demote(ms *memberState, key string) {
 func (r *Router) replicate(ctx context.Context, rt *route, key string) {
 	committed := map[*memberState]bool{}
 	for _, f := range rt.followers {
-		if err := r.syncKey(ctx, rt.lead, f.backing, rt.bs.name, key, nil); err == nil {
+		err := r.syncKey(ctx, rt.lead, f.backing, rt.bs.name, key, false, nil)
+		if err == nil {
 			committed[f] = true
+		}
+		if errors.Is(err, errRestoredLocked) {
+			r.restoredLocked(rt.bs, key)
 		}
 	}
 	r.settle(rt, key, committed)
@@ -605,7 +609,8 @@ func (r *Router) deleteBucket(ctx context.Context, name string) error {
 	for bname, ms := range bs.members {
 		cancel = append(cancel, ms)
 		if bname != prim.Name {
-			r.addPurgeLocked(name, bname)
+			i := bs.rec.member(bname)
+			r.addPurgeLocked(name, bname, i > 0 && bs.rec.Members[i].Diverged)
 		}
 	}
 	r.mu.Unlock()

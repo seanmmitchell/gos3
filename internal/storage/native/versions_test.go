@@ -862,3 +862,43 @@ func TestTaggingUnsupported(t *testing.T) {
 		t.Errorf("Refresh = %+v, %v; want no tagging capability", rs, err)
 	}
 }
+
+// TestDeleteVersionIfGoneVersionDoesNotDeadlock: DeleteVersionIf lists the
+// key under its object lock; when the version was removed outside gos3 and
+// the key has overlays, the listing prunes them without taking that lock
+// again (H-08). Before, the call never returned and wedged the key.
+func TestDeleteVersionIfGoneVersionDoesNotDeadlock(t *testing.T) {
+	h := newHarness(t, s3clienttest.Options{}, nil)
+	ctx := t.Context()
+	h.mkVersioned("b")
+	v1 := h.mustPut("b", "k", []byte("one"), storage.ObjectMeta{})
+	h.mustPut("b", "k", []byte("two"), storage.ObjectMeta{})
+	if _, err := h.UpdateObjectMeta(ctx, "b", "k", v1.VersionID, func(m *storage.ObjectMeta) error { m.ACL = "public-read"; return nil }); err != nil {
+		t.Fatal(err)
+	}
+	overlays := native.OverlayCount(h.st, "b", "k")
+	time.Sleep(10 * time.Millisecond) // the overlay predates the listing
+	// Another client (or the remote's lifecycle) removes the version.
+	if _, err := h.c.DeleteObjectWith(ctx, remoteName("b"), "k", s3client.DeleteOptions{VersionID: v1.VersionID}); err != nil {
+		t.Fatal(err)
+	}
+
+	done := make(chan error, 1)
+	go func() {
+		_, err := h.DeleteVersionIf(ctx, "b", "k", v1.VersionID, 1, func(storage.ObjectInfo, []storage.ObjectInfo) error { return nil })
+		done <- err
+	}()
+	select {
+	case err := <-done:
+		if !errors.Is(err, storage.ErrVersionNotFound) {
+			t.Fatalf("DeleteVersionIf of a gone version = %v, want ErrVersionNotFound", err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("DeleteVersionIf deadlocked")
+	}
+	if n := native.OverlayCount(h.st, "b", "k"); n != overlays-1 {
+		t.Errorf("%d overlays after pruning the gone version's, want %d", n, overlays-1)
+	}
+	// The key is not wedged.
+	h.mustPut("b", "k", []byte("three"), storage.ObjectMeta{})
+}

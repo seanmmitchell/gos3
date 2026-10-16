@@ -11,8 +11,10 @@ import (
 	"strings"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"github.com/seanmmitchell/gos3/internal/auth"
+	"github.com/seanmmitchell/gos3/internal/iam"
 	"github.com/seanmmitchell/gos3/internal/storage"
 )
 
@@ -147,6 +149,28 @@ func TestConditionContext(t *testing.T) {
 	c = e.server.conditionContext(httptest.NewRequest("GET", "/", nil), rc, authzTarget{})
 	if c["aws:PrincipalType"][0] != "Account" || c["s3:authType"][0] != "REST-HEADER" {
 		t.Fatalf("root context %v", c)
+	}
+}
+
+// TestConditionContextTruncatesClientValues: free-form client values are cut
+// to iam.MaxRequestValueLen bytes (at a character boundary) before
+// policies glob or substitute them (H-02, H-03).
+func TestConditionContextTruncatesClientValues(t *testing.T) {
+	e := newTestEnv(t)
+	long := strings.Repeat("é", iam.MaxRequestValueLen) // 2 bytes per character
+	r := httptest.NewRequest("GET", "/b?prefix="+url.QueryEscape(long)+"&delimiter="+url.QueryEscape(long), nil)
+	r.Header.Set("User-Agent", long)
+	r.Header.Set("Referer", long)
+	rc := &reqContext{query: r.URL.Query(), identity: auth.Anonymous, auth: &auth.Result{Method: auth.MethodAnonymous}}
+	c := e.server.conditionContext(r, rc, authzTarget{})
+	want := long[:iam.MaxRequestValueLen]
+	for _, k := range []string{"aws:UserAgent", "aws:Referer", "s3:prefix", "s3:delimiter"} {
+		if got := c[k]; len(got) != 1 || got[0] != want {
+			t.Errorf("%s: got %d bytes, want the first %d", k, len(got[0]), len(want))
+		}
+	}
+	if got := iam.TruncateRequestValue("a" + long); len(got) != iam.MaxRequestValueLen-1 || !utf8.ValidString(got) {
+		t.Errorf("TruncateRequestValue split a character: %d bytes", len(got))
 	}
 }
 

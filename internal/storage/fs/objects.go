@@ -389,11 +389,16 @@ const openRetries = 8
 // OpenObject returns a version's info and a reader over its content (an
 // *os.File for non-empty objects). The reader is nil for delete markers.
 func (b *Backend) OpenObject(ctx context.Context, bucket, key, versionID string) (storage.ObjectInfo, io.ReadSeekCloser, error) {
+	// raced records that the version's data file changed between attempts,
+	// so exhausting the retries means contention, not a broken backing.
+	prevDataID, raced := "", false
 	for attempt := 0; ; attempt++ {
 		info, bucketID, dataID, err := b.lookupObject(ctx, bucket, key, versionID)
 		if err != nil {
 			return storage.ObjectInfo{}, nil, err
 		}
+		raced = raced || (attempt > 0 && dataID != prevDataID)
+		prevDataID = dataID
 		if info.DeleteMarker {
 			return info, nil, nil
 		}
@@ -413,6 +418,9 @@ func (b *Backend) OpenObject(ctx context.Context, bucket, key, versionID string)
 				// being unlinked right now); the metadata has changed, so
 				// resolve again.
 				continue
+			}
+			if raced {
+				return storage.ObjectInfo{}, nil, fmt.Errorf("fs: open data of %s/%s: %w: %w", bucket, key, storage.ErrConflict, err)
 			}
 			return storage.ObjectInfo{}, nil, fmt.Errorf("fs: open data of %s/%s: %w", bucket, key, err)
 		}
@@ -639,7 +647,7 @@ func (b *Backend) updateObjectMeta(ctx context.Context, bucket, key, versionID s
 			return cloneInfo(info), nil
 		}
 	}
-	return storage.ObjectInfo{}, fmt.Errorf("fs: update metadata of %s/%s: too much contention", bucket, key)
+	return storage.ObjectInfo{}, fmt.Errorf("fs: update metadata of %s/%s: %w", bucket, key, storage.ErrConflict)
 }
 
 // DeleteObject deletes a version or creates a delete marker per S3 semantics

@@ -18,6 +18,18 @@ import (
 // copied; it is copied again.
 var errSourceChanged = errors.New("multi: source changed during copy")
 
+// errRestoredLocked: syncKey copied locked versions that only the
+// destination had back to the source (the primary). The key is copied
+// again, and every other copy of the bucket must receive them too (see
+// restoredLocked).
+var errRestoredLocked = fmt.Errorf("multi: locked versions restored to the primary: %w", errSourceChanged)
+
+// errLockedConflict: the destination holds a locked version under an ID
+// for which the source holds a different version (a null version written
+// on both sides of a failover). Neither may be deleted or replaced, so the
+// key is left as it is on the destination.
+var errLockedConflict = errors.New("multi: a locked version conflicts with the primary's")
+
 // walkBatchKeys is the number of keys a full comparison collects per walk.
 const walkBatchKeys = 256
 
@@ -25,8 +37,11 @@ const walkBatchKeys = 256
 // the key's lock. prog, when non-nil, counts the work.
 func (r *Router) syncMemberKey(ctx context.Context, ms *memberState, key string, prog *Progress) error {
 	r.mu.RLock()
-	src := ms.bucket.members[ms.bucket.rec.primary()].backing
+	rec := ms.bucket.rec
+	src := ms.bucket.members[rec.primary()].backing
 	removed := ms.bucket.removed
+	i := rec.member(ms.backing.Name)
+	diverged := i > 0 && rec.Members[i].Diverged
 	r.mu.RUnlock()
 	if removed || ms.isCanceled() {
 		return errCanceled
@@ -36,12 +51,39 @@ func (r *Router) syncMemberKey(ctx context.Context, ms *memberState, key string,
 	}
 	unlock := r.keys.lock(ms.bucket.name, key)
 	defer unlock()
-	err := r.syncKey(ctx, src, ms.backing, ms.bucket.name, key, prog)
+	err := r.syncKey(ctx, src, ms.backing, ms.bucket.name, key, diverged, prog)
+	if errors.Is(err, errRestoredLocked) {
+		r.restoredLocked(ms.bucket, key)
+	}
 	if errors.Is(err, errSourceChanged) {
 		r.markDirty(ms, key)
 		return nil
 	}
+	if errors.Is(err, errLockedConflict) {
+		r.log.Error("a locked version on a bucket copy conflicts with the primary's; leaving the key as it is there",
+			"bucket", ms.bucket.name, "key", key, "backing", ms.backing.Name, "err", err)
+		return nil
+	}
 	return err
+}
+
+// restoredLocked reacts to syncKey having copied locked versions of key
+// back to the primary of bs: every other copy is brought up to date in the
+// background, and subscribers learn of the change.
+func (r *Router) restoredLocked(bs *bucketState, key string) {
+	r.mu.RLock()
+	primary := bs.rec.primary()
+	others := make([]*memberState, 0, len(bs.members))
+	for name, ms := range bs.members {
+		if name != primary {
+			others = append(others, ms)
+		}
+	}
+	r.mu.RUnlock()
+	for _, ms := range others {
+		r.markDirty(ms, key)
+	}
+	r.emitObject(bs.name, key)
 }
 
 // syncKey makes the versions of bucket/key on dst identical to those on
@@ -53,7 +95,18 @@ func (r *Router) syncMemberKey(ctx context.Context, ms *memberState, key string,
 // kept (with metadata updated where it differs) and the rest of dst is
 // replaced by the rest of src. In the common case (new versions added on
 // src) that copies just the new versions.
-func (r *Router) syncKey(ctx context.Context, src, dst *backing, bucket, key string, prog *Progress) error {
+//
+// With restore (dst is a Diverged member: the old primary after a forced
+// promote or a failover to a lagging replica), a dst version that object
+// lock protects (legal hold, unexpired retention) and src does not have is
+// never deleted: it can be an acknowledged write the new primary never
+// received, and the S3 layer, which enforces the lock for clients, is not
+// involved here. It is copied back to src instead (errRestoredLocked). If
+// src holds a different version under its ID, dst is left unchanged
+// (errLockedConflict). Without restore, src is authoritative: a locked
+// version it lacks was deleted there legitimately (by a client allowed to
+// bypass governance retention, say), and is deleted on dst too.
+func (r *Router) syncKey(ctx context.Context, src, dst *backing, bucket, key string, restore bool, prog *Progress) error {
 	sv, err := copier.KeyVersions(ctx, src.Backend, bucket, key)
 	if err != nil {
 		return r.observe(src, fmt.Errorf("listing %s/%s on backing %q: %w", bucket, key, src.Name, err))
@@ -68,6 +121,11 @@ func (r *Router) syncKey(ctx context.Context, src, dst *backing, bucket, key str
 	srcByID := make(map[string]storage.ObjectInfo, len(sv))
 	for _, v := range sv {
 		srcByID[v.VersionID] = v
+	}
+	if restore {
+		if err := r.restoreLocked(ctx, src, dst, bucket, key, srcByID, dv); err != nil {
+			return err
+		}
 	}
 	del := func(id string) error {
 		_, err := dst.Backend.DeleteObject(ctx, bucket, key, id)
@@ -131,6 +189,42 @@ func (r *Router) syncKey(ctx context.Context, src, dst *backing, bucket, key str
 		return errSourceChanged
 	}
 	return nil
+}
+
+// restoreLocked copies the locked versions in dv (dst's versions of
+// bucket/key) that src does not have back to src, oldest first, and then
+// returns errRestoredLocked; it returns errLockedConflict when src has a
+// different version under a locked version's ID, and nil when no locked
+// version is missing from src.
+func (r *Router) restoreLocked(ctx context.Context, src, dst *backing, bucket, key string, srcByID map[string]storage.ObjectInfo, dv []storage.ObjectInfo) error {
+	now := time.Now()
+	var restore []storage.ObjectInfo
+	for _, d := range dv {
+		s, ok := srcByID[d.VersionID]
+		if ok && copier.SameVersion(s, d) {
+			continue
+		}
+		why := copier.LockReason(d, now)
+		if why == "" {
+			continue
+		}
+		if ok {
+			return fmt.Errorf("%w: %s/%s version %s on backing %q is %s, and backing %q has another version under that ID",
+				errLockedConflict, bucket, key, d.VersionID, dst.Name, why, src.Name)
+		}
+		restore = append(restore, d)
+	}
+	if len(restore) == 0 {
+		return nil
+	}
+	for _, d := range slices.Backward(restore) { // dv is newest first
+		r.log.Warn("restoring a locked version that only a bucket copy has to the primary",
+			"bucket", bucket, "key", key, "version", d.VersionID, "from", dst.Name, "to", src.Name)
+		if _, err := r.importVersion(ctx, dst, src, bucket, key, d); err != nil {
+			return err
+		}
+	}
+	return errRestoredLocked
 }
 
 // importVersion copies version v of bucket/key from src to dst. It returns
@@ -425,15 +519,19 @@ func abortUploads(ctx context.Context, b *backing, bucket string, r *Router) err
 type purgeJob struct {
 	rec     purgeRecord
 	running bool // guarded by Router.mu
+	// diverged: the copy was a Diverged member (guarded by Router.mu; see
+	// purgeLocked).
+	diverged bool
 }
 
-// addPurgeLocked records a copy to delete. Router.mu must be held (or
-// Open must be running).
-func (r *Router) addPurgeLocked(bucket, backingName string) {
+// addPurgeLocked records a copy to delete; diverged says it was a Diverged
+// member. Router.mu must be held (or Open must be running).
+func (r *Router) addPurgeLocked(bucket, backingName string, diverged bool) {
 	p := purgeRecord{Bucket: bucket, Backing: backingName}
 	if r.purges[p] == nil {
 		r.purges[p] = &purgeJob{rec: p}
 	}
+	r.purges[p].diverged = r.purges[p].diverged || diverged
 }
 
 // startPurge runs j in the background unless it runs already. Router.mu
@@ -448,7 +546,10 @@ func (r *Router) startPurge(j *purgeJob) {
 		defer r.wg.Done()
 		backoff := minBackoff
 		for {
-			err := r.purge(r.ctx, j.rec)
+			r.mu.RLock()
+			diverged := j.diverged
+			r.mu.RUnlock()
+			err := r.purge(r.ctx, j.rec, diverged)
 			if err == nil {
 				r.mu.Lock()
 				delete(r.purges, j.rec)
@@ -472,9 +573,57 @@ func (r *Router) startPurge(j *purgeJob) {
 	}()
 }
 
+// purgeLocked lets purge delete version v of bucket's copy on backing b.
+// A copy that was not a Diverged member only holds what the primary
+// holds or held (a locked version the primary lacks was deleted there
+// legitimately), so everything goes. Of a diverged copy, a version under
+// object lock goes only if the bucket's primary holds the same version; a
+// locked version the primary does not have is copied to it first, and
+// one that cannot be kept elsewhere (the bucket is gone, or its primary
+// holds another version under that ID) fails the purge, which is retried,
+// so the copy stays until the lock ends.
+func (r *Router) purgeLocked(ctx context.Context, b *backing, bucket string, v storage.ObjectInfo, diverged bool) error {
+	why := copier.LockReason(v, time.Now())
+	if !diverged || why == "" {
+		return nil
+	}
+	r.mu.RLock()
+	bs := r.buckets[bucket]
+	var prim *backing
+	if bs != nil && !bs.removed {
+		if ms := bs.members[bs.rec.primary()]; ms != nil {
+			prim = ms.backing
+		}
+	}
+	r.mu.RUnlock()
+	if prim == nil || prim == b {
+		return fmt.Errorf("not deleting %s/%s version %s on backing %q: it is %s", bucket, v.Key, v.VersionID, b.Name, why)
+	}
+	unlock := r.keys.lock(bucket, v.Key)
+	defer unlock()
+	pv, err := prim.Backend.GetObjectInfo(ctx, bucket, v.Key, v.VersionID)
+	switch {
+	case err == nil && copier.SameVersion(pv, v):
+		return nil
+	case err == nil:
+		return fmt.Errorf("not deleting %s/%s version %s on backing %q: it is %s, and the primary %q has another version under that ID",
+			bucket, v.Key, v.VersionID, b.Name, why, prim.Name)
+	case !errors.Is(err, storage.ErrVersionNotFound) && !errors.Is(err, storage.ErrObjectNotFound):
+		return r.observe(prim, err)
+	}
+	r.log.Warn("restoring a locked version that only a deleted bucket copy has to the primary",
+		"bucket", bucket, "key", v.Key, "version", v.VersionID, "from", b.Name, "to", prim.Name)
+	if _, err := r.importVersion(ctx, b, prim, bucket, v.Key, v); err != nil {
+		return err
+	}
+	r.restoredLocked(bs, v.Key)
+	return nil
+}
+
 // purge deletes every version, upload and configuration document of the
-// bucket on the backing, then the bucket itself.
-func (r *Router) purge(ctx context.Context, p purgeRecord) error {
+// bucket on the backing, then the bucket itself; diverged says the copy
+// was a Diverged member (see purgeLocked).
+func (r *Router) purge(ctx context.Context, p purgeRecord, diverged bool) error {
 	b := r.topology.Load().backings[p.Backing]
 	if b == nil {
 		return nil
@@ -505,6 +654,9 @@ func (r *Router) purge(ctx context.Context, p purgeRecord) error {
 			break
 		}
 		for _, v := range vs {
+			if err := r.purgeLocked(ctx, b, p.Bucket, v, diverged); err != nil {
+				return err
+			}
 			_, err := b.Backend.DeleteObject(ctx, p.Bucket, v.Key, v.VersionID)
 			if err != nil && !errors.Is(err, storage.ErrVersionNotFound) && !errors.Is(err, storage.ErrObjectNotFound) {
 				return r.observe(b, err)
