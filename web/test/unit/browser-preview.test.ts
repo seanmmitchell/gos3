@@ -54,6 +54,42 @@ describe('renderMarkdown', () => {
   })
 })
 
+describe('renderMarkdown tables', () => {
+  it('renders a GFM table with alignment and inline Markdown', () => {
+    const html = renderMarkdown('Intro\n| Name | Size | Note |\n| :--- | ---: | :-: |\n| `a.txt` | 12 | **new** |\n| b\\|c | 3 |\n\nAfter')
+    expect(html).toBe([
+      '<p>Intro</p>',
+      '<table><thead><tr><th style="text-align:left">Name</th><th style="text-align:right">Size</th><th style="text-align:center">Note</th></tr></thead>'
+      + '<tbody><tr><td style="text-align:left"><code>a.txt</code></td><td style="text-align:right">12</td><td style="text-align:center"><strong>new</strong></td></tr>'
+      + '<tr><td style="text-align:left">b|c</td><td style="text-align:right">3</td><td style="text-align:center"></td></tr></tbody></table>',
+      '<p>After</p>'
+    ].join('\n'))
+  })
+
+  it('accepts rows without outer pipes and ends at the next block', () => {
+    const html = renderMarkdown('a | b\n--|--\n1 | 2 | extra\n# Next')
+    expect(html).toBe('<table><thead><tr><th>a</th><th>b</th></tr></thead><tbody><tr><td>1</td><td>2</td></tr></tbody></table>\n<h1>Next</h1>')
+  })
+
+  it('needs a matching delimiter row', () => {
+    expect(renderMarkdown('a | b\n--- | --- | ---')).not.toContain('<table')
+    expect(renderMarkdown('| a | b |\n| x | y |')).not.toContain('<table')
+    expect(renderMarkdown('text\n---')).toBe('<p>text</p>\n<hr>')
+  })
+
+  it('escapes cell contents', () => {
+    const html = renderMarkdown('| <b>x</b> |\n|---|\n| <img src=x onerror=alert(1)> |')
+    expect(html).not.toContain('<img')
+    expect(html).toContain('<th>&lt;b&gt;x&lt;/b&gt;</th>')
+  })
+
+  it('checks long delimiter-like lines in linear time', () => {
+    const start = performance.now()
+    renderMarkdown(`a | b\n|${' '.repeat(100_000)}x`)
+    expect(performance.now() - start).toBeLessThan(500)
+  })
+})
+
 describe('renderMarkdown link filter (review fix)', () => {
   it('drops links that URL parsers turn into javascript: URLs', () => {
     for (const c of ['\u0001', '\u0008', '\u000e', '\u001f', '\u007f']) {
