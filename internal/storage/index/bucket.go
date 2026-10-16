@@ -305,6 +305,33 @@ func (b *Bucket[P]) DeleteIf(key, versionID string, check func(storage.ObjectInf
 	return b.Delete(key, versionID)
 }
 
+// DeleteVersionIf permanently deletes version versionID (not "") of key
+// when check accepts it and the at most limit versions newer than it,
+// nearest first (see storage.NewerVersionsDeleter); a refusal is returned
+// as is.
+func (b *Bucket[P]) DeleteVersionIf(key, versionID string, limit int, check func(storage.ObjectInfo, []storage.ObjectInfo) error) (storage.DeleteResult, Change[P], error) {
+	if versionID == "" {
+		return storage.DeleteResult{}, Change[P]{}, fmt.Errorf("%w: %s/%s: no version ID", storage.ErrVersionNotFound, b.Info.Name, key)
+	}
+	v, latest, err := b.Find(key, versionID)
+	if err != nil {
+		return storage.DeleteResult{}, Change[P]{}, err
+	}
+	obj, _ := b.objects.Get(key)
+	i := obj.indexByStamp(v.Stamp)
+	limit = max(limit, 1)
+	newer := make([]storage.ObjectInfo, 0, min(limit, len(obj.versions)-1-i))
+	for j := i + 1; j < len(obj.versions) && len(newer) < limit; j++ {
+		newer = append(newer, obj.versions[j].Info(b.Info.Name, key, j == len(obj.versions)-1))
+	}
+	if err := check(v.Info(b.Info.Name, key, latest), newer); err != nil {
+		return storage.DeleteResult{}, Change[P]{}, err
+	}
+	ch := Change[P]{Key: key, Removed: []*Version[P]{v}}
+	b.Apply(ch)
+	return storage.DeleteResult{VersionID: v.ID, DeleteMarker: v.DeleteMarker}, ch, nil
+}
+
 // UpdateMeta mutates the metadata of an existing version (versionID "" =
 // latest) per storage.Backend.UpdateObjectMeta: fn receives a private copy
 // and nothing changes if it fails; ObjectMeta.Encryption cannot be changed.

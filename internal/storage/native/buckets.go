@@ -162,7 +162,11 @@ func (s *Store) Refresh(ctx context.Context, bucket string) (RemoteState, error)
 }
 
 // probe reads the state of t's remote bucket: versioning and object lock
-// configuration, each support (a 501 answer means none).
+// configuration, each support (a 501 answer means none). Credentials that
+// may use the bucket's objects but not read its configuration (a
+// bucket-scoped Cloudflare R2 token) get 403 answers there: the feature
+// is then left to the remote (no support), as long as the bucket itself
+// answers HEAD.
 func (s *Store) probe(ctx context.Context, t *target) (RemoteState, error) {
 	st := RemoteState{Caps: Caps{Versioning: true, ObjectLock: true, Tagging: s.tagging(t)}}
 	var status string
@@ -171,8 +175,23 @@ func (s *Store) probe(ctx context.Context, t *target) (RemoteState, error) {
 		status, err = c.GetBucketVersioning(ctx, t.b.Remote)
 		return err
 	})
+	var headed, reachable bool // whether the bucket was asked HEAD, and answered
+	denied := func(what string, err error) bool {
+		if !s3client.IsAccessDenied(err) {
+			return false
+		}
+		if !headed {
+			headed = true
+			reachable = s.call(ctx, t, func(c *s3client.Client) error { return c.HeadBucket(ctx, t.b.Remote) }) == nil
+		}
+		if reachable {
+			s.log.Warn("native: the credentials may not read the remote bucket's "+what+" configuration; gos3 leaves it to the remote",
+				"backing", s.name, "bucket", t.bucket, "remote", t.b.Remote, "err", err)
+		}
+		return reachable
+	}
 	switch {
-	case s3client.IsNotImplemented(err):
+	case s3client.IsNotImplemented(err), denied("versioning", err):
 		st.Caps.Versioning = false
 	case err != nil:
 		return RemoteState{}, s.remoteErr("GetBucketVersioning", t, "", bucketOp, err)
@@ -193,7 +212,7 @@ func (s *Store) probe(ctx context.Context, t *target) (RemoteState, error) {
 		return err
 	})
 	switch {
-	case s3client.IsNotImplemented(err):
+	case s3client.IsNotImplemented(err), denied("object lock", err):
 		st.Caps.ObjectLock = false
 	case err != nil:
 		return RemoteState{}, s.remoteErr("GetObjectLockConfiguration", t, "", bucketOp, err)

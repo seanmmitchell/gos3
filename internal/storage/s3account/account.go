@@ -242,6 +242,7 @@ type NativeStore interface {
 
 	objectStore
 	storage.ConditionalDeleter
+	storage.NewerVersionsDeleter
 	storage.CheckedDeleter
 	storage.ConditionalMetaUpdater
 	storage.UploadWalker
