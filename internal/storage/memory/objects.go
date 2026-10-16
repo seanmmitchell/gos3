@@ -339,6 +339,22 @@ func (b *Backend) DeleteObjectIf(ctx context.Context, bucketName, key, versionID
 	return b.deleteChecked(ctx, bucketName, key, versionID, func(o storage.ObjectInfo, _ bool) error { return check(o) }, false)
 }
 
+// DeleteVersionIf permanently deletes a version when check accepts it and
+// the versions newer than it, under the bucket's write lock (see
+// storage.NewerVersionsDeleter).
+func (b *Backend) DeleteVersionIf(ctx context.Context, bucketName, key, versionID string, limit int, check func(storage.ObjectInfo, []storage.ObjectInfo) error) (storage.DeleteResult, error) {
+	if check == nil {
+		return storage.DeleteResult{}, errors.New("memory: nil delete check")
+	}
+	bk, err := b.lockBucket(ctx, bucketName)
+	if err != nil {
+		return storage.DeleteResult{}, err
+	}
+	defer bk.mu.Unlock()
+	res, _, err := bk.ix.DeleteVersionIf(key, versionID, limit, check)
+	return res, err
+}
+
 // DeleteObjectChecked is DeleteObjectIf whose check is also consulted
 // when the key has no versions (see storage.CheckedDeleter).
 func (b *Backend) DeleteObjectChecked(ctx context.Context, bucketName, key, versionID string, check func(storage.ObjectInfo, bool) error) (storage.DeleteResult, error) {

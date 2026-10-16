@@ -248,6 +248,7 @@ func (bs *bucketState) cacheInfo(in storage.BucketInfo) {
 var (
 	_ storage.Backend                = (*Router)(nil)
 	_ storage.ConditionalDeleter     = (*Router)(nil)
+	_ storage.NewerVersionsDeleter   = (*Router)(nil)
 	_ storage.CheckedDeleter         = (*Router)(nil)
 	_ storage.ConditionalMetaUpdater = (*Router)(nil)
 	_ storage.ConfigViewer           = (*Router)(nil)

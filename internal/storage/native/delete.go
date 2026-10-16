@@ -3,6 +3,7 @@ package native
 import (
 	"context"
 	"errors"
+	"slices"
 	"time"
 
 	"github.com/seanmmitchell/gos3/internal/s3client"
@@ -21,7 +22,8 @@ import (
 // layer approved a bypass (storage.GovernanceBypass): the remote enforces
 // retention and legal holds itself, and a refusal is ErrRemoteDenied.
 //
-// The conditional deletes (DeleteObjectIf, DeleteObjectChecked) look up,
+// The conditional deletes (DeleteObjectIf, DeleteObjectChecked,
+// DeleteVersionIf) look up,
 // check and delete under the object's lock: atomic against other users of
 // this Store. s3client has no conditional DELETE, so a client writing the
 // object directly on the remote between the check and the delete is not
@@ -153,6 +155,54 @@ func (s *Store) deleteLatest(ctx context.Context, t *target, key string) (storag
 	return storage.DeleteResult{VersionID: res.VersionID, DeleteMarker: true}, nil
 }
 
+// DeleteVersionIf implements storage.NewerVersionsDeleter. Under the
+// object's lock, the key's versions are listed newest first down to vid
+// (the remote cannot list the versions newer than a given one any other
+// way), keeping the last limit seen; then the version is read, checked
+// with them and deleted as by DeleteObjectIf. A version the listing does
+// not show is ErrVersionNotFound.
+func (s *Store) DeleteVersionIf(ctx context.Context, bucket, key, vid string, limit int, check func(storage.ObjectInfo, []storage.ObjectInfo) error) (storage.DeleteResult, error) {
+	if check == nil {
+		return storage.DeleteResult{}, errors.New("native: nil delete check")
+	}
+	t, err := s.target(ctx, bucket)
+	if err != nil {
+		return storage.DeleteResult{}, err
+	}
+	if vid == "" || s.checkKey(key) != nil {
+		return storage.DeleteResult{}, notFound(t.bucket, key, vid)
+	}
+	unlock := s.lockObject(t.bucket, key)
+	defer unlock()
+	limit = max(limit, 1)
+	var (
+		win   []storage.ObjectInfo // the last limit versions before vid, newest first
+		found bool
+	)
+	err = s.WalkVersions(ctx, bucket, key, "", "", func(o storage.ObjectInfo) error {
+		if o.Key != key {
+			return storage.ErrStopWalk // keys extending key sort after it
+		}
+		if o.VersionID == vid {
+			found = true
+			return storage.ErrStopWalk
+		}
+		if len(win) == limit {
+			win = append(win[:0], win[1:]...)
+		}
+		win = append(win, o)
+		return nil
+	})
+	if err != nil {
+		return storage.DeleteResult{}, err
+	}
+	if !found {
+		return storage.DeleteResult{}, notFound(t.bucket, key, vid)
+	}
+	slices.Reverse(win)
+	return s.deleteVersionLocked(ctx, t, key, vid, func(info storage.ObjectInfo) error { return check(info, win) })
+}
+
 // deleteVersion permanently deletes version vid of key after check (nil =
 // none) accepted it.
 func (s *Store) deleteVersion(ctx context.Context, t *target, key, vid string, check func(storage.ObjectInfo) error) (storage.DeleteResult, error) {
@@ -161,6 +211,12 @@ func (s *Store) deleteVersion(ctx context.Context, t *target, key, vid string, c
 	}
 	unlock := s.lockObject(t.bucket, key)
 	defer unlock()
+	return s.deleteVersionLocked(ctx, t, key, vid, check)
+}
+
+// deleteVersionLocked is deleteVersion for a caller holding the object's
+// lock.
+func (s *Store) deleteVersionLocked(ctx context.Context, t *target, key, vid string, check func(storage.ObjectInfo) error) (storage.DeleteResult, error) {
 	mode := statQuick
 	if check != nil {
 		mode = statFull

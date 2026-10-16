@@ -565,6 +565,17 @@ func (b *Backend) DeleteObjectIf(ctx context.Context, bucket, key, versionID str
 	})
 }
 
+// DeleteVersionIf permanently deletes a version when check accepts it and
+// the versions newer than it (see storage.NewerVersionsDeleter).
+func (b *Backend) DeleteVersionIf(ctx context.Context, bucket, key, versionID string, limit int, check func(storage.ObjectInfo, []storage.ObjectInfo) error) (storage.DeleteResult, error) {
+	if check == nil {
+		return storage.DeleteResult{}, errors.New("s3store: nil delete check")
+	}
+	return b.deleteObject(ctx, bucket, func(ix *index.Bucket[blobRef]) (storage.DeleteResult, index.Change[blobRef], error) {
+		return ix.DeleteVersionIf(key, versionID, limit, check)
+	})
+}
+
 // DeleteObjectChecked is DeleteObjectIf whose check is also consulted when
 // the key has no versions (see storage.CheckedDeleter).
 func (b *Backend) DeleteObjectChecked(ctx context.Context, bucket, key, versionID string, check func(storage.ObjectInfo, bool) error) (storage.DeleteResult, error) {

@@ -22,8 +22,8 @@
 // CONTRACT: the exported names in this file are used by s3account; the
 // Store's object and multipart methods have exactly the signatures and
 // semantics of the storage.Backend methods of the same names (and of
-// storage.ConditionalDeleter, CheckedDeleter, ConditionalMetaUpdater and
-// UploadWalker).
+// storage.ConditionalDeleter, NewerVersionsDeleter, CheckedDeleter,
+// ConditionalMetaUpdater and UploadWalker).
 package native
 
 import (

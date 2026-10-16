@@ -45,6 +45,7 @@ type hbucket struct {
 var (
 	_ storage.Backend                = (*harness)(nil)
 	_ storage.ConditionalDeleter     = (*harness)(nil)
+	_ storage.NewerVersionsDeleter   = (*harness)(nil)
 	_ storage.CheckedDeleter         = (*harness)(nil)
 	_ storage.ConditionalMetaUpdater = (*harness)(nil)
 	_ storage.UploadWalker           = (*harness)(nil)
@@ -331,6 +332,10 @@ func (h *harness) DeleteObject(ctx context.Context, bucket, key, versionID strin
 
 func (h *harness) DeleteObjectIf(ctx context.Context, bucket, key, versionID string, check func(storage.ObjectInfo) error) (storage.DeleteResult, error) {
 	return h.st.DeleteObjectIf(ctx, bucket, key, versionID, check)
+}
+
+func (h *harness) DeleteVersionIf(ctx context.Context, bucket, key, versionID string, limit int, check func(storage.ObjectInfo, []storage.ObjectInfo) error) (storage.DeleteResult, error) {
+	return h.st.DeleteVersionIf(ctx, bucket, key, versionID, limit, check)
 }
 
 func (h *harness) DeleteObjectChecked(ctx context.Context, bucket, key, versionID string, check func(storage.ObjectInfo, bool) error) (storage.DeleteResult, error) {

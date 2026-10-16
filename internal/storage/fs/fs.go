@@ -177,8 +177,9 @@ type Backend struct {
 }
 
 var (
-	_ storage.Backend            = (*Backend)(nil)
-	_ storage.ConditionalDeleter = (*Backend)(nil)
+	_ storage.Backend              = (*Backend)(nil)
+	_ storage.ConditionalDeleter   = (*Backend)(nil)
+	_ storage.NewerVersionsDeleter = (*Backend)(nil)
 )
 var (
 	_ storage.ConditionalDeleter = (*Backend)(nil)
