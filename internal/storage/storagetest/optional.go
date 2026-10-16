@@ -18,6 +18,7 @@ func optionalTests() []testCase {
 	return []testCase{
 		{"DeleteObjectIf", testDeleteObjectIf},
 		{"DeleteObjectIfRace", testDeleteObjectIfRace},
+		{"DeleteVersionIf", testDeleteVersionIf},
 		{"WalkMultipartUploads", testWalkUploads},
 		{"DeleteObjectChecked", testDeleteObjectChecked},
 		{"UpdateObjectMetaIf", testUpdateObjectMetaIf},
@@ -137,6 +138,92 @@ func testDeleteObjectIf(e *env) {
 			e.t.Errorf("suspended DeleteObjectIf result %+v, want a null delete marker", res)
 		}
 		e.wantHistory("s", "k", vref{VersionID: storage.NullVersionID, DeleteMarker: true})
+	})
+}
+
+// testDeleteVersionIf checks storage.NewerVersionsDeleter: the check sees
+// the addressed version and, nearest first, at most limit of the versions
+// newer than it as they are at the delete.
+func testDeleteVersionIf(e *env) {
+	nd, ok := e.b.(storage.NewerVersionsDeleter)
+	if !ok {
+		e.t.Skip("backend does not implement storage.NewerVersionsDeleter")
+	}
+	type seen struct {
+		v     storage.ObjectInfo
+		newer []vref
+	}
+	call := func(bucket, key, vid string, limit int, verdict error) (seen, error) {
+		var got seen
+		_, err := nd.DeleteVersionIf(e.ctx, bucket, key, vid, limit, func(v storage.ObjectInfo, newer []storage.ObjectInfo) error {
+			got = seen{v: v}
+			for _, n := range newer {
+				got.newer = append(got.newer, vref{Key: n.Key, VersionID: n.VersionID, DeleteMarker: n.DeleteMarker, IsLatest: n.IsLatest})
+			}
+			return verdict
+		})
+		return got, err
+	}
+	e.run("MissingVersion", func(e *env) {
+		e.mkVersioned("m", storage.VersioningEnabled)
+		e.put("m", "k", []byte("x"))
+		called := false
+		check := func(storage.ObjectInfo, []storage.ObjectInfo) error { called = true; return nil }
+		_, err := nd.DeleteVersionIf(e.ctx, "m", "k", storage.NullVersionID, 1, check)
+		e.wantErr("DeleteVersionIf of a missing version", err, storage.ErrVersionNotFound)
+		_, err = nd.DeleteVersionIf(e.ctx, "m", "nokey", storage.NullVersionID, 1, check)
+		e.wantErr("DeleteVersionIf of a missing key", err, storage.ErrVersionNotFound, storage.ErrObjectNotFound)
+		_, err = nd.DeleteVersionIf(e.ctx, "nobucket", "k", storage.NullVersionID, 1, check)
+		e.wantErr("DeleteVersionIf in a missing bucket", err, storage.ErrBucketNotFound)
+		if called {
+			e.t.Error("check was called for a missing version or bucket")
+		}
+	})
+	e.run("NewerVersions", func(e *env) {
+		e.mkVersioned("v", storage.VersioningEnabled)
+		v1 := e.put("v", "k", []byte("1"))
+		v2 := e.put("v", "k", []byte("2"))
+		e.put("v", "k2", []byte("other key"))
+		v3 := e.put("v", "k", []byte("3"))
+		dm := e.del("v", "k", "")
+
+		got, err := call("v", "k", v1.VersionID, 10, errCheckRefused)
+		if !errors.Is(err, errCheckRefused) {
+			e.t.Fatalf("refused DeleteVersionIf: err = %v, want the check's error", err)
+		}
+		want := []vref{
+			{Key: "k", VersionID: v2.VersionID},
+			{Key: "k", VersionID: v3.VersionID},
+			{Key: "k", VersionID: dm.VersionID, DeleteMarker: true, IsLatest: true},
+		}
+		if got.v.VersionID != v1.VersionID || got.v.IsLatest || !slices.Equal(got.newer, want) {
+			e.t.Errorf("check saw %q latest=%v newer %+v, want %q noncurrent, newer %+v", got.v.VersionID, got.v.IsLatest, got.newer, v1.VersionID, want)
+		}
+		got, _ = call("v", "k", v1.VersionID, 2, errCheckRefused)
+		if !slices.Equal(got.newer, want[:2]) {
+			e.t.Errorf("limit 2: newer %+v, want %+v", got.newer, want[:2])
+		}
+		got, _ = call("v", "k", dm.VersionID, 3, errCheckRefused)
+		if !got.v.IsLatest || !got.v.DeleteMarker || len(got.newer) != 0 {
+			e.t.Errorf("latest delete marker: check saw %+v newer %+v, want it latest with no newer versions", got.v, got.newer)
+		}
+		e.wantHistory("v", "k",
+			vref{VersionID: dm.VersionID, DeleteMarker: true}, vref{VersionID: v3.VersionID},
+			vref{VersionID: v2.VersionID}, vref{VersionID: v1.VersionID})
+
+		// A newer version removed meanwhile is no longer passed.
+		e.del("v", "k", v2.VersionID)
+		got, _ = call("v", "k", v1.VersionID, 10, errCheckRefused)
+		if !slices.Equal(got.newer, want[1:]) {
+			e.t.Errorf("after deleting %q: newer %+v, want %+v", v2.VersionID, got.newer, want[1:])
+		}
+		res, err := call("v", "k", v1.VersionID, 1, nil)
+		e.noErr("accepted DeleteVersionIf", err)
+		if res.v.VersionID != v1.VersionID {
+			e.t.Errorf("accepted DeleteVersionIf checked %q, want %q", res.v.VersionID, v1.VersionID)
+		}
+		e.wantHistory("v", "k", vref{VersionID: dm.VersionID, DeleteMarker: true}, vref{VersionID: v3.VersionID})
+		e.wantHistory("v", "k2", vref{VersionID: e.info("v", "k2", "").VersionID})
 	})
 }
 

@@ -132,6 +132,25 @@ func (c *clockBackend) DeleteObjectIf(ctx context.Context, bucket, key, versionI
 	return res, err
 }
 
+// DeleteVersionIf passes the wrapped backend's version info and newer
+// versions to check with the test-controlled LastModified times.
+func (c *clockBackend) DeleteVersionIf(ctx context.Context, bucket, key, versionID string, limit int, check func(storage.ObjectInfo, []storage.ObjectInfo) error) (storage.DeleteResult, error) {
+	if c.failDelete != "" && strings.HasPrefix(key, c.failDelete) {
+		return storage.DeleteResult{}, errors.New("injected delete failure")
+	}
+	if c.beforeDelete != nil {
+		c.beforeDelete(bucket, key, versionID)
+	}
+	nd := c.Backend.(storage.NewerVersionsDeleter)
+	return nd.DeleteVersionIf(ctx, bucket, key, versionID, limit, func(o storage.ObjectInfo, newer []storage.ObjectInfo) error {
+		fixed := make([]storage.ObjectInfo, len(newer))
+		for i := range newer {
+			fixed[i] = c.fix(newer[i])
+		}
+		return check(c.fix(o), fixed)
+	})
+}
+
 // stampMarker stamps a delete marker created by the worker with the fake
 // clock.
 func (c *clockBackend) stampMarker(bucket, key, versionID string, res storage.DeleteResult, err error) {
@@ -782,6 +801,74 @@ func TestWorkerManyKeysBatched(t *testing.T) {
 			e.expectStats(e.run(), Stats{Buckets: 1})
 		})
 	}
+}
+
+// walkSizeBackend records the largest number of versions a single
+// WalkVersions call delivered.
+type walkSizeBackend struct {
+	*clockBackend
+	mu      sync.Mutex
+	maxWalk int
+}
+
+func (w *walkSizeBackend) WalkVersions(ctx context.Context, bucket, prefix, km, vm string, fn func(storage.ObjectInfo) error) error {
+	n := 0
+	err := w.clockBackend.WalkVersions(ctx, bucket, prefix, km, vm, func(o storage.ObjectInfo) error {
+		n++
+		return fn(o)
+	})
+	w.mu.Lock()
+	w.maxWalk = max(w.maxWalk, n)
+	w.mu.Unlock()
+	return err
+}
+
+// TestWorkerManyVersionsOfOneKey: the versions of a key are walked in
+// batches like any others, so a pass over a key with many versions does not
+// hold all of them (issue #33), and the rules still see every version in
+// order across the batches.
+func TestWorkerManyVersionsOfOneKey(t *testing.T) {
+	e := newEnv(t)
+	e.bucket("b", storage.VersioningEnabled, false)
+	e.lifecycle("b", `<ID>nc</ID><Filter><Prefix>k</Prefix></Filter><Status>Enabled</Status><NoncurrentVersionExpiration><NoncurrentDays>1</NoncurrentDays><NewerNoncurrentVersions>3</NewerNoncurrentVersions></NoncurrentVersionExpiration>`,
+		`<ID>m</ID><Filter><Prefix>m</Prefix></Filter><Status>Enabled</Status><Expiration><ExpiredObjectDeleteMarker>true</ExpiredObjectDeleteMarker></Expiration><NoncurrentVersionExpiration><NoncurrentDays>1</NoncurrentDays></NoncurrentVersionExpiration>`)
+	const n = 2*walkBatch + 5
+	var ids []string
+	for i := range n {
+		ids = append(ids, e.put("b", "k", 0, base.Add(time.Duration(i)*time.Minute), storage.ObjectMeta{}).VersionID)
+	}
+	// "m" ends in a lone delete marker after its versions expire: it must
+	// be removed although its versions span batches.
+	for i := range walkBatch {
+		e.put("b", "m", 0, base.Add(time.Duration(i)*time.Minute), storage.ObjectMeta{})
+	}
+	e.del("b", "m", base.Add(time.Duration(walkBatch)*time.Minute))
+	e.put("b", "z", 0, base, storage.ObjectMeta{})
+	e.setNow(base.AddDate(0, 0, 10))
+
+	w := &walkSizeBackend{clockBackend: e.b}
+	e.w = NewWorker(w, Options{Logger: e.w.log, Now: e.clock})
+	t.Cleanup(e.w.Stop)
+	e.expectStats(e.run(), Stats{Buckets: 1, NoncurrentExpired: n - 4 + walkBatch, DeleteMarkersRemoved: 1})
+	if w.maxWalk > walkBatch+1 {
+		t.Errorf("a walk delivered %d versions, want at most %d", w.maxWalk, walkBatch+1)
+	}
+	vs := e.versions("b", "k")
+	if len(vs) != 4 {
+		t.Fatalf("k: %d versions left, want 4", len(vs))
+	}
+	for i, v := range vs {
+		if want := ids[n-1-i]; v.VersionID != want {
+			t.Errorf("k: version %d is %s, want %s", i, v.VersionID, want)
+		}
+	}
+	if got := e.shape("b", "m"); got != "" {
+		t.Errorf("m: %q, want no versions", got)
+	}
+	if got := e.shape("b", "z"); got != "o" {
+		t.Errorf("z: %q, want it kept", got)
+	}
+	e.expectStats(e.run(), Stats{Buckets: 1})
 }
 
 func TestWorkerContextCancel(t *testing.T) {

@@ -137,6 +137,7 @@ func (bk *bucket) gone() bool { return bk.deleted || bk.stale }
 var (
 	_ storage.Backend                    = (*Backend)(nil)
 	_ storage.ConditionalDeleter         = (*Backend)(nil)
+	_ storage.NewerVersionsDeleter       = (*Backend)(nil)
 	_ storage.CheckedDeleter             = (*Backend)(nil)
 	_ storage.ConditionalMetaUpdater     = (*Backend)(nil)
 	_ storage.ConfigViewer               = (*Backend)(nil)

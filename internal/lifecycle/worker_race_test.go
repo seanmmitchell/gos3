@@ -136,6 +136,60 @@ func TestWorkerDeleteRaceRetaggedNoncurrent(t *testing.T) {
 	}
 }
 
+// TestWorkerNoncurrentRuleRecheckedAtDelete: NewerNoncurrentVersions and
+// NoncurrentDays are evaluated again, atomically with the delete, against
+// the versions newer than the expiring one at that time. A newer version
+// removed after the walk can stop the delete (issue #35).
+func TestWorkerNoncurrentRuleRecheckedAtDelete(t *testing.T) {
+	day := 24 * time.Hour
+	t.Run("NewerNoncurrentVersions", func(t *testing.T) {
+		e := newEnv(t)
+		e.bucket("b", storage.VersioningEnabled, false)
+		e.lifecycle("b", fltAll+`<NoncurrentVersionExpiration><NoncurrentDays>1</NoncurrentDays><NewerNoncurrentVersions>1</NewerNoncurrentVersions></NoncurrentVersionExpiration>`)
+		oldest := e.put("b", "k", 1, base, storage.ObjectMeta{})
+		middle := e.put("b", "k", 1, base.Add(time.Hour), storage.ObjectMeta{})
+		cur := e.put("b", "k", 1, base.Add(2*time.Hour), storage.ObjectMeta{})
+		e.setNow(base.Add(10 * day))
+		// The walk saw one newer noncurrent version above oldest; it is
+		// gone before the delete, so oldest is the only one left to keep.
+		e.b.afterWalk = func() {
+			if _, err := e.b.Backend.DeleteObject(e.ctx, "b", "k", middle.VersionID); err != nil {
+				t.Error(err)
+			}
+		}
+		e.expectStats(e.run(), Stats{Buckets: 1})
+		vs := e.versions("b", "k")
+		if len(vs) != 2 || vs[0].VersionID != cur.VersionID || vs[1].VersionID != oldest.VersionID {
+			t.Fatalf("versions %+v, want current %s and oldest %s", vs, cur.VersionID, oldest.VersionID)
+		}
+	})
+	t.Run("NoncurrentDays", func(t *testing.T) {
+		e := newEnv(t)
+		e.bucket("b", storage.VersioningEnabled, false)
+		e.lifecycle("b", fltAll+`<NoncurrentVersionExpiration><NoncurrentDays>3</NoncurrentDays></NoncurrentVersionExpiration>`)
+		// Expiry rounds up to the next midnight UTC (base is at noon).
+		v1 := e.put("b", "k", 1, base, storage.ObjectMeta{})
+		v2 := e.put("b", "k", 1, base.Add(day), storage.ObjectMeta{}) // v1 noncurrent since: due 2024-01-15
+		v3 := e.put("b", "k", 1, base.Add(4*day), storage.ObjectMeta{})
+		e.setNow(utc(2024, 1, 15, 0, 0, 0))
+		// Without v2, v1 is noncurrent since v3 was written: due 2024-01-18.
+		e.b.afterWalk = func() {
+			if _, err := e.b.Backend.DeleteObject(e.ctx, "b", "k", v2.VersionID); err != nil {
+				t.Error(err)
+			}
+		}
+		e.expectStats(e.run(), Stats{Buckets: 1})
+		vs := e.versions("b", "k")
+		if len(vs) != 2 || vs[0].VersionID != v3.VersionID || vs[1].VersionID != v1.VersionID {
+			t.Fatalf("versions %+v, want %s and %s", vs, v3.VersionID, v1.VersionID)
+		}
+		e.setNow(utc(2024, 1, 17, 23, 59, 0))
+		e.expectStats(e.run(), Stats{Buckets: 1})
+		e.setNow(utc(2024, 1, 18, 0, 0, 0))
+		e.expectStats(e.run(), Stats{Buckets: 1, NoncurrentExpired: 1})
+	})
+}
+
 func TestWorkerWithoutConditionalDeleter(t *testing.T) {
 	// A backend that cannot delete conditionally only gets the actions a
 	// race cannot turn into data loss: delete markers in versioning-enabled

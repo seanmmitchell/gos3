@@ -659,6 +659,59 @@ func (b *Backend) DeleteObjectIf(ctx context.Context, bucket, key, versionID str
 	return b.deleteObject(ctx, bucket, key, versionID, func(o storage.ObjectInfo, _ bool) error { return check(o) }, false)
 }
 
+// DeleteVersionIf permanently deletes a version when check accepts it and
+// the versions newer than it, inside the delete's write transaction (see
+// storage.NewerVersionsDeleter).
+func (b *Backend) DeleteVersionIf(ctx context.Context, bucket, key, versionID string, limit int, check func(storage.ObjectInfo, []storage.ObjectInfo) error) (storage.DeleteResult, error) {
+	if check == nil {
+		return storage.DeleteResult{}, errors.New("fs: nil delete check")
+	}
+	if versionID == "" {
+		return storage.DeleteResult{}, fmt.Errorf("%w: %s/%.64s: no version ID", storage.ErrVersionNotFound, bucket, key)
+	}
+	if err := b.begin(ctx); err != nil {
+		return storage.DeleteResult{}, err
+	}
+	var (
+		res      storage.DeleteResult
+		unlink   []string
+		bucketID string
+	)
+	err := b.update(func(tx *bbolt.Tx) error {
+		res, unlink = storage.DeleteResult{}, nil
+		br, bb, err := loadBucket(tx, bucket)
+		if err != nil {
+			return err
+		}
+		bucketID = br.ID
+		rec, vk, latest, err := findVersion(bb, bucket, key, versionID)
+		if err != nil {
+			return err
+		}
+		newer, err := newerVersions(bb, bucket, key, vk, max(limit, 1))
+		if err != nil {
+			return err
+		}
+		if err := check(cloneInfo(rec.info(bucket, key, latest)), newer); err != nil {
+			return err
+		}
+		id, err := removeVersion(bb, key, vk, rec)
+		if err != nil {
+			return err
+		}
+		if id != "" {
+			unlink = append(unlink, id)
+		}
+		res = storage.DeleteResult{VersionID: rec.VersionID, DeleteMarker: rec.DeleteMarker}
+		return refreshCurrent(bb, key)
+	})
+	if err != nil {
+		return storage.DeleteResult{}, err
+	}
+	b.unlinkData(bucketID, unlink)
+	return res, nil
+}
+
 // DeleteObjectChecked is DeleteObjectIf whose check is also consulted when
 // the key has no versions (see storage.CheckedDeleter).
 func (b *Backend) DeleteObjectChecked(ctx context.Context, bucket, key, versionID string, check func(storage.ObjectInfo, bool) error) (storage.DeleteResult, error) {

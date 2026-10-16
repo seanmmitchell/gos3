@@ -703,6 +703,24 @@ func (b *Backend) DeleteObjectIf(ctx context.Context, bucket, key, versionID str
 	return res, t.c.walkErr(err)
 }
 
+// DeleteVersionIf implements storage.NewerVersionsDeleter.
+func (b *Backend) DeleteVersionIf(ctx context.Context, bucket, key, versionID string, limit int, check func(storage.ObjectInfo, []storage.ObjectInfo) error) (storage.DeleteResult, error) {
+	t, err := b.lookup(ctx, bucket)
+	if err != nil {
+		return storage.DeleteResult{}, err
+	}
+	if t.native() {
+		return t.nat.DeleteVersionIf(ctx, bucket, key, versionID, limit, check)
+	}
+	res, err := t.c.store.DeleteVersionIf(ctx, bucket, key, versionID, limit, func(v storage.ObjectInfo, newer []storage.ObjectInfo) error {
+		if err := check(v, newer); err != nil {
+			return &callbackErr{err}
+		}
+		return nil
+	})
+	return res, t.c.walkErr(err)
+}
+
 // DeleteObjectChecked implements storage.CheckedDeleter.
 func (b *Backend) DeleteObjectChecked(ctx context.Context, bucket, key, versionID string, check func(storage.ObjectInfo, bool) error) (storage.DeleteResult, error) {
 	t, err := b.lookup(ctx, bucket)
