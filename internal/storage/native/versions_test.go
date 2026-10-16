@@ -712,6 +712,57 @@ func TestErrorClasses(t *testing.T) {
 	}
 }
 
+// TestAdoptWithObjectScopedCredentials adopts a remote bucket with
+// credentials that may use its objects but not read its configuration (a
+// bucket-scoped Cloudflare R2 token): versioning and object lock are left
+// to the remote. Credentials denied the bucket itself are refused as such
+// (not as an unavailable backing).
+func TestAdoptWithObjectScopedCredentials(t *testing.T) {
+	h := newHarness(t, s3clienttest.Options{}, nil)
+	ctx := t.Context()
+	h.remote.CreateBucket(t, "scoped")
+	configOnly := func(r *http.Request) int {
+		if q := r.URL.Query(); q.Has("versioning") || q.Has("object-lock") {
+			return http.StatusForbidden
+		}
+		return 0
+	}
+	h.remote.Fail.Store(&configOnly)
+	st, err := h.adopt(ctx, "sc", "scoped", "")
+	if err != nil {
+		t.Fatalf("adopt with object-scoped credentials: %v", err)
+	}
+	if st.Caps.Versioning || st.Caps.ObjectLock || st.Versioning != storage.VersioningUnversioned || st.ObjectLock {
+		t.Errorf("adopted state %+v, want no versioning or object lock capability", st)
+	}
+	h.mustPut("sc", "k", []byte("x"), storage.ObjectMeta{})
+	if rs, err := h.st.Refresh(ctx, "sc"); err != nil || rs.Caps.Versioning || rs.Caps.ObjectLock {
+		t.Errorf("Refresh = %+v, %v", rs, err)
+	}
+
+	// Denied the bucket as a whole.
+	h.remote.CreateBucket(t, "denied")
+	bucketDenied := func(r *http.Request) int {
+		if strings.HasPrefix(strings.Trim(r.URL.Path, "/"), "denied") {
+			return http.StatusForbidden
+		}
+		return 0
+	}
+	h.remote.Fail.Store(&bucketDenied)
+	if _, err := h.adopt(ctx, "dn", "denied", "us-east-1"); !errors.Is(err, storage.ErrRemoteDenied) || errors.Is(err, storage.ErrBackingUnavailable) {
+		t.Errorf("adopt a denied remote bucket: %v, want ErrRemoteDenied", err)
+	}
+	// A bound bucket denied later is unavailable.
+	h.remote.Fail.Store(&configOnly)
+	if _, err := h.adopt(ctx, "dn", "denied", ""); err != nil {
+		t.Fatal(err)
+	}
+	h.remote.Fail.Store(&bucketDenied)
+	if _, err := h.st.Refresh(ctx, "dn"); !errors.Is(err, storage.ErrBucketUnavailable) {
+		t.Errorf("Refresh of a denied bound bucket: %v, want ErrBucketUnavailable", err)
+	}
+}
+
 func TestAttachBucket(t *testing.T) {
 	h := newHarness(t, s3clienttest.Options{}, nil)
 	ctx := t.Context()

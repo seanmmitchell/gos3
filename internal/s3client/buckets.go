@@ -51,7 +51,18 @@ type ListBucketsOutput struct {
 // ListBuckets lists one page of the buckets the credentials can see.
 // Services that do not paginate return everything in one page (and may
 // ignore Prefix and BucketRegion: callers filter again when it matters).
+// A service answering 501 to the optional parameters (Cloudflare R2 to
+// max-buckets) is asked again without them.
 func (c *Client) ListBuckets(ctx context.Context, in ListBucketsInput) (ListBucketsOutput, error) {
+	out, err := c.listBuckets(ctx, in)
+	if IsNotImplemented(err) && in != (ListBucketsInput{}) {
+		return c.listBuckets(ctx, ListBucketsInput{})
+	}
+	return out, err
+}
+
+// listBuckets sends one ListBuckets request.
+func (c *Client) listBuckets(ctx context.Context, in ListBucketsInput) (ListBucketsOutput, error) {
 	q := url.Values{}
 	if in.Prefix != "" {
 		q.Set("prefix", in.Prefix)
