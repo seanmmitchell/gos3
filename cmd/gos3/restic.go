@@ -10,6 +10,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -62,7 +63,9 @@ whole-bucket snapshots.
 SOURCE is where the repository and its password come from:
   online, the server running:  --server URL [--access-key KEY --secret-key SECRET]
       (keys default to AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY; the key needs
-      admin:GetResticCredentials, and the server logs every disclosure)
+      admin:GetResticCredentials, and the server logs every disclosure; a plain
+      http:// URL of another machine needs --allow-http; the answer may name
+      only s3 or local repositories, s3.* options and AWS_* credentials)
   offline, the server stopped: --config FILE, --data DIR or --offline
       (the server's configuration, GOS3_* variables included; read from the
       backings directly)
@@ -91,7 +94,7 @@ type resticFlags struct {
 	snapshots       bool
 	// online
 	server, accessKey, secretKey, region string
-	insecure                             bool
+	insecure, allowHTTP                  bool
 	timeout                              time.Duration
 	// offline
 	configPath, data string
@@ -116,6 +119,7 @@ func addResticFlags(fs *flag.FlagSet, snapshots bool) *resticFlags {
 	fs.StringVar(&f.secretKey, "secret-key", "", "online: its secret key (default $AWS_SECRET_ACCESS_KEY)")
 	fs.StringVar(&f.region, "region", "", "online: signing region (default: the server's, from /_gos3/info, else us-east-1)")
 	fs.BoolVar(&f.insecure, "insecure", false, "online: skip TLS certificate verification")
+	fs.BoolVar(&f.allowHTTP, "allow-http", false, "online: allow a plain http:// --server that is not on this machine (the secrets cross the network unencrypted)")
 	fs.DurationVar(&f.timeout, "timeout", 30*time.Second, "online: timeout of the requests to the server")
 	fs.StringVar(&f.configPath, "config", "", "offline: the server's JSON or YAML configuration file (env GOS3_CONFIG)")
 	fs.StringVar(&f.data, "data", "", "offline: the server's data directory (storage.path)")
@@ -269,8 +273,12 @@ type envVar struct{ name, value string }
 var validEnvName = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*$`).MatchString
 
 // resticEnvVars returns restic's environment for loc: RESTIC_REPOSITORY,
-// RESTIC_PASSWORD, then loc.Env by name.
+// RESTIC_PASSWORD, then loc.Env by name. loc must pass Location.Check (so
+// that `eval` never sets a variable that runs a program).
 func resticEnvVars(loc restic.Location) ([]envVar, error) {
+	if err := loc.Check(); err != nil {
+		return nil, err
+	}
 	vars := []envVar{{"RESTIC_REPOSITORY", loc.Repository}, {"RESTIC_PASSWORD", loc.Password}}
 	var extra []envVar
 	for _, e := range loc.Env {
@@ -643,8 +651,13 @@ const adminPrefix = "/_gos3/admin/v1"
 // online asks the server for the repository's credentials.
 func (f *resticFlags) online(ctx context.Context, purpose string) (resticRepo, error) {
 	base := strings.TrimRight(f.server, "/")
-	if u, err := url.Parse(base); err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" || u.Path != "" {
+	u, err := url.Parse(base)
+	if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" || u.Path != "" {
 		return resticRepo{}, fmt.Errorf("--server %q: want the server's base URL, e.g. https://s3.example.com:9000", f.server)
+	}
+	if u.Scheme == "http" && !f.allowHTTP && !loopbackHost(u.Hostname()) {
+		return resticRepo{}, fmt.Errorf("--server %q uses plain HTTP: the repository's password and the backing's S3 keys would cross the network unencrypted, "+
+			"and anyone on the way could change the answer; use https://, or --allow-http to accept that", f.server)
 	}
 	creds := auth.Credentials{AccessKey: f.accessKey, SecretKey: f.secretKey}
 	if creds.AccessKey == "" {
@@ -697,7 +710,23 @@ func (f *resticFlags) online(ctx context.Context, purpose string) (resticRepo, e
 		loc.Env = append(loc.Env, name+"="+value)
 	}
 	slices.Sort(loc.Env)
+	// The answer is run by restic (and eval'ed after `env`): accept only
+	// what gos3's own repositories use, never a backend, option or
+	// variable that makes restic or a shell run a program.
+	if err := loc.Check(); err != nil {
+		return resticRepo{}, fmt.Errorf("refusing the server's answer: %w", err)
+	}
 	return resticRepo{loc: loc, backing: c.Backing}, nil
+}
+
+// loopbackHost reports whether host (a URL's hostname) is this machine:
+// "localhost" or a loopback address.
+func loopbackHost(host string) bool {
+	if strings.EqualFold(host, "localhost") {
+		return true
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
 }
 
 // apiError describes an error answer of the admin API.

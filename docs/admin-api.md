@@ -66,7 +66,7 @@ ARNs, policy variables such as `${aws:username}` included):
 | `arn:gos3:admin:::user/<name>` | CreateUser (the new user's name), GetUser, UpdateUser, DeleteUser, CreateAccessKey (the target user; choosing the access key ID also needs it at service level), UpdateAccessKey / DeleteAccessKey (the key's owner; an unknown key is evaluated at service level) |
 | `arn:gos3:admin:::policy/<name>` | GetPolicy, PutPolicy, DeletePolicy |
 | `arn:gos3:admin:::bucket/<name>` | GetBucket, CreateBucket, ForceDeleteBucket, ReleaseBucket, GetBucketCompression, PutBucketCompression, GetBucketEncryption, PutBucketEncryption, GetBucketPlacement, UpdateBucketPlacement, GetResticCredentials, GetBucketSnapshots, PutBucketSnapshots, RunBucketSnapshot, RestoreBucketSnapshot; CreateCopyJob, GetJob, UpdateJob (the job's source and target buckets) |
-| `arn:gos3:admin:::backing/<name>` | ListRemoteBuckets, CreateRemoteBucket, AdoptRemoteBucket, ManageContainers (s3 backings, see [Remote buckets and containers](#remote-buckets-and-containers-s3-backings)) |
+| `arn:gos3:admin:::backing/<name>` | ListRemoteBuckets, CreateRemoteBucket, AdoptRemoteBucket, ManageContainers (s3 backings, see [Remote buckets and containers](#remote-buckets-and-containers-s3-backings)); also, besides the bucket, UpdateBucketPlacement (a backing that receives a new replica or a move), PutBucketSnapshots (a snapshot target's backing) and GetResticCredentials (the backing whose S3 keys the credentials carry) |
 | service level | every other action (list actions, config, stats, discovery, simulate, self-service) |
 
 The policy resources `*` and `arn:gos3:admin:::*` match every admin
@@ -333,7 +333,7 @@ stores. See [operations.md](operations.md#compression).
 | GET | `/buckets/{name}/encryption-provider` | GetBucketEncryption | `{"provider":"AES256"\|"restic", "scope":"sse"\|"all", "available":["AES256","restic"], "backings":["default",…]}` |
 | PUT | `/buckets/{name}/encryption-provider` | PutBucketEncryption | body `{"provider":"AES256"\|"restic", "scope"?:"sse"\|"all"}`; prepares the provider, then saves it and returns the GET document. `scope: "all"` (restic only) archives **every** write in the bucket's restic repository, not only writes that request SSE (the per-version restic archive toggle); default `sse` |
 | GET | `/buckets/{name}/restic` | GetBucketEncryption | `ResticInfo`: where the bucket's restic data lives and how to recover it without gos3 (no secrets) |
-| POST | `/buckets/{name}/restic/credentials` | GetResticCredentials | body (optional) `{"backing"?: "<name>", "purpose"?: "archive"\|"snapshots"}` → `ResticCredentials` (the repository password and environment for the `restic` CLI). `purpose` defaults to `archive`, the archive of the copy on `backing` (default: the primary); `backing` is refused with `snapshots` (400: the bucket has one snapshot repository). Every disclosure is logged at Warn with the caller, access key, client address, bucket, backing and purpose (never the secrets). 404 when the bucket has no repository of that purpose on that backing (none yet, none at all, or a backing holding no copy of the bucket); 503 when the repository cannot be reached; other failures are 500 without their cause (which is logged) |
+| POST | `/buckets/{name}/restic/credentials` | GetResticCredentials; when the environment carries a backing's S3 keys (a repository on an s3 backing), also on `arn:gos3:admin:::backing/<name>` of that backing (service level when unknown) | body (optional) `{"backing"?: "<name>", "purpose"?: "archive"\|"snapshots"}` → `ResticCredentials` (the repository password and environment for the `restic` CLI). `purpose` defaults to `archive`, the archive of the copy on `backing` (default: the primary); `backing` is refused with `snapshots` (400: the bucket has one snapshot repository). Every disclosure is logged at Warn with the caller, access key, client address, bucket, backing and purpose (never the secrets). 404 when the bucket has no repository of that purpose on that backing (none yet, none at all, or a backing holding no copy of the bucket); 503 when the repository cannot be reached; other failures are 500 without their cause (which is logged) |
 
 The provider is the bucket's implementation of SSE-S3: it applies to bucket
 default encryption and to uploads that request `AES256`. Provider actions use
@@ -433,7 +433,11 @@ for the semantics.
 | POST | `/buckets/{name}/placement/resync` | UpdateBucketPlacement | body `{"backing"?: "fast"}` (default: every replica) → 202 `Placement`. Compares the replica(s) with the primary and copies every difference (versions, metadata, bucket configuration) |
 
 `UpdateBucketPlacement` and `GetBucketPlacement` are evaluated against
-`arn:gos3:admin:::bucket/<name>`, `ListBackings` at service level. The
+`arn:gos3:admin:::bucket/<name>`, `ListBackings` at service level. Putting a
+copy of the bucket on a backing (a replica that `PUT …/placement` adds, the
+`to` of a move) also needs `UpdateBucketPlacement` on
+`arn:gos3:admin:::backing/<name>` of that backing (403 otherwise, before
+anything changes); replicas the bucket already has need nothing more. The
 built-in `diagnostics` policy allows `ListBackings` and `GetBucketPlacement`.
 404 `NotFound` for an unknown bucket.
 
@@ -749,7 +753,7 @@ content (see [encryption.md](encryption.md#whole-bucket-snapshots)).
 | Method | Path | Action | Response |
 |---|---|---|---|
 | GET | `/buckets/{name}/restic/snapshots` | GetBucketSnapshots | `{"config": SnapshotConfig \| null, "status": SnapshotStatus, "repository": RepositoryInfo \| null, "snapshots": Snapshot[], "error"?: "…"}` (snapshots cached 30 s; `error` says why the repository or its snapshots could not be read, the rest of the document is still valid) |
-| PUT | `/buckets/{name}/restic/snapshots/config` | PutBucketSnapshots | body `SnapshotConfig` → `SnapshotConfig` (validated; the repository is prepared) |
+| PUT | `/buckets/{name}/restic/snapshots/config` | PutBucketSnapshots, also on `arn:gos3:admin:::backing/<name>` when `target.backing` names one | body `SnapshotConfig` → `SnapshotConfig` (validated; the repository is prepared) |
 | DELETE | `/buckets/{name}/restic/snapshots/config` | PutBucketSnapshots | 204 (stops scheduling; existing snapshots stay; idempotent) |
 | POST | `/buckets/{name}/restic/snapshots` | RunBucketSnapshot | 202 `Job` (`restic-snapshot`); 409 while one runs for the bucket; 400 without a schedule |
 | DELETE | `/buckets/{name}/restic/snapshots/{id}` | PutBucketSnapshots | forgets one whole-bucket snapshot of this bucket → 204 (never a per-version archive snapshot: 400; `{id}` is the full snapshot ID, 64 lower-case hex digits; 404 for an unknown snapshot) |

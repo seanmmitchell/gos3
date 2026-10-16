@@ -63,7 +63,8 @@ func (f *fakeSnapshots) Config(_ context.Context, bucket string) (json.RawMessag
 
 func (f *fakeSnapshots) PutConfig(_ context.Context, bucket string, doc json.RawMessage) (json.RawMessage, error) {
 	var cfg struct {
-		Interval string `json:"interval"`
+		Interval string          `json:"interval"`
+		Target   json.RawMessage `json:"target"` // accepted, not kept
 	}
 	dec := json.NewDecoder(bytes.NewReader(doc))
 	dec.DisallowUnknownFields()

@@ -9,6 +9,7 @@ import (
 	"strings"
 
 	"github.com/seanmmitchell/gos3/internal/config"
+	"github.com/seanmmitchell/gos3/internal/iam"
 	"github.com/seanmmitchell/gos3/internal/storage"
 	"github.com/seanmmitchell/gos3/internal/storage/multi"
 	"github.com/seanmmitchell/gos3/internal/storage/restic"
@@ -231,7 +232,10 @@ type credentialsRequest struct {
 // the password, environment and options of one of the bucket's restic
 // repositories, for recovering data with the restic CLI. Every disclosure
 // is logged at Warn with the caller, the bucket, the backing and the
-// purpose (never the secrets). A repository that does not exist (not
+// purpose (never the secrets). The environment of a repository on an s3
+// backing holds the backing's own S3 keys, which reach far beyond the
+// bucket, so disclosing it also needs admin:GetResticCredentials on the
+// backing (requireBackingCredentials). A repository that does not exist (not
 // created yet, or none on that backing) is 404. Errors never carry the
 // secrets: the repository's location is resolved without running restic,
 // and unexpected failures are reported without their cause (which is
@@ -262,6 +266,9 @@ func (a *api) getResticCredentials(rc *reqCtx) (int, any, error) {
 	if err != nil {
 		return 0, nil, a.credentialsError(bucket, req.Purpose, err)
 	}
+	if err := a.requireBackingCredentials(rc, loc, backing); err != nil {
+		return 0, nil, err
+	}
 	out := resticCredentials{
 		Backing:    backing,
 		Purpose:    req.Purpose,
@@ -280,6 +287,24 @@ func (a *api) getResticCredentials(rc *reqCtx) (int, any, error) {
 		"caller", describeIdentity(rc.id), "accessKey", rc.id.AccessKey, "remote", ip,
 		"bucket", bucket, "backing", backing, "purpose", req.Purpose, "repository", loc.Repository)
 	return http.StatusOK, out, nil
+}
+
+// requireBackingCredentials authorizes disclosing loc's environment, which
+// for a repository on an s3 backing holds that backing's S3 credentials:
+// besides the route's action on the bucket, the caller needs it on the
+// backing (at service level when the backing is unknown). A grant on a
+// bucket alone must not reveal keys to the backing's whole S3 account,
+// since the caller may have chosen that backing itself (a snapshot target,
+// a replica, a bucket created there).
+func (a *api) requireBackingCredentials(rc *reqCtx, loc restic.Location, backing string) error {
+	if len(loc.Env) == 0 {
+		return nil
+	}
+	resource := ""
+	if backing != "" {
+		resource = iam.AdminBackingARN(backing)
+	}
+	return a.requireAction(rc, rc.action, resource, nil)
 }
 
 // archiveCredentials returns the location of the archive repository of

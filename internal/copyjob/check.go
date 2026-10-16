@@ -433,7 +433,7 @@ func (s *Service) warnings(ctx context.Context, sp *Spec, in *inspection) []stri
 			dstDoc, _ = getConfig(ctx, s.router, sp.Target.Bucket, key)
 		}
 		if !selected(sp, key) {
-			if aclGuard(key, srcDoc) && !aclGuard(key, dstDoc) {
+			if storage.ACLGuard(key, srcDoc) && !storage.ACLGuard(key, dstDoc) {
 				add("the source's %s configuration is copied although configs does not select it: "+
 					"it keeps the ACLs the copied objects carry from granting access", key)
 			}

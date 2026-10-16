@@ -3,9 +3,11 @@ package admin
 import (
 	"errors"
 	"net/http"
+	"slices"
 	"strings"
 
 	"github.com/seanmmitchell/gos3/internal/config"
+	"github.com/seanmmitchell/gos3/internal/iam"
 	"github.com/seanmmitchell/gos3/internal/storage"
 	"github.com/seanmmitchell/gos3/internal/storage/multi"
 	"github.com/seanmmitchell/gos3/internal/storage/s3account"
@@ -152,6 +154,21 @@ type placementRequest struct {
 	Replicas []string   `json:"replicas"`
 }
 
+// requirePlacementBacking authorizes putting a copy of a bucket on backing:
+// besides the route's admin:UpdateBucketPlacement on the bucket, the caller
+// needs it on arn:gos3:admin:::backing/<backing>. A grant on a bucket alone
+// does not choose where its data may go (and a copy's restic repository on
+// an s3 backing is opened with that backing's own S3 keys).
+func (a *api) requirePlacementBacking(rc *reqCtx, backing string) error {
+	if backing == "" {
+		return nil // refused by the router as invalid
+	}
+	return a.requireAction(rc, rc.action, iam.AdminBackingARN(backing), nil)
+}
+
+// putPlacement implements PUT /buckets/{name}/placement. Every replica
+// that is not already a member of the placement is authorized with
+// requirePlacementBacking.
 func (a *api) putPlacement(rc *reqCtx) (int, any, error) {
 	r, err := a.router()
 	if err != nil {
@@ -161,7 +178,19 @@ func (a *api) putPlacement(rc *reqCtx) (int, any, error) {
 	if err := rc.decodeBody(&req, false); err != nil {
 		return 0, nil, err
 	}
-	st, err := r.SetReplication(rc.ctx, rc.r.PathValue("name"), req.Mode, req.Replicas)
+	bucket := rc.r.PathValue("name")
+	cur, err := r.Placement(bucket)
+	if err != nil {
+		return 0, nil, err
+	}
+	for _, b := range req.Replicas {
+		if !slices.ContainsFunc(cur.Members, func(m multi.MemberStatus) bool { return m.Backing == b }) {
+			if err := a.requirePlacementBacking(rc, b); err != nil {
+				return 0, nil, err
+			}
+		}
+	}
+	st, err := r.SetReplication(rc.ctx, bucket, req.Mode, req.Replicas)
 	if err != nil {
 		return 0, nil, err
 	}
@@ -190,6 +219,9 @@ func (a *api) startMove(rc *reqCtx) (int, any, error) {
 	}
 	if req.To == "" {
 		return 0, nil, badRequest("\"to\" (the target backing) is required")
+	}
+	if err := a.requirePlacementBacking(rc, req.To); err != nil {
+		return 0, nil, err
 	}
 	var target *storage.BucketTarget
 	if req.Container != "" {

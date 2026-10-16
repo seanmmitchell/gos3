@@ -308,6 +308,10 @@ type restoreRun struct {
 	status jobStatus
 	db     *bbolt.DB
 	done   [][]byte // index paths restored, to delete from the index
+
+	// privateACLs restores every version without its ACL (private): the
+	// snapshot's ACL guards are unknown (see applyACLGuards).
+	privateACLs bool
 }
 
 // Index buckets of the temporary database.
@@ -418,7 +422,8 @@ func (r *restoreRun) bucketDoc(ctx context.Context) (*bucketDoc, error) {
 }
 
 // prepareTarget creates the target bucket if needed (and gives it the
-// snapshot bucket's versioning) and copies the configurations.
+// snapshot bucket's versioning), applies the snapshot bucket's ACL guards
+// whatever "configs" says (applyACLGuards) and copies the configurations.
 func (r *restoreRun) prepareTarget(ctx context.Context, doc *bucketDoc) error {
 	s, spec := r.s, r.spec
 	target := spec.Target.Bucket
@@ -455,6 +460,9 @@ func (r *restoreRun) prepareTarget(ctx context.Context, doc *bucketDoc) error {
 			return jobs.Permanent(fmt.Errorf("%w: target bucket %q is not empty", jobs.ErrConflict, target))
 		}
 	}
+	if err := r.applyACLGuards(ctx, doc); err != nil {
+		return err
+	}
 	if !r.retry {
 		if r.cp.Created && doc != nil && doc.Bucket.Versioning != "" {
 			if err := s.router.SetBucketVersioning(ctx, target, storage.VersioningStatus(doc.Bucket.Versioning)); err != nil {
@@ -469,6 +477,59 @@ func (r *restoreRun) prepareTarget(ctx context.Context, doc *bucketDoc) error {
 	}
 	r.cp.Started = true
 	return r.saveCheckpoint()
+}
+
+// applyACLGuards gives the target the snapshot bucket's ACL guards
+// (storage.ACLGuardConfigs: a public access block ignoring public ACLs,
+// ownership controls disabling ACLs) whatever "configs" says, as a copy
+// job does: the restored versions keep their ACLs, which the source's
+// guards kept from granting access. A guard the target already has the
+// same way is left alone; a target that cannot store one fails the
+// restore permanently. When the guards are unknown (the snapshot has no
+// readable bucket description, or a guard document cannot be decoded) the
+// restore fails closed: every version is restored without its ACL
+// (privateACLs), with a warning.
+func (r *restoreRun) applyACLGuards(ctx context.Context, doc *bucketDoc) error {
+	r.privateACLs = false
+	if doc == nil {
+		r.privateACLs = true
+		r.status.Warnings = append(r.status.Warnings,
+			"the snapshot bucket's ACL guards are unknown: objects are restored private, without their ACLs")
+		return nil
+	}
+	target := r.spec.Target.Bucket
+	for _, key := range storage.ACLGuardConfigs {
+		d, ok := doc.Configs[key]
+		if !ok {
+			continue
+		}
+		data, err := d.bytes()
+		if err != nil {
+			r.privateACLs = true
+			r.status.Warnings = append(r.status.Warnings, fmt.Sprintf(
+				"configuration %s cannot be read (%v): objects are restored private, without their ACLs", key, err))
+			continue
+		}
+		if !storage.ACLGuard(key, data) {
+			continue
+		}
+		cur, err := r.s.router.GetBucketConfig(ctx, target, key)
+		switch {
+		case errors.Is(err, storage.ErrConfigNotFound):
+		case err != nil:
+			return err
+		case storage.ACLGuard(key, cur):
+			continue
+		}
+		if err := r.s.router.PutBucketConfig(ctx, target, key, data); err != nil {
+			if errors.Is(err, storage.ErrNotSupported) || errors.Is(err, errors.ErrUnsupported) {
+				return jobs.Permanent(fmt.Errorf("resticsnap: the target bucket %q cannot keep the snapshot bucket's %s configuration, "+
+					"which keeps the restored objects' ACLs from granting access: %w", target, key, err))
+			}
+			return err
+		}
+	}
+	return nil
 }
 
 // verbatimConfigs are the configuration documents a "safe" restore copies
@@ -862,7 +923,11 @@ func (r *restoreRun) write(ctx context.Context, e *entry, body io.Reader) error 
 		r.status.Keys++
 		return nil
 	}
-	w, err := copier.WriteVersion(ctx, r.s.router, r.spec.Target.Bucket, e.Key, e.objectInfo(), body, copier.Policy{}, copier.WriteImportOrPlain)
+	oi := e.objectInfo()
+	if r.privateACLs {
+		oi.ACL = ""
+	}
+	w, err := copier.WriteVersion(ctx, r.s.router, r.spec.Target.Bucket, e.Key, oi, body, copier.Policy{}, copier.WriteImportOrPlain)
 	if err != nil {
 		return restoreFailure(fmt.Errorf("resticsnap: restore %q: %w", e.Key, err))
 	}

@@ -155,11 +155,13 @@ func TestResticInfo(t *testing.T) {
 }
 
 // The info endpoint is GetBucketEncryption; the credentials need
-// GetResticCredentials.
+// GetResticCredentials on the bucket and, as they carry the backing's S3
+// keys, on the backing (see TestResticCredentialsNeedBackingGrant).
 func TestResticCredentialsAuthorization(t *testing.T) {
 	e, _, logs := newResticEnv(t)
 	e.putPolicy("enc", map[string]any{"Effect": "Allow", "Action": "admin:GetBucketEncryption", "Resource": "arn:gos3:admin:::bucket/photos"})
-	e.putPolicy("creds", map[string]any{"Effect": "Allow", "Action": "admin:GetResticCredentials", "Resource": "arn:gos3:admin:::bucket/photos"})
+	e.putPolicy("creds", map[string]any{"Effect": "Allow", "Action": "admin:GetResticCredentials",
+		"Resource": []string{"arn:gos3:admin:::bucket/photos", "arn:gos3:admin:::backing/default"}})
 	viewer := e.addUser("viewer", "enc")
 	revealer := e.addUser("revealer", "creds")
 

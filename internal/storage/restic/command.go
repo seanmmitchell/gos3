@@ -127,9 +127,9 @@ func baseEnv() []string {
 // loc: global options (--repo, --retry-lock, --http-user-agent
 // storage.ResticUserAgent, the cache and loc.Options) come first. Its
 // environment is the server's without RESTIC_* and AWS_* variables, plus
-// RESTIC_PASSWORD and loc.Env. When ctx ends, restic is interrupted (so
-// that it removes its lock) and killed if it has not exited 15 seconds
-// later.
+// RESTIC_PASSWORD and loc.Env; loc must pass Location.Check. When ctx
+// ends, restic is interrupted (so that it removes its lock) and killed if
+// it has not exited 15 seconds later.
 //
 // Command fails (wrapping storage.ErrEncryptionUnavailable) when no
 // restic of at least MinVersion is on PATH.
@@ -150,8 +150,13 @@ type cmdOptions struct {
 	env []string
 }
 
-// command implements Command with the options o.
+// command implements Command with the options o. A Location that fails
+// Location.Check is refused, so that no repository, option or variable
+// can make restic run another program.
 func (rt *Runtime) command(ctx context.Context, loc Location, o cmdOptions, args ...string) (*exec.Cmd, error) {
+	if err := loc.Check(); err != nil {
+		return nil, err
+	}
 	bin, err := rt.executable(ctx)
 	if err != nil {
 		return nil, err

@@ -492,7 +492,9 @@ of discarding them. See [operations.md](operations.md#the-data-directory).
   also receives the source's bucket policy (rewritten to the target's
   name), bucket ACL and public access block: a public source makes a
   public target. Use `configs: "none"` and review the target when that is
-  not wanted.
+  not wanted. Snapshot restores follow the same rule; when a snapshot's
+  guards are unknown (no readable bucket description) its objects are
+  restored private.
 - **Copies can leave encryption behind only when asked.** An encrypted
   version is never stored unencrypted unless the job sets
   `allowPlaintext` (needed for native buckets, memory backings and
@@ -505,8 +507,11 @@ of discarding them. See [operations.md](operations.md#the-data-directory).
   and, for a repository on an s3 backing, the **backing's own S3 access
   key and secret key**, which reach everything those credentials reach in
   the S3 account, other buckets and containers included. It needs
-  `admin:GetResticCredentials` on the bucket, which no built-in policy but
-  `admin` grants (whoami capability `revealResticCredentials`). Every
+  `admin:GetResticCredentials` on the bucket and, when the answer carries
+  a backing's S3 keys, also on `arn:gos3:admin:::backing/<name>` of that
+  backing, so a grant scoped to buckets never reveals a backing's account
+  keys. No built-in policy but `admin` grants it (whoami capability
+  `revealResticCredentials`). Every
   disclosure is logged at warn level (`admin: restic repository
   credentials disclosed`) with the caller, its access key, the client
   address, the bucket, the backing, the purpose and the repository, never
@@ -514,6 +519,17 @@ of discarding them. See [operations.md](operations.md#the-data-directory).
   sources only. `gos3 restic env` puts the backing's keys into
   `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY`: close that shell when
   done.
+- **The CLI trusts the server's answer only so far.** `gos3 restic
+  --server` runs what the server answers (restic, or the shell `eval` of
+  `env`), so it accepts only an `s3:` or local repository, `s3.*` options
+  and the `AWS_*` credential variables (`AWS_ACCESS_KEY_ID`,
+  `AWS_SECRET_ACCESS_KEY`, `AWS_SESSION_TOKEN`, `AWS_DEFAULT_REGION`,
+  `AWS_REGION`), and refuses anything else, such as
+  `RESTIC_PASSWORD_COMMAND`, `sftp.command` or an `sftp:` repository; the
+  server's restic runs under the same rule. A plain `http://` server that
+  is not on this machine is refused unless `--allow-http` is given, as are
+  untrusted certificates without `--insecure`: either lets anyone on the
+  network read the secrets.
 - **Offline recovery** (`gos3 restic env --config …` with the server
   stopped) needs what it reads: the configuration file with the backings'
   credentials and encryption keys, and the fs backings' key directories.
@@ -526,6 +542,17 @@ of discarding them. See [operations.md](operations.md#the-data-directory).
   deleted from the bucket; protect the repository, its key and backups
   like the bucket. A snapshot into another backing's aux repository puts
   the bucket's data on that backing.
+- **Choosing a backing is a backing permission.** Admin requests that put
+  a bucket's data on a backing the caller names need the route's action
+  on `arn:gos3:admin:::backing/<name>` as well as on the bucket:
+  `admin:PutBucketSnapshots` for a snapshot target on a backing,
+  `admin:UpdateBucketPlacement` for a new replica or the target of a move.
+  So a delegate scoped to `arn:gos3:admin:::bucket/<pattern>` cannot move
+  data to, or obtain the keys of, a backing it was not given. The S3
+  `x-gos3-backing` header of CreateBucket is not an admin request: any
+  holder of `s3:CreateBucket` can create a bucket on any backing (the
+  choice `GET /whoami` offers everyone), but that discloses no backing
+  credentials.
 - **Aux repository keys.** An aux repository's password is the hex
   encoding of a random key: on an fs backing in `.gos3/keys/aux/<name>`
   (mode 0600, with the key directory's protection; its recovery record

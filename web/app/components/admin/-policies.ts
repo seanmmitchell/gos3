@@ -178,7 +178,7 @@ export const ADMIN_RESOURCE_FORMS: readonly { type: AdminResourceType | 'service
   { type: 'user', arn: adminArn('user', '<name>'), description: 'CreateUser, GetUser, UpdateUser, DeleteUser; CreateAccessKey (target user); UpdateAccessKey / DeleteAccessKey (the key\'s owner)' },
   { type: 'policy', arn: adminArn('policy', '<name>'), description: 'GetPolicy, PutPolicy, DeletePolicy' },
   { type: 'bucket', arn: adminArn('bucket', '<name>'), description: 'GetBucket, CreateBucket, ForceDeleteBucket, ReleaseBucket, GetBucketCompression, PutBucketCompression, GetBucketEncryption, PutBucketEncryption, GetBucketPlacement, UpdateBucketPlacement' },
-  { type: 'backing', arn: adminArn('backing', '<name>'), description: 'ListRemoteBuckets, CreateRemoteBucket, AdoptRemoteBucket, ManageContainers (s3 backings: remote buckets and containers)' }
+  { type: 'backing', arn: adminArn('backing', '<name>'), description: 'ListRemoteBuckets, CreateRemoteBucket, AdoptRemoteBucket, ManageContainers (s3 backings: remote buckets and containers); also UpdateBucketPlacement, PutBucketSnapshots and GetResticCredentials for the backing a bucket\'s data is put on or whose keys are revealed' }
 ]
 
 /** Every admin action (IAM action "admin:<Action>"), see docs/admin-api.md. */
@@ -344,19 +344,30 @@ export const IAM_POLICY_TEMPLATES: readonly IamPolicyTemplate[] = [
   {
     id: 'prefix-per-user',
     label: 'Home folder per user',
-    description: 'Each user may only use objects under <bucket>/<their user name>/ (${aws:username}).',
+    description: 'Each user may only use objects under <bucket>/<their user name>/ (${aws:username}). Listing shows the top level (folder names only, with delimiter "/") and everything under the user\'s own folder.',
     params: ['bucket'],
     required: ['bucket'],
     build: ({ bucket }) => {
       const b = bucketOrAll(bucket)
       return doc(
         { Sid: 'BucketLocation', Effect: 'Allow', Action: ['s3:GetBucketLocation'], Resource: [s3Arn(b)] },
+        // The top level only one level deep (delimiter "/"): folder names,
+        // not every user's keys.
+        {
+          Sid: 'ListRoot',
+          Effect: 'Allow',
+          Action: ['s3:ListBucket'],
+          Resource: [s3Arn(b)],
+          Condition: { StringEquals: { 's3:prefix': [''], 's3:delimiter': ['/'] } }
+        },
+        // The user's own folder, with its trailing "/": a bare
+        // ${aws:username} prefix would also list alice2/ for alice.
         {
           Sid: 'ListOwnPrefix',
           Effect: 'Allow',
           Action: ['s3:ListBucket'],
           Resource: [s3Arn(b)],
-          Condition: { StringLike: { 's3:prefix': ['', '${aws:username}', '${aws:username}/*'] } }
+          Condition: { StringLike: { 's3:prefix': ['${aws:username}/', '${aws:username}/*'] } }
         },
         {
           Sid: 'OwnObjects',
