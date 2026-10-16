@@ -389,6 +389,11 @@ func (b *Backend) Close() error {
 	err := b.eng.Close()
 	b.cancel()
 	b.wg.Wait()
+	// Restores of canceled restic reads finish in the background (and
+	// remove their temporary files); wait for them too.
+	if b.restic != nil {
+		b.restic.Wait()
+	}
 	b.mu.Lock()
 	st := b.st
 	b.st = nil

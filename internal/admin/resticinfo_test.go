@@ -42,7 +42,7 @@ func (b *resticHostBackend) ResticRepository(ctx context.Context, bucket string,
 	case b.missing && !create:
 		return restic.RepositoryInfo{}, restic.Location{}, fmt.Errorf("fake: bucket %q has no restic repository yet: %w: %w", bucket, errors.ErrUnsupported, iofs.ErrNotExist)
 	}
-	return restic.RepositoryInfo{
+	info := restic.RepositoryInfo{
 		BucketID:       "bid-" + bucket,
 		Repository:     "s3:https://s3.example.com/home/restic/bid-" + bucket,
 		RecordLocation: "s3://home/keys/bid-" + bucket + ".restic.json",
@@ -50,12 +50,14 @@ func (b *resticHostBackend) ResticRepository(ctx context.Context, bucket string,
 		Initialized:    true,
 		EnvNames:       []string{"AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY"},
 		Options:        []string{"s3.bucket-lookup=path"},
-	}, restic.Location{
+	}
+	loc := restic.Location{
 		Repository: "s3:https://s3.example.com/home/restic/bid-" + bucket,
 		Password:   testResticPassword,
 		Env:        []string{"AWS_ACCESS_KEY_ID=AKIDEXAMPLE", "AWS_SECRET_ACCESS_KEY=" + testResticSecret},
 		Options:    []string{"s3.bucket-lookup=path"},
-	}, nil
+	}
+	return info, loc, nil
 }
 
 func (b *resticHostBackend) ResticAuxRepository(context.Context, string, bool) (restic.RepositoryInfo, restic.Location, error) {

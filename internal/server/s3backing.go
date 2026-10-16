@@ -198,6 +198,13 @@ func (s *Server) waitS3Startup(backings []multi.Backing) {
 			if err := acct.WaitReady(ctx); err != nil {
 				s.log.Warn("s3 storage backing is not available yet; starting without it (its buckets answer 503 "+
 					"until it loads, which is retried in the background)", "backing", b.Name, "location", b.Location, "err", err)
+				return
+			}
+			// The records are loaded; let the other containers finish
+			// loading too, so their wrapped buckets serve right away.
+			if loading := acct.WaitContainers(ctx); len(loading) > 0 {
+				s.log.Warn("s3 storage backing: containers still loading; their buckets answer 503 until they do",
+					"backing", b.Name, "containers", loading)
 			}
 		})
 	}

@@ -555,6 +555,47 @@ func (b *Backend) WaitReady(ctx context.Context) error {
 	}
 }
 
+// WaitContainers waits until every container other than the home has
+// settled: it serves, or its load failed for good (its buckets then answer
+// storage.ErrBucketUnavailable). It returns the IDs of containers still
+// loading when ctx ends (none once all settled). Containers load in the
+// background after the records (see WaitReady); the server waits for them
+// at startup so that the buckets they hold do not answer 503 for a moment
+// after a restart.
+func (b *Backend) WaitContainers(ctx context.Context) []string {
+	tick := time.NewTicker(20 * time.Millisecond)
+	defer tick.Stop()
+	for {
+		loading := b.loadingContainers()
+		if len(loading) == 0 || b.closed.Load() {
+			return nil
+		}
+		select {
+		case <-ctx.Done():
+			return loading
+		case <-tick.C:
+		}
+	}
+}
+
+// loadingContainers returns the IDs of the containers (the home excluded)
+// whose store is still loading, sorted.
+func (b *Backend) loadingContainers() []string {
+	b.mu.RLock()
+	defer b.mu.RUnlock()
+	var ids []string
+	for id, c := range b.containers {
+		if c.home || c.store == nil {
+			continue
+		}
+		if st, _ := c.state(); st == "loading" {
+			ids = append(ids, id)
+		}
+	}
+	slices.Sort(ids)
+	return ids
+}
+
 // serving returns nil when the backing can serve requests.
 func (b *Backend) serving(ctx context.Context) error {
 	if ctx != nil {

@@ -199,7 +199,16 @@ type Runtime struct {
 	mu     sync.Mutex
 	repos  map[string]*repoState // by Location.Repository
 	spools map[string]*spool     // by spoolKey
+
+	// restores counts the background restores (runSpool) in flight.
+	restores sync.WaitGroup
 }
+
+// Wait waits until no restore runs in the background. A restore whose
+// readers all went away is canceled but finishes on its own (removing its
+// temporary file); Wait lets callers that remove TempDir (tests, a
+// shutdown) wait for that.
+func (rt *Runtime) Wait() { rt.restores.Wait() }
 
 // repoState is the preparation state of one repository.
 type repoState struct {

@@ -77,6 +77,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"syscall"
 	"testing"
 	"time"
 )
@@ -99,7 +100,12 @@ const (
 //	func TestMain(m *testing.M) { restictest.Main(m) }
 func Main(m *testing.M) {
 	if os.Getenv(EnvFake) == "1" {
-		os.Exit(run(os.Args[1:]))
+		// syscall.Exit, not os.Exit: a test binary built with -race sleeps
+		// for a second at os.Exit (the race detector's atexit_sleep_ms,
+		// whose GORACE setting restic's scrubbed environment drops), which
+		// made every fake restic call take a second under -race. The fake
+		// writes its output unbuffered, so nothing is lost.
+		syscall.Exit(run(os.Args[1:]))
 	}
 	code := m.Run()
 	if dir != "" {

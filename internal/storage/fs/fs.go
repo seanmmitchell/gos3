@@ -388,6 +388,10 @@ func (b *Backend) Close() error {
 	}
 	b.cancel()
 	b.wg.Wait()
+	// Restores of canceled restic reads finish in the background (and
+	// remove their temporary files); wait for them before the data
+	// directory is released.
+	b.resticRuntime().Wait()
 	if err := b.db.Close(); err != nil {
 		return fmt.Errorf("fs: close metadata database: %w", err)
 	}
