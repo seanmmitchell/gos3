@@ -186,23 +186,34 @@ func TestMaxConnections(t *testing.T) {
 		return &http.Client{Timeout: 5 * time.Second, Transport: &http.Transport{Proxy: nil}}
 	}
 
-	// A keep-alive connection left idle gives way to a new client.
-	idle := newClient()
-	if err := get(idle); err != nil {
-		t.Fatal(err)
-	}
-	// net/http reports the connection idle only after the response is
-	// finished, which the client may see first: wait for the server to
-	// count it idle, or the new client races it and is (rightly) refused.
+	// net/http reports a connection idle only after the response is
+	// finished, which the client may see first, and reports a connection
+	// the limiter shed as closed only once its serving goroutine notices.
+	// Each step below waits for the server's counts to settle: a client
+	// that races them is (rightly) refused, or (rightly) served.
 	lim := srv.limiter.Load()
 	if lim == nil {
 		t.Fatal("no connection limiter")
 	}
-	for deadline := time.Now().Add(5 * time.Second); lim.idleConns() == 0; time.Sleep(time.Millisecond) {
-		if time.Now().After(deadline) {
-			t.Fatal("the first connection never became idle")
+	waitConns := func(what string, open, idle int) {
+		t.Helper()
+		var o, i int
+		for deadline := time.Now().Add(5 * time.Second); ; time.Sleep(time.Millisecond) {
+			o, i = lim.conns()
+			if o == open && i == idle {
+				return
+			}
+			if time.Now().After(deadline) {
+				t.Fatalf("%s: %d open, %d idle connections, want %d, %d", what, o, i, open, idle)
+			}
 		}
 	}
+
+	// A keep-alive connection left idle gives way to a new client.
+	if err := get(newClient()); err != nil {
+		t.Fatal(err)
+	}
+	waitConns("the first connection never became idle", 1, 1)
 	start := time.Now()
 	if err := get(newClient()); err != nil {
 		t.Fatalf("new client while a connection is idle: %v", err)
@@ -210,6 +221,7 @@ func TestMaxConnections(t *testing.T) {
 	if d := time.Since(start); d > 2*time.Second {
 		t.Errorf("new client waited %v", d)
 	}
+	waitConns("the first connection was not closed, or the second one never became idle", 1, 1)
 
 	// A busy connection (headers not yet sent) is not closed; the next one
 	// is refused at once.
@@ -220,7 +232,9 @@ func TestMaxConnections(t *testing.T) {
 	if _, err := io.WriteString(hold, "GET /_gos3/health HTTP/1.1\r\n"); err != nil {
 		t.Fatal(err)
 	}
-	time.Sleep(300 * time.Millisecond) // let the shed idle connection close
+	// The held connection took the idle one's place: the only open one is
+	// busy.
+	waitConns("the held connection was refused, or the idle one not closed", 1, 0)
 	start = time.Now()
 	if err := get(newClient()); err == nil {
 		t.Error("connection served while the only one is busy")

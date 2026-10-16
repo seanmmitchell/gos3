@@ -161,11 +161,12 @@ func (l *connLimiter) connState(c net.Conn, st http.ConnState) {
 	}
 }
 
-// idleConns returns the number of connections counted as idle.
-func (l *connLimiter) idleConns() int {
+// conns returns the number of connections counted as open and, of those,
+// as idle.
+func (l *connLimiter) conns() (open, idle int) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	return len(l.idle)
+	return l.open, len(l.idle)
 }
 
 // admit reports whether a newly accepted connection may be served, closing
