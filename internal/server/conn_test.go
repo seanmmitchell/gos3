@@ -198,11 +198,15 @@ func TestMaxConnections(t *testing.T) {
 	if lim == nil {
 		t.Fatal("no connection limiter")
 	}
-	for deadline := time.Now().Add(5 * time.Second); lim.idleConns() == 0; time.Sleep(time.Millisecond) {
-		if time.Now().After(deadline) {
-			t.Fatal("the first connection never became idle")
+	waitIdle := func(which string) {
+		t.Helper()
+		for deadline := time.Now().Add(5 * time.Second); lim.idleConns() == 0; time.Sleep(time.Millisecond) {
+			if time.Now().After(deadline) {
+				t.Fatalf("the %s connection never became idle", which)
+			}
 		}
 	}
+	waitIdle("first")
 	start := time.Now()
 	if err := get(newClient()); err != nil {
 		t.Fatalf("new client while a connection is idle: %v", err)
@@ -212,7 +216,9 @@ func TestMaxConnections(t *testing.T) {
 	}
 
 	// A busy connection (headers not yet sent) is not closed; the next one
-	// is refused at once.
+	// is refused at once. The second client's connection must count as idle
+	// first so hold can take its place, for the same reason as above.
+	waitIdle("second")
 	hold, err := net.Dial("tcp", addr)
 	if err != nil {
 		t.Fatal(err)
