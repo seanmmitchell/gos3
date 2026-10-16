@@ -129,11 +129,16 @@ func (a *api) getSnapshots(rc *reqCtx) (int, any, error) {
 
 // putSnapshotConfig implements PUT /buckets/{name}/restic/snapshots/config:
 // the service validates the SnapshotConfig, prepares its repository and
-// stores it. Changes of one bucket's schedule are serialized.
+// stores it. Changes of one bucket's schedule are serialized. A target on
+// a named backing also needs the route's action on that backing
+// (requireSnapshotBacking).
 func (a *api) putSnapshotConfig(rc *reqCtx) (int, any, error) {
 	bucket := rc.r.PathValue("name")
 	doc, err := rc.readJSONObject()
 	if err != nil {
+		return 0, nil, err
+	}
+	if err := a.requireSnapshotBacking(rc, doc); err != nil {
 		return 0, nil, err
 	}
 	s, err := a.snapshots(rc.ctx, bucket)
@@ -147,6 +152,28 @@ func (a *api) putSnapshotConfig(rc *reqCtx) (int, any, error) {
 	}
 	a.log.Info("admin: whole-bucket snapshot schedule set", "bucket", bucket, "by", describeIdentity(rc.id))
 	return http.StatusOK, out, nil
+}
+
+// requireSnapshotBacking authorizes the backing a SnapshotConfig's target
+// names: snapshots there put the bucket's data into a repository on that
+// backing (whose credentials GetResticCredentials then discloses), so the
+// caller needs admin:PutBucketSnapshots on arn:gos3:admin:::backing/<name>
+// as well as on the bucket. The default target (the bucket's own
+// repository, or one on the default backing) needs no more. It is checked
+// before the service validates or prepares anything.
+func (a *api) requireSnapshotBacking(rc *reqCtx, doc json.RawMessage) error {
+	var in struct {
+		Target *struct {
+			Backing string `json:"backing"`
+		} `json:"target"`
+	}
+	if err := json.Unmarshal(doc, &in); err != nil {
+		return badRequest("invalid snapshot configuration: %s", jsonErrorMessage(err))
+	}
+	if in.Target == nil || in.Target.Backing == "" {
+		return nil
+	}
+	return a.requireAction(rc, rc.action, iam.AdminBackingARN(in.Target.Backing), nil)
 }
 
 // deleteSnapshotConfig implements DELETE

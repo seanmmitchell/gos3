@@ -1,3 +1,5 @@
+import { readFileSync } from 'node:fs'
+import { fileURLToPath } from 'node:url'
 import { describe, expect, it } from 'vitest'
 import {
   ADMIN_ACTIONS,
@@ -60,6 +62,22 @@ describe('IAM policy templates', () => {
     const text = renderIamTemplate('prefix-per-user', { bucket: 'home' })
     expect(text).toContain('arn:aws:s3:::home/${aws:username}/*')
     expect(text).toContain('"s3:prefix"')
+  })
+
+  it('prefix-per-user lists only the top level and the own folder', () => {
+    type Stmt = { Sid: string, Action: string[], Condition?: Record<string, Record<string, string[]>> }
+    const doc = JSON.parse(renderIamTemplate('prefix-per-user', { bucket: 'home' })) as { Statement: Stmt[] }
+    const lists = doc.Statement.filter(s => s.Action.includes('s3:ListBucket'))
+    // The whole bucket ('' without a delimiter) and the bare user name
+    // (alice also matching alice2/) must not be listable.
+    expect(lists).toEqual([
+      expect.objectContaining({ Sid: 'ListRoot', Condition: { StringEquals: { 's3:prefix': [''], 's3:delimiter': ['/'] } } }),
+      expect.objectContaining({ Sid: 'ListOwnPrefix', Condition: { StringLike: { 's3:prefix': ['${aws:username}/', '${aws:username}/*'] } } })
+    ])
+    // The Go IAM evaluation test (internal/iam TestHomeFolderTemplate)
+    // evaluates this exact document.
+    const fixture = readFileSync(fileURLToPath(new URL('../../../internal/iam/testdata/prefix-per-user.json', import.meta.url)), 'utf8')
+    expect(doc).toEqual(JSON.parse(fixture))
   })
 
   it('ip-restricted denies outside the given networks', () => {

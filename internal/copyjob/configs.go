@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
-	"encoding/xml"
 	"errors"
 	"fmt"
 	"slices"
@@ -25,17 +24,12 @@ var safeConfigs = []string{
 	storage.ConfigEncryptionProvider, storage.ConfigObjectLock, storage.ConfigPolicy, storage.ConfigLifecycle,
 }
 
-// aclGuardConfigs are the configuration documents that can keep object
-// ACLs from granting access: a public access block ignoring public ACLs,
-// and ownership controls disabling ACLs. Copied versions keep their ACLs,
-// so a source's guard is copied whatever "configs" says (see aclGuard).
-var aclGuardConfigs = []string{storage.ConfigPublicAccessBlock, storage.ConfigOwnership}
-
 // configKeys returns the configuration documents the job copies. Never
 // copied: replication (it names the source's destinations) and the restic
 // snapshot schedule (snapshots belong to the source), and for mirrors the
-// lifecycle, whose expirations would be applied twice. The ACL guards are
-// always considered (see syncConfigs).
+// lifecycle, whose expirations would be applied twice. The ACL guards
+// (storage.ACLGuardConfigs) are always considered: copied versions keep
+// their ACLs (see syncConfigs).
 func configKeys(sp *Spec) []string {
 	var keys []string
 	switch sp.Options.Configs {
@@ -48,7 +42,7 @@ func configKeys(sp *Spec) []string {
 		return k == storage.ConfigReplication || k == storage.ConfigResticSnapshots ||
 			k == storage.ConfigLifecycle && sp.mirror()
 	})
-	for _, k := range aclGuardConfigs {
+	for _, k := range storage.ACLGuardConfigs {
 		if !slices.Contains(keys, k) {
 			keys = append(keys, k)
 		}
@@ -57,49 +51,13 @@ func configKeys(sp *Spec) []string {
 }
 
 // selected reports whether the spec's "configs" option selects key (the
-// ACL guards are copied regardless when they guard, see aclGuard).
+// ACL guards are copied regardless when they guard, see storage.ACLGuard).
 func selected(sp *Spec, key string) bool {
 	switch sp.Options.Configs {
 	case ConfigsSafe:
 		return slices.Contains(safeConfigs, key)
 	case ConfigsAll:
 		return true
-	}
-	return false
-}
-
-// aclGuard reports whether configuration document data (of key) keeps
-// object ACLs from granting access, as the S3 layer applies it: a public
-// access block with IgnorePublicAcls (an unreadable one counts, as it is
-// applied as the most restrictive), ownership controls with
-// BucketOwnerEnforced.
-func aclGuard(key string, data []byte) bool {
-	if len(data) == 0 {
-		return false
-	}
-	switch key {
-	case storage.ConfigPublicAccessBlock:
-		var pab struct {
-			IgnorePublicAcls bool `xml:"IgnorePublicAcls"`
-		}
-		if xml.Unmarshal(data, &pab) != nil {
-			return true
-		}
-		return pab.IgnorePublicAcls
-	case storage.ConfigOwnership:
-		var oc struct {
-			Rules []struct {
-				ObjectOwnership string `xml:"ObjectOwnership"`
-			} `xml:"Rule"`
-		}
-		if xml.Unmarshal(data, &oc) != nil {
-			return bytes.Contains(data, []byte("BucketOwnerEnforced"))
-		}
-		for _, r := range oc.Rules {
-			if strings.TrimSpace(r.ObjectOwnership) == "BucketOwnerEnforced" {
-				return true
-			}
-		}
 	}
 	return false
 }
@@ -111,7 +69,7 @@ func aclGuard(key string, data []byte) bool {
 // before (kept in the checkpoint); syncConfigs returns warnings for the
 // documents it skipped and the updated list.
 //
-// The ACL guards (aclGuardConfigs) of the source are copied even when
+// The ACL guards (storage.ACLGuardConfigs) of the source are copied even when
 // "configs" does not select them, unless the target is guarded the same
 // way already, since the copied versions keep their ACLs; a target that
 // cannot store them fails the job.
@@ -138,10 +96,10 @@ func (r *run) syncConfigs(ctx context.Context, copied []string) ([]string, []str
 		if err != nil {
 			return warnings, copied, fmt.Errorf("reading the target's %s configuration: %w", key, err)
 		}
-		guard := aclGuard(key, data)
+		guard := storage.ACLGuard(key, data)
 		if !selected(&r.sp, key) {
 			// An ACL guard that configs does not select.
-			if !guard || aclGuard(key, cur) {
+			if !guard || storage.ACLGuard(key, cur) {
 				if r.sp.mirror() && !guard {
 					if err := drop(key, cur); err != nil {
 						return warnings, copied, err

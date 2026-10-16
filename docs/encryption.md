@@ -354,8 +354,12 @@ SOURCE says where the repository and its password come from:
   `--secret-key` or in `AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY`.
   The command calls `POST /buckets/{name}/restic/credentials`, which the
   server logs. `--region` sets the signing region (default: the server's,
-  from `/_gos3/info`), `--insecure` skips TLS certificate verification and
-  `--timeout` bounds the request (default 30 s). `gos3 restic env` (and
+  from `/_gos3/info`), `--insecure` skips TLS certificate verification,
+  `--allow-http` accepts a plain `http://` URL of another machine (one on
+  this machine needs no flag) and `--timeout` bounds the request (default
+  30 s). The answer may name only an `s3:` or local repository, `s3.*`
+  options and `AWS_*` credential variables; anything else is refused (see
+  [security.md](security.md)). `gos3 restic env` (and
   revealed credentials) set `AWS_ACCESS_KEY_ID` and
   `AWS_SECRET_ACCESS_KEY` to the **repository's** keys, those of the
   backing, so after `eval "$(gos3 restic env …)"` a later online command
@@ -656,7 +660,12 @@ snapshot fails the job; a retried run skips the keys the target already
 holds. `configs` (`safe`, the default, or `none`) restores the bucket
 configuration from `gos3-bucket.json` as a one-shot
 [copy job](jobs.md#bucket-configuration) would, and `prefix` restores
-only some keys. It needs `admin:RestoreBucketSnapshot` on the bucket and
+only some keys. As for a copy job, the snapshotted bucket's ACL guards
+(public access block with `IgnorePublicAcls`, ownership controls
+`BucketOwnerEnforced`) are applied to the target whatever `configs` says,
+since restored objects keep their ACLs; a target that cannot keep them
+fails the restore. A snapshot without a readable `gos3-bucket.json`
+restores every object without its ACL (private), with a warning. It needs `admin:RestoreBucketSnapshot` on the bucket and
 `admin:CreateCopyJob` on the target; the job's progress and warnings
 (configuration it skipped) are in its status.
 
