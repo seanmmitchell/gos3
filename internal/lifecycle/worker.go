@@ -19,9 +19,10 @@ const DefaultInterval = time.Hour
 // walkBatch is the number of object versions collected from a backend walk
 // before the walk is suspended and the batch processed. The worker never
 // mutates the backend from inside a walk callback, so that backends holding
-// locks or transactions during a walk are safe. A batch only ends at a key
-// boundary, so a single key with more versions than walkBatch is still
-// processed as a whole.
+// locks or transactions during a walk are safe. A batch of versions may end
+// in the middle of a key: the worker keeps only a bounded summary of the
+// key's versions across batches (see keyState), so its memory does not
+// grow with the number of versions of a key.
 const walkBatch = 1000
 
 // Options configure a Worker.
@@ -341,10 +342,11 @@ type pass struct {
 	now    time.Time
 	st     *Stats
 
-	// cd deletes conditionally (nil when the backend cannot): see
-	// expireCurrent and deleteVersion.
+	// cd and nd delete conditionally (nil when the backend cannot): see
+	// expireCurrent, expireNoncurrent and removeMarker.
 	cd           storage.ConditionalDeleter
-	warnedNoCond bool // the missing ConditionalDeleter was logged
+	nd           storage.NewerVersionsDeleter
+	warnedNoCond bool // a missing conditional delete was logged
 
 	rules      []*compiledRule // enabled rules, in document order
 	objects    bool            // some rule acts on object versions
@@ -357,6 +359,7 @@ type pass struct {
 func newPass(w *Worker, b storage.BucketInfo, cfg *Configuration, now time.Time, st *Stats) *pass {
 	p := &pass{w: w, bucket: b, now: now, st: st}
 	p.cd, _ = w.backend.(storage.ConditionalDeleter)
+	p.nd, _ = w.backend.(storage.NewerVersionsDeleter)
 	first := true
 	for i := range cfg.Rules {
 		r := &cfg.Rules[i]
@@ -474,18 +477,25 @@ func (p *pass) markerRule(dm *storage.ObjectInfo) *compiledRule {
 // that are newer than it.
 func (p *pass) noncurrentRule(o *storage.ObjectInfo, since time.Time, newer int) *compiledRule {
 	for _, r := range p.rules {
-		n := r.NoncurrentVersionExpiration
-		if n == nil || n.NoncurrentDays == nil || !r.matchesVersion(o) {
-			continue
-		}
-		if n.NewerNoncurrentVersions != nil && newer < *n.NewerNoncurrentVersions {
-			continue
-		}
-		if !p.now.Before(Expiry(since, *n.NoncurrentDays)) {
+		if r.matchesVersion(o) && p.noncurrentDue(r, since, newer) {
 			return r
 		}
 	}
 	return nil
+}
+
+// noncurrentDue reports whether r's NoncurrentVersionExpiration expires a
+// version that became noncurrent at since and has newer noncurrent
+// versions that are newer than it (the rule's filter is not consulted).
+func (p *pass) noncurrentDue(r *compiledRule, since time.Time, newer int) bool {
+	n := r.NoncurrentVersionExpiration
+	if n == nil || n.NoncurrentDays == nil {
+		return false
+	}
+	if n.NewerNoncurrentVersions != nil && newer < *n.NewerNoncurrentVersions {
+		return false
+	}
+	return !p.now.Before(Expiry(since, *n.NoncurrentDays))
 }
 
 // abortRule returns the first rule that aborts u at p.now. Only the key
@@ -546,105 +556,168 @@ func (p *pass) walkUnversioned(ctx context.Context) error {
 }
 
 // walkVersioned processes every key of a versioned or versioning-suspended
-// bucket, one key's versions at a time.
+// bucket, one version at a time (newest first within a key), in batches of
+// walkBatch versions. The last version a walk delivers is only processed
+// with the next batch: it is the next walk's resume marker, and deleting it
+// first would make resuming after it backend-dependent.
 func (p *pass) walkVersioned(ctx context.Context) error {
 	b := p.w.backend
-	keyMarker := ""
+	var (
+		keyMarker, vidMarker string
+		carry                *storage.ObjectInfo // the previous walk's last version
+		ks                   keyState
+	)
 	for {
-		var (
-			groups [][]storage.ObjectInfo // versions of one key each, newest first
-			total  int
-			full   bool
-		)
-		err := b.WalkVersions(ctx, p.bucket.Name, p.walkPrefix, keyMarker, "", func(o storage.ObjectInfo) error {
-			if n := len(groups); n == 0 || groups[n-1][0].Key != o.Key {
-				if total >= walkBatch {
-					full = true
-					return storage.ErrStopWalk
-				}
-				groups = append(groups, nil)
+		batch := make([]storage.ObjectInfo, 0, 64)
+		if carry != nil {
+			batch = append(batch, *carry)
+		}
+		full := false
+		err := b.WalkVersions(ctx, p.bucket.Name, p.walkPrefix, keyMarker, vidMarker, func(o storage.ObjectInfo) error {
+			batch = append(batch, o)
+			if len(batch) > walkBatch {
+				full = true
+				return storage.ErrStopWalk
 			}
-			groups[len(groups)-1] = append(groups[len(groups)-1], o)
-			total++
 			return nil
 		})
 		if err != nil {
 			return fmt.Errorf("walk versions: %w", err)
 		}
-		for _, vs := range groups {
+		n := len(batch)
+		if full {
+			n--
+			last := batch[n]
+			carry = &last
+			keyMarker, vidMarker = last.Key, last.VersionID
+		}
+		for i := range batch[:n] {
 			if err := ctx.Err(); err != nil {
 				return err
 			}
-			p.processKey(ctx, vs)
+			p.version(ctx, &ks, &batch[i])
 		}
 		if !full {
+			if err := ctx.Err(); err != nil {
+				return err
+			}
+			p.endKey(ctx, &ks)
 			return nil
 		}
-		keyMarker = groups[len(groups)-1][0].Key
 	}
 }
 
-// processKey applies the rules to the versions of one key (newest first).
-func (p *pass) processKey(ctx context.Context, vs []storage.ObjectInfo) {
-	if len(vs) == 0 || !vs[0].IsLatest {
+// keyState is what processing the versions of one key, newest first, keeps
+// from one version to the next: a bounded summary, never the versions
+// themselves.
+type keyState struct {
+	key string
+	// ok is false before the first key and once the key is left to the
+	// next pass (its walk did not start with its latest version, or
+	// reported a second latest version) or finished (endKey).
+	ok  bool
+	cur storage.ObjectInfo // the key's latest version, first in the walk
+	// seen counts the versions walked so far (cur included), remaining
+	// those of them not deleted.
+	seen, remaining int
+	// prevModified is the LastModified of the last version walked: the
+	// time the next (older) one became noncurrent.
+	prevModified time.Time
+	// null is the key's null version when it is protected by object lock
+	// (versioning-suspended buckets only, see expireCurrent).
+	null *storage.ObjectInfo
+}
+
+// version applies the rules to o, the next version of the walk. The first
+// version of a key finishes the previous key (endKey) and starts the new
+// one; the key's later versions are noncurrent.
+func (p *pass) version(ctx context.Context, ks *keyState, o *storage.ObjectInfo) {
+	if ks.seen == 0 || o.Key != ks.key {
+		p.endKey(ctx, ks)
 		// Walks start at key boundaries, so the first version is the
 		// latest; anything else means the key changed under us. It will
 		// be handled by the next pass.
+		*ks = keyState{key: o.Key, ok: o.IsLatest, cur: *o, seen: 1, remaining: 1, prevModified: o.LastModified}
+		p.noteNull(ks, o)
 		return
 	}
-	for i := 1; i < len(vs); i++ {
-		if vs[i].IsLatest {
-			// A second "latest" entry: newer versions were removed while
-			// the walk read the key (e.g. its delete marker was deleted to
-			// restore it), so vs[1:] are not all noncurrent. Leave the key
-			// to the next pass.
-			return
-		}
+	if !ks.ok {
+		return
 	}
-	remaining := len(vs)
-	for i := 1; i < len(vs); i++ {
-		v := &vs[i]
-		// A version becomes noncurrent when the next newer version is
-		// created; i-1 noncurrent versions are newer than it.
-		r := p.noncurrentRule(v, vs[i-1].LastModified, i-1)
-		if r == nil {
-			continue
-		}
-		switch p.deleteVersion(ctx, v, false, r, "noncurrent version expired") {
-		case versionDeleted:
-			p.st.NoncurrentExpired++
-			remaining--
-		case versionGone:
-			remaining--
-		}
+	if o.IsLatest {
+		// A second "latest" entry: newer versions were removed while the
+		// walk read the key (e.g. its delete marker was deleted to restore
+		// it), so the rest of the walk is not all noncurrent. Leave the key
+		// to the next pass. The deletes already made were each checked
+		// against the key's versions at the time (expireNoncurrent).
+		ks.ok = false
+		return
 	}
+	// A version becomes noncurrent when the next newer version is
+	// created; seen-1 noncurrent versions are newer than it.
+	since, newer := ks.prevModified, ks.seen-1
+	ks.seen++
+	ks.remaining++
+	ks.prevModified = o.LastModified
+	p.noteNull(ks, o)
+	r := p.noncurrentRule(o, since, newer)
+	if r == nil {
+		return
+	}
+	switch p.expireNoncurrent(ctx, o, r) {
+	case versionDeleted:
+		p.st.NoncurrentExpired++
+		ks.remaining--
+	case versionGone:
+		ks.remaining--
+	}
+}
 
-	cur := &vs[0]
-	if !cur.DeleteMarker {
-		p.expireCurrent(ctx, cur, vs)
+// noteNull records o in ks when it is the null version of a key in a
+// versioning-suspended bucket and protected by object lock.
+func (p *pass) noteNull(ks *keyState, o *storage.ObjectInfo) {
+	if p.bucket.Versioning == storage.VersioningSuspended && o.VersionID == storage.NullVersionID && Protected(*o, p.now) {
+		null := *o
+		ks.null = &null
+	}
+}
+
+// endKey applies the rules to the latest version of the key of ks once its
+// versions have been walked: Expiration of a current object, or the
+// removal of an expired object delete marker. It acts at most once per key.
+func (p *pass) endKey(ctx context.Context, ks *keyState) {
+	if !ks.ok {
 		return
 	}
-	if remaining != 1 {
+	ks.ok = false
+	cur := &ks.cur
+	if !cur.DeleteMarker {
+		p.expireCurrent(ctx, cur, ks.null)
+		return
+	}
+	if ks.remaining != 1 {
 		return
 	}
 	r := p.markerRule(cur)
 	if r == nil || !p.onlyVersion(ctx, cur) {
 		return
 	}
-	if p.deleteVersion(ctx, cur, true, r, "expired object delete marker removed") == versionDeleted {
+	if p.removeMarker(ctx, cur, r) == versionDeleted {
 		p.st.DeleteMarkersRemoved++
 	}
 }
 
-// errSkip is returned by the conditional delete checks of expireCurrent
-// and deleteVersion when the version changed since the walk or is
-// protected; the delete is then not performed.
+// errSkip is returned by the conditional delete checks of expireCurrent,
+// expireNoncurrent and removeMarker when the version changed since the
+// walk, is no longer expired or is protected; the delete is then not
+// performed.
 var errSkip = errors.New("lifecycle: version changed or protected")
 
 // noConditionalDelete logs, once per pass, that a permanent delete was
-// skipped because the backend cannot delete conditionally: an
-// unconditional delete could remove data written or locked after the
-// worker's last check.
+// skipped because the backend cannot delete conditionally (it implements
+// neither storage.ConditionalDeleter nor, for noncurrent versions,
+// storage.NewerVersionsDeleter): an unconditional delete could remove data
+// written or locked after the worker's last check.
 func (p *pass) noConditionalDelete() {
 	if !p.warnedNoCond {
 		p.warnedNoCond = true
@@ -654,15 +727,15 @@ func (p *pass) noConditionalDelete() {
 }
 
 // expireCurrent applies Expiration Days/Date to o, the current version of
-// its key. versions holds all versions of the key in a versioned bucket
-// (nil for unversioned buckets).
+// its key. null is the key's null version when the walk found it protected
+// by object lock in a versioning-suspended bucket (nil otherwise).
 //
 // The delete (no version ID) is conditional, atomically in the backend, on
 // the key's latest version still being o, unchanged (so a version written
 // meanwhile is never removed or hidden), still expired by a rule (its tags
 // may have changed) and, in unversioned and suspended buckets where the
 // delete removes it permanently, not protected by object lock.
-func (p *pass) expireCurrent(ctx context.Context, o *storage.ObjectInfo, versions []storage.ObjectInfo) {
+func (p *pass) expireCurrent(ctx context.Context, o *storage.ObjectInfo, null *storage.ObjectInfo) {
 	if p.currentRule(o) == nil {
 		return
 	}
@@ -675,13 +748,9 @@ func (p *pass) expireCurrent(ctx context.Context, o *storage.ObjectInfo, version
 	// may be a noncurrent version the check below does not see. Object
 	// lock cannot be enabled on suspended buckets, so this snapshot test
 	// is only defensive.
-	if p.bucket.Versioning == storage.VersioningSuspended {
-		for i := range versions {
-			if versions[i].VersionID == storage.NullVersionID && Protected(versions[i], p.now) {
-				p.protected(&versions[i], p.currentRule(o))
-				return
-			}
-		}
+	if null != nil {
+		p.protected(null, p.currentRule(o))
+		return
 	}
 	var (
 		r         *compiledRule // the rule expiring the fresh version
@@ -741,7 +810,7 @@ func (p *pass) expireCurrent(ctx context.Context, o *storage.ObjectInfo, version
 	p.w.log.Info("lifecycle: object expired", attrs...)
 }
 
-// deleteOutcome is the result of deleteVersion.
+// deleteOutcome is the result of expireNoncurrent and removeMarker.
 type deleteOutcome int
 
 const (
@@ -750,27 +819,52 @@ const (
 	versionGone                         // already removed by someone else
 )
 
-// deleteVersion permanently removes the version v, which rule r selected.
-// The delete is conditional, atomically in the backend, on v being
-// unchanged since the walk, being (latest) or not being (!latest) the
-// key's latest version, so a noncurrent version that has become the latest
-// (e.g. a null version replaced by a new current one) is never deleted,
-// still being selected by r, and not being protected by object lock (a
-// retention or legal hold set meanwhile is honoured).
-func (p *pass) deleteVersion(ctx context.Context, v *storage.ObjectInfo, latest bool, r *compiledRule, msg string) deleteOutcome {
-	if v.IsLatest != latest {
+// unchanged reports whether fresh, the version v as the backend stores it
+// at the delete, is still what the walk saw and is (latest) or is not
+// (!latest) the key's latest version: a noncurrent version that has become
+// the latest (e.g. a null version replaced by a new current one) is never
+// deleted.
+func unchanged(fresh, v *storage.ObjectInfo, latest bool) bool {
+	return fresh.IsLatest == latest && fresh.DeleteMarker == v.DeleteMarker &&
+		fresh.LastModified.Equal(v.LastModified) && fresh.ETag == v.ETag
+}
+
+// expireNoncurrent permanently removes v, a noncurrent version that rule r
+// selected from the walk. The delete is conditional, atomically in the
+// backend (storage.NewerVersionsDeleter), on v being unchanged since the
+// walk and noncurrent, still being selected by r, not being protected by
+// object lock (a retention or legal hold set meanwhile is honoured), and on
+// r still expiring v given the versions newer than v at the delete: a newer
+// version removed since the walk can make v noncurrent for a shorter time
+// (NoncurrentDays) or leave it fewer newer noncurrent versions than
+// NewerNoncurrentVersions keeps.
+func (p *pass) expireNoncurrent(ctx context.Context, v *storage.ObjectInfo, r *compiledRule) deleteOutcome {
+	if v.IsLatest {
 		return versionKept
 	}
-	if p.cd == nil {
+	if p.nd == nil {
 		p.noConditionalDelete()
 		return versionKept
 	}
+	// The newer versions the check needs: the next newer one (since when v
+	// is noncurrent) and enough to count NewerNoncurrentVersions of them
+	// besides the latest.
+	limit := 1
+	if n := r.NoncurrentVersionExpiration.NewerNoncurrentVersions; n != nil {
+		limit = *n + 1
+	}
 	var protected *storage.ObjectInfo
-	check := func(fresh storage.ObjectInfo) error {
+	check := func(fresh storage.ObjectInfo, newer []storage.ObjectInfo) error {
 		protected = nil
-		if fresh.IsLatest != latest || fresh.DeleteMarker != v.DeleteMarker ||
-			!fresh.LastModified.Equal(v.LastModified) || fresh.ETag != v.ETag || !r.matchesVersion(&fresh) {
+		if !unchanged(&fresh, v, false) || !r.matchesVersion(&fresh) || len(newer) == 0 {
 			return errSkip // changed since the walk; the next pass decides
+		}
+		count := len(newer) // newer noncurrent versions (a lower bound at limit)
+		if newer[count-1].IsLatest {
+			count--
+		}
+		if !p.noncurrentDue(r, newer[0].LastModified, count) {
+			return errSkip
 		}
 		if Protected(fresh, p.now) {
 			protected = &fresh
@@ -778,7 +872,38 @@ func (p *pass) deleteVersion(ctx context.Context, v *storage.ObjectInfo, latest 
 		}
 		return nil
 	}
-	_, err := p.cd.DeleteObjectIf(ctx, p.bucket.Name, v.Key, v.VersionID, check)
+	_, err := p.nd.DeleteVersionIf(ctx, p.bucket.Name, v.Key, v.VersionID, limit, check)
+	if errors.Is(err, errors.ErrUnsupported) {
+		// A routing backend whose bucket's storage cannot.
+		p.noConditionalDelete()
+		return versionKept
+	}
+	return p.deleted(err, v, r, protected, "noncurrent version expired")
+}
+
+// removeMarker permanently removes dm, an expired object delete marker
+// (the only version of its key) that rule r selected. The delete is
+// conditional, atomically in the backend, on dm being unchanged since the
+// walk and still the latest version, and still being selected by r.
+func (p *pass) removeMarker(ctx context.Context, dm *storage.ObjectInfo, r *compiledRule) deleteOutcome {
+	if p.cd == nil {
+		p.noConditionalDelete()
+		return versionKept
+	}
+	check := func(fresh storage.ObjectInfo) error {
+		if !unchanged(&fresh, dm, true) || !r.matchesVersion(&fresh) {
+			return errSkip // changed since the walk; the next pass decides
+		}
+		return nil
+	}
+	_, err := p.cd.DeleteObjectIf(ctx, p.bucket.Name, dm.Key, dm.VersionID, check)
+	return p.deleted(err, dm, r, nil, "expired object delete marker removed")
+}
+
+// deleted classifies err, the result of a conditional permanent delete of
+// v that rule r selected, and logs it; protected is the version as stored
+// when object lock refused the delete.
+func (p *pass) deleted(err error, v *storage.ObjectInfo, r *compiledRule, protected *storage.ObjectInfo, msg string) deleteOutcome {
 	switch {
 	case err == nil:
 	case errors.Is(err, errSkip):

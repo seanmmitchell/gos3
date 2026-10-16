@@ -217,6 +217,14 @@ See the doc comments in `storage.go`. Key points:
     worker use it; without it the S3 layer checks just before the delete and
     the lifecycle worker skips permanent deletes (it still adds delete
     markers).
+  - `NewerVersionsDeleter.DeleteVersionIf` is `DeleteObjectIf` for a
+    version ID whose check also receives (at most `limit` of) the versions
+    newer than the addressed one, nearest first. The lifecycle worker
+    re-evaluates `NoncurrentDays` and `NewerNoncurrentVersions` with it, so
+    a newer version removed after its walk stops the delete; without it the
+    worker skips noncurrent-version expiration. The native gateway store
+    lists the key's versions down to the addressed one under the object
+    lock to provide it.
   - `CheckedDeleter.DeleteObjectChecked` is `DeleteObjectIf` whose check
     is also consulted when the key has no versions (and the delete then
     adds the delete marker of a versioned bucket), so a delete authorized
@@ -364,7 +372,10 @@ See the doc comments in `storage.go`. Key points:
 - `WalkVersions` sets `IsLatest` only on the first entry delivered for a key,
   never on a later entry of the same key, even if the key changes during the
   walk (every built-in backend). The lifecycle worker skips a key whose walk reports
-  more than one latest version until the next pass.
+  more than one latest version until the next pass. It walks versions in
+  batches of 1000 that may end inside a key, keeping only a fixed-size
+  summary of the key (its latest version and counters) between batches, so
+  its memory does not depend on how many versions a key has.
 - `memory` keeps each bucket in an `internal/storage/index` index (guarded
   by an RW mutex per bucket), with object data as byte slices. Imported
   versions get a fresh internal stamp (so they sort newest) but keep their

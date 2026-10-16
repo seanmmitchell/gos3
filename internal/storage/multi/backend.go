@@ -769,6 +769,24 @@ func (r *Router) DeleteObjectIf(ctx context.Context, bucket, key, versionID stri
 	return res, err
 }
 
+// DeleteVersionIf implements storage.NewerVersionsDeleter.
+func (r *Router) DeleteVersionIf(ctx context.Context, bucket, key, versionID string, limit int, check func(storage.ObjectInfo, []storage.ObjectInfo) error) (storage.DeleteResult, error) {
+	var res storage.DeleteResult
+	cb := &cbTracker{}
+	err := r.objectWrite(ctx, bucket, key, cb, func(b storage.Backend) error {
+		nd, ok := b.(storage.NewerVersionsDeleter)
+		if !ok {
+			return fmt.Errorf("newer-version conditional deletes: %w", errors.ErrUnsupported)
+		}
+		var err error
+		res, err = nd.DeleteVersionIf(ctx, bucket, key, versionID, limit, func(v storage.ObjectInfo, newer []storage.ObjectInfo) error {
+			return cb.note(check(v, newer))
+		})
+		return err
+	})
+	return res, err
+}
+
 // DeleteObjectChecked implements storage.CheckedDeleter.
 func (r *Router) DeleteObjectChecked(ctx context.Context, bucket, key, versionID string, check func(storage.ObjectInfo, bool) error) (storage.DeleteResult, error) {
 	var res storage.DeleteResult

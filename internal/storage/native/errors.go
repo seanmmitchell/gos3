@@ -20,7 +20,7 @@ import (
 //	NoSuchBucket, bucket-level 403, a wrong region   ErrBucketUnavailable
 //	  after one retry in the right region, SlowDown
 //	  after the client's retries
-//	object-level 403                                 ErrRemoteDenied
+//	object-level 403, any 403 while attaching        ErrRemoteDenied
 //	NoSuchVersion / NoSuchKey / 404                  ErrVersionNotFound / ErrObjectNotFound
 //	412, 409 ConditionalRequestConflict              ErrPreconditionFailed
 //	501 NotImplemented                               ErrNotSupported
@@ -30,6 +30,8 @@ import (
 // ErrBucketUnavailable wraps ErrBackingUnavailable (the S3 layer answers
 // 503) but tells the multi router that only this bucket is affected, so a
 // deleted or forbidden remote bucket never marks the whole backing down.
+// While a bucket is being attached a 403 is the request's fault (the
+// credentials do not reach the bucket asked for), not an outage.
 // Version-addressed reads and deletes map 404 and 400 answers to
 // ErrVersionNotFound themselves (head, deleteVersion): services differ in
 // how they report an unknown version ID.
@@ -84,7 +86,7 @@ func (s *Store) remoteErr(op string, t *target, key string, kind opKind, err err
 		return fmt.Errorf("%s: remote bucket %q keeps throttling: %w: %w", pre, t.b.Remote, storage.ErrBucketUnavailable, err)
 	case s3client.IsNotImplemented(err):
 		return fmt.Errorf("%s: %w: %w", pre, storage.ErrNotSupported, err)
-	case s3client.IsAccessDenied(err) && kind == bucketOp:
+	case s3client.IsAccessDenied(err) && kind == bucketOp && !t.attaching:
 		return fmt.Errorf("%s: access to remote bucket %q denied: %w: %w", pre, t.b.Remote, storage.ErrBucketUnavailable, err)
 	case s3client.IsAccessDenied(err):
 		return fmt.Errorf("%s: %w: %w", pre, storage.ErrRemoteDenied, err)
