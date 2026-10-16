@@ -41,6 +41,13 @@
 // single-copy bucket whose backing can let it go without deleting its
 // data (a native bucket keeps its remote bucket).
 //
+// For the layers above it (copy jobs, snapshot schedulers), the router
+// imports versions itself (storage.VersionImporter, into a bucket's
+// primary and in-sync active-active replicas; see import.go), reports the
+// changes made through it to subscribers (Subscribe), and answers for each
+// bucket's capabilities (storage.BucketCapabilities) and restic repository
+// (restic.Host) with those of its primary copy.
+//
 // A backing is marked unhealthy after a failure of the backing itself (see
 // isBackingError) or a failed health probe (storage.HealthProber, else
 // ListBuckets). A failure of one bucket's remote location
@@ -205,6 +212,10 @@ type Router struct {
 	keys keyLocks
 	jobs *workQueue
 
+	// changes are the subscribers to the changes made through the router
+	// (see Subscribe).
+	changes changeFeed
+
 	ctx    context.Context // canceled by Close
 	cancel context.CancelFunc
 	wg     sync.WaitGroup
@@ -242,6 +253,9 @@ var (
 	_ storage.ConfigViewer           = (*Router)(nil)
 	_ storage.UploadWalker           = (*Router)(nil)
 	_ storage.CompressingBackend     = (*Router)(nil)
+	_ storage.VersionImporter        = (*Router)(nil)
+	_ storage.CompressingImporter    = (*Router)(nil)
+	_ storage.BucketCapabilities     = (*Router)(nil)
 )
 
 // Open builds a Router over opts.Backings: it loads the state file,

@@ -181,7 +181,7 @@ func cmdServe(ctx context.Context, args []string, stdout, stderr io.Writer) erro
 			info := srv.Info()
 			logger.Info("gos3 ready", "url", srv.URL(), "endpoints", info.Endpoints.All, "ui", info.Endpoints.UI,
 				"backend", srv.BackendName(), "data", srv.DataPath(), "credentials", srv.CredentialsSource(),
-				"credentialsFile", credsFile)
+				"credentialsFile", credsFile, "jobsDir", srv.JobsDir(), "jobsWorkers", srv.JobsWorkers())
 		} else if !*quiet {
 			printBanner(stderr, srv, showSecret, credsFile)
 		}
@@ -259,6 +259,7 @@ func printBanner(w io.Writer, srv *server.Server, showSecret bool, credsFile str
 	}
 	fmt.Fprintf(tw, "  Region\t%s\n", info.Region)
 	fmt.Fprintf(tw, "  Storage\t%s\n", storageSummary(srv.BackendName(), srv.DataPath(), srv.Config().Storage.S3))
+	fmt.Fprintf(tw, "  Jobs\t%s\n", jobsSummary(srv.JobsWorkers(), srv.JobsDir()))
 	fmt.Fprintf(tw, "  Access key\t%s\n", ak)
 	switch srv.CredentialsSource() {
 	case config.CredentialsConfigured:
@@ -283,6 +284,16 @@ func printBanner(w io.Writer, srv *server.Server, showSecret bool, credsFile str
 	_ = tw.Flush()
 	b.WriteString("\n  Press Ctrl-C to stop.\n\n")
 	_, _ = io.WriteString(w, b.String())
+}
+
+// jobsSummary describes the background jobs for the banner: how many run
+// at once and where they are kept.
+func jobsSummary(workers int, dir string) string {
+	n := fmt.Sprintf("%d at once", workers)
+	if dir == "" {
+		return n + ", kept in memory (lost on exit)"
+	}
+	return n + ", state in " + dir
 }
 
 // storageSummary describes the default backing for the banner: its

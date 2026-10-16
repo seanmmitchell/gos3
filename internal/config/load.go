@@ -66,6 +66,14 @@ const (
 	// MaxBackings bounds storage.backings.
 	MaxBackings = 64
 
+	// Background jobs (jobs.workers) and whole-bucket restic snapshot runs
+	// (restic.snapshots.*).
+	DefaultJobsWorkers        = 2
+	MaxJobsWorkers            = 64
+	DefaultSnapshotWorkers    = 1
+	DefaultSnapshotSpoolBytes = int64(8) << 30  // 8 GiB
+	MinSnapshotSpoolBytes     = int64(64) << 20 // 64 MiB
+
 	// Replication modes (storage.replication.default_mode).
 	ReplicationSingle        = "single"
 	ReplicationActivePassive = "active-passive"
@@ -157,6 +165,12 @@ func Default() Config {
 			MinSize:          DefaultCompressionMinSize,
 			SkipContentTypes: slices.Clone(DefaultSkipContentTypes),
 		},
+		Jobs: JobsConfig{Workers: DefaultJobsWorkers},
+		Restic: ResticConfig{Snapshots: ResticSnapshotsConfig{
+			Workers:     DefaultSnapshotWorkers,
+			SpoolBytes:  DefaultSnapshotSpoolBytes,
+			Incremental: true,
+		}},
 	}
 }
 
@@ -248,20 +262,23 @@ var unknownFieldRe = regexp.MustCompile(`field (\S+) not found in type (\S+)`)
 
 // yamlSections maps the Go types of Config sections to their YAML keys.
 var yamlSections = map[string]string{
-	"config.AdminConfig":       "admin",
-	"config.ServerConfig":      "server",
-	"config.StorageConfig":     "storage",
-	"config.BackingConfig":     "storage.backings",
-	"config.S3Config":          "s3",
-	"config.ReplicationConfig": "storage.replication",
-	"config.AuthConfig":        "auth",
-	"config.UIConfig":          "ui",
-	"config.CORSConfig":        "cors",
-	"discovery.Config":         "discovery",
-	"config.LoggingConfig":     "logging",
-	"config.LifecycleConfig":   "lifecycle",
-	"config.MetricsConfig":     "metrics",
-	"config.CompressionConfig": "compression",
+	"config.AdminConfig":           "admin",
+	"config.ServerConfig":          "server",
+	"config.StorageConfig":         "storage",
+	"config.BackingConfig":         "storage.backings",
+	"config.S3Config":              "s3",
+	"config.ReplicationConfig":     "storage.replication",
+	"config.AuthConfig":            "auth",
+	"config.UIConfig":              "ui",
+	"config.CORSConfig":            "cors",
+	"discovery.Config":             "discovery",
+	"config.LoggingConfig":         "logging",
+	"config.LifecycleConfig":       "lifecycle",
+	"config.MetricsConfig":         "metrics",
+	"config.CompressionConfig":     "compression",
+	"config.JobsConfig":            "jobs",
+	"config.ResticConfig":          "restic",
+	"config.ResticSnapshotsConfig": "restic.snapshots",
 }
 
 // describeUnknownField rewrites an unknown-field message in terms of YAML
@@ -272,7 +289,7 @@ func describeUnknownField(m string) string {
 		return fmt.Sprintf("unknown key %q in section %q", sub[1], sec)
 	}
 	if sub[2] == "config.Config" {
-		return fmt.Sprintf("unknown top-level key %q (expected server, storage, auth, ui, admin, cors, discovery, logging, lifecycle, metrics or compression)", sub[1])
+		return fmt.Sprintf("unknown top-level key %q (expected server, storage, auth, ui, admin, cors, discovery, logging, lifecycle, metrics, compression, jobs or restic)", sub[1])
 	}
 	return fmt.Sprintf("unknown key %q", sub[1])
 }
@@ -343,6 +360,17 @@ func (c *Config) Normalize() {
 		c.Compression.Level = DefaultCompressionLevel
 	}
 	c.Compression.SkipContentTypes = trimList(c.Compression.SkipContentTypes)
+	if c.Jobs.Workers == 0 {
+		c.Jobs.Workers = DefaultJobsWorkers
+	}
+	snap := &c.Restic.Snapshots
+	if snap.Workers == 0 {
+		snap.Workers = DefaultSnapshotWorkers
+	}
+	if snap.SpoolBytes == 0 {
+		snap.SpoolBytes = DefaultSnapshotSpoolBytes
+	}
+	snap.StageDir = strings.TrimSpace(snap.StageDir)
 }
 
 func trimList(in []string) []string {
@@ -430,12 +458,34 @@ func (c Config) Validate() error {
 			return fmt.Errorf("lifecycle.interval: must be a whole number of seconds between %s and %s, got %s", lo, hi, iv)
 		}
 	}
+	if err := c.validateJobs(); err != nil {
+		return err
+	}
 	if err := ValidateSettings(SettingsFrom(c)); err != nil {
 		var fe *FieldError
 		if errors.As(err, &fe) {
 			return fmt.Errorf("%s: %s", yamlField(fe.Field), fe.Msg)
 		}
 		return err
+	}
+	return nil
+}
+
+// validateJobs checks jobs.* and restic.snapshots.* (zero values are the
+// defaults Normalize fills in).
+func (c Config) validateJobs() error {
+	if n := c.Jobs.Workers; n != 0 && (n < 1 || n > MaxJobsWorkers) {
+		return fmt.Errorf("jobs.workers: must be between 1 and %d, got %d", MaxJobsWorkers, n)
+	}
+	snap := c.Restic.Snapshots
+	if n := snap.Workers; n != 0 && (n < 1 || n > MaxJobsWorkers) {
+		return fmt.Errorf("restic.snapshots.workers: must be between 1 and %d, got %d", MaxJobsWorkers, n)
+	}
+	if n := snap.SpoolBytes; n != 0 && n < MinSnapshotSpoolBytes {
+		return fmt.Errorf("restic.snapshots.spool_bytes: must be at least %d bytes (64 MiB), got %d", MinSnapshotSpoolBytes, n)
+	}
+	if strings.ContainsRune(snap.StageDir, 0) {
+		return errors.New("restic.snapshots.stage_dir: must not contain NUL characters")
 	}
 	return nil
 }

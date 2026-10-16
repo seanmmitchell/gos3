@@ -118,6 +118,27 @@ export interface Capabilities {
   adoptRemote?: boolean
   /** admin:ManageContainers: add, remove and choose the default container of wrapped buckets. */
   manageContainers?: boolean
+  /**
+   * admin:ListJobs at service level: the Jobs page (copy, mirror and restic
+   * jobs). Absent from servers without jobs: treated as false.
+   */
+  viewJobs?: boolean
+  /** admin:CreateCopyJob at service level: create copy and mirror jobs. */
+  manageJobs?: boolean
+  /** admin:UpdateJob at service level: pause, resume, cancel, run and delete jobs. */
+  updateJobs?: boolean
+  /**
+   * admin:PutBucketSnapshots at service level: configure, run, forget and
+   * prune whole-bucket restic snapshots. Absent from servers without restic
+   * snapshots (no "Backup & archive" tab).
+   */
+  manageSnapshots?: boolean
+  /** admin:GetResticCredentials at service level: reveal a bucket's restic repository password. */
+  revealResticCredentials?: boolean
+  /** admin:RunBucketSnapshot at service level: take a whole-bucket snapshot now. */
+  runSnapshots?: boolean
+  /** admin:RestoreBucketSnapshot at service level: restore a whole-bucket snapshot (CreateCopyJob on the target too). */
+  restoreSnapshots?: boolean
 }
 
 export type CapabilityName = keyof Capabilities
@@ -1021,6 +1042,14 @@ export interface HealthStatus {
 export type EncryptionProviderName = 'AES256' | 'restic'
 
 /**
+ * Which writes use the bucket's encryption provider:
+ * - sse: only writes that request SSE (default encryption or an explicit header)
+ * - all: every write (restic only): the per-version restic archive, where
+ *        every object version becomes a restic snapshot
+ */
+export type EncryptionScope = 'sse' | 'all'
+
+/**
  * GET/PUT /buckets/{name}/encryption-provider: the bucket's implementation
  * of SSE-S3 (native AES-256-GCM or restic), used for default encryption and
  * for uploads that request AES256. Restic repositories live on the backing
@@ -1028,6 +1057,8 @@ export type EncryptionProviderName = 'AES256' | 'restic'
  */
 export interface BucketEncryptionProvider {
   provider: EncryptionProviderName
+  /** Which writes use the provider. Absent from servers without scopes (= "sse"). */
+  scope?: EncryptionScope | string
   /**
    * Providers the bucket can use now (restic needs the restic executable on
    * the server and a filesystem or S3 backing for every copy). Absent when the
@@ -1037,4 +1068,358 @@ export interface BucketEncryptionProvider {
   /** Backings holding the bucket (primary first). */
   backings?: string[]
 }
-export interface BucketEncryptionProviderInput { provider: EncryptionProviderName }
+export interface BucketEncryptionProviderInput {
+  provider: EncryptionProviderName
+  /** "all" is valid with restic only. Omitted: the server's default ("sse"). */
+  scope?: EncryptionScope
+}
+
+/** The bucket's encryption provider document (ResticInfo.settings). */
+export interface EncryptionSettings {
+  provider: EncryptionProviderName | string
+  scope?: EncryptionScope | string
+}
+
+// ---------------------------------------------------------------------------
+// Restic: recovery information, credentials, whole-bucket snapshots
+// ---------------------------------------------------------------------------
+
+/**
+ * Where a restic repository is and where its password comes from (never a
+ * secret). Go restic.RepositoryInfo.
+ */
+export interface RepositoryInfo {
+  /** The backend's ID of the bucket ("" / absent for an aux repository). */
+  bucketId?: string
+  /** restic's --repo: a directory, or "s3:https://host/bucket/path". */
+  repository: string
+  /** Where the repository's recovery record is kept (a path or an s3:// URL). */
+  recordLocation?: string
+  /** How the password is obtained, e.g. "field password of <record>". */
+  passwordSource: string
+  initialized: boolean
+  /** Names (not values) of the environment variables restic needs besides RESTIC_REPOSITORY / RESTIC_PASSWORD. */
+  envNames?: string[] | null
+  /** restic -o options for the repository, e.g. "s3.bucket-lookup=path". */
+  options?: string[] | null
+}
+
+/** The per-version archive repository of one copy of the bucket (ResticInfo.archive). */
+export interface ResticArchiveCopy {
+  backing: string
+  role: PlacementRole | string
+  /** null / absent when the copy has no repository (see error). */
+  info?: RepositoryInfo | null
+  /** e.g. "no repository" for native buckets ("" otherwise). */
+  error?: string
+}
+
+/** Restic tags gos3 uses (for `restic snapshots --tag …`). */
+export interface ResticTags {
+  /** Per-version archive snapshots, e.g. "gos3-object". */
+  object: string
+  /** The bucket's tag, e.g. "gos3-bucket:<b64url name>". */
+  bucket: string
+  /** e.g. "gos3-bucket-id:<id>". */
+  bucketId?: string
+  /** Whole-bucket snapshots, e.g. "gos3-snapshot". */
+  snapshot: string
+}
+
+/** GET /buckets/{name}/restic: where the bucket's restic data lives and how to recover it without gos3. */
+export interface ResticInfo {
+  /** The bucket's encryption provider document (null when none is stored). */
+  settings: EncryptionSettings | null
+  /** Per copy of the bucket (primary, replicas, a move target). */
+  archive: ResticArchiveCopy[] | null
+  /** The whole-bucket snapshot schedule, if configured. */
+  snapshots: SnapshotConfig | null
+  /** Where whole-bucket snapshots go. */
+  snapshotRepository: RepositoryInfo | null
+  /** Why the snapshot repository could not be determined or read ("" / absent when fine). */
+  snapshotsError?: string
+  tags: ResticTags
+}
+
+/** Which repository credentials are for. */
+export type ResticPurpose = 'archive' | 'snapshots'
+
+/** POST /buckets/{name}/restic/credentials body. */
+export interface ResticCredentialsRequest {
+  /** Default: the primary's backing. */
+  backing?: string
+  /** Default: archive. */
+  purpose?: ResticPurpose
+}
+
+/** POST /buckets/{name}/restic/credentials: the secrets the restic CLI needs. Never stored by the UI. */
+export interface ResticCredentials {
+  backing: string
+  purpose: ResticPurpose | string
+  repository: string
+  password: string
+  /** Further environment variables, e.g. AWS_ACCESS_KEY_ID. */
+  env?: Record<string, string> | null
+  /** restic -o options. */
+  options?: string[] | null
+}
+
+/** Which snapshots retention keeps (UTC buckets, like restic forget --keep-*). */
+export interface SnapshotRetention {
+  keepLast: number
+  keepHourly: number
+  keepDaily: number
+  keepWeekly: number
+  keepMonthly: number
+  keepYearly: number
+  /** Go duration string, e.g. "720h" ("0s" = none). */
+  keepWithin: string
+}
+
+/**
+ * Where whole-bucket snapshots go:
+ * - bucket:  the bucket's own restic repository (fs and wrapped buckets)
+ * - backing: an aux repository on that backing (any bucket); `repo` is
+ *            generated by the server on the first PUT and read-only
+ */
+export interface SnapshotTarget {
+  kind: 'bucket' | 'backing' | string
+  backing?: string
+  repo?: string
+}
+
+export interface SnapshotPrune {
+  enabled: boolean
+  /** Go duration string, e.g. "168h". */
+  interval: string
+  /**
+   * Set by the server when `enabled` was not chosen explicitly: it then
+   * follows the bucket's archive scope (off for scope "all"). Sent back
+   * unchanged unless the user changes `enabled`.
+   */
+  default?: boolean
+}
+
+/**
+ * Whole-bucket restic snapshot schedule (bucket configuration document
+ * "restic-snapshots"; replicates with the bucket). Durations are Go
+ * duration strings ("24h", "30m").
+ */
+export interface SnapshotConfig {
+  enabled: boolean
+  /** Between snapshots (1h–30d). */
+  interval: string
+  /** UTC time of day "HH:MM" for intervals of 24h or more. */
+  at?: string
+  /** Versioned buckets: the versions current at the snapshot's start. */
+  consistent: boolean
+  /** Only keys with this prefix. */
+  prefix?: string
+  retention: SnapshotRetention
+  /** Always set by the server; left out of a new schedule's PUT so the server chooses. */
+  target?: SnapshotTarget
+  prune: SnapshotPrune
+}
+
+/** Scheduler state of a bucket's whole-bucket snapshots. */
+export interface SnapshotStatus {
+  lastAttemptAt?: Timestamp
+  lastSuccessAt?: Timestamp
+  /** ID of the last snapshot taken. */
+  lastSnapshot?: string
+  lastError?: string
+  nextRunAt?: Timestamp
+  /** ID of the restic-snapshot job running now. */
+  running?: string
+}
+
+/** What a snapshot's backup did (restic's summary). */
+export interface SnapshotSummary {
+  filesNew: number
+  filesChanged: number
+  filesUnmodified: number
+  dataAdded: number
+  totalFilesProcessed: number
+  totalBytesProcessed: number
+}
+
+/** One whole-bucket snapshot. */
+export interface Snapshot {
+  /** 64 hex characters. */
+  id: string
+  shortId: string
+  time: Timestamp
+  tags?: string[] | null
+  /** Part of a chain written when the spool budget was reached (tag gos3-partial); cannot be restored. */
+  partial?: boolean
+  summary?: SnapshotSummary | null
+}
+
+/** GET /buckets/{name}/restic/snapshots */
+export interface BucketSnapshots {
+  config: SnapshotConfig | null
+  status: SnapshotStatus | null
+  repository: RepositoryInfo | null
+  /** Cached 30 s by the server. */
+  snapshots: Snapshot[] | null
+  /** Why the snapshots could not be listed (the repository failed); "" / absent when fine. */
+  error?: string
+}
+
+/** POST /buckets/{name}/restic/snapshots/{id}/restore body. */
+export interface RestoreSnapshotRequest {
+  target: { bucket: string, create?: CopyTargetCreate }
+  /** Only keys with this prefix. */
+  prefix?: string
+  onExisting?: 'fail' | 'merge'
+  configs?: 'safe' | 'none'
+}
+
+// ---------------------------------------------------------------------------
+// Jobs: copy, mirror and restic jobs
+// ---------------------------------------------------------------------------
+
+export type JobKind = 'copy' | 'mirror' | 'restic-snapshot' | 'restic-restore' | 'restic-prune'
+
+/**
+ * - queued:    waiting for a free worker
+ * - running:   working
+ * - waiting:   between runs: a mirror between passes, or a retry after a failure
+ * - paused:    stopped by pause (resume continues)
+ * - succeeded, failed, canceled: finished (kept as history)
+ */
+export type JobState = 'queued' | 'running' | 'waiting' | 'paused' | 'succeeded' | 'failed' | 'canceled'
+
+/** CopyJobSpec.target.create: create the target bucket (fields as for bucket creation). */
+export interface CopyTargetCreate {
+  /** Default: the server's default backing. */
+  backing?: string
+  /** s3 backings: native or wrapped (default: the backing's default kind). */
+  kind?: BucketKind
+  /** wrapped: the container (default: the backing's default container). */
+  container?: string
+  /** native: the remote bucket to create (default: the bucket name). */
+  remoteBucket?: string
+  objectLock?: boolean
+}
+
+export type CopyVersions = 'all' | 'current'
+export type CopyConfigs = 'safe' | 'all' | 'none'
+export type CopyOnExisting = 'fail' | 'merge' | 'adopt'
+
+/** CopyJobSpec.options (every field optional; the server fills defaults). */
+export interface CopyJobOptions {
+  /** Default: all when the target keeps versions, else current. */
+  versions?: CopyVersions
+  /** Bucket configuration to copy (default safe). */
+  configs?: CopyConfigs
+  /** Existing target: refuse unless empty (fail, default), copy without deleting (merge), or take it over (adopt, mirror). */
+  onExisting?: CopyOnExisting
+  encryption?: 'preserve' | 'target'
+  allowPlaintext?: boolean
+  dropRetention?: boolean
+  compression?: 'preserve' | 'target'
+  /** mirror: deletes in the source are applied to the target. */
+  propagateDeletes?: boolean
+  /** mirror: delete target keys the source does not have. */
+  deleteExtraneous?: boolean
+  /** mirror of a native source: how often to compare listings (Go duration, >= 30s). */
+  pollInterval?: string
+  /** mirror: full comparison besides change notifications (Go duration). */
+  verifyInterval?: string
+  /** Keys copied in parallel (1–32). */
+  concurrency?: number
+  /** copy: compare again after the first pass. */
+  finalPass?: boolean
+}
+
+/** POST /jobs body: copy a bucket into another once (copy) or continuously (mirror). */
+export interface CopyJobSpec {
+  kind: 'copy' | 'mirror'
+  source: { bucket: string, prefix?: string }
+  target: { bucket: string, prefix?: string, create?: CopyTargetCreate }
+  options?: CopyJobOptions
+  /** Validate and normalize only (200 with warnings, nothing created). */
+  dryRun?: boolean
+}
+
+/** POST /jobs with dryRun: the normalized spec and what to look out for. */
+export interface CopyJobDryRun {
+  spec: CopyJobSpec
+  warnings: string[] | null
+}
+
+/** Progress of a copy or mirror job (Job.status). */
+export interface CopyStatus {
+  keysScanned: number
+  keysCopied: number
+  versionsCopied: number
+  bytesCopied: number
+  /** Bytes copied or found identical (progress against totalBytes). */
+  bytesDone: number
+  keysDeleted: number
+  conflicts: number
+  conflictSamples?: { key: string, reason: string }[] | null
+  totalKeys: number
+  totalBytes: number
+  bytesPerSecond: number
+  etaSeconds: number
+  /** mirror: changed keys not yet copied. */
+  pending?: number
+  /** mirror: age of the oldest pending change. */
+  lagSeconds?: number
+  lastPassAt?: Timestamp
+  nextPassAt?: Timestamp
+  passes?: number
+  /** The last 20 errors. */
+  errors?: { key: string, error: string, at: Timestamp }[] | null
+}
+
+/** Progress of restic-snapshot / restic-restore / restic-prune jobs (Job.status). */
+export interface SnapshotJobStatus {
+  keys: number
+  bytes: number
+  materialized: number
+  partials: number
+  /** The snapshot written (or restored). */
+  snapshot?: string
+  forgotten: number
+  repository?: string
+}
+
+/** A background job (GET /jobs). */
+export interface Job {
+  id: string
+  kind: JobKind | string
+  state: JobState | string
+  /** e.g. preparing, copying, verifying, watching. */
+  phase?: string
+  createdBy?: string
+  createdAt: Timestamp
+  startedAt?: Timestamp
+  updatedAt?: Timestamp
+  finishedAt?: Timestamp
+  /** When a waiting job runs again (a mirror pass, a retry). */
+  nextRunAt?: Timestamp
+  /** Error of the last failed run. */
+  lastError?: string
+  /** Failed runs since the last success (retries back off). */
+  failures?: number
+  /** e.g. {"source": "photos", "target": "photos-bak"}. */
+  labels?: Record<string, string> | null
+  /** The normalized spec (CopyJobSpec for copy and mirror jobs). */
+  spec?: unknown
+  status?: CopyStatus | SnapshotJobStatus | Record<string, unknown> | null
+}
+
+/** Query of GET /jobs. */
+export interface ListJobsOptions {
+  kind?: JobKind | string
+  state?: JobState | string
+  /** Jobs whose source or target is this bucket. */
+  bucket?: string
+  signal?: AbortSignal
+}
+
+/** Actions on a job (POST /jobs/{id}/<action>). */
+export type JobAction = 'pause' | 'resume' | 'cancel' | 'run'

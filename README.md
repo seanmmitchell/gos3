@@ -44,6 +44,15 @@ Run `gos3 serve`, point the AWS CLI, an SDK, `mc` or rclone at it, and open
   object lock passed through. Browse the account's buckets, adopt existing
   ones, and add and edit S3 backings live from the web UI. See
   [docs/backings.md](docs/backings.md).
+- **Copy and mirror jobs**: copy a bucket into another once, or keep it
+  mirrored, across backings and bucket kinds (native buckets included)
+  and under another name, with versions, metadata, object lock and bucket
+  configuration. Jobs report progress and lag, can be paused and resumed,
+  and survive restarts. See [docs/jobs.md](docs/jobs.md).
+- **Restic backups**: archive every version written to a bucket in an
+  encrypted restic repository, or snapshot whole buckets on a schedule
+  with retention, and restore them with gos3 or with plain `restic`,
+  without gos3. See [docs/encryption.md](docs/encryption.md#whole-bucket-snapshots).
 - **Web UI**: embedded in the binary or run standalone to manage many gos3
   and other S3 servers. It has an object browser with uploads, versions,
   metadata and share links, bucket settings, users and policies, server
@@ -385,7 +394,8 @@ More in [docs/security.md](docs/security.md).
 | [docs/configuration.md](docs/configuration.md) | every YAML key, environment variable and flag |
 | [docs/deployment.md](docs/deployment.md) | Docker, Compose, systemd, Kubernetes, reverse proxies, TLS |
 | [docs/backings.md](docs/backings.md) | storage backings: S3 accounts as a backend (whole server or per bucket), native and wrapped buckets, containers, the remote bucket browser, live configuration |
-| [docs/encryption.md](docs/encryption.md) | native AES256 and restic encryption, keys and recovery |
+| [docs/jobs.md](docs/jobs.md) | copy and mirror jobs between buckets, backings and bucket kinds |
+| [docs/encryption.md](docs/encryption.md) | native AES256 and restic encryption, the restic archive, whole-bucket snapshots, keys and recovery |
 | [docs/operations.md](docs/operations.md) | health checks, metrics, logs, backups, lifecycle, upgrades |
 | [docs/security.md](docs/security.md) | authentication, stored secrets, exposure checklist |
 | [docs/s3-compatibility.md](docs/s3-compatibility.md) | supported S3 operations and differences from AWS |

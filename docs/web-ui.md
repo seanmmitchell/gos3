@@ -22,7 +22,10 @@ the internet.
 - **Dashboard** of all configured servers with status, version and usage.
 - **Buckets**: create and delete; versioning, policy editor with templates,
   CORS, lifecycle, tags, object lock, default encryption and ACL settings,
-  and (gos3 only) compression and restic encryption providers.
+  and (gos3 only) compression, restic encryption providers, the restic
+  archive, recovery information and whole-bucket snapshots
+  ([Backup & archive](#backup--archive)), and copying or mirroring a bucket
+  into another ([Jobs](#jobs)).
 - **Object browser**: folders, drag-and-drop uploads (multipart with parallel
   parts and progress), downloads, delete, rename and copy, metadata and tag
   editors, versions, and presigned share links.
@@ -41,6 +44,8 @@ the internet.
   account's remote buckets and the containers of wrapped buckets, and per
   bucket its placement, replication, moves and promotions (see
   [Storage backings and placement](#storage-backings-and-placement)).
+- **Jobs** (gos3 only): copy and mirror jobs and restic snapshot jobs,
+  with their progress (see [Jobs](#jobs)).
 
 Pages are shown according to the signed-in identity's permissions (from
 `GET /_gos3/admin/v1/whoami`). For example, Users appears only with
@@ -94,7 +99,11 @@ policies and clears that option.
   its data directory, on an S3 backing in the container of the (wrapped)
   bucket; replicas and moves use the destination backing. Repository passwords are
   server-managed. This encrypts new writes; older objects are unchanged. See
-  [encryption.md](encryption.md).
+  [encryption.md](encryption.md). The card shows the provider's scope
+  (restic for every write: the per-version archive), warns when switching
+  to native AES-256-GCM would end the archive, and links to **Backup &
+  archive**, where the scope is changed and the repository's credentials
+  are shown (see [Backup & archive](#backup--archive)).
 - **Compression.** The server settings page has a Compression section where
   the administrator chooses the mode (Optional, Enforced, Disabled), the
   DEFLATE level, the minimum size and the media types to skip. A bucket's
@@ -232,6 +241,69 @@ and [backings.md](backings.md)):
   placement and the buckets are not all on one backing.
 - Servers that do not report `viewStorage` (older versions) show neither the
   page nor the tab.
+
+### Jobs
+
+Copy and mirror jobs ([jobs.md](jobs.md)) and restic snapshot, restore
+and prune jobs:
+
+- **Jobs** (sidebar, whoami capability `viewJobs`, `admin:ListJobs`) lists
+  the jobs with their kind, source and target, state and phase, progress,
+  the estimated time left of a copy or the lag of a mirror, and the last
+  error, filtered by kind, state and bucket. It refreshes every 3 seconds
+  while a job is busy, otherwise every 15 seconds. With `updateJobs`
+  (`admin:UpdateJob`; the server checks it on both buckets of a job, and
+  a refused change shows its 403) jobs can be paused, resumed (failed jobs
+  too), run now (a waiting mirror or retry), canceled and, once finished,
+  deleted.
+- **Copy / Mirror…** (`manageJobs`, `admin:CreateCopyJob`) in a bucket's
+  settings header and in the object browser opens a wizard for the
+  bucket: the target, a new bucket (name, backing and, on an S3 backing,
+  its kind with its container or remote bucket, object lock) or an
+  existing one, each with an optional prefix, and the source prefix; the
+  [options](jobs.md#sources-and-targets) (versions, with *all* disabled
+  and explained when the target cannot keep them, bucket configuration, a
+  non-empty target, encryption, retention, compression, mirror options,
+  parallelism); and a review of the server's dry run, with the normalized
+  job and its warnings, before **Create job**.
+- A bucket's **Overview** tab has a Jobs card with the copy, mirror and
+  restic jobs whose source or target is the bucket (hidden without
+  `admin:GetJob` on it).
+
+### Backup & archive
+
+Bucket settings → **Backup & archive** (gos3 servers) gathers the restic
+features of a bucket ([encryption.md](encryption.md)):
+
+- **Archive**: the per-version archive toggle (restic provider with scope
+  *every write*, [Archiving every write](encryption.md#archiving-every-write)),
+  with whether the bucket can use it (the reason when not: restic not
+  installed, a native or memory bucket, an S3 backing without an
+  encryption key), a warning about its cost, and the current scope. Saving
+  needs `admin:PutBucketEncryption`.
+- **Recovery**: where each copy's archive repository and the snapshot
+  repository live, their recovery records and password sources, and
+  bash and PowerShell commands for the `restic` tool that list the
+  snapshots without gos3
+  ([Recovery without gos3](encryption.md#recovery-without-gos3)).
+  **Reveal credentials…** (whoami capability `revealResticCredentials`,
+  `admin:GetResticCredentials`) asks for confirmation, then shows the
+  password and the environment in a dialog; nothing is stored in the
+  browser, and the server logs every reveal.
+- **Snapshots** ([Whole-bucket snapshots](encryption.md#whole-bucket-snapshots)):
+  the schedule (interval, time of day, consistency, prefix, retention with
+  presets, the target repository, the bucket's own or a backing's aux
+  repository, and pruning, with a note when pruning would hold up the
+  bucket's archive writes); its status (last and next run, last error, the
+  running job); **Snapshot now**; **Prune**; and the snapshots with
+  **Restore to bucket…** and **Forget** (not for partial snapshots, which
+  cannot be restored). Changing the schedule, forgetting and pruning need
+  `manageSnapshots` (`admin:PutBucketSnapshots`), **Snapshot now**
+  `runSnapshots` (`admin:RunBucketSnapshot`), and restoring
+  `restoreSnapshots` (`admin:RestoreBucketSnapshot`) plus `manageJobs`
+  (`admin:CreateCopyJob` on the target). A new schedule leaves the
+  repository to the server unless one is chosen. The card polls while a
+  snapshot job runs.
 
 ### Object browser notes
 

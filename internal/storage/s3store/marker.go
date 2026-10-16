@@ -349,7 +349,7 @@ func (e *Engine) checkOwned(m Marker) error {
 
 // checkUnmanaged refuses a prefix without a marker that holds backing data.
 func (e *Engine) checkUnmanaged(ctx context.Context) error {
-	for _, dir := range []string{metaDir, dataDir, partsDir, keysDir, resticDir, gatewayDir} {
+	for _, dir := range []string{metaDir, dataDir, partsDir, keysDir, resticDir, resticAuxDir, gatewayDir} {
 		out, err := e.client().ListObjectsV2(ctx, e.opts.Bucket, s3client.ListInput{Prefix: e.keys.prefix + dir, MaxKeys: 100})
 		if err != nil {
 			return remoteErr("list "+dir, err)

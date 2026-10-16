@@ -31,7 +31,14 @@ export const NO_CAPS: Readonly<Capabilities> = Object.freeze({
   browseRemote: false,
   createRemote: false,
   adoptRemote: false,
-  manageContainers: false
+  manageContainers: false,
+  viewJobs: false,
+  manageJobs: false,
+  manageSnapshots: false,
+  revealResticCredentials: false,
+  updateJobs: false,
+  runSnapshots: false,
+  restoreSnapshots: false
 })
 
 /** True when the connection is gos3 and the identity has `cap`. */
@@ -213,6 +220,80 @@ export function canManageCompression(kind: ConnectionKind | undefined, caps: Cap
   return bucketCompressionAccess(kind, caps) === 'manage'
 }
 
+/**
+ * The Jobs page (GET /jobs, admin:ListJobs). Servers without jobs do not
+ * report `viewJobs`, so a missing field means false.
+ */
+export function canViewJobs(kind: ConnectionKind | undefined, caps: Capabilities | null | undefined): boolean {
+  return hasCapability(kind, caps, 'viewJobs')
+}
+
+/**
+ * Creating copy and mirror jobs (admin:CreateCopyJob on the source and
+ * target buckets). Offered with the service-level `manageJobs`; the server
+ * still checks both buckets and its 403 is shown.
+ */
+export function canManageJobs(kind: ConnectionKind | undefined, caps: Capabilities | null | undefined): boolean {
+  return hasCapability(kind, caps, 'manageJobs')
+}
+
+/**
+ * Pausing, resuming, canceling, running and deleting jobs (admin:UpdateJob
+ * on the job's buckets), offered with the service-level `updateJobs`.
+ * Servers without the field (older ones) offer no job actions.
+ */
+export function canUpdateJobs(kind: ConnectionKind | undefined, caps: Capabilities | null | undefined): boolean {
+  return hasCapability(kind, caps, 'updateJobs')
+}
+
+/**
+ * The server knows jobs (its /whoami reports `viewJobs`, allowed or not).
+ * A bucket's jobs (GET /buckets/{name}/jobs) need admin:GetJob on that
+ * bucket, which a service-level capability cannot show: the bucket overview
+ * tries and stays quiet on a 403.
+ */
+export function serverHasJobs(kind: ConnectionKind | undefined, caps: Capabilities | null | undefined): boolean {
+  return kind === 'gos3' && caps?.viewJobs !== undefined
+}
+
+/**
+ * What the identity may do on a bucket's "Backup & archive" tab (restic).
+ * Reading (GET /buckets/{name}/restic and …/restic/snapshots) and the
+ * archive toggle (PUT encryption-provider) are bucket-scoped
+ * (admin:GetBucketEncryption, admin:GetBucketSnapshots,
+ * admin:PutBucketEncryption) and have no capability: they are always
+ * offered and a 403 is shown. The rest follows the service-level
+ * capabilities.
+ */
+export interface ResticAccess {
+  /** Configure the schedule, forget and prune whole-bucket snapshots (manageSnapshots, admin:PutBucketSnapshots). */
+  snapshots: boolean
+  /** "Snapshot now" (runSnapshots, admin:RunBucketSnapshot). */
+  run: boolean
+  /** Restore a snapshot into a bucket (restoreSnapshots, admin:RestoreBucketSnapshot, plus manageJobs: CreateCopyJob on the target). */
+  restore: boolean
+  /** Reveal the repository password (revealResticCredentials). */
+  reveal: boolean
+}
+
+/** Missing fields (older servers) count as false. */
+export function resticAccess(kind: ConnectionKind | undefined, caps: Capabilities | null | undefined): ResticAccess {
+  return {
+    snapshots: hasCapability(kind, caps, 'manageSnapshots'),
+    run: hasCapability(kind, caps, 'runSnapshots'),
+    restore: hasCapability(kind, caps, 'restoreSnapshots') && hasCapability(kind, caps, 'manageJobs'),
+    reveal: hasCapability(kind, caps, 'revealResticCredentials')
+  }
+}
+
+/**
+ * The server has the "Backup & archive" tab: gos3 with restic snapshots,
+ * which reports `manageSnapshots` in /whoami (allowed or not).
+ */
+export function resticTabAvailable(kind: ConnectionKind | undefined, caps: Capabilities | null | undefined): boolean {
+  return kind === 'gos3' && caps?.manageSnapshots !== undefined
+}
+
 /** Bucket usage / owner / public flag come from the gos3 admin API. */
 export function canShowBucketUsage(kind: ConnectionKind | undefined, caps: Capabilities | null | undefined): boolean {
   return kind === 'gos3' && !!caps?.admin
@@ -226,6 +307,7 @@ export type BucketSettingsTab =
   | 'lifecycle'
   | 'tags'
   | 'encryption'
+  | 'restic'
   | 'compression'
   | 'object-lock'
   | 'access'
@@ -239,10 +321,11 @@ export interface BucketTabDef {
 }
 
 /**
- * Bucket settings tabs. Every tab but "compression" maps to plain S3 bucket
- * sub-resources, so they are shown for gos3 and generic S3 alike;
- * "compression" is a gos3 admin API feature (see bucketTabs). Per-bucket
- * permissions are not knowable up front and each tab handles AccessDenied.
+ * Bucket settings tabs. Every tab but "restic" and "compression" maps to
+ * plain S3 bucket sub-resources, so they are shown for gos3 and generic S3
+ * alike; "restic" (Backup & archive) and "compression" are gos3 admin API
+ * features (see bucketTabs). Per-bucket permissions are not knowable up
+ * front and each tab handles AccessDenied.
  */
 export const BUCKET_TABS: readonly BucketTabDef[] = [
   { value: 'overview', label: 'Overview', icon: 'i-lucide-info' },
@@ -252,6 +335,7 @@ export const BUCKET_TABS: readonly BucketTabDef[] = [
   { value: 'lifecycle', label: 'Lifecycle', icon: 'i-lucide-timer' },
   { value: 'tags', label: 'Tags', icon: 'i-lucide-tags' },
   { value: 'encryption', label: 'Encryption', icon: 'i-lucide-lock' },
+  { value: 'restic', label: 'Backup & archive', icon: 'i-lucide-archive' },
   { value: 'compression', label: 'Compression', icon: 'i-lucide-file-archive' },
   { value: 'object-lock', label: 'Object lock', icon: 'i-lucide-shield-alert' },
   { value: 'access', label: 'Access', icon: 'i-lucide-key-round' },
@@ -260,7 +344,8 @@ export const BUCKET_TABS: readonly BucketTabDef[] = [
 
 /** Tabs that only some servers offer, with the rule that decides. */
 const TAB_AVAILABLE: Partial<Record<BucketSettingsTab, (kind: ConnectionKind | undefined, caps: Capabilities | null | undefined) => boolean>> = {
-  compression: (kind, caps) => bucketCompressionAccess(kind, caps) !== 'unavailable'
+  compression: (kind, caps) => bucketCompressionAccess(kind, caps) !== 'unavailable',
+  restic: resticTabAvailable
 }
 
 /** The bucket settings tabs a connection offers (BUCKET_TABS minus gos3-only ones it lacks). */

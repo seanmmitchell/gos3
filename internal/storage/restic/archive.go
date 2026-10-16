@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"os/exec"
+	"unicode"
 )
 
 // Archiver archives one object version by streaming it into
@@ -37,18 +38,78 @@ type Archiver struct {
 	started, stopped bool
 }
 
+// Snapshot tags written by gos3. Names are encoded in unpadded base64url,
+// which restic keeps intact (a comma would split a tag).
+const (
+	// TagObject marks the snapshot of one object version (Archiver).
+	// Whole-bucket snapshot retention never forgets such snapshots.
+	TagObject = "gos3-object"
+	// TagBucketPrefix starts the tag naming a snapshot's bucket (BucketTag).
+	TagBucketPrefix = "gos3-bucket:"
+	// TagBucketIDPrefix starts the tag naming a snapshot's bucket ID
+	// (BucketIDTag).
+	TagBucketIDPrefix = "gos3-bucket-id:"
+	// TagKeyPrefix starts the tag naming an object version's key (KeyTag).
+	TagKeyPrefix = "gos3-key:"
+)
+
+// BucketTag returns the tag naming the bucket bucket.
+func BucketTag(bucket string) string {
+	return TagBucketPrefix + base64.RawURLEncoding.EncodeToString([]byte(bucket))
+}
+
+// BucketIDTag returns the tag naming the bucket ID id (verbatim: bucket
+// IDs are tokens; see ValidTag).
+func BucketIDTag(id string) string { return TagBucketIDPrefix + id }
+
+// KeyTag returns the tag naming the object key key.
+func KeyTag(key string) string {
+	return TagKeyPrefix + base64.RawURLEncoding.EncodeToString([]byte(key))
+}
+
+// ValidTag reports whether restic keeps tag as one tag: it is not empty
+// and holds no comma (restic splits tags at commas), white space or
+// control characters.
+func ValidTag(tag string) bool {
+	if tag == "" {
+		return false
+	}
+	for _, r := range tag {
+		if r == ',' || unicode.IsSpace(r) || unicode.IsControl(r) {
+			return false
+		}
+	}
+	return true
+}
+
+// ArchiveOptions identifies the object version an Archiver archives.
+type ArchiveOptions struct {
+	// Bucket is the bucket's name (tagged with BucketTag).
+	Bucket string
+	// BucketID is the bucket's ID, tagged with BucketIDTag unless "". It
+	// must be a ValidTag; otherwise the first write fails.
+	BucketID string
+	// Key is the object's key (tagged with KeyTag).
+	Key string
+}
+
 // NewArchiver returns an Archiver of a version of bucket/key into the
-// repository loc, which the caller has prepared (see Prepare). The
-// snapshot is tagged "gos3-object", "gos3-bucket:<bucket>" and
-// "gos3-key:<key>" (names in unpadded base64url), with host "gos3" and
+// repository loc: NewArchiverWith without a bucket ID.
+func (rt *Runtime) NewArchiver(ctx context.Context, loc Location, bucket, key string) *Archiver {
+	return rt.NewArchiverWith(ctx, loc, ArchiveOptions{Bucket: bucket, Key: key})
+}
+
+// NewArchiverWith returns an Archiver of a version of o.Bucket/o.Key into
+// the repository loc, which the caller has prepared (see PrepareWith). The
+// snapshot is tagged TagObject, BucketTag(o.Bucket), KeyTag(o.Key) and,
+// when o.BucketID is set, BucketIDTag(o.BucketID), with host "gos3" and
 // file name "object". Nothing runs until the first byte is written; the
 // caller must Finish or Abort it.
-func (rt *Runtime) NewArchiver(ctx context.Context, loc Location, bucket, key string) *Archiver {
-	a := &Archiver{rt: rt, ctx: ctx, loc: loc, tags: []string{
-		"gos3-object",
-		"gos3-bucket:" + base64.RawURLEncoding.EncodeToString([]byte(bucket)),
-		"gos3-key:" + base64.RawURLEncoding.EncodeToString([]byte(key)),
-	}}
+func (rt *Runtime) NewArchiverWith(ctx context.Context, loc Location, o ArchiveOptions) *Archiver {
+	a := &Archiver{rt: rt, ctx: ctx, loc: loc, tags: []string{TagObject, BucketTag(o.Bucket), KeyTag(o.Key)}}
+	if o.BucketID != "" {
+		a.tags = append(a.tags, BucketIDTag(o.BucketID))
+	}
 	a.cmdCtx, a.cancel = context.WithCancel(ctx)
 	return a
 }
@@ -58,6 +119,9 @@ func (a *Archiver) start() error {
 	a.started = true
 	args := []string{"backup", "--stdin", "--stdin-filename", "object", "--json", "--host", "gos3"}
 	for _, t := range a.tags {
+		if !ValidTag(t) {
+			return fmt.Errorf("restic: invalid snapshot tag %q", t)
+		}
 		args = append(args, "--tag", t)
 	}
 	cmd, err := a.rt.Command(a.cmdCtx, a.loc, args...)
@@ -155,20 +219,24 @@ func (a *Archiver) Finish(check func() error) (string, error) {
 	return a.out.snapshot, nil
 }
 
-// snapshotOutput consumes restic's JSON progress incrementally: a long
-// upload must not fill a bounded buffer and lose the final summary that
-// holds the snapshot ID.
-type snapshotOutput struct {
-	pending  []byte
-	snapshot string
+// maxRecord bounds one JSON record of restic's output.
+const maxRecord = 1 << 20
+
+// jsonLines splits restic's JSON output (one record per line) and passes
+// each non-blank record to record as it completes, so that long outputs
+// (backup progress, diffs) are consumed incrementally instead of being
+// buffered. An error from record stops the output (and so restic).
+type jsonLines struct {
+	record  func([]byte) error
+	pending []byte
 }
 
-func (w *snapshotOutput) Write(p []byte) (int, error) {
+func (w *jsonLines) Write(p []byte) (int, error) {
 	n := len(p)
 	for len(p) > 0 {
 		line, rest, complete := bytes.Cut(p, []byte{'\n'})
-		if len(w.pending)+len(line) > 1<<20 {
-			return 0, errors.New("restic: oversized backup progress record")
+		if len(w.pending)+len(line) > maxRecord {
+			return 0, errors.New("restic: oversized JSON record")
 		}
 		w.pending = append(w.pending, line...)
 		if !complete {
@@ -182,23 +250,58 @@ func (w *snapshotOutput) Write(p []byte) (int, error) {
 	return n, nil
 }
 
-// consume decodes the pending JSON record, keeping the snapshot ID of a
-// summary.
-func (w *snapshotOutput) consume() error {
-	if len(bytes.TrimSpace(w.pending)) == 0 {
-		w.pending = w.pending[:0]
+// consume passes the pending record (the last one may lack a newline:
+// call consume once restic exited).
+func (w *jsonLines) consume() error {
+	line := bytes.TrimSpace(w.pending)
+	w.pending = w.pending[:0]
+	if len(line) == 0 {
 		return nil
 	}
+	return w.record(line)
+}
+
+// snapshotOutput consumes restic's JSON backup output incrementally: a long
+// upload must not fill a bounded buffer and lose the final summary that
+// holds the snapshot ID.
+type snapshotOutput struct {
+	jsonLines
+	snapshot string  // the summary's snapshot ID
+	summary  Summary // valid when snapshot is set
+}
+
+// Write implements io.Writer.
+func (w *snapshotOutput) Write(p []byte) (int, error) {
+	if w.record == nil {
+		w.record = w.decode
+	}
+	return w.jsonLines.Write(p)
+}
+
+// consume decodes the pending record (see jsonLines.consume).
+func (w *snapshotOutput) consume() error {
+	if w.record == nil {
+		w.record = w.decode
+	}
+	return w.jsonLines.consume()
+}
+
+// decode decodes one JSON record, keeping a summary.
+func (w *snapshotOutput) decode(line []byte) error {
 	var item struct {
 		MessageType string `json:"message_type"`
-		SnapshotID  string `json:"snapshot_id"`
 	}
-	if err := json.Unmarshal(w.pending, &item); err != nil {
+	if err := json.Unmarshal(line, &item); err != nil {
 		return fmt.Errorf("restic: decode backup result: %w", err)
 	}
-	if item.MessageType == "summary" {
-		w.snapshot = item.SnapshotID
+	if item.MessageType != "summary" {
+		return nil
 	}
-	w.pending = w.pending[:0]
+	var s resticSummary
+	if err := json.Unmarshal(line, &s); err != nil {
+		return fmt.Errorf("restic: decode backup summary: %w", err)
+	}
+	w.summary = s.summary()
+	w.snapshot = s.SnapshotID
 	return nil
 }

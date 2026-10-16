@@ -2,8 +2,9 @@
 import type { BucketSummary } from '~/types/admin'
 import type { ObjectLockConfiguration, VersioningStatus } from '~/types/s3'
 import { S3Error } from '~/utils/s3/errors'
-import { bucketSettingsTabs, canShowBucketUsage, resolveBucketTab, type BucketSettingsTab } from '~/components/admin/-capabilities'
+import { bucketSettingsTabs, canManageJobs, canShowBucketUsage, resolveBucketTab, type BucketSettingsTab } from '~/components/admin/-capabilities'
 import { modeOption } from '~/components/admin/-storage'
+import CopyBucketModal from '~/components/jobs/CopyBucketModal.vue'
 
 /**
  * Bucket settings with one section per S3 bucket sub-resource, plus gos3-only
@@ -11,7 +12,8 @@ import { modeOption } from '~/components/admin/-storage'
  * with `?tab=`). Shared state — versioning, object lock, the admin
  * BucketSummary and (gos3) the primary storage backing with, on s3
  * backings, the bucket's kind (native or wrapped) and location — is loaded
- * here and refreshed when a tab changes it.
+ * here and refreshed when a tab changes it. With manageJobs the header
+ * offers "Copy / Mirror…" (CopyBucketModal).
  */
 const route = useRoute()
 const router = useRouter()
@@ -141,6 +143,22 @@ const replication = computed(() => {
 
 const notFound = computed(() => stateError.value instanceof S3Error && stateError.value.code === 'NoSuchBucket')
 const lockEnabled = computed(() => !!objectLock.value?.enabled)
+
+// Copy / mirror jobs (gos3, admin:CreateCopyJob).
+const canCopy = computed(() => canManageJobs(connection.value?.kind, capabilities.value))
+const overlay = useOverlay()
+/** Bumped when a job was created here, so the overview's Jobs card reloads. */
+const jobsKey = ref(0)
+async function openCopy() {
+  const job = await overlay.create(CopyBucketModal, { destroyOnClose: true }).open({
+    bucket: bucket.value,
+    versioning: versioningUnsupported.value ? '' : versioning.value,
+    // Known once the bucket's state has loaded; else the dialog asks the server.
+    objectLock: versioning.value === null ? null : lockEnabled.value,
+    serverId: id.value
+  })
+  if (job) jobsKey.value++
+}
 </script>
 
 <template>
@@ -165,6 +183,7 @@ const lockEnabled = computed(() => !!objectLock.value?.enabled)
         />
       </template>
       <template #actions>
+        <UButton v-if="canCopy && !notFound" color="neutral" variant="outline" icon="i-lucide-copy-plus" label="Copy / Mirror…" data-testid="copy-bucket" @click="openCopy" />
         <UButton color="neutral" variant="outline" icon="i-lucide-folder-open" label="Browse" :to="appRoutes.bucket(id, bucket)" />
       </template>
     </CommonPageHeader>
@@ -193,6 +212,7 @@ const lockEnabled = computed(() => !!objectLock.value?.enabled)
           :backing-details="backingDetails"
           :kind="bucketKind"
           :location="bucketLocation"
+          :jobs-key="jobsKey"
           @navigate="tab = $event"
         />
         <BucketSettingsVersioningTab
@@ -207,7 +227,8 @@ const lockEnabled = computed(() => !!objectLock.value?.enabled)
         <BucketSettingsCorsTab v-else-if="tab === 'cors'" :bucket="bucket" @changed="loadSummary" />
         <BucketSettingsLifecycleTab v-else-if="tab === 'lifecycle'" :bucket="bucket" :versioning="versioning" @changed="loadSummary" />
         <BucketSettingsTagsTab v-else-if="tab === 'tags'" :bucket="bucket" @changed="loadSummary" />
-        <BucketSettingsEncryptionTab v-else-if="tab === 'encryption'" :bucket="bucket" @changed="loadSummary" />
+        <BucketSettingsEncryptionTab v-else-if="tab === 'encryption'" :bucket="bucket" :kind="bucketKind" @changed="loadSummary" />
+        <BucketSettingsResticTab v-else-if="tab === 'restic'" :bucket="bucket" :kind="bucketKind" @changed="loadSummary" />
         <BucketSettingsCompressionTab v-else-if="tab === 'compression'" :bucket="bucket" @changed="loadSummary" />
         <BucketSettingsObjectLockTab
           v-else-if="tab === 'object-lock'"

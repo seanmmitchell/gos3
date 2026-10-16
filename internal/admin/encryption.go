@@ -13,20 +13,56 @@ import (
 )
 
 // encryptionDocument is the response of GET/PUT
-// /buckets/{name}/encryption-provider: the bucket's SSE-S3 implementation,
-// the providers it can use right now (omitted when the backend cannot
-// tell) and the backings its restic repositories live on.
+// /buckets/{name}/encryption-provider: the bucket's SSE-S3 implementation
+// and which writes use it, the providers it can use right now and the
+// backings its restic repositories live on.
 type encryptionDocument struct {
-	Provider  string   `json:"provider"`
-	Available []string `json:"available,omitempty"`
+	Provider string `json:"provider"`
+	Scope    string `json:"scope"`
+	// Available is always sent: [] when the bucket can use no provider
+	// (a native bucket, a backing without an encryption key), null only
+	// when the backend cannot tell (it does not implement
+	// storage.EncryptionProvidersBackend, or listing failed).
+	Available []string `json:"available"`
 	Backings  []string `json:"backings,omitempty"`
 }
 
+// normalizeEncryptionSettings returns s with its scope spelled out: the
+// stored document leaves out the default scope (so builds that predate
+// scopes read it unchanged), the API always names it.
+func normalizeEncryptionSettings(s storage.EncryptionSettings) storage.EncryptionSettings {
+	if s.Scope == "" {
+		s.Scope = storage.EncryptionScopeSSE
+	}
+	return s
+}
+
+// bucketEncryptionSettings reads the bucket's provider document with
+// storage.ParseEncryptionSettings, the parser writes use, so an invalid
+// stored document is an error here too instead of being shown as valid. A
+// bucket without one uses AES256 for SSE writes only. The scope is
+// normalized (normalizeEncryptionSettings).
+func (a *api) bucketEncryptionSettings(ctx context.Context, bucket string) (storage.EncryptionSettings, error) {
+	raw, err := a.d.Backend.GetBucketConfig(ctx, bucket, storage.ConfigEncryptionProvider)
+	switch {
+	case errors.Is(err, storage.ErrConfigNotFound):
+		return normalizeEncryptionSettings(storage.EncryptionSettings{Provider: storage.EncryptionAES256}), nil
+	case err != nil:
+		return storage.EncryptionSettings{}, err
+	}
+	s, err := storage.ParseEncryptionSettings(raw)
+	if err != nil {
+		return storage.EncryptionSettings{}, fmt.Errorf("reading the encryption provider: %w (PUT a provider to replace it)", err)
+	}
+	return normalizeEncryptionSettings(s), nil
+}
+
 // describeBucketEncryption builds the encryptionDocument of bucket with
-// provider. Availability and placement are informational: failing to read
-// them is logged, not fatal.
-func (a *api) describeBucketEncryption(ctx context.Context, bucket, provider string) encryptionDocument {
-	doc := encryptionDocument{Provider: provider}
+// settings s. Availability and placement are informational: failing to
+// read them is logged, not fatal.
+func (a *api) describeBucketEncryption(ctx context.Context, bucket string, s storage.EncryptionSettings) encryptionDocument {
+	s = normalizeEncryptionSettings(s)
+	doc := encryptionDocument{Provider: s.Provider, Scope: s.Scope}
 	if p, err := a.encryptionProviders(ctx, bucket); err != nil {
 		a.log.Warn("admin: cannot list encryption providers", "bucket", bucket, "err", err)
 	} else {
@@ -54,30 +90,29 @@ func (a *api) encryptionProviders(ctx context.Context, bucket string) ([]string,
 	return p, err
 }
 
-// getBucketEncryption returns the bucket's provider. It reads the document
-// with storage.EncryptionProvider, the parser writes use, so an invalid
-// stored provider is an error here too instead of being shown as valid.
+// getBucketEncryption returns the bucket's provider and scope (see
+// bucketEncryptionSettings).
 func (a *api) getBucketEncryption(rc *reqCtx) (int, any, error) {
 	bucket := rc.r.PathValue("name")
-	provider, err := storage.EncryptionProvider(rc.ctx, a.d.Backend, bucket)
+	s, err := a.bucketEncryptionSettings(rc.ctx, bucket)
 	if err != nil {
-		if errors.Is(err, storage.ErrBucketNotFound) {
-			return 0, nil, err
-		}
-		return 0, nil, fmt.Errorf("reading the encryption provider: %w (PUT a provider to replace it)", err)
+		return 0, nil, err
 	}
-	return http.StatusOK, a.describeBucketEncryption(rc.ctx, bucket, provider), nil
+	return http.StatusOK, a.describeBucketEncryption(rc.ctx, bucket, s), nil
 }
 
 // putBucketEncryption selects the implementation of SSE-S3, independently
-// of whether bucket default SSE is enabled. Storage locations and secrets
-// are not bucket state: each backing holding a copy of the bucket keeps its
-// keys and restic repository itself.
+// of whether bucket default SSE is enabled, and its scope: "sse" (the
+// default) for writes that request SSE, "all" (restic only) for every
+// write, which makes every object version a restic snapshot. Storage
+// locations and secrets are not bucket state: each backing holding a copy
+// of the bucket keeps its keys and restic repository itself.
 //
 // The new provider is stored only once it is ready: the backend validates
 // it and prepares its keys or repository first, so a failure leaves the
 // previous provider in effect instead of switching the bucket's writes to
 // a provider that cannot store them. Changes are serialized per bucket.
+// The stored document leaves out the default scope.
 func (a *api) putBucketEncryption(rc *reqCtx) (int, any, error) {
 	bucket := rc.r.PathValue("name")
 	var in storage.EncryptionSettings
@@ -86,6 +121,16 @@ func (a *api) putBucketEncryption(rc *reqCtx) (int, any, error) {
 	}
 	if !storage.ValidEncryptionProvider(in.Provider) {
 		return 0, nil, badRequest("provider must be %s or %s", storage.EncryptionAES256, storage.EncryptionRestic)
+	}
+	switch in.Scope {
+	case "", storage.EncryptionScopeSSE:
+		in.Scope = ""
+	case storage.EncryptionScopeAll:
+		if in.Provider != storage.EncryptionRestic {
+			return 0, nil, badRequest("scope %q (archive every write) needs provider %s", in.Scope, storage.EncryptionRestic)
+		}
+	default:
+		return 0, nil, badRequest("scope must be %s or %s", storage.EncryptionScopeSSE, storage.EncryptionScopeAll)
 	}
 	e, ok := a.d.Backend.(storage.EncryptionBackend)
 	if !ok {
@@ -109,11 +154,16 @@ func (a *api) putBucketEncryption(rc *reqCtx) (int, any, error) {
 	if err != nil {
 		return 0, nil, err
 	}
+	// The writers' parser must accept what is stored.
+	if _, err := storage.ParseEncryptionSettings(data); err != nil {
+		return 0, nil, badRequest("%v", err)
+	}
 	if err := a.d.Backend.PutBucketConfig(rc.ctx, bucket, storage.ConfigEncryptionProvider, data); err != nil {
 		return 0, nil, err
 	}
-	a.log.Info("admin: bucket encryption provider set", "bucket", bucket, "provider", in.Provider, "by", rc.id.User)
-	return http.StatusOK, a.describeBucketEncryption(rc.ctx, bucket, in.Provider), nil
+	in = normalizeEncryptionSettings(in)
+	a.log.Info("admin: bucket encryption provider set", "bucket", bucket, "provider", in.Provider, "scope", in.Scope, "by", rc.id.User)
+	return http.StatusOK, a.describeBucketEncryption(rc.ctx, bucket, in), nil
 }
 
 // unavailableProviderMessage explains why provider is not in a bucket's

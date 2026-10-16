@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"sync"
 
 	"github.com/seanmmitchell/gos3/internal/storage"
@@ -50,16 +51,25 @@ func errNoWriteOptions(name string, o storage.WriteOptions) error {
 	return fmt.Errorf("%s cannot store data %s: %w", who, what, errors.ErrUnsupported)
 }
 
-// objectWriter writes a new version to the bucket's primary and, in an
-// active-active bucket, streams the same bytes to every in-sync replica,
-// which stores the version under the ID the primary assigned at commit.
-// It holds the bucket's gate from creation until Commit or Abort.
-type objectWriter struct {
+// leadWriter is the primary's writer of a fanout: a storage.ObjectWriter
+// or a storage.VersionWriter, whose Commit methods differ.
+type leadWriter interface {
+	io.Writer
+	Abort() error
+}
+
+// fanout is what objectWriter and versionWriter share: it streams a new
+// version to the bucket's primary (lead) and, in an active-active bucket,
+// the same bytes to every in-sync replica (tees), which stores the version
+// under the identity the primary committed. It holds the bucket's gate
+// from creation until commit or Abort, so that no cutover happens while
+// the version is in flight.
+type fanout struct {
 	r      *Router
 	rt     *route
 	bucket string
 	key    string
-	w      storage.ObjectWriter
+	lead   leadWriter
 	tees   []*teeWriter
 
 	mu    sync.Mutex
@@ -72,6 +82,163 @@ type teeWriter struct {
 	ms     *memberState
 	w      storage.VersionWriter
 	failed bool
+}
+
+// newFanout starts the tees of a write of bucket/key along rt, whose lead
+// writer is lead and whose gate leave releases: one imported version per
+// follower, stored as opts asks. A follower that cannot take the version
+// is demoted (the key is copied to it in the background).
+func (r *Router) newFanout(ctx context.Context, rt *route, leave func(), bucket, key string, lead leadWriter, opts storage.WriteOptions) *fanout {
+	f := &fanout{r: r, rt: rt, bucket: bucket, key: key, lead: lead, leave: leave}
+	for _, m := range rt.followers {
+		vw, err := newVersionWriter(ctx, m.backing, bucket, key, opts)
+		if err != nil {
+			r.observe(m.backing, err) // errors.ErrUnsupported is not a failure of the backing
+			r.demote(m, key)
+			continue
+		}
+		f.tees = append(f.tees, &teeWriter{ms: m, w: vw})
+	}
+	return f
+}
+
+func (f *fanout) Write(p []byte) (int, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.done {
+		return 0, errWriterDone
+	}
+	n, err := f.lead.Write(p)
+	if err != nil {
+		f.r.observe(f.rt.lead, err)
+		return n, err
+	}
+	for _, t := range f.tees {
+		if t.failed {
+			continue
+		}
+		if _, err := t.w.Write(p[:n]); err != nil {
+			t.failed = true
+			_ = t.w.Abort()
+			f.r.observe(t.ms.backing, err)
+		}
+	}
+	return n, nil
+}
+
+// commit publishes the version: commitLead commits the lead writer and
+// returns the stored info, with which every tee is committed; cb (may be
+// nil) tells the errors of the caller's callbacks apart. The change is
+// reported to the subscribers (see Subscribe) once the gate and key lock
+// are released.
+func (f *fanout) commit(ctx context.Context, cb *cbTracker, commitLead func() (storage.ObjectInfo, error)) (storage.ObjectInfo, error) {
+	info, err := f.commitGated(ctx, cb, commitLead)
+	if err != nil {
+		return storage.ObjectInfo{}, err
+	}
+	f.r.emitObject(f.bucket, f.key)
+	return info, nil
+}
+
+func (f *fanout) commitGated(ctx context.Context, cb *cbTracker, commitLead func() (storage.ObjectInfo, error)) (storage.ObjectInfo, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.done {
+		return storage.ObjectInfo{}, errWriterDone
+	}
+	f.done = true
+	defer f.leave()
+	if len(f.tees) > 0 || len(f.rt.followers) > 0 {
+		// Replicas must commit the key's versions in the primary's order.
+		unlock := f.r.keys.lock(f.bucket, f.key)
+		defer unlock()
+	}
+	info, err := commitLead()
+	if err != nil {
+		// Abort after Commit is a no-op; it frees what a failed commit may
+		// have kept, since the caller's Abort is now ours to forward.
+		_ = f.lead.Abort()
+		f.abortTees()
+		if !cb.isCaller(err) {
+			f.r.observe(f.rt.lead, err)
+		}
+		return storage.ObjectInfo{}, err
+	}
+	committed := map[*memberState]bool{}
+	for _, t := range f.tees {
+		if t.failed {
+			continue
+		}
+		if _, err := t.w.Commit(ctx, info); err != nil {
+			f.r.observe(t.ms.backing, err)
+			continue
+		}
+		committed[t.ms] = true
+	}
+	f.r.settle(f.rt, f.key, committed)
+	return info, nil
+}
+
+// Abort discards the version on every backing.
+func (f *fanout) Abort() error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.done {
+		return nil
+	}
+	f.done = true
+	defer f.leave()
+	f.abortTees()
+	return f.lead.Abort()
+}
+
+// abortTees aborts the tees still writing. f.mu must be held.
+func (f *fanout) abortTees() {
+	for _, t := range f.tees {
+		if !t.failed {
+			_ = t.w.Abort()
+		}
+	}
+}
+
+// settle propagates a change of key, made on rt.lead, to the members that
+// did not take it synchronously: a follower missing from committed is
+// demoted, one demoted meanwhile by another failure gets the key checked
+// in the background (it may have missed something since), and so does
+// every other member (see markAsync). The caller still holds the bucket's
+// gate.
+func (r *Router) settle(rt *route, key string, committed map[*memberState]bool) {
+	for _, f := range rt.followers {
+		switch {
+		case !committed[f]:
+			r.demote(f, key)
+		case !r.inSyncMode(f):
+			r.markDirty(f, key)
+		}
+	}
+	r.markAsync(rt, key)
+}
+
+// markAsync queues key for the members of rt's bucket that copy changes in
+// the background. They are taken from the bucket's current route, not from
+// rt (computed when the write started): a replica or move target added
+// meanwhile (SetReplication and Move do not wait for the writes in
+// flight) may have compared the key before it changed, and would then miss
+// the change. Followers cannot join while the caller holds the gate (that
+// takes a cutover).
+func (r *Router) markAsync(rt *route, key string) {
+	for _, a := range r.writeRoute(rt.bs).async {
+		r.markDirty(a, key)
+	}
+}
+
+// objectWriter writes a new version to the bucket's primary and, in an
+// active-active bucket, streams the same bytes to every in-sync replica,
+// which stores the version under the ID the primary assigned at commit
+// (see fanout).
+type objectWriter struct {
+	*fanout
+	w storage.ObjectWriter
 }
 
 // NewObjectWriter starts writing a new version of bucket/key.
@@ -108,119 +275,14 @@ func (r *Router) NewObjectWriterWith(ctx context.Context, bucket, key string, op
 		leave()
 		return nil, r.observe(rt.lead, err)
 	}
-	ow := &objectWriter{r: r, rt: rt, bucket: bucket, key: key, w: w, leave: leave}
-	for _, f := range rt.followers {
-		vw, err := newVersionWriter(ctx, f.backing, bucket, key, opts)
-		if errors.Is(err, errors.ErrUnsupported) {
-			r.demote(f, key)
-			continue
-		}
-		if err != nil {
-			r.observe(f.backing, err)
-			r.demote(f, key)
-			continue
-		}
-		ow.tees = append(ow.tees, &teeWriter{ms: f, w: vw})
-	}
-	return ow, nil
+	return &objectWriter{fanout: r.newFanout(ctx, rt, leave, bucket, key, w, opts), w: w}, nil
 }
 
-func (w *objectWriter) Write(p []byte) (int, error) {
-	w.mu.Lock()
-	defer w.mu.Unlock()
-	if w.done {
-		return 0, errWriterDone
-	}
-	n, err := w.w.Write(p)
-	if err != nil {
-		w.r.observe(w.rt.lead, err)
-		return n, err
-	}
-	for _, t := range w.tees {
-		if t.failed {
-			continue
-		}
-		if _, err := t.w.Write(p[:n]); err != nil {
-			t.failed = true
-			_ = t.w.Abort()
-			w.r.observe(t.ms.backing, err)
-		}
-	}
-	return n, nil
-}
-
-// finish marks the writer done and leaves the gate (once).
-func (w *objectWriter) finish() bool {
-	if w.done {
-		return false
-	}
-	w.done = true
-	return true
-}
-
+// Commit publishes the version on the primary, then on the tees, under the
+// ID the primary assigned.
 func (w *objectWriter) Commit(ctx context.Context, meta storage.ObjectMeta, opts storage.CommitOptions) (storage.ObjectInfo, error) {
-	w.mu.Lock()
-	defer w.mu.Unlock()
-	if !w.finish() {
-		return storage.ObjectInfo{}, errWriterDone
-	}
-	defer w.leave()
-	if len(w.tees) > 0 || len(w.rt.followers) > 0 {
-		// Replicas must commit the key's versions in the primary's order.
-		unlock := w.r.keys.lock(w.bucket, w.key)
-		defer unlock()
-	}
 	cb := &cbTracker{}
-	info, err := w.w.Commit(ctx, meta, cb.commitOptions(opts))
-	if err != nil {
-		for _, t := range w.tees {
-			if !t.failed {
-				_ = t.w.Abort()
-			}
-		}
-		if !cb.isCaller(err) {
-			w.r.observe(w.rt.lead, err)
-		}
-		return storage.ObjectInfo{}, err
-	}
-	committed := map[*memberState]bool{}
-	for _, t := range w.tees {
-		if t.failed {
-			continue
-		}
-		if _, err := t.w.Commit(ctx, info); err != nil {
-			w.r.observe(t.ms.backing, err)
-			continue
-		}
-		committed[t.ms] = true
-	}
-	for _, f := range w.rt.followers {
-		switch {
-		case !committed[f]:
-			w.r.demote(f, w.key)
-		case !w.r.inSyncMode(f):
-			// Demoted meanwhile by another failure: it may have missed
-			// something since; let the background copy check the key.
-			w.r.markDirty(f, w.key)
-		}
-	}
-	for _, a := range w.rt.async {
-		w.r.markDirty(a, w.key)
-	}
-	return info, nil
-}
-
-func (w *objectWriter) Abort() error {
-	w.mu.Lock()
-	defer w.mu.Unlock()
-	if !w.finish() {
-		return nil
-	}
-	defer w.leave()
-	for _, t := range w.tees {
-		if !t.failed {
-			_ = t.w.Abort()
-		}
-	}
-	return w.w.Abort()
+	return w.commit(ctx, cb, func() (storage.ObjectInfo, error) {
+		return w.w.Commit(ctx, meta, cb.commitOptions(opts))
+	})
 }

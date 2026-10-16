@@ -184,26 +184,31 @@ func (r *Router) demote(ms *memberState, key string) {
 
 // replicate propagates a change of key, made on rt.lead, to the other
 // members: synchronously to the followers (the caller holds the key's
-// lock), in the background to the others.
+// lock), in the background to the others (see settle).
 func (r *Router) replicate(ctx context.Context, rt *route, key string) {
+	committed := map[*memberState]bool{}
 	for _, f := range rt.followers {
-		if err := r.syncKey(ctx, rt.lead, f.backing, rt.bs.name, key, nil); err != nil {
-			r.demote(f, key)
-			continue
-		}
-		if !r.inSyncMode(f) {
-			r.markDirty(f, key)
+		if err := r.syncKey(ctx, rt.lead, f.backing, rt.bs.name, key, nil); err == nil {
+			committed[f] = true
 		}
 	}
-	for _, a := range rt.async {
-		r.markDirty(a, key)
-	}
+	r.settle(rt, key, committed)
 }
 
 // objectWrite runs op, a change of bucket/key, on the bucket's primary and
-// replicates it. caller reports whether an error came from the caller's
-// callback rather than from the backing.
+// replicates it, then reports the change to the subscribers (see
+// Subscribe). cb tells errors of the caller's callbacks apart from those
+// of the backing.
 func (r *Router) objectWrite(ctx context.Context, bucket, key string, cb *cbTracker, op func(b storage.Backend) error) error {
+	if err := r.objectWriteGated(ctx, bucket, key, cb, op); err != nil {
+		return err
+	}
+	r.emitObject(bucket, key)
+	return nil
+}
+
+// objectWriteGated is objectWrite without reporting the change.
+func (r *Router) objectWriteGated(ctx context.Context, bucket, key string, cb *cbTracker, op func(b storage.Backend) error) error {
 	rt, leave, err := r.enterWrite(ctx, bucket)
 	if err != nil {
 		return err
@@ -224,8 +229,19 @@ func (r *Router) objectWrite(ctx context.Context, bucket, key string, cb *cbTrac
 }
 
 // bucketWrite applies op (a bucket-level change) to the primary, then to
-// every other copy. A copy that fails gets a full comparison later.
-func (r *Router) bucketWrite(ctx context.Context, bucket string, op func(b storage.Backend) error) error {
+// every other copy. A copy that fails gets a full comparison later. The
+// change is reported to the subscribers as a ChangeBucketConfig of
+// configKey (see Change.ConfigKey: "" for a bucket setting).
+func (r *Router) bucketWrite(ctx context.Context, bucket, configKey string, op func(b storage.Backend) error) error {
+	if err := r.bucketWriteGated(ctx, bucket, op); err != nil {
+		return err
+	}
+	r.emit(Change{Kind: ChangeBucketConfig, Bucket: bucket, ConfigKey: configKey})
+	return nil
+}
+
+// bucketWriteGated is bucketWrite without reporting the change.
+func (r *Router) bucketWriteGated(ctx context.Context, bucket string, op func(b storage.Backend) error) error {
 	rt, leave, err := r.enterWrite(ctx, bucket)
 	if err != nil {
 		return err
@@ -379,8 +395,18 @@ func (r *Router) ListBuckets(ctx context.Context) ([]storage.BucketInfo, error) 
 // checked (storage.NewCapsOf) before anything is created. The default
 // replicas are added except the chosen backing itself, when the new bucket
 // keeps a version history to copy (not a native bucket) and they can
-// receive copies.
+// receive copies. The new bucket is reported to the subscribers (see
+// Subscribe).
 func (r *Router) CreateBucket(ctx context.Context, name string, opts storage.CreateBucketOptions) error {
+	if err := r.createBucket(ctx, name, opts); err != nil {
+		return err
+	}
+	r.emit(Change{Kind: ChangeBucketCreated, Bucket: name})
+	return nil
+}
+
+// createBucket is CreateBucket without reporting the change.
+func (r *Router) createBucket(ctx context.Context, name string, opts storage.CreateBucketOptions) error {
 	if r.closed.Load() {
 		return ErrClosed
 	}
@@ -545,8 +571,18 @@ func (r *Router) primaryOf(bs *bucketState) string {
 }
 
 // DeleteBucket deletes the (empty) bucket from its primary; the other
-// copies are deleted in the background.
+// copies are deleted in the background. The deletion is reported to the
+// subscribers (see Subscribe).
 func (r *Router) DeleteBucket(ctx context.Context, name string) error {
+	if err := r.deleteBucket(ctx, name); err != nil {
+		return err
+	}
+	r.emit(Change{Kind: ChangeBucketDeleted, Bucket: name})
+	return nil
+}
+
+// deleteBucket is DeleteBucket without reporting the change.
+func (r *Router) deleteBucket(ctx context.Context, name string) error {
 	if r.closed.Load() {
 		return ErrClosed
 	}
@@ -587,12 +623,12 @@ func (r *Router) DeleteBucket(ctx context.Context, name string) error {
 
 // SetBucketVersioning changes the versioning state on every copy.
 func (r *Router) SetBucketVersioning(ctx context.Context, name string, status storage.VersioningStatus) error {
-	return r.bucketWrite(ctx, name, func(b storage.Backend) error { return b.SetBucketVersioning(ctx, name, status) })
+	return r.bucketWrite(ctx, name, "", func(b storage.Backend) error { return b.SetBucketVersioning(ctx, name, status) })
 }
 
 // SetBucketObjectLock enables object lock on every copy.
 func (r *Router) SetBucketObjectLock(ctx context.Context, name string, enabled bool) error {
-	return r.bucketWrite(ctx, name, func(b storage.Backend) error { return b.SetBucketObjectLock(ctx, name, enabled) })
+	return r.bucketWrite(ctx, name, "", func(b storage.Backend) error { return b.SetBucketObjectLock(ctx, name, enabled) })
 }
 
 // GetBucketConfig returns a configuration document.
@@ -633,12 +669,12 @@ func (r *Router) ViewBucketConfig(ctx context.Context, bucket, key string, fn fu
 
 // PutBucketConfig stores a configuration document on every copy.
 func (r *Router) PutBucketConfig(ctx context.Context, bucket, key string, data []byte) error {
-	return r.bucketWrite(ctx, bucket, func(b storage.Backend) error { return b.PutBucketConfig(ctx, bucket, key, data) })
+	return r.bucketWrite(ctx, bucket, key, func(b storage.Backend) error { return b.PutBucketConfig(ctx, bucket, key, data) })
 }
 
 // DeleteBucketConfig removes a configuration document from every copy.
 func (r *Router) DeleteBucketConfig(ctx context.Context, bucket, key string) error {
-	return r.bucketWrite(ctx, bucket, func(b storage.Backend) error { return b.DeleteBucketConfig(ctx, bucket, key) })
+	return r.bucketWrite(ctx, bucket, key, func(b storage.Backend) error { return b.DeleteBucketConfig(ctx, bucket, key) })
 }
 
 // --- objects ---

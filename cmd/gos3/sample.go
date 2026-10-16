@@ -229,4 +229,27 @@ compression:
     - application/epub+zip
     - application/vnd.openxmlformats-officedocument.*
     - application/vnd.oasis.opendocument.*
+
+jobs:
+  # Background jobs (copy, mirror, whole-bucket snapshots, restores and
+  # prunes) running at once, 1-64; further jobs wait queued. The jobs are
+  # managed through the admin API / web UI and kept in <path>/.gos3/jobs/.
+  workers: 2
+
+restic:
+  # Whole-bucket restic snapshots (schedules are set per bucket through the
+  # admin API / web UI; see docs/encryption.md).
+  snapshots:
+    # Snapshot, restore and prune jobs running restic at once (each also
+    # takes one of jobs.workers).
+    workers: 1
+    # Where runs stage buckets (kept between runs; needs about spool_bytes
+    # free and an inode per object). Default: <path>/.gos3/restic-stage.
+    stage_dir: ""
+    # Data a run stages before it saves a partial snapshot and goes on
+    # (8 GiB; at least 64 MiB).
+    spool_bytes: 8589934592
+    # Stage unchanged objects as sparse placeholders, so a run reads only
+    # new and changed objects. false reads every object at every run.
+    incremental: true
 `

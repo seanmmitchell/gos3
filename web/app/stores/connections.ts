@@ -68,7 +68,14 @@ export const NO_CAPABILITIES: Capabilities = Object.freeze({
   browseRemote: false,
   createRemote: false,
   adoptRemote: false,
-  manageContainers: false
+  manageContainers: false,
+  viewJobs: false,
+  manageJobs: false,
+  manageSnapshots: false,
+  revealResticCredentials: false,
+  updateJobs: false,
+  runSnapshots: false,
+  restoreSnapshots: false
 })
 
 /**

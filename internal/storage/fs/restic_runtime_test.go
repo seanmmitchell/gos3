@@ -44,11 +44,8 @@ func putRestic(t *testing.T, b *Backend, bucket, key, data string, opts storage.
 func TestResticArchiveStreamsAndPreparesOnce(t *testing.T) {
 	b, log := newResticBucket(t)
 	recovery := filepath.Join(b.sysDir, "keys", mustBucketID(t, b, "arc")+".restic.json")
-	before, err := os.Stat(recovery)
-	if err != nil {
-		t.Fatal(err)
-	}
-	for _, data := range []string{"first version", strings.Repeat("second ", 50000)} {
+	var before os.FileInfo
+	for i, data := range []string{"first version", strings.Repeat("second ", 50000), "third"} {
 		if err := b.PrepareEncryption(ctx, "arc", storage.EncryptionRestic); err != nil {
 			t.Fatal(err)
 		}
@@ -58,12 +55,23 @@ func TestResticArchiveStreamsAndPreparesOnce(t *testing.T) {
 		}
 		eq(t, "encryption", info.Encryption, storage.EncryptionRestic)
 		eq(t, "content", read(t, b, "arc", "k", info.VersionID), data)
+		if i == 0 {
+			// The first write recorded the bucket's name.
+			rec, _, err := readRecovery(recovery)
+			if err != nil || rec.Bucket != "arc" {
+				t.Fatalf("recovery record = %+v, %v", rec, err)
+			}
+			if before, err = os.Stat(recovery); err != nil {
+				t.Fatal(err)
+			}
+		}
 	}
 	// K5: the repository was opened (and initialized) once for all writes,
-	// and the unchanged recovery record was not rewritten.
+	// and the unchanged recovery record was not rewritten after the first
+	// write named the bucket.
 	eq(t, "cat config", resticCalls(t, log, "cat config"), 1)
 	eq(t, "init", resticCalls(t, log, "init"), 1)
-	eq(t, "backup", resticCalls(t, log, "backup"), 2)
+	eq(t, "backup", resticCalls(t, log, "backup"), 3)
 	after, err := os.Stat(recovery)
 	if err != nil {
 		t.Fatal(err)

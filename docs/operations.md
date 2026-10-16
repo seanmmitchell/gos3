@@ -1,7 +1,7 @@
 # Operations
 
 Running gos3 day to day: health checks, metrics, logs, backups, the lifecycle
-worker and upgrades.
+worker, background jobs and restic snapshots, and upgrades.
 
 ## Health and readiness
 
@@ -103,9 +103,15 @@ gos3 logs to stderr with Go's `log/slog`, as `text` (default) or `json`
     ├── orphans/<time>-<id>/     unreferenced files moved aside at startup (fs backend)
     ├── keys/                    per-bucket encryption keys and restic recovery records (fs backend) (secret)
     │   ├── <bucket-id>              a bucket's encryption master key
-    │   └── <bucket-id>.restic.json  its restic repository location and password
+    │   ├── <bucket-id>.restic.json  its restic repository location and password
+    │   └── aux/<name>[.restic.json] key and recovery record of an aux restic repository
     ├── restic/<bucket-id>/      local restic repositories (fs backend)
+    ├── restic-aux/<name>/       aux restic repositories: whole-bucket snapshots of other buckets (fs backend)
     ├── restic-cache/            restic's local repository cache (fs backend)
+    ├── restic-stage/            stage of whole-bucket snapshots (default restic.snapshots.stage_dir)
+    ├── restic-snapshots.json    state of the snapshot scheduler: last and next runs per bucket
+    ├── jobs/jobs.json           copy, mirror and restic jobs: specs, states, progress, checkpoints
+    ├── jobs/<id>/               a job's own state (state.db), deleted with the job
     ├── lock                     held by the running server
     ├── iam.json                 IAM users, keys, policies        (secret)
     ├── root-credentials.json    generated root keys, if any      (secret)
@@ -120,13 +126,16 @@ Encrypted objects cannot be read without `keys/`, so back it up together
 with `meta.db` and the data (see
 [encryption.md](encryption.md#keys-and-recovery)). Keys, restic recovery
 records and local restic repositories stay after their bucket is deleted.
-Each additional fs backing has its own `keys/`, `restic/` and
-`restic-cache/`. Restic repositories are always local to an fs backing
-(`restic/<bucket-id>`).
+Each additional fs backing has its own `keys/`, `restic/`, `restic-aux/`
+and `restic-cache/`. Restic repositories are always local to an fs backing
+(`restic/<bucket-id>`, `restic-aux/<name>`). `jobs/`,
+`restic-snapshots.json` and `restic-stage/` belong to the server and exist
+only in the system directory.
 
 With the memory backend and a data path, only the system files (`iam.json`,
-`settings.json`, `placements.json`, `backings.json`, `server-id`,
-`root-credentials.json`) are kept; objects live in memory. The same holds
+`settings.json`, `placements.json`, `backings.json`, `jobs/`,
+`restic-snapshots.json`, `server-id`, `root-credentials.json`) are kept;
+objects live in memory. The same holds
 when the default backing is an [s3 backing](backings.md) with a home: its
 buckets, metadata, keys and restic repositories live in its S3 account, and
 `storage.path` is optional and only holds the system files. Without it they
@@ -227,7 +236,9 @@ Things to know:
   field of Move in the web UI). An s3 backing without any container can
   hold no replicas. A native bucket that is no longer wanted in gos3 can be
   released (`POST /buckets/{name}/release`): gos3 forgets it and its remote
-  bucket stays as it is.
+  bucket stays as it is. To get a native bucket's data onto another
+  backing, or to keep a second copy of it, use a
+  [copy or mirror job](jobs.md#copy-jobs-replicas-and-moves).
 - Changes waiting to be copied are kept in memory. After a restart every
   replica is compared with its primary in full, in the background (cost:
   reading the metadata of every object on both sides); active-active replicas
@@ -284,7 +295,14 @@ can end up inconsistent with the data files.
 
 The copy includes the encryption keys (`.gos3/keys/`) and `backings.json`
 with the credentials and encryption keys of s3 backings configured in the
-web UI, so protect it like the keys themselves.
+web UI, so protect it like the keys themselves. It also includes the jobs
+(`.gos3/jobs/`) and the snapshot scheduler's state
+(`.gos3/restic-snapshots.json`): without them copy and mirror jobs are
+gone (mirrors stop until they are created again) and the snapshot
+scheduler forgets when each bucket was last snapshotted (every schedule
+then snapshots at its next check, or its next time of day). The snapshot stage
+(`.gos3/restic-stage/`) need not be backed up: a run without it rebuilds
+it from the newest snapshot's manifest.
 
 Restore by stopping gos3, replacing the directory contents (keep the owner and
 mode 0700) and starting it again. The restored server keeps its server ID,
@@ -313,6 +331,18 @@ example `rclone sync gos3:bucket backup:bucket` or
 suitable flags, versions) to any S3 service or disk. It does not include IAM
 users, policies, bucket configurations or object lock state, so also back up
 `.gos3/iam.json` and `.gos3/settings.json` (both secret or private).
+gos3 can do this itself: a [mirror job](jobs.md) keeps a bucket copied
+into another bucket, on another disk, an S3 service or another gos3
+server (through an s3 backing), with its versions, metadata, object lock
+and bucket configuration.
+
+**3. Restic snapshots.** [Whole-bucket snapshots](encryption.md#whole-bucket-snapshots)
+back a bucket up on a schedule into a restic repository, with retention,
+as files plus a manifest of keys and metadata, which `restic restore`
+reads without gos3. The [per-version archive](encryption.md#archiving-every-write)
+keeps every version written to a bucket. Both live on the bucket's own
+backing unless a snapshot schedule names another one, so combine them
+with an off-site copy of that backing.
 
 ## Lifecycle worker
 
@@ -347,6 +377,73 @@ after `LastModified + Days`. A pass starts at startup and then repeats
 worker off or change the interval at runtime in Settings
 (`lifecycle.enabled`, `lifecycle.intervalSeconds`); the change applies
 immediately. Each action and a summary per pass are logged.
+
+## Jobs and restic snapshots
+
+Copy and mirror [jobs](jobs.md), and the snapshots, restores and prunes of
+[whole-bucket restic snapshots](encryption.md#whole-bucket-snapshots), run
+in the background, at most `jobs.workers` (default 2) at a time (see
+[configuration.md](configuration.md#jobs-and-restic-snapshots)). They are
+kept in `.gos3/jobs/jobs.json` and survive restarts: a job interrupted by
+a shutdown or crash continues from its last checkpoint at the next start.
+Finished jobs stay in the history for 30 days (at most 200).
+
+Snapshot, restore and prune jobs also wait for one of the
+`restic.snapshots.workers` (default 1) before they run restic, in the phase
+`waiting`, and hold their job worker while they wait. With the defaults a
+second snapshot job therefore occupies the other job worker until the
+first one finishes, and copy jobs queue behind both; raise `jobs.workers`
+when many buckets have snapshot schedules.
+
+Monitoring:
+
+- The web UI's **Jobs** page, or `GET /_gos3/admin/v1/jobs?state=failed`
+  (and `state=waiting` with a `lastError` for jobs retrying a failure),
+  needs `admin:ListJobs` (granted by the built-in `diagnostics` policy).
+  A mirror's `lagSeconds` and `pending` show how far its target is behind.
+- `GET /_gos3/admin/v1/buckets/{name}/restic/snapshots` reports each
+  snapshot schedule's last attempt, last success, last error and next run.
+- The log has a line per job event, with `job` and `kind`: `job submitted`
+  and `job succeeded` at info level, `job run failed; will retry` and
+  `job failed` at warn level with the error; the admin API also logs who
+  created, paused, resumed, canceled, ran or deleted a job. A failing run
+  is retried with a growing delay (at most every 5 minutes) until it
+  succeeds or the job is paused or canceled, so alert on warnings that
+  repeat for the same job. Problems that did not fail a job (a skipped
+  policy, a failed retention or prune) are in its status's `warnings`.
+- There are no Prometheus metrics for jobs yet.
+
+### Restic snapshot stage
+
+Each snapshot run builds its tree in the stage directory
+(`restic.snapshots.stage_dir`, default `.gos3/restic-stage/` in the system
+directory), one subdirectory per repository and bucket, kept between runs
+(see [How a run works](encryption.md#how-a-run-works)). Without a system
+directory each server process uses a private stage in the temporary
+directory.
+
+- **Plain text**: while a run copies objects into the stage, their content
+  is there unencrypted until restic has stored it. Between runs, and after
+  a failed run, the stage holds only placeholders; a bucket's stage is
+  removed when its snapshot schedule is deleted. Keep the stage on a
+  private local file system (mode 0700), like the data directory.
+- **Space**: objects that did not change since the previous snapshot are
+  sparse placeholders that take no space; new and changed objects take
+  their full size until they are in a snapshot. A run needs about
+  `restic.snapshots.spool_bytes` (8 GiB by default, at least 64 MiB) plus
+  the largest object, however large the bucket; lower the setting on small
+  disks (more partial snapshots per run), or raise it to make fewer.
+- **Inodes**: every key of the bucket is a file in the stage, plus a
+  directory per "folder". A bucket with ten million keys needs ten million
+  inodes there; check `df -i` on file systems with a fixed inode count
+  (ext4), or put the stage on one without (XFS, btrfs, ZFS).
+- **File system**: it must keep sparse files and file times exactly (ext4,
+  XFS, btrfs, ZFS and NTFS do; some network file systems do not). If
+  verification keeps failing, set `restic.snapshots.incremental: false`,
+  which writes every object at every run.
+- The stage may be deleted while no snapshot runs; the next run rebuilds
+  it from the newest snapshot's manifest. Restic's own cache and temporary
+  files come on top.
 
 ## Compression
 
@@ -416,7 +513,9 @@ archives, which the default skip list leaves alone.
 
 SIGTERM or SIGINT stops accepting connections, lets in-flight requests finish
 for up to `server.shutdown_timeout` (30 s), then stops discovery (sending a
-beacon "bye"), the lifecycle worker and the storage backend. A second signal
+beacon "bye"), the lifecycle worker, the background jobs (a running copy,
+mirror pass or snapshot is interrupted and continues from its checkpoint
+at the next start) and the storage backend. A second signal
 exits immediately. `/_gos3/ready` returns 503 during shutdown. Give the process
 manager a longer stop timeout than `shutdown_timeout`; the systemd unit uses
 45 s, as does the Kubernetes manifest's `terminationGracePeriodSeconds`.
@@ -451,6 +550,21 @@ usage counts that reach one of them fail for the whole bucket:
 
 Otherwise restore the backup. Runtime
 settings in `settings.json` and IAM data in `iam.json` are kept across upgrades.
+
+Copy jobs and restic snapshots add state that earlier versions ignore:
+
+- A bucket that [archives every write](encryption.md#archiving-every-write)
+  (restic scope `all`) archives only SSE writes after a rollback to a
+  version without scopes; other writes are stored unencrypted again.
+  Versions archived so far stay readable.
+- `jobs/`, `restic-snapshots.json` and the buckets' `restic-snapshots`
+  configuration documents are not read by earlier versions: jobs and
+  snapshot schedules stop until the newer version runs again, which
+  resumes them. Whole-bucket snapshots and aux repositories stay in their
+  repositories.
+- `jobs.json` records a format version; a gos3 version with jobs that does
+  not know that format (one written by a later version) refuses to start
+  rather than overwrite it.
 
 Development builds before the s3 backend kind configured remote storage
 differently: a `restic_s3` block on fs backings (restic repositories on an
@@ -493,5 +607,11 @@ upgrading if you may need to roll back. See
 | s3 backing: `prefix in use by another server` | Another gos3 server runs on the same home or container. After a crash, the next start waits until the old lease is 30 s old. |
 | s3 backing: `the S3 service does not support conditional writes` | The service ignores `If-None-Match` / `If-Match` on PUT; gos3 cannot use it for an s3 backing. |
 | s3 backing: `encryption key does not match this backing` | The configured `encryption_key` differs from the one the backing's keys are wrapped with; configure the original key. |
+| Creating a copy or mirror job is refused because "the source holds … -encrypted data", or the job fails with "the copy would store encrypted data unencrypted" | The source holds AES256 or restic versions and the target cannot store them encrypted (a native bucket, a memory backing, an s3 backing without an encryption key). Choose another target, `encryption: "target"`, or allow plaintext copies (`allowPlaintext`). See [jobs.md](jobs.md#what-is-copied-with-each-version). |
+| Creating a job is refused because "the source bucket … has object lock and the target has none" | Create the target with object lock, or copy without retention (`dropRetention`). |
+| A job is refused with `409` "the target … is not empty" | The target range holds versions, delete markers or multipart uploads; choose an empty target, or `onExisting: "merge"` (or `"adopt"` for a mirror). |
+| A job reports conflicts | Target versions under retention or legal hold that the job would delete or replace, or keys too long for the target prefix; the job leaves them alone. `conflictSamples` names some. |
+| A whole-bucket snapshot run fails verification | restic read placeholder files in the stage (a stage file system that does not keep sparse files or file times exactly). Move `restic.snapshots.stage_dir`, or set `restic.snapshots.incremental: false`. See [above](#restic-snapshot-stage). |
+| Writes to a restic bucket wait or fail during a prune | Prune holds the repository's exclusive lock; schedule it for a quiet time or turn it off for that bucket ([encryption.md](encryption.md#prune)). |
 | Peers show `unverified` with a TLS error | The peer uses a certificate that this server does not trust. |
 | Configuration changes have no effect | `settings.json` overrides them for runtime keys; see [configuration.md](configuration.md#runtime-settings-settingsjson). |

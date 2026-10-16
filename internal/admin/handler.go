@@ -19,8 +19,10 @@ import (
 	"github.com/seanmmitchell/gos3/internal/clientip"
 	"github.com/seanmmitchell/gos3/internal/discovery"
 	"github.com/seanmmitchell/gos3/internal/iam"
+	"github.com/seanmmitchell/gos3/internal/jobs"
 	"github.com/seanmmitchell/gos3/internal/s3err"
 	"github.com/seanmmitchell/gos3/internal/storage"
+	"github.com/seanmmitchell/gos3/internal/storage/restic"
 	"github.com/seanmmitchell/gos3/internal/storage/s3account"
 	"github.com/seanmmitchell/gos3/internal/storage/s3store"
 )
@@ -217,6 +219,16 @@ func (a *api) routes() []route {
 		{"POST", "/buckets/{name}/placement/resync", "UpdateBucketPlacement", bucket, a.resync},
 		{"GET", "/buckets/{name}/encryption-provider", "GetBucketEncryption", bucket, a.getBucketEncryption},
 		{"PUT", "/buckets/{name}/encryption-provider", "PutBucketEncryption", bucket, a.putBucketEncryption},
+		{"GET", "/buckets/{name}/restic", "GetBucketEncryption", bucket, a.getResticInfo},
+		{"POST", "/buckets/{name}/restic/credentials", "GetResticCredentials", bucket, a.getResticCredentials},
+		// Whole-bucket restic snapshots
+		{"GET", "/buckets/{name}/restic/snapshots", "GetBucketSnapshots", bucket, a.getSnapshots},
+		{"POST", "/buckets/{name}/restic/snapshots", "RunBucketSnapshot", bucket, a.runSnapshot},
+		{"PUT", "/buckets/{name}/restic/snapshots/config", "PutBucketSnapshots", bucket, a.putSnapshotConfig},
+		{"DELETE", "/buckets/{name}/restic/snapshots/config", "PutBucketSnapshots", bucket, a.deleteSnapshotConfig},
+		{"DELETE", "/buckets/{name}/restic/snapshots/{id}", "PutBucketSnapshots", bucket, a.forgetSnapshot},
+		{"POST", "/buckets/{name}/restic/snapshots/{id}/restore", "RestoreBucketSnapshot", bucket, a.restoreSnapshot}, // + CreateCopyJob on the target
+		{"POST", "/buckets/{name}/restic/prune", "PutBucketSnapshots", bucket, a.pruneSnapshots},
 		{"GET", "/buckets/{name}/compression", "GetBucketCompression", bucket, a.getBucketCompression},
 		{"PUT", "/buckets/{name}/compression", "PutBucketCompression", bucket, a.putBucketCompression},
 		{"DELETE", "/buckets/{name}/compression", "PutBucketCompression", bucket, a.deleteBucketCompression},
@@ -228,6 +240,16 @@ func (a *api) routes() []route {
 		{"PUT", "/backings/{name}/containers/default", "ManageContainers", backing, a.setDefaultContainer},
 		{"DELETE", "/backings/{name}/containers/{id}", "ManageContainers", backing, a.removeContainer},
 		{"POST", "/backings/{name}/buckets", "CreateBucket", inHandler, a.createBucketOnBacking}, // bucket/<body bucket>, + backing actions
+		// Jobs (GetJob and UpdateJob on the job's buckets, see authorizedJob)
+		{"GET", "/jobs", "ListJobs", service, a.listJobs},
+		{"POST", "/jobs", "CreateCopyJob", inHandler, a.createJob}, // bucket/<source> and bucket/<target>
+		{"GET", "/jobs/{id}", "GetJob", inHandler, a.getJob},
+		{"DELETE", "/jobs/{id}", "UpdateJob", inHandler, a.deleteJob},
+		{"POST", "/jobs/{id}/pause", "UpdateJob", inHandler, a.updateJob("paused", pauseJob)},
+		{"POST", "/jobs/{id}/resume", "UpdateJob", inHandler, a.updateJob("resumed", resumeJob)},
+		{"POST", "/jobs/{id}/cancel", "UpdateJob", inHandler, a.updateJob("canceled", cancelJob)},
+		{"POST", "/jobs/{id}/run", "UpdateJob", inHandler, a.updateJob("run", runJob)},
+		{"GET", "/buckets/{name}/jobs", "GetJob", bucket, a.listBucketJobs},
 		// Discovery
 		{"GET", "/discovery", "GetDiscovery", service, a.getDiscovery},
 		{"POST", "/discovery/probe", "ProbeNetwork", service, a.probe},
@@ -538,10 +560,23 @@ func (a *api) toAPIError(err error) *apiError {
 	msg = strings.TrimPrefix(msg, "storage: ")
 	msg = strings.TrimPrefix(msg, "multi: ")
 	msg = strings.TrimPrefix(msg, "s3account: ")
+	msg = strings.TrimPrefix(msg, "jobs: ")
+	msg = strings.TrimPrefix(msg, "restic: ")
 	if pe := placementError(err, msg); pe != nil {
 		return pe
 	}
 	switch {
+	// jobs and restic (before storage: a runner may wrap a storage error
+	// in an invalid spec)
+	case errors.Is(err, jobs.ErrInvalidSpec), errors.Is(err, jobs.ErrUnknownKind),
+		errors.Is(err, restic.ErrForgetRefused):
+		return errorf(http.StatusBadRequest, codeInvalidRequest, "%s", msg)
+	case errors.Is(err, jobs.ErrConflict):
+		return errorf(http.StatusConflict, codeConflict, "%s", msg)
+	case errors.Is(err, jobs.ErrNotFound), errors.Is(err, restic.ErrSnapshotNotFound):
+		return errorf(http.StatusNotFound, codeNotFound, "%s", msg)
+	case errors.Is(err, jobs.ErrClosed):
+		return errorf(http.StatusServiceUnavailable, codeInternalError, "%s", msg)
 	// iam (order matters: some errors wrap others)
 	case errors.Is(err, iam.ErrUserNotFound), errors.Is(err, iam.ErrKeyNotFound), errors.Is(err, iam.ErrPolicyNotFound):
 		return errorf(http.StatusNotFound, codeNotFound, "%s", msg)
@@ -579,7 +614,15 @@ func (a *api) toAPIError(err error) *apiError {
 		// whose service does not answer), or one bucket's remote location
 		// (storage.ErrBucketUnavailable, e.g. a container still loading).
 		return errorf(http.StatusServiceUnavailable, codeInternalError, "%s", msg)
-	case errors.Is(err, storage.ErrInvalidTarget), errors.Is(err, storage.ErrNotSupported):
+	case errors.Is(err, storage.ErrEncryptionUnavailable):
+		// A bucket's keys or restic installation or repository cannot
+		// serve the request now (restic missing, a repository locked or
+		// unreachable).
+		return errorf(http.StatusServiceUnavailable, codeInternalError, "%s", msg)
+	case errors.Is(err, storage.ErrInvalidTarget), errors.Is(err, storage.ErrNotSupported),
+		errors.Is(err, errors.ErrUnsupported):
+		// ErrUnsupported: e.g. a bucket whose backing keeps no restic
+		// repository.
 		return errorf(http.StatusBadRequest, codeInvalidRequest, "%s", msg)
 	case errors.Is(err, storage.ErrRemoteDenied), errors.Is(err, storage.ErrRemoteRejected):
 		// The remote service refused what the backing's credentials asked

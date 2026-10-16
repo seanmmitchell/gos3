@@ -47,6 +47,15 @@ type capabilities struct {
 	CreateRemote     bool `json:"createRemote"`     // admin:CreateRemoteBucket
 	AdoptRemote      bool `json:"adoptRemote"`      // admin:AdoptRemoteBucket
 	ManageContainers bool `json:"manageContainers"` // admin:ManageContainers
+	// Background jobs and restic (granted on every bucket: a grant on
+	// arn:gos3:admin:::bucket/<name> does not show).
+	ViewJobs                bool `json:"viewJobs"`                // admin:ListJobs
+	ManageJobs              bool `json:"manageJobs"`              // admin:CreateCopyJob
+	ManageSnapshots         bool `json:"manageSnapshots"`         // admin:PutBucketSnapshots
+	RevealResticCredentials bool `json:"revealResticCredentials"` // admin:GetResticCredentials
+	RunSnapshots            bool `json:"runSnapshots"`            // admin:RunBucketSnapshot
+	RestoreSnapshots        bool `json:"restoreSnapshots"`        // admin:RestoreBucketSnapshot
+	UpdateJobs              bool `json:"updateJobs"`              // admin:UpdateJob
 }
 
 // adminActions are every admin:* action used by the API; "admin" in
@@ -60,6 +69,8 @@ var adminActions = []string{
 	"GetBucketCompression", "PutBucketCompression", "GetBucketEncryption", "PutBucketEncryption",
 	"ListBackings", "GetBucketPlacement", "UpdateBucketPlacement",
 	"ListRemoteBuckets", "CreateRemoteBucket", "AdoptRemoteBucket", "ManageContainers",
+	"ListJobs", "GetJob", "UpdateJob", "CreateCopyJob",
+	"GetResticCredentials", "GetBucketSnapshots", "PutBucketSnapshots", "RunBucketSnapshot", "RestoreBucketSnapshot",
 	"GetDiscovery", "ScanNetwork", "ProbeNetwork",
 }
 
@@ -107,6 +118,14 @@ func (a *api) whoami(rc *reqCtx) (int, any, error) {
 			CreateRemote:      allowed["CreateRemoteBucket"],
 			AdoptRemote:       allowed["AdoptRemoteBucket"],
 			ManageContainers:  allowed["ManageContainers"],
+			ViewJobs:          allowed["ListJobs"],
+			ManageJobs:        allowed["CreateCopyJob"],
+			ManageSnapshots:   allowed["PutBucketSnapshots"],
+			// The repository passwords: the UI offers "reveal" only then.
+			RevealResticCredentials: allowed["GetResticCredentials"],
+			RunSnapshots:            allowed["RunBucketSnapshot"],
+			RestoreSnapshots:        allowed["RestoreBucketSnapshot"],
+			UpdateJobs:              allowed["UpdateJob"],
 			// Root has no IAM keys to manage (POST /whoami/keys answers 400).
 			CreateOwnKeys: !rc.id.IsRoot && a.authorize(rc, actionCreateOwnKey, "", nil).Allowed,
 		},

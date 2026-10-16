@@ -33,8 +33,8 @@ Base path: `/_gos3/admin/v1` on the S3 listener. JSON in/out
   [Resources and condition keys](#resources-and-condition-keys)). Root is
   always allowed; the built-in `admin` policy allows all; `diagnostics`
   allows `ServerInfo`, `GetStats`, `GetDiscovery`, `ListBackings`,
-  `GetBucketPlacement` (not `ProbeNetwork` or
-  `ScanNetwork`).
+  `GetBucketPlacement`, `ListJobs`, `GetJob`, `GetBucketSnapshots` (not
+  `ProbeNetwork`, `ScanNetwork` or `GetResticCredentials`).
 - Endpoints marked *any* only require a valid (non-anonymous) identity.
   `DELETE /whoami/keys/{accessKey}` is refused with 403 `AccessDenied` only
   when an explicit Deny matches `admin:DeleteOwnAccessKey` (a Deny of
@@ -65,7 +65,7 @@ ARNs, policy variables such as `${aws:username}` included):
 |---|---|
 | `arn:gos3:admin:::user/<name>` | CreateUser (the new user's name), GetUser, UpdateUser, DeleteUser, CreateAccessKey (the target user; choosing the access key ID also needs it at service level), UpdateAccessKey / DeleteAccessKey (the key's owner; an unknown key is evaluated at service level) |
 | `arn:gos3:admin:::policy/<name>` | GetPolicy, PutPolicy, DeletePolicy |
-| `arn:gos3:admin:::bucket/<name>` | GetBucket, CreateBucket, ForceDeleteBucket, ReleaseBucket, GetBucketCompression, PutBucketCompression, GetBucketEncryption, PutBucketEncryption, GetBucketPlacement, UpdateBucketPlacement |
+| `arn:gos3:admin:::bucket/<name>` | GetBucket, CreateBucket, ForceDeleteBucket, ReleaseBucket, GetBucketCompression, PutBucketCompression, GetBucketEncryption, PutBucketEncryption, GetBucketPlacement, UpdateBucketPlacement, GetResticCredentials, GetBucketSnapshots, PutBucketSnapshots, RunBucketSnapshot, RestoreBucketSnapshot; CreateCopyJob, GetJob, UpdateJob (the job's source and target buckets) |
 | `arn:gos3:admin:::backing/<name>` | ListRemoteBuckets, CreateRemoteBucket, AdoptRemoteBucket, ManageContainers (s3 backings, see [Remote buckets and containers](#remote-buckets-and-containers-s3-backings)) |
 | service level | every other action (list actions, config, stats, discovery, simulate, self-service) |
 
@@ -105,7 +105,11 @@ Non-2xx responses: `{"error": {"code": "<Code>", "message": "<text>"}}`.
 | 429 | `TooManyRequests` (`POST /discovery/scan`: 2 scans, or `POST /discovery/probe`: 4 probes, are already running on this server) |
 | 500 | `InternalError` |
 | 502 | `ProbeFailed` (`POST /discovery/probe`: the target did not answer as a gos3 server; the message ends in `unreachable`, `timed out`, `HTTP <status>` or `not a gos3 server`) |
-| 503 | `InternalError` (request canceled or timed out, or a storage backing that cannot be reached, e.g. an s3 backing whose service does not answer or that is still loading; also an unknown bucket name while a backing that could not be listed at startup is pending adoption) |
+| 503 | `InternalError` (request canceled or timed out, or a storage backing that cannot be reached, e.g. an s3 backing whose service does not answer or that is still loading; also an unknown bucket name while a backing that could not be listed at startup is pending adoption; a bucket's encryption keys or restic installation or repository that cannot serve the request) |
+
+Endpoints of a feature this server does not run (background jobs, copy
+job dry runs, whole-bucket snapshots) answer 404 `NotFound` with a message
+saying so, after authorization.
 
 ## Endpoints
 
@@ -143,7 +147,14 @@ Non-2xx responses: `{"error": {"code": "<Code>", "message": "<text>"}}`.
     "browseRemote": false,    // admin:ListRemoteBuckets
     "createRemote": false,    // admin:CreateRemoteBucket
     "adoptRemote": false,     // admin:AdoptRemoteBucket
-    "manageContainers": false // admin:ManageContainers
+    "manageContainers": false, // admin:ManageContainers
+    "viewJobs": false,        // admin:ListJobs
+    "manageJobs": false,      // admin:CreateCopyJob
+    "manageSnapshots": false, // admin:PutBucketSnapshots
+    "revealResticCredentials": false, // admin:GetResticCredentials
+    "runSnapshots": false,    // admin:RunBucketSnapshot
+    "restoreSnapshots": false, // admin:RestoreBucketSnapshot
+    "updateJobs": false       // admin:UpdateJob
   },
   "server": Info,             // same as GET /_gos3/info
   "backings": {               // storage backings a new bucket can be put on (x-gos3-backing),
@@ -319,8 +330,10 @@ stores. See [operations.md](operations.md#compression).
 
 | Method | Path | Action | Response |
 |---|---|---|---|
-| GET | `/buckets/{name}/encryption-provider` | GetBucketEncryption | `{"provider":"AES256"\|"restic", "available":["AES256","restic"], "backings":["default",…]}` |
-| PUT | `/buckets/{name}/encryption-provider` | PutBucketEncryption | body `{"provider":"AES256"\|"restic"}`; prepares the provider, then saves it and returns the GET document |
+| GET | `/buckets/{name}/encryption-provider` | GetBucketEncryption | `{"provider":"AES256"\|"restic", "scope":"sse"\|"all", "available":["AES256","restic"], "backings":["default",…]}` |
+| PUT | `/buckets/{name}/encryption-provider` | PutBucketEncryption | body `{"provider":"AES256"\|"restic", "scope"?:"sse"\|"all"}`; prepares the provider, then saves it and returns the GET document. `scope: "all"` (restic only) archives **every** write in the bucket's restic repository, not only writes that request SSE (the per-version restic archive toggle); default `sse` |
+| GET | `/buckets/{name}/restic` | GetBucketEncryption | `ResticInfo`: where the bucket's restic data lives and how to recover it without gos3 (no secrets) |
+| POST | `/buckets/{name}/restic/credentials` | GetResticCredentials | body (optional) `{"backing"?: "<name>", "purpose"?: "archive"\|"snapshots"}` → `ResticCredentials` (the repository password and environment for the `restic` CLI). `purpose` defaults to `archive`, the archive of the copy on `backing` (default: the primary); `backing` is refused with `snapshots` (400: the bucket has one snapshot repository). Every disclosure is logged at Warn with the caller, access key, client address, bucket, backing and purpose (never the secrets). 404 when the bucket has no repository of that purpose on that backing (none yet, none at all, or a backing holding no copy of the bucket); 503 when the repository cannot be reached; other failures are 500 without their cause (which is logged) |
 
 The provider is the bucket's implementation of SSE-S3: it applies to bucket
 default encryption and to uploads that request `AES256`. Provider actions use
@@ -328,7 +341,9 @@ default encryption and to uploads that request `AES256`. Provider actions use
 secret fields are rejected (naming the field), since restic derives its
 repositories from each assigned backing.
 
-`available` lists the providers the bucket can use now, the ones every
+`available` is always sent: `[]` when the bucket can use no provider, and
+`null` only when the storage backend cannot tell which providers it can
+store. It lists the providers the bucket can use now, the ones every
 backing holding a copy of the bucket (primary, replicas and a move target)
 can store: `AES256` needs every copy on an s3 backing to be a wrapped bucket
 of a backing with an encryption key; `restic` needs the restic executable on
@@ -351,6 +366,49 @@ with the bucket.
 Restic repositories follow the bucket's backings and have no settings of
 their own: an fs backing keeps them in its data directory, an s3 backing in
 the container holding the (wrapped) bucket.
+
+`scope` is always returned (`sse` when the stored document has none); the
+stored document leaves out the default `sse`, so builds that predate scopes
+read it unchanged. `scope: "all"` with `AES256`, or an unknown scope, is
+400 and changes nothing.
+
+`GET /buckets/{name}/restic` describes repositories as they are and never
+creates one. A copy whose repository cannot be described has `"info":
+null` and an `error`: `not created yet: …` (the bucket's first restic
+write creates it), `no repository: …` (a backing that keeps no restic
+repositories, e.g. memory, or a native bucket), or the backing's error.
+`tags.bucketId` is the primary's bucket ID tag, omitted until its
+repository exists (each backing has its own bucket ID). `snapshots` and
+`snapshotRepository` are null when the bucket has no snapshot schedule or
+the server has no whole-bucket snapshots; `snapshotsError` (omitted when
+empty) says why they could not be read. A stored provider document that is
+not valid fails the request with 500, as for `GET …/encryption-provider`.
+
+```jsonc
+// ResticInfo (GET /buckets/{name}/restic)
+{ "settings": { "provider": "restic", "scope": "all" },   // the bucket's encryption provider document
+  "archive": [                    // per copy of the bucket: its per-version archive repository
+    { "backing": "default", "role": "primary" | "replica" | "move-target",
+      "info": { "bucketId": "…", "repository": "/data/.gos3/restic/<id>" | "s3:https://…/bucket/prefix/restic/<id>",
+                "recordLocation": "…", "passwordSource": "…", "initialized": true,
+                "envNames": ["AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY"], "options": ["s3.bucket-lookup=path"] },
+      "error": "" } ],            // e.g. "no repository: …" for native buckets (info is then null)
+  "snapshots": SnapshotConfig | null,          // whole-bucket snapshot schedule (see below)
+  "snapshotRepository": RepositoryInfo | null, // where whole-bucket snapshots go
+  "snapshotsError"?: "…",                      // why the two above could not be read
+  "tags": { "object": "gos3-object", "bucket": "gos3-bucket:<b64url name>", "bucketId": "gos3-bucket-id:<id>",
+            "snapshot": "gos3-snapshot" } }   // restic tags gos3 uses (for `restic snapshots --tag …`)
+
+// ResticCredentials (POST /buckets/{name}/restic/credentials)
+{ "backing": "default",           // snapshots: the backing the schedule's target names (omitted when unknown)
+  "purpose": "archive", "repository": "…", "password": "…",
+  "env": { "AWS_ACCESS_KEY_ID": "…", "AWS_SECRET_ACCESS_KEY": "…" }, // {} when none
+  "options": ["s3.region=eu-central-1"] }
+```
+
+Per-version archive snapshots (tag `gos3-object`) are read by gos3 while
+the objects exist: never forget or prune them by hand (see
+[encryption.md](encryption.md)).
 
 ### Storage backings and bucket placement
 
@@ -591,6 +649,166 @@ a container is not loaded. A taken gos3 bucket name is refused before
 anything is done remotely; when the bucket cannot be created after
 `newContainer` was added, the container stays registered and the message
 names it: retry with `container`.
+
+### Jobs: copy and mirror
+
+Background **jobs** copy one bucket into another (any backings, any kinds,
+different names) once (`copy`) or continuously (`mirror`), and run restic
+snapshots and restores (see below). Jobs survive restarts (`jobs.json` in
+the system directory; in memory without one) and report progress. See
+[jobs.md](jobs.md).
+
+| Method | Path | Action | Response |
+|---|---|---|---|
+| GET | `/jobs?kind=&state=&bucket=` | ListJobs | `{"jobs": Job[]}`, newest first; `bucket` matches the source or target bucket |
+| POST | `/jobs` | CreateCopyJob on **both** `bucket/<source>` and `bucket/<target>` | body `CopyJobSpec` → 201 `Job`; with `"dryRun": true` → 200 `{"spec": CopyJobSpec, "warnings": ["…"]}` (validated and normalized, nothing created) |
+| GET | `/jobs/{id}` | GetJob on `bucket/<source>` and `bucket/<target>` | `Job` |
+| POST | `/jobs/{id}/pause` \| `/resume` \| `/cancel` \| `/run` | UpdateJob on `bucket/<source>` and `bucket/<target>` | `Job`. `run` starts a waiting job (a mirror pass, a retry) now; on a queued or running job it does nothing (a running mirror makes another pass right after this one), on a paused or finished job it is 409; `resume` also retries a failed job from its checkpoint |
+| DELETE | `/jobs/{id}` | UpdateJob (as above) | 204; 409 unless the job is finished (succeeded, failed or canceled) |
+| GET | `/buckets/{name}/jobs` | GetJob on `bucket/<name>` | `{"jobs": Job[]}`: jobs whose source or target is the bucket (also after it was deleted), newest first, `kind` and `state` filters as for `/jobs`; only the jobs the caller may also get by ID (GetJob on their other bucket) |
+
+A job's buckets are its `labels`: `source` and `target` (copy, mirror,
+restore jobs) or `bucket`. They are what `bucket=` filters on and what
+GetJob and UpdateJob are evaluated against (every one of them; a job
+without bucket labels at service level). An unknown job ID is evaluated at
+service level too, so a caller whose grants name buckets gets 403 rather
+than telling unknown IDs from other buckets' jobs. `POST /jobs` evaluates
+CreateCopyJob on both buckets before it validates anything else; only
+kinds `copy` and `mirror` can be submitted (other kinds 400: restic jobs
+come from the snapshot endpoints). `dryRun` (matched like any member,
+case-insensitively) is removed from the spec the job keeps. Responses
+never include a job's checkpoint. `state=` must be a job state (400
+otherwise).
+
+Errors: 400 `InvalidRequest` for an invalid spec (unknown fields, a bucket
+copied onto itself, an unknown backing or container, `onExisting: "adopt"`
+on a copy, `versions: "all"` to a
+target that cannot keep versions, encrypted data to a target that cannot
+store it without `allowPlaintext`, locked data to a target without object
+lock without `dropRetention`); 409 `Conflict` for a non-empty target with
+`onExisting: "fail"` (versions, delete markers and multipart uploads
+count), a target range overlapping that of another active job with
+`onExisting: "fail"`, a mirror cycle, a target of an active mirror, a
+mirror into the target of another active job, or a
+state change the job's state does not allow; 404 for unknown jobs.
+
+```jsonc
+// CopyJobSpec
+{ "kind": "copy" | "mirror",
+  "source": { "bucket": "photos", "prefix"?: "" },
+  "target": { "bucket": "photos-bak", "prefix"?: "",
+              "create"?: { "backing"?: "cold", "kind"?: "native" | "wrapped", "container"?: "c-7f3a",
+                           "remoteBucket"?: "acme-photos-bak", "objectLock"?: false } }, // create the target bucket
+  "options"?: {
+    "versions": "all" | "current",              // default: all when the target keeps versions, else current
+    "configs": "safe" | "all" | "none",         // bucket configuration to copy (default safe)
+    "onExisting": "fail" | "merge" | "adopt",   // existing target bucket: refuse unless empty (default),
+                                                //   copy without deleting, or (mirror only) take it over:
+                                                //   target keys the source lacks are deleted
+    "encryption": "preserve" | "target",        // keep each version's encryption, or use the target's settings
+    "allowPlaintext": false,                    // allow copying encrypted data to an unencrypted target
+    "dropRetention": false,                     // allow copying locked versions to a target without object lock
+    "compression": "preserve" | "target",
+    "propagateDeletes": true,                   // mirror: deletes in the source are applied to the target
+    "deleteExtraneous": false,                  // mirror: delete target keys the source does not have
+    "pollInterval": "5m",                       // mirror of a native source: how often to compare listings (>= 30s)
+    "verifyInterval": "24h",                    // mirror: full comparison besides change notifications (>= 1m)
+    "concurrency": 4,                           // keys copied in parallel (1-32)
+    "finalPass": true },                        // copy: compare again after the first pass
+  "dryRun"?: false }
+
+// Job
+{ "id": "…", "kind": "copy" | "mirror" | "restic-snapshot" | "restic-restore" | "restic-prune",
+  "state": "queued" | "running" | "waiting" | "paused" | "succeeded" | "failed" | "canceled",
+  "phase": "preparing" | "copying" | "verifying" | "watching" | "done"    // copy and mirror jobs
+         | "waiting" | "scanning" | "planning" | "staging" | "backing up" | "retention" | "pruning" | "…", // restic jobs
+  "createdBy": "alice", "createdAt": "…", "startedAt": "…", "updatedAt": "…", "finishedAt": "…", "nextRunAt": "…",
+  "lastError": "", "failures": 0,
+  "labels": { "source": "photos", "target": "photos-bak" },
+  "spec": { … },          // the normalized spec
+  "status": CopyStatus | SnapshotJobStatus }
+
+// CopyStatus
+{ "keysScanned": 0, "keysCopied": 0, "versionsCopied": 0, "bytesCopied": 0, "bytesDone": 0, "keysDeleted": 0,
+  "conflicts": 0, "conflictSamples": [ { "key": "k", "reason": "locked version" } ],
+  "totalKeys": 0, "totalBytes": 0, "bytesPerSecond": 0, "etaSeconds": 0,
+  "pending": 0, "lagSeconds": 0, "lastPassAt": "…", "nextPassAt": "…", "passes": 0,   // mirror
+  "errors": [ { "key": "k", "error": "…", "at": "…" } ],                               // last 20
+  "mode": "identity" | "fingerprint",          // how keys are compared (see jobs.md)
+  "warnings": [ "…" ] }                         // what the job skipped on purpose (e.g. a policy it cannot rewrite)
+```
+
+### Whole-bucket restic snapshots
+
+A bucket can be snapshotted on a schedule into a restic repository: each
+snapshot holds the bucket's objects as files plus a manifest
+(`gos3-manifest.jsonl`) and the bucket's configuration
+(`gos3-bucket.json`), so `restic restore` alone recovers the bucket's
+content (see [encryption.md](encryption.md#whole-bucket-snapshots)).
+
+| Method | Path | Action | Response |
+|---|---|---|---|
+| GET | `/buckets/{name}/restic/snapshots` | GetBucketSnapshots | `{"config": SnapshotConfig \| null, "status": SnapshotStatus, "repository": RepositoryInfo \| null, "snapshots": Snapshot[], "error"?: "…"}` (snapshots cached 30 s; `error` says why the repository or its snapshots could not be read, the rest of the document is still valid) |
+| PUT | `/buckets/{name}/restic/snapshots/config` | PutBucketSnapshots | body `SnapshotConfig` → `SnapshotConfig` (validated; the repository is prepared) |
+| DELETE | `/buckets/{name}/restic/snapshots/config` | PutBucketSnapshots | 204 (stops scheduling; existing snapshots stay; idempotent) |
+| POST | `/buckets/{name}/restic/snapshots` | RunBucketSnapshot | 202 `Job` (`restic-snapshot`); 409 while one runs for the bucket; 400 without a schedule |
+| DELETE | `/buckets/{name}/restic/snapshots/{id}` | PutBucketSnapshots | forgets one whole-bucket snapshot of this bucket → 204 (never a per-version archive snapshot: 400; `{id}` is the full snapshot ID, 64 lower-case hex digits; 404 for an unknown snapshot) |
+| POST | `/buckets/{name}/restic/snapshots/{id}/restore` | RestoreBucketSnapshot on the bucket, plus CreateCopyJob on the target | body `{"target": {"bucket": "photos-restored", "create"?: {…as CopyJobSpec}}, "prefix"?: "", "onExisting"?: "fail" \| "merge", "configs"?: "safe" \| "none"}` → 202 `Job` (`restic-restore`) |
+| POST | `/buckets/{name}/restic/prune` | PutBucketSnapshots | 202 `Job` (`restic-prune`): removes data no snapshot references (takes restic's exclusive lock: archive writes wait) |
+
+```jsonc
+// SnapshotConfig (bucket configuration document "restic-snapshots"; replicates with the bucket)
+{ "enabled": true,
+  "interval": "24h",          // between snapshots (1h-30d)
+  "at"?: "03:00",             // UTC time of day for intervals of 24h or more
+  "consistent": true,         // versioned buckets: the versions current at the snapshot's start
+  "prefix"?: "",              // only keys with this prefix
+  "retention": { "keepLast": 7, "keepHourly": 0, "keepDaily": 7, "keepWeekly": 4, "keepMonthly": 12,
+                 "keepYearly": 0, "keepWithin": "0s" },
+  "target": { "kind": "bucket" }                     // the bucket's own restic repository (fs and wrapped buckets)
+          | { "kind": "backing", "backing": "cold",  // an aux repository on that backing (any bucket;
+              "repo": "snap-…" },                    //   repo is generated on first PUT and read-only)
+  "prune": { "enabled": true, "interval": "168h", // 1h-366d
+             "default": true } }  // read-only on GET, echoed back on PUT: enabled was not chosen and
+                                  //   follows the bucket's archive (off while the encryption scope is "all");
+                                  //   a PUT without "default" (or false) makes enabled an explicit choice
+// Absent fields take the defaults shown (retention: keepLast 7, keepDaily 7, keepWeekly 4,
+// keepMonthly 12); the retention must keep something besides the newest snapshot, which is always kept.
+
+// SnapshotStatus
+{ "lastAttemptAt": "…", "lastSuccessAt": "…", "lastSnapshot": "<id>", "lastError": "", "nextRunAt": "…",
+  "running": "<job id>" }
+
+// Snapshot
+{ "id": "<64 hex>", "shortId": "…", "time": "…", "host": "gos3-snapshot", "tags": ["gos3-snapshot", "…"],
+  "paths": ["…"], "parent"?: "<id>",
+  "partial": false,           // always sent; true for a partial snapshot (tag gos3-partial)
+  "summary"?: { "filesNew": 0, "filesChanged": 0, "filesUnmodified": 0, "dirsNew": 0, "dirsChanged": 0,
+                "dirsUnmodified": 0, "dataAdded": 0, "totalFilesProcessed": 0, "totalBytesProcessed": 0 } }
+
+// SnapshotJobStatus (status of restic-snapshot / restic-restore / restic-prune jobs)
+{ "keys": 0, "bytes": 0, "materialized": 0, "partials": 0, "snapshot": "<id>", "forgotten": 0, "repository": "…",
+  "warnings": [ "…" ] }       // problems that did not fail the job (retention, prune, configuration a restore skipped)
+```
+
+The default target is `bucket` for buckets on fs backings and wrapped
+buckets of s3 backings, and otherwise an aux repository on the default
+backing when it can hold one (an fs backing with a system directory, an s3
+backing with a home and an encryption key); else the PUT must name a
+backing. Retention is applied by gos3 to this bucket's whole-bucket
+snapshots only (tags `gos3-snapshot` and the bucket's tag), never to
+per-version archive snapshots.
+
+The restore's `target.bucket` is read like the snapshot service reads the
+body, and CreateCopyJob on it is evaluated before the service validates the
+request. An unknown bucket is 404 on every snapshot endpoint.
+
+Identity capabilities (WhoAmI): `viewJobs` (admin:ListJobs), `manageJobs`
+(admin:CreateCopyJob), `updateJobs` (admin:UpdateJob), `manageSnapshots`
+(admin:PutBucketSnapshots), `runSnapshots` (admin:RunBucketSnapshot),
+`restoreSnapshots` (admin:RestoreBucketSnapshot), `revealResticCredentials`
+(admin:GetResticCredentials), evaluated at service level like the others. The built-in `diagnostics` policy allows
+ListJobs, GetJob and GetBucketSnapshots.
 
 ### Discovery
 | Method | Path | Action | Response |

@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import type { BreadcrumbItem, NavigationMenuItem } from '@nuxt/ui'
 import { useConnectionsStore } from '~/stores/connections'
-import { usersPageMode } from '~/components/admin/-capabilities'
+import { canViewJobs, usersPageMode } from '~/components/admin/-capabilities'
 
 const store = useConnectionsStore()
 const route = useRoute()
@@ -26,6 +26,7 @@ const serverItems = computed<NavigationMenuItem[]>(() => {
     if (caps.manageConfig) items.push({ label: 'Settings', icon: 'i-lucide-settings', to: appRoutes.settings(c.id) })
     // Backing pages (/servers/:id/backings/:name) belong to Storage.
     if (caps.viewStorage) items.push({ label: 'Storage', icon: 'i-lucide-hard-drive', to: appRoutes.storage(c.id), active: route.path.startsWith(`${appRoutes.server(c.id)}/backings/`) || undefined })
+    if (canViewJobs(c.kind, caps)) items.push({ label: 'Jobs', icon: 'i-lucide-list-checks', to: appRoutes.jobs(c.id) })
     if (caps.discovery) items.push({ label: 'Discovery', icon: 'i-lucide-radar', to: appRoutes.discovery(c.id) })
   }
   return items
@@ -42,6 +43,7 @@ const SECTION_LABELS: Record<string, string> = {
   policies: 'Policies',
   settings: 'Settings',
   storage: 'Storage',
+  jobs: 'Jobs',
   discovery: 'Discovery'
 }
 

@@ -15,6 +15,8 @@ import (
 //	meta/journal/<epoch:016x>/<seq:016x>   journal batches and seals (journal.go)
 //	meta/snapshots/<lsn:016x>-<epoch:016x> metadata snapshots (snapshot.go)
 //	data/, parts/, keys/, restic/, gateway/ object data and keys (backend)
+//	keys/aux/<name>.key, restic-aux/<name>/ aux restic repositories of
+//	                                       whole-bucket snapshots (restic_host.go)
 //
 // Numbers in keys are fixed-width lower-case hex, so the lexical order of
 // keys is their numeric order.
@@ -29,6 +31,7 @@ const (
 	partsDir       = "parts/"
 	keysDir        = "keys/"
 	resticDir      = "restic/"
+	resticAuxDir   = "restic-aux/"
 	gatewayDir     = "gateway/"
 	markerFormat   = 1
 	markerKind     = "s3"
@@ -39,7 +42,8 @@ const (
 // Errors of the metadata engine, besides those in options.go.
 var (
 	// ErrUnmanagedPrefix means the prefix holds backing data (meta/, data/,
-	// parts/, keys/, restic/ or gateway/ objects) but no gos3.json marker,
+	// parts/, keys/, restic/, restic-aux/ or gateway/ objects) but no
+	// gos3.json marker,
 	// so it is not opened (and no marker is created over it).
 	ErrUnmanagedPrefix = errors.New("s3store: prefix holds gos3 data but no gos3.json marker")
 	// ErrMarkerMismatch means the prefix's gos3.json marker does not

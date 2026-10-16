@@ -106,6 +106,11 @@ const (
 	// ConfigCompression is the gos3 bucket compression setting (JSON, see
 	// the admin API), not an S3 configuration.
 	ConfigCompression = "compression"
+	// ConfigResticSnapshots is the gos3 schedule of whole-bucket restic
+	// snapshots of a bucket (JSON, see internal/resticsnap and the admin
+	// API), not an S3 configuration. It replicates with the bucket's
+	// copies; copy jobs never copy it.
+	ConfigResticSnapshots = "restic-snapshots"
 )
 
 // BucketInfo describes a bucket.

@@ -6,7 +6,7 @@ one of three backend kinds:
 | Backend | Where buckets live | Needs | Notes |
 |---|---|---|---|
 | `fs` | files in a local directory (`<path>/.gos3/`) | a `path` | the default |
-| `memory` | the server's memory | nothing | lost on restart; no restic |
+| `memory` | the server's memory | nothing | lost on restart; no restic repository ([whole-bucket snapshots](encryption.md#whole-bucket-snapshots) go to another backing) |
 | `s3` | an account of a remote S3 service (AWS S3, MinIO, Cloudflare R2, another gos3, ...): **native** buckets in remote buckets of their own, **wrapped** buckets in gos3's format inside a container | an endpoint and credentials; a home bucket or `storage.path` (for its records); **no local data directory** | features depend on the [bucket kind](#bucket-kinds); one gos3 server per home and per container |
 
 An s3 backing is a connection to one account of an S3 service. Its buckets
@@ -31,7 +31,9 @@ the backing's shared container.
 
 A bucket's backing is chosen when it is created and can later be changed
 with a move (see [operations.md](operations.md#multiple-backings-and-replication)),
-except that native buckets can neither be moved nor receive copies.
+except that native buckets can neither be moved nor receive copies. Any
+bucket, native or not, can be copied or mirrored into another bucket on
+any backing with a [copy or mirror job](jobs.md).
 
 ## The default backing and additional backings
 
@@ -319,8 +321,9 @@ are gone.
 The home bucket must exist and the credentials must be able to read and
 write it. The home may share its bucket with other data under other
 prefixes, but give it a prefix of its own: a home prefix that holds gos3
-data (`meta/`, `data/`, `parts/`, `keys/`, `restic/` or `gateway/` objects)
-without a `gos3.json` marker is refused rather than mixed with.
+data (`meta/`, `data/`, `parts/`, `keys/`, `restic/`, `restic-aux/` or
+`gateway/` objects) without a `gos3.json` marker is refused rather than
+mixed with.
 
 ## Bucket kinds
 
@@ -332,8 +335,10 @@ without a `gos3.json` marker is refused rather than mixed with.
 | Versioning, object lock | the remote bucket's, passed through: remote version IDs and delete markers, retention enforced by the remote ([details](#native-buckets-versioning-and-object-lock)); not offered where the service lacks them | gos3's own, on any S3 service |
 | Bucket configuration (policy, CORS, lifecycle, tags, ACL, ...) | kept by gos3 in the backing's records; only versioning and object lock are set on the remote bucket | in the container |
 | Replicas and moves | no: a native bucket can neither be replicated nor moved, and replicas and move targets are never native | yes, like fs buckets; replicas and move targets on s3 backings are always wrapped buckets |
+| Copy and mirror jobs ([jobs.md](jobs.md)) | yes, as source and as target (copies get the remote's own version IDs) | yes, as source and as target |
 | Compression | no: data is stored as sent (the bucket's compression setting has no effect) | yes |
-| Native AES256, restic | no: AES256 uploads answer `501 NotImplemented` | yes, with the backing's encryption key |
+| Native AES256, restic (and the per-version restic archive) | no: AES256 uploads answer `501 NotImplemented` | yes, with the backing's encryption key |
+| [Whole-bucket restic snapshots](encryption.md#whole-bucket-snapshots) | yes, into an aux repository of a backing that can hold one (an fs backing, or an s3 backing with a home and an encryption key) | yes, into the bucket's own repository or an aux repository |
 | Deleting the gos3 bucket | must be empty (versions and delete markers count); deletes the remote bucket too only if gos3 created it | must be empty |
 | Releasing (gos3 forgets the bucket, the data stays) | yes (admin) | no: move or delete it |
 | How it comes to be | CreateBucket creates a new remote bucket; an administrator can adopt an existing one | CreateBucket in a container |
@@ -342,8 +347,8 @@ Choose **native** for data that other tools must keep reading and writing,
 or to bring existing remote buckets under gos3's IAM, policies, web UI and
 discovery. Choose **wrapped** for gos3's full feature set, replication and
 moves, encryption, or to keep many small buckets in one remote bucket. A
-bucket's kind cannot change; copy its objects into a bucket of the other
-kind instead.
+bucket's kind cannot change; copy it into a bucket of the other kind
+instead, with a [copy job](jobs.md#copy-jobs-replicas-and-moves).
 
 The kind of a new bucket is the backing's `default_kind` unless the
 request names one: CreateBucket's `x-gos3-bucket-kind` (or a container or
@@ -592,7 +597,13 @@ refusals (`403` on the bucket, a deleted bucket) make that bucket answer
   other is just another S3 client: overlay records and multipart uploads
   are per server.
 - No compression, AES256 or restic, no replicas and no moves (see
-  [Bucket kinds](#bucket-kinds)).
+  [Bucket kinds](#bucket-kinds)). [Copy and mirror jobs](jobs.md) copy
+  native buckets to other backings, and
+  [whole-bucket snapshots](encryption.md#whole-bucket-snapshots) back
+  them up into a restic repository on another backing. Copies out of a
+  native bucket detect changes from its listings, so metadata changed
+  without rewriting an object is not picked up
+  ([jobs.md](jobs.md#how-changes-are-detected)).
 
 ## How a container stores wrapped buckets
 
@@ -644,12 +655,14 @@ Every key is under `<prefix>` in the container's bucket:
 | `keys/<bucket-id>.key` | the bucket's AES master key, wrapped (encrypted) with the encryption key |
 | `keys/<bucket-id>.restic.json` | the bucket's restic recovery record (repository location; no password) |
 | `restic/<bucket-id>/` | the bucket's restic repository |
+| `keys/aux/<name>.key`, `keys/aux/<name>.restic.json` | home only: the key (wrapped with the encryption key) and recovery record (no password) of an aux restic repository |
+| `restic-aux/<name>/` | home only: an aux restic repository, holding [whole-bucket snapshots](encryption.md#whole-bucket-snapshots) of buckets without a repository of their own |
 | `gateway/parts/<namespace>/...` | home only: small parts of multipart uploads to native buckets, staged until completion |
 
 Do not change or delete these objects with other tools, and do not put
 other data under the prefix. gos3 refuses to open a prefix that holds
-`meta/`, `data/`, `parts/`, `keys/`, `restic/` or `gateway/` objects but no
-`gos3.json`, rather than mixing data.
+`meta/`, `data/`, `parts/`, `keys/`, `restic/`, `restic-aux/` or `gateway/`
+objects but no `gos3.json`, rather than mixing data.
 
 ### Requirements and limits
 
@@ -777,6 +790,13 @@ through the bucket's default encryption) answer `501 NotImplemented`.
   holds the repository location only. Restic needs the KEK, the backing's
   credentials, and the restic executable on the gos3 server (see
   [encryption.md](encryption.md)).
+- A backing with a home and an encryption key also keeps **aux
+  repositories** in its home (`<prefix>restic-aux/<name>`, each with a
+  random key wrapped with the KEK in `<prefix>keys/aux/<name>.key`). They
+  hold [whole-bucket snapshots](encryption.md#whole-bucket-snapshots) of
+  buckets that have no repository of their own, native buckets included,
+  and of buckets whose schedule names this backing. A backing without a
+  home cannot hold them. Native buckets have no per-version archive.
 - Local files: each s3 backing gets its own temporary directory under the
   operating system's temporary directory (`gos3-<backing>-*`), removed at
   shutdown. It holds upload spool files, restic's cache and restores of
@@ -836,7 +856,10 @@ prefix taken while gos3 is stopped. A copy of a running container can be
 inconsistent (a snapshot without the data it refers to). Native buckets
 hold ordinary objects that any S3 tool can back up; gos3 keeps their
 configuration, overlay records and in-progress multipart uploads in the
-backing's records.
+backing's records. gos3 can also keep copies itself: a
+[mirror job](jobs.md) into a bucket on another backing or service, or
+[whole-bucket snapshots](encryption.md#whole-bucket-snapshots) into a
+restic repository.
 
 Also back up, separately:
 

@@ -22,6 +22,50 @@ import (
 // A native bucket has neither: it can be neither replicated nor moved, and
 // copies are never stored in one.
 
+// BucketCaps implements storage.BucketCapabilities: a bucket can do what
+// its primary copy can (storage.CapsOf on the primary's backend), which
+// receives every write and import first; its replicas and move target were
+// checked when they were added (see checkNewMembers). Unknown buckets yield
+// storage.ErrBucketNotFound.
+//
+// The router implements storage.BucketCapabilities rather than leave
+// storage.CapsOf to its default: the router imports versions
+// (storage.VersionImporter) whatever its buckets are, so the default would
+// report every bucket, a native one too, as an import target.
+func (r *Router) BucketCaps(ctx context.Context, bucket string) (storage.BucketCaps, error) {
+	b, err := r.primary(bucket)
+	if err != nil {
+		return storage.BucketCaps{}, err
+	}
+	caps, err := storage.CapsOf(ctx, b.Backend, bucket)
+	if err != nil {
+		return storage.BucketCaps{}, r.observe(b, err)
+	}
+	return caps, nil
+}
+
+// NewBucketCaps implements storage.BucketCapabilities: the capabilities of
+// a bucket created with opts (see CreateBucket), as the backing it would be
+// created on reports them (storage.NewCapsOf on opts.Backing, or on the
+// default backing when it is empty; storage.ErrInvalidBacking for an
+// unknown backing). No I/O. The default replicas CreateBucket adds do not
+// change the result.
+func (r *Router) NewBucketCaps(ctx context.Context, opts storage.CreateBucketOptions) (storage.BucketCaps, error) {
+	if r.closed.Load() {
+		return storage.BucketCaps{}, ErrClosed
+	}
+	topology := r.topology.Load()
+	b := topology.def
+	if opts.Backing != "" {
+		if b = topology.backings[opts.Backing]; b == nil {
+			return storage.BucketCaps{}, fmt.Errorf("%w: %q", storage.ErrInvalidBacking, opts.Backing)
+		}
+	}
+	// The member backends do not know the router's backing names.
+	opts.Backing = ""
+	return storage.NewCapsOf(ctx, b.Backend, opts)
+}
+
 // importTarget returns nil when a bucket created on backing b with target
 // (nil: the backing's choice for copies) can receive copies, i.e. be a
 // replica or a move target, and else an ErrInvalidPlacement error saying

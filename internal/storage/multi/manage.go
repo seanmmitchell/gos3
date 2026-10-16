@@ -447,7 +447,18 @@ func (r *Router) CancelMove(ctx context.Context, bucket string) (PlacementStatus
 // follows DeleteBucket. The bucket must have a single copy (remove its
 // replicas first) and no move in progress (ErrConflict otherwise); a
 // backing that cannot release the bucket answers storage.ErrNotSupported.
+// The subscribers (see Subscribe) see the bucket deleted: the router no
+// longer has it.
 func (r *Router) ReleaseBucket(ctx context.Context, name string) error {
+	if err := r.releaseBucket(ctx, name); err != nil {
+		return err
+	}
+	r.emit(Change{Kind: ChangeBucketDeleted, Bucket: name})
+	return nil
+}
+
+// releaseBucket is ReleaseBucket without reporting the change.
+func (r *Router) releaseBucket(ctx context.Context, name string) error {
 	if r.closed.Load() {
 		return ErrClosed
 	}

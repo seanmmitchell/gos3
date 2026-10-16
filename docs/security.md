@@ -22,6 +22,10 @@ the settings to review before you expose a server.
       use, keep those buckets private, decide who may adopt remote buckets,
       and store each backing's encryption key somewhere safe (see
       [s3 backings](#s3-backings)).
+- [ ] Grant `admin:CreateCopyJob`, `admin:GetResticCredentials` and
+      `admin:RestoreBucketSnapshot` only to those who may read the buckets
+      concerned in full (see
+      [Copy jobs, snapshots and restic credentials](#copy-jobs-snapshots-and-restic-credentials)).
 - [ ] If metrics are public (`metrics.public`), restrict who can reach
       `/_gos3/metrics`.
 - [ ] Enable a standalone web UI's local discovery
@@ -153,7 +157,10 @@ cannot create a user with the `admin` policy and take its key.
 
 Built-in policies: `admin` (everything, including the admin API), `readwrite`
 (all S3 actions), `readonly`, `writeonly`, and `diagnostics` (server info,
-stats and discovery state in the admin API only; no probes or scans). Custom
+stats, discovery state, storage backings and placements, and the lists of
+jobs and whole-bucket snapshots in the admin API only: `ListJobs`,
+`GetJob`, `GetBucketSnapshots`; no probes or scans, no restic
+credentials). Custom
 policies use the IAM policy language; the admin API's `/authz/simulate`
 endpoint and the UI's policy simulator show which statement decides a
 request.
@@ -184,7 +191,9 @@ per-target resources (see
 as its owner), `arn:gos3:admin:::policy/<name>` for policy actions,
 `arn:gos3:admin:::bucket/<name>` for bucket actions (`admin:GetBucket`,
 `admin:CreateBucket`, `admin:ForceDeleteBucket`, `admin:ReleaseBucket`, the
-compression, encryption provider and placement actions) and
+compression, encryption provider, placement, restic and snapshot actions,
+and the job actions `admin:CreateCopyJob`, `admin:GetJob` and
+`admin:UpdateJob`, evaluated on a job's source and target buckets) and
 `arn:gos3:admin:::backing/<name>` for the remote buckets and containers of
 an s3 backing (`admin:ListRemoteBuckets`, `admin:CreateRemoteBucket`,
 `admin:AdoptRemoteBucket`, `admin:ManageContainers`; see
@@ -277,8 +286,11 @@ The data directory (default `./data`, `/data` in the container) holds:
 | `.gos3/s3/<backing>/` | records of an s3 backing without a home: its buckets and containers, the configuration of its native buckets, overlay metadata, staged small multipart parts | private (0700) |
 | `.gos3/meta.db` | bucket and object metadata, bucket policies and configurations (fs backend) | private (0600) |
 | `.gos3/data/`, `.gos3/uploads/` | object and part data | your data (files 0600) |
-| `.gos3/keys/` | bucket encryption keys and restic repository passwords (fs backend) | **secret** (0600) |
-| `.gos3/restic/`, `.gos3/restic-cache/` | restic repositories and cache (fs backend) | encrypted by restic |
+| `.gos3/keys/` | bucket encryption keys and restic repository passwords (fs backend), including the keys and passwords of aux repositories (`keys/aux/`) | **secret** (0600) |
+| `.gos3/restic/`, `.gos3/restic-aux/`, `.gos3/restic-cache/` | restic repositories (per-version archives and whole-bucket snapshots) and cache (fs backend) | encrypted by restic |
+| `.gos3/restic-stage/` | stage of whole-bucket snapshot runs: object contents in **plain text** while a run copies them, placeholders otherwise | your data (0700) |
+| `.gos3/jobs/` | copy and mirror jobs (bucket names, prefixes, options, progress) and each job's database of copied keys | private (0600) |
+| `.gos3/restic-snapshots.json` | the snapshot scheduler's state | private (0600) |
 | `.gos3/server-id` | random server ID | public |
 
 Keep the directory owned by the gos3 user with mode 0700, and treat backups as
@@ -314,7 +326,9 @@ service. What it keeps there:
   metadata, tags, policies and other bucket configuration, unencrypted),
   object data, wrapped encryption keys and restic repositories. The home
   also holds the backing's records: its buckets and containers, the
-  configuration of its native buckets and their overlay metadata. Anyone
+  configuration of its native buckets and their overlay metadata, and the
+  aux restic repositories with whole-bucket snapshots of other buckets
+  (encrypted by restic, their keys wrapped with the encryption key). Anyone
   who can read these locations can read the metadata and every
   unencrypted object; anyone who can write them can change or destroy the
   backing's buckets.
@@ -455,6 +469,84 @@ reference at startup; it moves them to `.gos3/orphans/` (deleted after 7
 days), so treat that directory like the rest of the data. It also refuses to
 start when `meta.db` is missing or empty while object files exist, instead
 of discarding them. See [operations.md](operations.md#the-data-directory).
+
+## Copy jobs, snapshots and restic credentials
+
+- **Jobs run as the server.** A [copy or mirror job](jobs.md) reads every
+  version of its source with its metadata, tags, ACLs and the bucket's
+  configuration, and writes and deletes in its target, whatever S3
+  permissions, bucket policies and object ACLs say. Creating one therefore
+  needs `admin:CreateCopyJob` on **both** buckets
+  (`arn:gos3:admin:::bucket/<name>`), evaluated before the spec is
+  validated: on a source it amounts to reading the whole bucket, on a
+  target to writing it (and creating it). Reading and controlling a job
+  needs `admin:GetJob` / `admin:UpdateJob` on every one of its buckets. A
+  job is authorized when it is created and when it is changed; a mirror
+  keeps running after its creator loses these permissions, so cancel the
+  jobs of an identity whose access you revoke.
+- **Copies carry permissions.** Every version keeps its object ACL. When
+  the source neutralises object ACLs (public access block with
+  `IgnorePublicAcls`, or ownership controls `BucketOwnerEnforced`), those
+  settings are copied to the target whatever `configs` says, so the copies
+  do not become public. With `configs: "safe"` (the default) the target
+  also receives the source's bucket policy (rewritten to the target's
+  name), bucket ACL and public access block: a public source makes a
+  public target. Use `configs: "none"` and review the target when that is
+  not wanted.
+- **Copies can leave encryption behind only when asked.** An encrypted
+  version is never stored unencrypted unless the job sets
+  `allowPlaintext` (needed for native buckets, memory backings and
+  backings without an encryption key); the copies then are as readable as
+  the target's storage. Locked versions keep their retention unless
+  `dropRetention` is set.
+- **Credential disclosure.** `POST /buckets/{name}/restic/credentials`
+  (also used by `gos3 restic env` against a running server and by
+  **Reveal credentials** in the web UI) returns a repository's password
+  and, for a repository on an s3 backing, the **backing's own S3 access
+  key and secret key**, which reach everything those credentials reach in
+  the S3 account, other buckets and containers included. It needs
+  `admin:GetResticCredentials` on the bucket, which no built-in policy but
+  `admin` grants (whoami capability `revealResticCredentials`). Every
+  disclosure is logged at warn level (`admin: restic repository
+  credentials disclosed`) with the caller, its access key, the client
+  address, the bucket, the backing, the purpose and the repository, never
+  the secrets. `GET /buckets/{name}/restic` shows locations and password
+  sources only. `gos3 restic env` puts the backing's keys into
+  `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY`: close that shell when
+  done.
+- **Offline recovery** (`gos3 restic env --config …` with the server
+  stopped) needs what it reads: the configuration file with the backings'
+  credentials and encryption keys, and the fs backings' key directories.
+  Anyone with those can decrypt everything anyway.
+- **Snapshot repositories hold full copies.** A whole-bucket snapshot
+  holds every object's content, its metadata (in the manifest) and the
+  bucket's configuration, policy included (`gos3-bucket.json`), encrypted
+  by restic. Whoever has the repository's password and can read its
+  storage can read the bucket as of each snapshot, even after objects were
+  deleted from the bucket; protect the repository, its key and backups
+  like the bucket. A snapshot into another backing's aux repository puts
+  the bucket's data on that backing.
+- **Aux repository keys.** An aux repository's password is the hex
+  encoding of a random key: on an fs backing in `.gos3/keys/aux/<name>`
+  (mode 0600, with the key directory's protection; its recovery record
+  holds the password too), on an s3 backing in `<prefix>keys/aux/<name>.key`
+  in the home, wrapped with the backing's encryption key, so the S3 account
+  alone does not reveal it.
+- **The stage holds plain text while a run copies objects.** A snapshot
+  run copies new and changed objects into the stage directory unencrypted
+  until restic has stored them. Between runs, and after a failed run, the
+  stage holds only placeholders (sparse files without content), and a
+  bucket's stage is removed when its snapshot schedule is deleted. Keep
+  `restic.snapshots.stage_dir` on a private local file system (the default
+  is `restic-stage/` inside the system directory; without one, each
+  server process uses a private stage in the temporary directory).
+- **Snapshot actions.** Changing a schedule, forgetting snapshots and
+  pruning need `admin:PutBucketSnapshots`, snapshotting now
+  `admin:RunBucketSnapshot`, and restoring `admin:RestoreBucketSnapshot` on
+  the bucket plus `admin:CreateCopyJob` on the target, since a restore
+  writes the snapshot's content and permissions into it. gos3 forgets only
+  whole-bucket snapshots of the bucket (it checks their tags first), never
+  per-version archive snapshots.
 
 ## Transport
 

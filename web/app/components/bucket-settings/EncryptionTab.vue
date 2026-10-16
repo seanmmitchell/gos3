@@ -1,6 +1,8 @@
 <script setup lang="ts">
 import type { BucketEncryptionProvider, EncryptionProviderName } from '~/types/admin'
 import { AdminError } from '~/utils/admin/client'
+import { resticTabAvailable } from '~/components/admin/-capabilities'
+import { NATIVE_NO_PROVIDER, archiveEnabled, availableProviders } from './-restic'
 
 /**
  * Bucket encryption: two independent settings, each loaded and saved on
@@ -20,14 +22,22 @@ import { AdminError } from '~/utils/admin/client'
  *   backing holding the bucket; restic needs the restic executable and a
  *   filesystem or S3 backing for every copy). Without admin:GetBucketEncryption (403), or on servers
  *   without the endpoint (404), the card says so and default encryption
- *   keeps working through the S3 API alone.
+ *   keeps working through the S3 API alone. The provider's scope (restic
+ *   for every write: the per-version archive) is shown, with a warning
+ *   when switching to native would end it; it is changed on the "Backup &
+ *   archive" tab, which this card links to on servers that have it.
  */
-const props = defineProps<{ bucket: string }>()
+const props = defineProps<{
+  bucket: string
+  /** s3 backings: the bucket kind; native buckets offer no provider. */
+  kind?: string
+}>()
 const emit = defineEmits<{ changed: [] }>()
 
 type DefaultMode = 'none' | 'AES256' | 'aws:kms'
 
-const { requireS3, requireAdmin, isGos3 } = useConnection()
+const { id: serverId, connection, requireS3, requireAdmin, isGos3 } = useConnection()
+const { capabilities } = useWhoAmI()
 const confirm = useConfirm()
 
 // --- Default encryption (S3 API) ---------------------------------------
@@ -95,8 +105,6 @@ async function onSave() {
 
 // --- SSE-S3 implementation (gos3 admin API) -----------------------------
 
-const ALL_PROVIDERS: readonly EncryptionProviderName[] = ['AES256', 'restic']
-
 const provider = ref<EncryptionProviderName>('AES256')
 const providerLoader = useLoader(async () => {
   if (!isGos3.value) return null
@@ -114,7 +122,9 @@ const providerUnavailable = computed(() => {
   if (e.isAccessDenied) return 'denied'
   return undefined
 })
-const available = computed(() => providerDoc.value?.available ?? ALL_PROVIDERS)
+// The server always reports `available` (empty: none); only older servers omit it (then every provider is offered).
+const available = computed(() => availableProviders(providerDoc.value, props.kind))
+const native = computed(() => props.kind === 'native')
 const aesAvailable = computed(() => available.value.includes('AES256'))
 const resticAvailable = computed(() => available.value.includes('restic'))
 /** Why native encryption is unavailable (the only reason the server has). */
@@ -126,7 +136,7 @@ const providerItems = computed(() => [
     label: 'Native (AES-256-GCM)',
     value: 'AES256',
     disabled: !aesAvailable.value,
-    description: aesAvailable.value ? 'Encrypt object data on the server’s storage with per-bucket keys.' : AES_UNAVAILABLE
+    description: aesAvailable.value ? 'Encrypt object data on the server’s storage with per-bucket keys.' : native.value ? NATIVE_NO_PROVIDER : AES_UNAVAILABLE
   },
   {
     label: 'Restic',
@@ -134,11 +144,20 @@ const providerItems = computed(() => [
     disabled: !resticAvailable.value,
     description: resticAvailable.value
       ? 'Encrypt and archive object data in restic repositories; downloads retrieve it from the archive.'
-      : 'Not available for this bucket: restic must be installed on the server and every copy of the bucket must be on a filesystem backing or an S3 backing with an encryption key.'
+      : native.value
+        ? NATIVE_NO_PROVIDER
+        : 'Not available for this bucket: restic must be installed on the server and every copy of the bucket must be on a filesystem backing or an S3 backing with an encryption key.'
   }
 ])
 
+/** The archive (restic for every write) is on. */
+const archiveOn = computed(() => archiveEnabled(providerDoc.value))
+const resticTabLink = computed(() => (resticTabAvailable(connection.value?.kind, capabilities.value) && serverId.value
+  ? appRoutes.bucketSettings(serverId.value, props.bucket, 'restic')
+  : undefined))
+
 const saveProvider = useAsyncAction(async () => {
+  // Only a change of implementation is saved: switching to native ends the archive (scope "all" is restic only).
   providerLoader.data.value = await requireAdmin().putBucketEncryptionProvider(props.bucket, { provider: provider.value })
   emit('changed')
 }, { successMessage: 'SSE-S3 implementation saved', errorTitle: 'Could not change the SSE-S3 implementation' })
@@ -234,6 +253,29 @@ const saveProvider = useAsyncAction(async () => {
           title="Native encryption unavailable"
           description="An S3 backing of this bucket has no encryption key, so SSE-S3 uploads cannot be encrypted natively. Set an encryption key on that backing under the server’s Storage settings."
           data-testid="aes-unavailable"
+        />
+        <div class="flex flex-wrap items-center gap-2 text-sm" data-testid="provider-scope">
+          <span class="text-muted">Used for:</span>
+          <UBadge
+            :label="archiveOn ? 'Every write (restic archive)' : 'Writes that request SSE-S3'"
+            :color="archiveOn ? 'success' : 'neutral'"
+            variant="subtle"
+            size="sm"
+            :icon="archiveOn ? 'i-lucide-archive' : undefined"
+          />
+          <ULink v-if="resticTabLink" :to="resticTabLink" class="inline-flex items-center gap-1 text-primary hover:underline" data-testid="restic-tab-link">
+            <UIcon name="i-lucide-archive" class="size-4" aria-hidden="true" />
+            Backup &amp; archive
+          </ULink>
+        </div>
+        <UAlert
+          v-if="archiveOn && provider !== 'restic'"
+          color="warning"
+          variant="subtle"
+          icon="i-lucide-archive-x"
+          title="This turns the archive off"
+          description="Every write is archived in restic now. With native encryption, new writes are no longer archived; archived versions stay readable."
+          data-testid="archive-off-warning"
         />
         <div v-if="provider === 'restic'" class="space-y-2">
           <p v-if="providerDoc.backings?.length" class="text-sm text-muted">

@@ -20,9 +20,12 @@ import type {
   BucketCompression,
   BucketEncryptionProvider,
   BucketEncryptionProviderInput,
+  BucketSnapshots,
   BucketSummary,
   ContainerInfo,
   ContainerSpec,
+  CopyJobDryRun,
+  CopyJobSpec,
   CreateAccessKeyRequest,
   CreateOnBacking,
   CreateRemoteBucketRequest,
@@ -32,6 +35,9 @@ import type {
   DiscoveryState,
   HealthStatus,
   Info,
+  Job,
+  JobAction,
+  ListJobsOptions,
   ListRemoteBucketsOptions,
   MoveBucketRequest,
   NamedPolicy,
@@ -41,11 +47,16 @@ import type {
   RemoteBucket,
   RemoteBucketList,
   ReplicationMode,
+  ResticCredentials,
+  ResticCredentialsRequest,
+  ResticInfo,
+  RestoreSnapshotRequest,
   ScanRequest,
   ScanResult,
   ServerInfo,
   Settings,
   SimulateRequest,
+  SnapshotConfig,
   Stats,
   User,
   UserUpdate,
@@ -586,8 +597,116 @@ export class AdminClient {
     return this.request('GET', `/buckets/${enc(name)}/encryption-provider`)
   }
 
+  /**
+   * Sets the bucket's encryption provider; `scope: "all"` (restic only)
+   * archives every write in the bucket's restic repository. The server
+   * prepares the keys or repository first (400 and no change on failure).
+   */
   putBucketEncryptionProvider(name: string, body: BucketEncryptionProviderInput): Promise<BucketEncryptionProvider> {
-    return this.request('PUT', `/buckets/${enc(name)}/encryption-provider`, { body })
+    return this.request('PUT', `/buckets/${enc(name)}/encryption-provider`, { body, timeoutMs: REMOTE_TIMEOUT_MS })
+  }
+
+  // Restic: recovery information, credentials, whole-bucket snapshots ------
+
+  /** Where the bucket's restic data lives and how to recover it without gos3 (no secrets; admin:GetBucketEncryption). */
+  getBucketRestic(name: string, signal?: AbortSignal): Promise<ResticInfo> {
+    return this.request('GET', `/buckets/${enc(name)}/restic`, { signal })
+  }
+
+  /**
+   * The repository password and environment for the restic CLI
+   * (admin:GetResticCredentials; every disclosure is logged by the server).
+   * 404 when the bucket has no repository of that purpose on that backing.
+   */
+  getResticCredentials(name: string, req: ResticCredentialsRequest = {}): Promise<ResticCredentials> {
+    return this.request('POST', `/buckets/${enc(name)}/restic/credentials`, { body: req })
+  }
+
+  /** The snapshot schedule, its status, repository and snapshots (admin:GetBucketSnapshots); `snapshots` is never null. */
+  async getBucketSnapshots(name: string, signal?: AbortSignal): Promise<BucketSnapshots> {
+    // Listing runs `restic snapshots`, which may reach a remote repository.
+    const r = await this.request<BucketSnapshots>('GET', `/buckets/${enc(name)}/restic/snapshots`, { signal, timeoutMs: REMOTE_TIMEOUT_MS })
+    return { ...r, snapshots: r.snapshots ?? [] }
+  }
+
+  /** Saves the snapshot schedule (validated; the repository is prepared). Returns it with the generated repo name. */
+  putSnapshotConfig(name: string, config: SnapshotConfig): Promise<SnapshotConfig> {
+    return this.request('PUT', `/buckets/${enc(name)}/restic/snapshots/config`, { body: config, timeoutMs: REMOTE_TIMEOUT_MS })
+  }
+
+  /** Stops scheduling snapshots (existing snapshots stay; 204). */
+  deleteSnapshotConfig(name: string): Promise<void> {
+    return this.request('DELETE', `/buckets/${enc(name)}/restic/snapshots/config`, { expect: 'none' })
+  }
+
+  /** Takes a whole-bucket snapshot now: 202 with the restic-snapshot job (409 while one runs). */
+  runBucketSnapshot(name: string): Promise<Job> {
+    return this.request('POST', `/buckets/${enc(name)}/restic/snapshots`)
+  }
+
+  /** Forgets one whole-bucket snapshot of this bucket (never a per-version archive snapshot; 204). */
+  forgetSnapshot(name: string, id: string): Promise<void> {
+    return this.request('DELETE', `/buckets/${enc(name)}/restic/snapshots/${enc(id)}`, { expect: 'none', timeoutMs: REMOTE_TIMEOUT_MS })
+  }
+
+  /** Restores a snapshot into a bucket: 202 with the restic-restore job. */
+  restoreSnapshot(name: string, id: string, req: RestoreSnapshotRequest): Promise<Job> {
+    return this.request('POST', `/buckets/${enc(name)}/restic/snapshots/${enc(id)}/restore`, { body: req, timeoutMs: REMOTE_TIMEOUT_MS })
+  }
+
+  /** Removes data no snapshot references: 202 with the restic-prune job (archive writes wait for its lock). */
+  pruneBucketSnapshots(name: string): Promise<Job> {
+    return this.request('POST', `/buckets/${enc(name)}/restic/prune`)
+  }
+
+  // Jobs: copy, mirror and restic jobs --------------------------------------
+
+  /** Jobs, newest first (admin:ListJobs); `bucket` matches the source or target. Never null. */
+  async listJobs(opts: ListJobsOptions = {}): Promise<Job[]> {
+    const r = await this.request<{ jobs: Job[] | null }>('GET', '/jobs', {
+      query: { kind: opts.kind || undefined, state: opts.state || undefined, bucket: opts.bucket || undefined },
+      signal: opts.signal
+    })
+    return r.jobs ?? []
+  }
+
+  /** The jobs whose source or target is the bucket (admin:GetJob on the bucket). Never null. */
+  async listBucketJobs(name: string, signal?: AbortSignal): Promise<Job[]> {
+    const r = await this.request<{ jobs: Job[] | null }>('GET', `/buckets/${enc(name)}/jobs`, { signal })
+    return r.jobs ?? []
+  }
+
+  getJob(id: string, signal?: AbortSignal): Promise<Job> {
+    return this.request('GET', `/jobs/${enc(id)}`, { signal })
+  }
+
+  /**
+   * Creates a copy or mirror job (admin:CreateCopyJob on both buckets): 201
+   * with the job. The server validates the spec and may create the target.
+   */
+  createCopyJob(spec: CopyJobSpec): Promise<Job> {
+    const { dryRun: _dryRun, ...body } = spec
+    return this.request('POST', '/jobs', { body, timeoutMs: REMOTE_TIMEOUT_MS })
+  }
+
+  /** Validates and normalizes a copy or mirror job without creating anything; `warnings` is never null. */
+  async dryRunCopyJob(spec: CopyJobSpec): Promise<CopyJobDryRun> {
+    const r = await this.request<CopyJobDryRun>('POST', '/jobs', { body: { ...spec, dryRun: true }, timeoutMs: REMOTE_TIMEOUT_MS })
+    return { spec: r?.spec ?? spec, warnings: r?.warnings ?? [] }
+  }
+
+  /**
+   * pause, resume (also retries a failed job from its checkpoint), cancel,
+   * or run (starts a waiting job now). 409 when the job's state does not
+   * allow it.
+   */
+  jobAction(id: string, action: JobAction): Promise<Job> {
+    return this.request('POST', `/jobs/${enc(id)}/${action}`)
+  }
+
+  /** Deletes a finished job (204; 409 unless succeeded, failed or canceled). */
+  deleteJob(id: string): Promise<void> {
+    return this.request('DELETE', `/jobs/${enc(id)}`, { expect: 'none' })
   }
 
   // Remote buckets and containers (s3 backings) ----------------------------

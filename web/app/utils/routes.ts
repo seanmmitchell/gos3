@@ -60,7 +60,9 @@ export const appRoutes = {
     const q = new URLSearchParams(tab ? { tab, ...query } : query).toString()
     return `/servers/${seg(id)}/backings/${seg(backing)}${q ? `?${q}` : ''}`
   },
-  discovery: (id: string) => `/servers/${seg(id)}/discovery`
+  discovery: (id: string) => `/servers/${seg(id)}/discovery`,
+  /** Background jobs (copy, mirror, restic), optionally filtered by bucket. */
+  jobs: (id: string, bucket?: string) => `/servers/${seg(id)}/jobs${bucket ? `?bucket=${encodeURIComponent(bucket)}` : ''}`
 }
 
 /** Single string route param (first element for arrays). */

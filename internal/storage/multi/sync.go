@@ -6,13 +6,12 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"maps"
-	"reflect"
 	"slices"
 	"time"
 
 	"github.com/seanmmitchell/gos3/internal/storage"
 	"github.com/seanmmitchell/gos3/internal/storage/compress"
+	"github.com/seanmmitchell/gos3/internal/storage/copier"
 )
 
 // errSourceChanged: a key changed on the source while it was being
@@ -55,11 +54,11 @@ func (r *Router) syncMemberKey(ctx context.Context, ms *memberState, key string,
 // replaced by the rest of src. In the common case (new versions added on
 // src) that copies just the new versions.
 func (r *Router) syncKey(ctx context.Context, src, dst *backing, bucket, key string, prog *Progress) error {
-	sv, err := keyVersions(ctx, src.Backend, bucket, key)
+	sv, err := copier.KeyVersions(ctx, src.Backend, bucket, key)
 	if err != nil {
 		return r.observe(src, fmt.Errorf("listing %s/%s on backing %q: %w", bucket, key, src.Name, err))
 	}
-	dv, err := keyVersions(ctx, dst.Backend, bucket, key)
+	dv, err := copier.KeyVersions(ctx, dst.Backend, bucket, key)
 	if err != nil {
 		return r.observe(dst, fmt.Errorf("listing %s/%s on backing %q: %w", bucket, key, dst.Name, err))
 	}
@@ -82,7 +81,7 @@ func (r *Router) syncKey(ctx context.Context, src, dst *backing, bucket, key str
 	slices.Reverse(dv)
 	keep := dv[:0:0]
 	for _, d := range dv {
-		if s, ok := srcByID[d.VersionID]; ok && sameVersion(s, d) {
+		if s, ok := srcByID[d.VersionID]; ok && copier.SameVersion(s, d) {
 			keep = append(keep, d)
 			continue
 		}
@@ -101,12 +100,12 @@ func (r *Router) syncKey(ctx context.Context, src, dst *backing, bucket, key str
 	}
 	for i := range common {
 		s, d := sv[i], keep[i]
-		if s.DeleteMarker || metaEqual(s.ObjectMeta, d.ObjectMeta) {
+		if s.DeleteMarker || copier.MetaEqual(s.ObjectMeta, d.ObjectMeta) {
 			continue
 		}
-		meta := cloneMeta(s.ObjectMeta)
+		meta := copier.CloneMeta(s.ObjectMeta)
 		_, err := dst.Backend.UpdateObjectMeta(ctx, bucket, key, s.VersionID, func(m *storage.ObjectMeta) error {
-			*m = cloneMeta(meta)
+			*m = copier.CloneMeta(meta)
 			return nil
 		})
 		if err != nil && !errors.Is(err, storage.ErrVersionNotFound) {
@@ -181,7 +180,7 @@ func (r *Router) importVersion(ctx context.Context, src, dst *backing, bucket, k
 	if _, err := w.Commit(ctx, info); err != nil {
 		return 0, r.observe(dst, fmt.Errorf("copying %s/%s version %s to backing %q: %w", bucket, key, v.VersionID, dst.Name, err))
 	}
-	if !sameVersion(info, v) {
+	if !copier.SameVersion(info, v) {
 		return n, errSourceChanged
 	}
 	return n, nil
@@ -204,72 +203,6 @@ func newVersionWriter(ctx context.Context, b *backing, bucket, key string, opts 
 		return nil, fmt.Errorf("backing %q cannot receive copies: %w", b.Name, errors.ErrUnsupported)
 	}
 	return imp.NewVersionWriter(ctx, bucket, key)
-}
-
-// keyVersions returns the versions of bucket/key, newest first.
-func keyVersions(ctx context.Context, b storage.Backend, bucket, key string) ([]storage.ObjectInfo, error) {
-	var out []storage.ObjectInfo
-	err := b.WalkVersions(ctx, bucket, key, "", "", func(oi storage.ObjectInfo) error {
-		if oi.Key != key {
-			return storage.ErrStopWalk
-		}
-		out = append(out, oi)
-		return nil
-	})
-	return out, err
-}
-
-// sameVersion reports whether a and b are the same stored version.
-func sameVersion(a, b storage.ObjectInfo) bool {
-	return a.Encryption == b.Encryption && a.VersionID == b.VersionID && a.DeleteMarker == b.DeleteMarker && a.Size == b.Size &&
-		a.LastModified.Equal(b.LastModified) && a.ETag == b.ETag
-}
-
-// metaEqual compares object metadata, treating nil and empty maps and
-// slices as equal and comparing times by instant.
-func metaEqual(a, b storage.ObjectMeta) bool {
-	return reflect.DeepEqual(normMeta(a), normMeta(b))
-}
-
-func normMeta(m storage.ObjectMeta) storage.ObjectMeta {
-	m = cloneMeta(m)
-	norm := func(mm map[string]string) map[string]string {
-		if len(mm) == 0 {
-			return nil
-		}
-		return mm
-	}
-	m.UserMeta, m.Tags, m.Checksums = norm(m.UserMeta), norm(m.Tags), norm(m.Checksums)
-	if len(m.PartSizes) == 0 {
-		m.PartSizes = nil
-	}
-	if len(m.PartChecksums) == 0 {
-		m.PartChecksums = nil
-	}
-	for i, pc := range m.PartChecksums {
-		m.PartChecksums[i] = norm(pc)
-	}
-	if m.RetainUntil.IsZero() {
-		m.RetainUntil = time.Time{}
-	} else {
-		m.RetainUntil = time.Unix(0, m.RetainUntil.UnixNano()).UTC()
-	}
-	return m
-}
-
-func cloneMeta(m storage.ObjectMeta) storage.ObjectMeta {
-	m.UserMeta = maps.Clone(m.UserMeta)
-	m.Tags = maps.Clone(m.Tags)
-	m.Checksums = maps.Clone(m.Checksums)
-	m.PartSizes = slices.Clone(m.PartSizes)
-	if m.PartChecksums != nil {
-		pc := make([]map[string]string, len(m.PartChecksums))
-		for i, c := range m.PartChecksums {
-			pc[i] = maps.Clone(c)
-		}
-		m.PartChecksums = pc
-	}
-	return m
 }
 
 // walkKeys calls fn with the keys of bucket on b (each key once,

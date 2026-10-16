@@ -155,7 +155,7 @@ changed while running.
 | `storage.s3.addressing` | `GOS3_S3_ADDRESSING` | | `auto` | `s3` backend: `auto`, `path` or `virtual`. |
 | `storage.s3.part_size` | `GOS3_S3_PART_SIZE` | | `16MiB` | `s3` backend: upload part size and largest single PUT to the service, 5 MiB-5 GiB. |
 | `storage.s3.access_key`, `storage.s3.secret_key` | `GOS3_S3_ACCESS_KEY`, `GOS3_S3_SECRET_KEY` | | | `s3` backend: credentials. Required. The secret is redacted by `gos3 config print`. |
-| `storage.s3.encryption_key` | `GOS3_S3_ENCRYPTION_KEY` | | | `s3` backend: key-encryption key, base64 of exactly 32 bytes (`openssl rand -base64 32`). Enables native AES256 and restic on wrapped buckets; losing it loses the encrypted objects. Redacted by `gos3 config print`. |
+| `storage.s3.encryption_key` | `GOS3_S3_ENCRYPTION_KEY` | | | `s3` backend: key-encryption key, base64 of exactly 32 bytes (`openssl rand -base64 32`). Enables native AES256 and restic on wrapped buckets, and restic repositories for [whole-bucket snapshots](encryption.md#whole-bucket-snapshots) in the home; losing it loses the encrypted objects and those snapshots. Redacted by `gos3 config print`. |
 | `storage.s3.bucket`, `storage.s3.prefix`, `storage.s3.gateway` | `GOS3_S3_BUCKET`, `GOS3_S3_PREFIX`, `GOS3_S3_GATEWAY` | | | **Deprecated** aliases: `bucket` and `prefix` mean `home_bucket` and `home_prefix`, `gateway: true` means `default_kind: native`. Accepted with a warning at startup; an alias and its replacement with different values are an error. `gos3 config print` shows the new keys. |
 | `storage.fsync_data` | `GOS3_FSYNC` | `--fsync` | `true` | fsync object data before acknowledging a write (every fs backing). `--fsync=false` is faster but can lose recent writes on power loss. |
 | `storage.backings` | `GOS3_STORAGE_BACKINGS` | | none | Additional storage backings, see [below](#storage-backings). Env syntax: comma-separated `name=/path` (fs), `name=fs:/path`, `name=memory` or `name=s3` (configured by `GOS3_BACKING_<NAME>_*`). |
@@ -397,6 +397,24 @@ see [operations.md](operations.md#compression).
 | `compression.min_size` | `GOS3_COMPRESSION_MIN_SIZE` | `4096` | `compression.minSize` | Objects smaller than this (when the size is known before the upload, i.e. not for chunked uploads without a length) are stored uncompressed. Bytes or `4KiB`-style. |
 | `compression.skip_content_types` | `GOS3_COMPRESSION_SKIP_CONTENT_TYPES` | compressed images, `video/*`, `audio/*`, `font/woff*`, archives, zip-based document formats (see `gos3 config print`) | `compression.skipContentTypes` | Media types stored uncompressed because they are compressed already: `type/subtype`, `type/*` or a prefix ending in `*` (case-insensitive, parameters ignored), at most 256. `[]` compresses every type. Objects with a compressing `Content-Encoding` (`gzip`, `br`, `zstd`, …) are never compressed again. |
 
+### Jobs and restic snapshots
+
+Background [jobs](jobs.md) (copy, mirror, and the snapshots, restores and
+prunes of [whole-bucket restic snapshots](encryption.md#whole-bucket-snapshots))
+and the snapshot runs themselves. The jobs and the snapshot schedules are
+managed through the admin API and the web UI; these keys only size the
+machinery. They are static: a change takes effect at the next start. The
+jobs are kept in `<data>/.gos3/jobs/` (in memory, with a warning, without a
+system directory). See [operations.md](operations.md#jobs-and-restic-snapshots).
+
+| YAML key | Env | Default | Description |
+|---|---|---|---|
+| `jobs.workers` | `GOS3_JOBS_WORKERS` | `2` | Jobs running at once, of every kind, 1–64; further jobs wait in the `queued` state. A mirror between passes does not count. The keys a single copy job copies in parallel are its own `concurrency` option (default 4). |
+| `restic.snapshots.workers` | `GOS3_RESTIC_SNAPSHOTS_WORKERS` | `1` | Whole-bucket snapshot, restore and prune jobs running restic at once, 1–64. Each also takes one of the `jobs.workers`, so a value above `jobs.workers` has no effect. |
+| `restic.snapshots.stage_dir` | `GOS3_RESTIC_SNAPSHOTS_STAGE_DIR` | `restic-stage/` in the system directory | Where snapshot runs build their trees, one subdirectory per repository and bucket, kept between runs. Needs about `spool_bytes` free, an inode per key of the largest bucket, and a file system that keeps sparse files and file times (see [operations.md](operations.md#restic-snapshot-stage)). Without a system directory (and without this setting) each run of the server uses a private temporary directory, created on first use (mode 0700) and removed at shutdown. |
+| `restic.snapshots.spool_bytes` | `GOS3_RESTIC_SNAPSHOTS_SPOOL_BYTES` | `8GiB` | Data a run writes to the stage before it saves a partial snapshot and continues from it, at least 64 MiB (a single larger object is staged whole). Bytes or `8GiB`-style. |
+| `restic.snapshots.incremental` | `GOS3_RESTIC_SNAPSHOTS_INCREMENTAL` | `true` | Stage unchanged objects as sparse placeholders, so a run reads only new and changed objects. `false` reads and stages every object at every run (restic still stores only new data). |
+
 ### Other
 
 | Env | Flag | Description |
@@ -489,7 +507,12 @@ gos3 config env               list the GOS3_* environment variables
 gos3 discover [flags]         find gos3 servers on the local network
 gos3 keygen [--json]          generate a random access/secret key pair (alias: gos3 keys gen)
 gos3 healthcheck [flags]      check a server's health (exit 0 = healthy)
+gos3 restic env|exec|objects|recover [flags]   a bucket's restic repositories: credentials, restic, archived objects
 ```
+
+`gos3 restic` is described in
+[encryption.md](encryption.md#the-gos3-restic-command) (`gos3 restic help`
+lists its flags).
 
 Flags can be written with one or two dashes (`-address` or `--address`). Exit
 codes are 0 (success), 1 (error) and 2 (usage error).

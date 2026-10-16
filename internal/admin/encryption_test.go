@@ -106,6 +106,59 @@ func TestBucketEncryptionProvider(t *testing.T) {
 	e.root("GET", "/buckets/missing/encryption-provider", nil).expectError(t, 404, codeNotFound)
 }
 
+// The scope round-trips: "all" (restic only) is stored, the default "sse"
+// is left out of the stored document and spelled out in responses.
+func TestBucketEncryptionScope(t *testing.T) {
+	e := newEnv(t)
+	e.createBucket("photos", storage.CreateBucketOptions{})
+	b := &encryptionTestBackend{Backend: e.backend}
+	e.api.d.Backend = b
+	path := "/buckets/photos/encryption-provider"
+
+	var doc encryptionDocument
+	e.root("GET", path, nil).json(t, &doc)
+	if doc.Provider != storage.EncryptionAES256 || doc.Scope != storage.EncryptionScopeSSE {
+		t.Fatalf("default: %+v", doc)
+	}
+	e.root("PUT", path, map[string]any{"provider": "restic", "scope": "all"}).json(t, &doc)
+	if doc.Provider != "restic" || doc.Scope != "all" {
+		t.Fatalf("PUT all: %+v", doc)
+	}
+	if got := storedProvider(t, e, "photos"); got != `{"provider":"restic","scope":"all"}` {
+		t.Fatalf("stored %s", got)
+	}
+	doc = encryptionDocument{}
+	e.root("GET", path, nil).json(t, &doc)
+	if doc.Provider != "restic" || doc.Scope != "all" {
+		t.Fatalf("GET all: %+v", doc)
+	}
+	var info resticInfo
+	e.root("GET", "/buckets/photos/restic", nil).json(t, &info)
+	if info.Settings != (storage.EncryptionSettings{Provider: "restic", Scope: "all"}) {
+		t.Fatalf("restic info settings: %+v", info.Settings)
+	}
+
+	e.root("PUT", path, map[string]any{"provider": "restic", "scope": "sse"}).json(t, &doc)
+	if doc.Scope != "sse" || storedProvider(t, e, "photos") != `{"provider":"restic"}` {
+		t.Fatalf("PUT sse: %+v, stored %s", doc, storedProvider(t, e, "photos"))
+	}
+	// "all" needs restic; unknown scopes are refused; nothing is changed.
+	if msg := e.root("PUT", path, map[string]any{"provider": "AES256", "scope": "all"}).expectError(t, 400, codeInvalidRequest); !strings.Contains(msg, "restic") {
+		t.Fatalf("AES256 all: %q", msg)
+	}
+	e.root("PUT", path, map[string]any{"provider": "restic", "scope": "some"}).expectError(t, 400, codeInvalidRequest)
+	if got := storedProvider(t, e, "photos"); got != `{"provider":"restic"}` {
+		t.Fatalf("a refused PUT changed the document: %s", got)
+	}
+	// A stored document with an invalid scope fails GET like an invalid
+	// provider.
+	if err := e.backend.PutBucketConfig(context.Background(), "photos", storage.ConfigEncryptionProvider, []byte(`{"provider":"AES256","scope":"all"}`)); err != nil {
+		t.Fatal(err)
+	}
+	e.root("GET", path, nil).expectError(t, 500, codeInternalError)
+	e.root("GET", "/buckets/photos/restic", nil).expectError(t, 500, codeInternalError)
+}
+
 // The providers a bucket can use are reported, and others are refused
 // before anything is prepared.
 func TestBucketEncryptionProviderAvailability(t *testing.T) {
@@ -129,6 +182,23 @@ func TestBucketEncryptionProviderAvailability(t *testing.T) {
 	e.root("PUT", path, map[string]any{"provider": "restic"}).json(t, &doc)
 	if doc.Provider != "restic" || len(doc.Available) != 2 {
 		t.Fatalf("PUT: %+v", doc)
+	}
+}
+
+// "available" is always sent: [] when the backend reports that no provider
+// can be used, null only when it cannot tell.
+func TestBucketEncryptionProviderAvailableAlwaysSent(t *testing.T) {
+	e := newEnv(t)
+	e.createBucket("photos", storage.CreateBucketOptions{})
+	path := "/buckets/photos/encryption-provider"
+	enc := &encryptionTestBackend{Backend: e.backend}
+	e.api.d.Backend = &providersTestBackend{encryptionTestBackend: enc} // reports nil: none
+	if r := e.root("GET", path, nil); !strings.Contains(string(r.body), `"available":[]`) {
+		t.Fatalf("no providers: %s", r.body)
+	}
+	e.api.d.Backend = enc // does not report providers
+	if r := e.root("GET", path, nil); !strings.Contains(string(r.body), `"available":null`) {
+		t.Fatalf("unknown providers: %s", r.body)
 	}
 }
 

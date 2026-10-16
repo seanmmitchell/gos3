@@ -13,9 +13,16 @@
 //     one) and that the bucket's recovery record is current;
 //   - Runtime.Validate checks, without initializing anything, that a
 //     repository is reachable or does not exist yet;
-//   - Runtime.NewArchiver streams one version into a new snapshot;
+//   - Runtime.NewArchiverWith streams one version into a new snapshot;
 //   - Runtime.Open returns a lazy reader of a snapshot, restored on first
 //     use into an encrypted temporary file shared by concurrent readers.
+//
+// Whole-bucket snapshots (internal/resticsnap) back up a staged directory
+// tree instead: Runtime.BackupTree (incremental against a parent snapshot,
+// with unchanged files staged as sparse placeholders, see MakePlaceholder),
+// Runtime.Snapshots, Runtime.Diff, Runtime.DumpFile and Runtime.DumpTar,
+// and Runtime.Forget (of explicit, guarded snapshot IDs only) and
+// Runtime.Prune for retention.
 //
 // Every restic failure is reported wrapping storage.ErrEncryptionUnavailable
 // (or the request's context error when the request ended), never as a plain
@@ -86,6 +93,10 @@ type Record struct {
 	Initialized bool `json:"initialized,omitempty"`
 	// Repository is Location.Repository.
 	Repository string `json:"repository"`
+	// Bucket is the bucket's name when the repository was last prepared
+	// (see PrepareWith), so that offline tools can find a bucket's ID by
+	// its name; "" when unknown.
+	Bucket string `json:"bucket,omitempty"`
 }
 
 // RecoveryStore loads and stores the recovery records of a backend's
@@ -196,6 +207,8 @@ type repoState struct {
 	// prepared is set once this process found (or made) the repository
 	// initialized and recorded it; it is not checked again.
 	prepared bool
+	// bucket is the bucket name recorded when it was prepared.
+	bucket string
 }
 
 // repo returns the preparation state of the repository repo.

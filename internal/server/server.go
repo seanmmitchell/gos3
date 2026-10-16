@@ -1,8 +1,10 @@
 // Package server wires gos3 together: it opens the storage backend, system
 // state (<data>/.gos3: server-id, root credentials, iam.json,
 // settings.json), IAM, the S3 and admin API handlers, discovery, the
-// lifecycle worker and the embedded web UI, and serves them on one listener
-// with the top-level routing described in docs/ARCHITECTURE.md:
+// lifecycle worker, the background jobs (copy and mirror jobs, whole-bucket
+// restic snapshots; jobs.go) and the embedded web UI, and serves them on
+// one listener with the top-level routing described in
+// docs/ARCHITECTURE.md:
 //
 //  1. virtual-hosted-style requests (Host "<bucket>.<domain>") → S3, always;
 //  2. /_gos3/admin/v1 → admin API, /_gos3/ui/ → web UI, /_gos3/info,
@@ -40,10 +42,13 @@ import (
 	"github.com/seanmmitchell/gos3/internal/auth"
 	"github.com/seanmmitchell/gos3/internal/clientip"
 	"github.com/seanmmitchell/gos3/internal/config"
+	"github.com/seanmmitchell/gos3/internal/copyjob"
 	"github.com/seanmmitchell/gos3/internal/discovery"
 	"github.com/seanmmitchell/gos3/internal/iam"
+	"github.com/seanmmitchell/gos3/internal/jobs"
 	"github.com/seanmmitchell/gos3/internal/lifecycle"
 	"github.com/seanmmitchell/gos3/internal/metrics"
+	"github.com/seanmmitchell/gos3/internal/resticsnap"
 	"github.com/seanmmitchell/gos3/internal/s3"
 	"github.com/seanmmitchell/gos3/internal/storage"
 	fsbackend "github.com/seanmmitchell/gos3/internal/storage/fs"
@@ -119,6 +124,9 @@ type Server struct {
 	uiBuilt     bool
 	disc        *discovery.Service
 	lifecycle   *lifecycle.Worker
+	jobs        *jobs.Manager       // background jobs (jobs.go)
+	copyJobs    *copyjob.Service    // copy and mirror job runners
+	snapshots   *resticsnap.Service // whole-bucket restic snapshots
 	tlsConfig   *tls.Config
 	bodyIdle    time.Duration // idle read timeout of bodies sent to gos3 endpoints
 	writeIdle   time.Duration // idle write timeout of responses (see writeGuard)
@@ -288,6 +296,12 @@ func New(cfg config.Config, logger *slog.Logger, opts ...Option) (_ *Server, err
 	}
 	s.logControl.Set(st.Logging.Level, st.Logging.Format)
 
+	// Background jobs need the router and the settings (region and
+	// compression policy of the copies); they resume at once.
+	if err := s.openJobs(); err != nil {
+		return nil, err
+	}
+
 	s.verifier = auth.NewVerifier(s.iam, auth.Options{Region: st.Region, StrictRegion: cfg.Auth.StrictRegion})
 	s.metrics = metrics.NewRegistry()
 	s.s3 = s3.NewHandler(s3.Options{
@@ -314,6 +328,9 @@ func New(cfg config.Config, logger *slog.Logger, opts ...Option) (_ *Server, err
 			BackendName: s.backendName,
 			DataPath:    s.dataPath,
 			Logger:      logger,
+			Jobs:        s.jobs,
+			CopyJobs:    s.copyJobs,
+			Snapshots:   s.snapshots,
 
 			TrustProxyHeaders: s.clientIP,
 		}))
@@ -572,7 +589,8 @@ func validServerID(id string) bool {
 
 // Close stops background work and releases the backend and IAM. It is
 // idempotent and is called by Run/Serve on return; call it yourself only
-// when the server was never served.
+// when the server was never served. Background jobs are stopped (and
+// saved, to resume at the next start) before the storage closes.
 func (s *Server) Close() error {
 	s.closeOnce.Do(func() {
 		if s.lifeCancel != nil {
@@ -581,10 +599,13 @@ func (s *Server) Close() error {
 		if s.disc != nil {
 			s.disc.Stop()
 		}
+		var errs []error
+		if err := s.closeJobs(); err != nil {
+			errs = append(errs, err)
+		}
 		if s.lifecycle != nil {
 			s.lifecycle.Stop()
 		}
-		var errs []error
 		if s.backend != nil {
 			if err := s.backend.Close(); err != nil {
 				errs = append(errs, fmt.Errorf("closing storage: %w", err))

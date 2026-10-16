@@ -11,8 +11,10 @@ import (
 	"time"
 
 	"github.com/seanmmitchell/gos3/internal/iam"
+	"github.com/seanmmitchell/gos3/internal/jobs"
 	"github.com/seanmmitchell/gos3/internal/s3err"
 	"github.com/seanmmitchell/gos3/internal/storage"
+	"github.com/seanmmitchell/gos3/internal/storage/restic"
 )
 
 func TestNewHandlerRequiresDeps(t *testing.T) {
@@ -86,6 +88,16 @@ func TestToAPIError(t *testing.T) {
 		{storage.ErrInvalidName, 400, codeInvalidName},
 		{s3err.ErrMalformedPolicy, 400, codeInvalidRequest},
 		{context.Canceled, 503, codeInternalError},
+		{fmt.Errorf("%w: bad", jobs.ErrInvalidSpec), 400, codeInvalidRequest},
+		{fmt.Errorf("%w: source: %w", jobs.ErrInvalidSpec, storage.ErrBucketNotFound), 400, codeInvalidRequest},
+		{jobs.ErrUnknownKind, 400, codeInvalidRequest},
+		{jobs.ErrConflict, 409, codeConflict},
+		{jobs.ErrNotFound, 404, codeNotFound},
+		{jobs.ErrClosed, 503, codeInternalError},
+		{restic.ErrSnapshotNotFound, 404, codeNotFound},
+		{restic.ErrForgetRefused, 400, codeInvalidRequest},
+		{fmt.Errorf("restic missing: %w", storage.ErrEncryptionUnavailable), 503, codeInternalError},
+		{fmt.Errorf("no repository: %w", errors.ErrUnsupported), 400, codeInvalidRequest},
 		{errors.New("boom"), 500, codeInternalError},
 		{badRequest("x"), 400, codeInvalidRequest},
 	}

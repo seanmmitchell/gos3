@@ -212,7 +212,8 @@ func TestServeAndHealthcheck(t *testing.T) {
 		t.Fatalf("info = %+v", srv.Info())
 	}
 	banner := stderr.String()
-	for _, want := range []string{"S3 endpoint", srv.URL(), "Access key   serveaccesskey", "from the configuration", "fs at "} {
+	for _, want := range []string{"S3 endpoint", srv.URL(), "Access key   serveaccesskey", "from the configuration", "fs at ",
+		"Jobs         2 at once, state in " + filepath.Join(srv.DataPath(), ".gos3", "jobs")} {
 		if !strings.Contains(banner, want) {
 			t.Errorf("banner lacks %q:\n%s", want, banner)
 		}

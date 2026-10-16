@@ -1,13 +1,19 @@
 <script setup lang="ts">
-import type { AvailableBacking, BucketSummary } from '~/types/admin'
+import type { AvailableBacking, BucketSummary, Job } from '~/types/admin'
 import type { VersioningStatus } from '~/types/s3'
-import type { BucketSettingsTab } from '~/components/admin/-capabilities'
+import { AdminError } from '~/utils/admin/client'
+import { canUpdateJobs, serverHasJobs, type BucketSettingsTab } from '~/components/admin/-capabilities'
+import { jobPollInterval, sortJobs, upsertJob } from '~/components/jobs/-jobs'
+import JobsTable from '~/components/jobs/JobsTable.vue'
 
 /**
  * Bucket overview: usage, owner, creation date, region and configured
  * sub-resources (gos3 admin API when available), plus what plain S3 can
  * tell (location, creation date, policy status) and, on gos3, the storage
- * backing and, on s3 backings, the bucket's kind and location.
+ * backing and, on s3 backings, the bucket's kind and location. On gos3
+ * servers with jobs, a Jobs card lists the copy, mirror and restic jobs
+ * whose source or target is the bucket (GET /buckets/{name}/jobs, which
+ * needs admin:GetJob on the bucket: the card stays hidden on a 403).
  */
 const props = defineProps<{
   bucket: string
@@ -24,11 +30,14 @@ const props = defineProps<{
   kind?: string
   /** s3 backings: the remote bucket (native) or container (wrapped). */
   location?: string
+  /** Changes when a job for this bucket was created elsewhere on the page (reloads the Jobs card). */
+  jobsKey?: number
 }>()
 
 const emit = defineEmits<{ navigate: [tab: BucketSettingsTab] }>()
 
-const { requireS3, connection } = useConnection()
+const { id: serverId, requireS3, requireAdmin, connection } = useConnection()
+const { capabilities } = useWhoAmI()
 
 const s3Info = useLoader(async () => {
   const s3 = requireS3()
@@ -77,6 +86,51 @@ const configs = computed(() => {
 
 const backingInfo = computed(() => (props.backingDetails ? backingKindInfo(props.backingDetails) : null))
 const kindInfo = computed(() => (props.kind ? bucketKindInfo(props.kind) : null))
+
+// --- jobs of this bucket ---------------------------------------------------------------
+
+const jobsEnabled = computed(() => serverHasJobs(connection.value?.kind, capabilities.value))
+const canManage = computed(() => canUpdateJobs(connection.value?.kind, capabilities.value))
+const jobs = useLoader(async () => (jobsEnabled.value ? sortJobs(await requireAdmin().listBucketJobs(props.bucket)) : null), {
+  watch: [() => props.bucket, () => props.jobsKey, jobsEnabled]
+})
+/** Hidden while unknown, on servers without jobs and when not allowed (403) or unsupported (404). */
+const jobsHidden = computed(() => {
+  const e = jobs.error.value
+  return !jobsEnabled.value || (e instanceof AdminError && (e.isAccessDenied || e.isNotFound)) || (!jobs.data.value && !e)
+})
+const jobList = computed<Job[]>(() => jobs.data.value ?? [])
+
+/** Set on unmount: a response arriving later must not arm a new poll. */
+let disposed = false
+let jobsTimer: ReturnType<typeof setTimeout> | undefined
+function stopJobsTimer() {
+  if (jobsTimer) clearTimeout(jobsTimer)
+  jobsTimer = undefined
+}
+/** Arms the next poll of the bucket's jobs (the only place a timer is set). */
+function scheduleJobs() {
+  stopJobsTimer()
+  const list = jobs.data.value
+  if (disposed || !list) return
+  jobsTimer = setTimeout(() => void pollJobs(), jobPollInterval(list))
+}
+async function pollJobs() {
+  jobsTimer = undefined
+  if (document.visibilityState !== 'hidden') await jobs.refresh()
+  scheduleJobs()
+}
+// Every load (also after the bucket changes) re-plans the polling.
+watch(() => jobs.data.value, () => scheduleJobs())
+onBeforeUnmount(() => {
+  disposed = true
+  stopJobsTimer()
+})
+
+function onJobChanged(job: Job | null, jobId: string) {
+  const list = jobs.data.value ?? []
+  jobs.data.value = job ? upsertJob(list, job) : list.filter(j => j.id !== jobId)
+}
 
 const versioningLabel = computed(() => (props.versioning === 'Enabled' ? 'Enabled' : props.versioning === 'Suspended' ? 'Suspended' : 'Never enabled'))
 </script>
@@ -203,5 +257,34 @@ const versioningLabel = computed(() => (props.versioning === 'Enabled' ? 'Enable
         </ul>
       </UCard>
     </div>
+
+    <UCard v-if="!jobsHidden" :ui="{ body: 'p-0 sm:p-0' }" data-testid="bucket-jobs">
+      <template #header>
+        <div class="flex flex-wrap items-center justify-between gap-2">
+          <div>
+            <h3 class="font-semibold text-highlighted">
+              Jobs
+            </h3>
+            <p class="text-sm text-muted">
+              Copy, mirror and restic jobs reading or writing this bucket.
+            </p>
+          </div>
+          <UButton
+            v-if="serverId"
+            color="neutral"
+            variant="ghost"
+            size="sm"
+            trailing-icon="i-lucide-arrow-right"
+            label="All jobs"
+            :to="appRoutes.jobs(serverId, bucket)"
+          />
+        </div>
+      </template>
+      <CommonErrorAlert v-if="jobs.error.value" :error="jobs.error.value" title="Could not load the bucket's jobs" retryable class="m-4" @retry="jobs.refresh" />
+      <p v-else-if="!jobList.length" class="p-4 text-sm text-muted" data-testid="bucket-jobs-empty">
+        No jobs for this bucket.
+      </p>
+      <JobsTable v-else :jobs="jobList.slice(0, 10)" :server-id="serverId ?? ''" :can-manage="canManage" compact label="Jobs of this bucket" @changed="onJobChanged" />
+    </UCard>
   </div>
 </template>

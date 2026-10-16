@@ -91,6 +91,15 @@ func TestAuthorizeAdminResources(t *testing.T) {
 		{name: "existing arn:gos3:admin:::* grant per target", user: "uadmin", action: "admin:GetUser", resource: AdminUserARN("x"), want: true},
 		{name: "diagnostics no probe", user: "dave", action: "admin:ProbeNetwork"},
 		{name: "diagnostics discovery", user: "dave", action: "admin:GetDiscovery", want: true},
+		// Jobs and whole-bucket snapshots: read-only, never the repository
+		// credentials.
+		{name: "diagnostics list jobs", user: "dave", action: "admin:ListJobs", want: true},
+		{name: "diagnostics get job", user: "dave", action: "admin:GetJob", resource: AdminBucketARN("photos"), want: true},
+		{name: "diagnostics get snapshots", user: "dave", action: "admin:GetBucketSnapshots", resource: AdminBucketARN("photos"), want: true},
+		{name: "diagnostics no job updates", user: "dave", action: "admin:UpdateJob", resource: AdminBucketARN("photos")},
+		{name: "diagnostics no copy jobs", user: "dave", action: "admin:CreateCopyJob", resource: AdminBucketARN("photos")},
+		{name: "diagnostics no snapshot changes", user: "dave", action: "admin:PutBucketSnapshots", resource: AdminBucketARN("photos")},
+		{name: "diagnostics no restic credentials", user: "dave", action: "admin:GetResticCredentials", resource: AdminBucketARN("photos")},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
