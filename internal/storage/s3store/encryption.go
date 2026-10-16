@@ -3,7 +3,6 @@ package s3store
 import (
 	"context"
 	"errors"
-	"fmt"
 
 	"github.com/seanmmitchell/gos3/internal/storage"
 )
@@ -14,9 +13,6 @@ import (
 func (b *Backend) encryptionBucket(ctx context.Context, bucket, mode string) (*bucket, error) {
 	if mode != storage.EncryptionAES256 && mode != storage.EncryptionRestic {
 		return nil, errors.ErrUnsupported
-	}
-	if b.opts.Gateway {
-		return nil, fmt.Errorf("s3store: encrypted objects on a gateway backing: %w", errors.ErrUnsupported)
 	}
 	if err := b.checkWriteOptions(storage.WriteOptions{Encryption: mode}); err != nil {
 		return nil, err
@@ -32,9 +28,9 @@ func (b *Backend) encryptionBucket(ctx context.Context, bucket, mode string) (*b
 
 // PrepareEncryption implements storage.EncryptionBackend: it creates the
 // bucket's master key if needed (wrapped by the backing's KEK) and, for
-// restic, prepares its repository. Without a KEK, on a gateway backing,
-// for restic without the backing's credentials and for other modes it
-// returns errors.ErrUnsupported.
+// restic, prepares its repository. Without a KEK, for restic without the
+// backing's credentials and for other modes it returns
+// errors.ErrUnsupported.
 func (b *Backend) PrepareEncryption(ctx context.Context, bucket, mode string) error {
 	bk, err := b.encryptionBucket(ctx, bucket, mode)
 	if err != nil {
@@ -72,14 +68,14 @@ func (b *Backend) ValidateEncryptionSettings(ctx context.Context, bucket string,
 }
 
 // EncryptionProviders implements storage.EncryptionProvidersBackend: none
-// without a KEK (or on a gateway backing); with one AES256, plus restic
+// without a KEK; with one AES256, plus restic
 // when the restic executable is installed and the backing has credentials
 // restic can use. The bucket is not consulted.
 func (b *Backend) EncryptionProviders(ctx context.Context, bucket string) ([]string, error) {
 	if err := checkCtx(ctx); err != nil {
 		return nil, err
 	}
-	if b.opts.Gateway || len(b.conn.Load().kek) == 0 {
+	if len(b.conn.Load().kek) == 0 {
 		return []string{}, nil
 	}
 	providers := []string{storage.EncryptionAES256}

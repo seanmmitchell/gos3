@@ -297,7 +297,7 @@ func (a *api) simulate(rc *reqCtx) (int, any, error) {
 		}
 		if !iam.ValidAdminRequestResource(req.Resource) {
 			return 0, nil, badRequest("resource must be empty (service level) or arn:gos3:admin:::user/<name>, " +
-				"arn:gos3:admin:::policy/<name> or arn:gos3:admin:::bucket/<name>")
+				"arn:gos3:admin:::policy/<name>, arn:gos3:admin:::bucket/<name> or arn:gos3:admin:::backing/<name>")
 		}
 	} else if req.Resource != "" {
 		return 0, nil, badRequest("resource applies to admin actions; s3 actions take bucket and key")

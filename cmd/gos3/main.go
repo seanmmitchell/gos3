@@ -11,6 +11,7 @@
 //	gos3 discover [flags]       find gos3 servers on the network
 //	gos3 keygen                 generate a random access/secret key pair
 //	gos3 healthcheck [--url]    probe a server's health endpoint (exit code)
+//	gos3 restic env|exec|objects|recover  a bucket's restic repositories
 //
 // Configuration is read from defaults < JSON/YAML file (--config / GOS3_CONFIG)
 // < GOS3_* environment variables < flags.
@@ -70,6 +71,8 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 		err = cmdKeygen(rest[1:], stdout, stderr)
 	case "healthcheck":
 		err = cmdHealthcheck(ctx, rest, stdout, stderr)
+	case "restic":
+		err = cmdRestic(ctx, rest, stdout, stderr)
 	case "help", "-h", "--help":
 		usage(stdout)
 		return 0
@@ -78,9 +81,12 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 		usage(stderr)
 		return 2
 	}
+	var exit exitCodeError
 	switch {
 	case err == nil:
 		return 0
+	case errors.As(err, &exit):
+		return exit.code
 	case errors.Is(err, flag.ErrHelp):
 		return 0
 	case errors.Is(err, errUsage):
@@ -103,6 +109,9 @@ Usage:
   gos3 discover [flags]         find gos3 servers on the local network
   gos3 keygen [--json]          generate a random access/secret key pair
   gos3 healthcheck [--url URL]  check a server's health (exit 0 = healthy)
+  gos3 restic env|exec|objects|recover [flags]
+                                a bucket's restic repositories: credentials, restic,
+                                archived objects (see "gos3 restic help")
 
 Configuration: defaults < JSON/YAML file (--config or GOS3_CONFIG) < GOS3_*
 environment variables < flags. Root credentials are set only via the

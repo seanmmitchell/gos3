@@ -26,14 +26,14 @@ storage:
   backend: S3
   s3:
     endpoint: " https://s3.example.com:9000/ "
-    bucket: data
-    prefix: gos3
+    home_bucket: data
+    home_prefix: gos3
+    default_kind: NATIVE
     addressing: AUTO
     part_size: 8388608
     access_key: AK
     secret_key: SK
     encryption_key: `+testKEK+`
-    gateway: true
 `), env(nil), nil)
 	if err != nil {
 		t.Fatal(err)
@@ -42,7 +42,8 @@ storage:
 		t.Fatalf("backend %q path %q", c.Storage.Backend, c.Storage.Path)
 	}
 	s := c.Storage.S3
-	if s.Endpoint != "https://s3.example.com:9000" || s.Prefix != "gos3/" || s.Addressing != "" || s.PartSize != 8<<20 || !s.Gateway {
+	if s.Endpoint != "https://s3.example.com:9000" || s.HomeBucket != "data" || s.HomePrefix != "gos3/" || s.Addressing != "" ||
+		s.PartSize != 8<<20 || s.DefaultKind != BucketKindNative {
 		t.Fatalf("normalized %+v", *s)
 	}
 	if err := c.Validate(); err != nil {
@@ -57,30 +58,36 @@ storage:
 	if c.SystemDir() != "" {
 		t.Errorf("system dir %q, want ephemeral", c.SystemDir())
 	}
+	if d := c.Deprecations(); len(d) != 0 {
+		t.Errorf("Deprecations = %v", d)
+	}
 }
 
 func TestS3DefaultBackingJSON(t *testing.T) {
 	c, err := load(writeFile(t, "c.json", `{"storage": {"backend": "s3", "path": "/var/lib/gos3",
-		"s3": {"endpoint": "http://minio:9000", "bucket": "bk", "access_key": "a", "secret_key": "s", "part_size": 5242880, "gateway": false},
-		"backings": [{"name": "cold", "backend": "s3", "s3": {"endpoint": "http://minio:9000", "bucket": "bk", "prefix": "cold/", "access_key": "a", "secret_key": "s"}},
+		"s3": {"endpoint": "http://minio:9000", "home_bucket": "bk", "access_key": "a", "secret_key": "s", "part_size": 5242880, "default_kind": "wrapped"},
+		"backings": [{"name": "cold", "backend": "s3", "s3": {"endpoint": "http://minio:9000", "home_bucket": "bk", "home_prefix": "cold/", "access_key": "a", "secret_key": "s"}},
 		             {"name": "tmp", "backend": "memory", "s3": null}]}}`), env(nil), nil)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if c.Storage.S3 == nil || c.Storage.S3.Bucket != "bk" || len(c.Storage.Backings) != 2 || c.Storage.Backings[0].S3.Prefix != "cold/" {
+	if c.Storage.S3 == nil || c.Storage.S3.HomeBucket != "bk" || len(c.Storage.Backings) != 2 || c.Storage.Backings[0].S3.HomePrefix != "cold/" ||
+		c.Storage.Backings[0].S3.DefaultKind != BucketKindWrapped {
 		t.Fatalf("decoded %+v", c.Storage)
 	}
 	if c.Storage.Backings[1].S3 != nil {
 		t.Errorf("null s3 decoded as %+v", c.Storage.Backings[1].S3)
 	}
 	// "" (default) and "cold/" overlap in the same bucket.
-	if err := c.Validate(); err == nil || !strings.Contains(err.Error(), "storage.backings[0].s3.prefix") {
+	if err := c.Validate(); err == nil || !strings.Contains(err.Error(), "storage.backings[0].s3.home_prefix") {
 		t.Fatalf("overlap: %v", err)
 	}
 	for _, bad := range []string{
 		`{"storage": {"s3": {"part_size": "5MiB"}}}`,
 		`{"storage": {"s3": {"gateway": "yes"}}}`,
 		`{"storage": {"s3": {"bucket": 1}}}`,
+		`{"storage": {"s3": {"home_bucket": 1}}}`,
+		`{"storage": {"s3": {"default_kind": true}}}`,
 		`{"storage": {"s3": {"nope": "x"}}}`,
 		`{"storage": {"s3": []}}`,
 	} {
@@ -95,14 +102,14 @@ func TestS3DefaultBackingEnv(t *testing.T) {
 		"GOS3_STORAGE_BACKEND":   "s3",
 		"GOS3_S3_ENDPOINT":       "https://s3.eu-west-1.amazonaws.com",
 		"GOS3_S3_REGION":         "eu-west-1",
-		"GOS3_S3_BUCKET":         "bkt",
-		"GOS3_S3_PREFIX":         "x/y",
+		"GOS3_S3_HOME_BUCKET":    "bkt",
+		"GOS3_S3_HOME_PREFIX":    "x/y",
+		"GOS3_S3_DEFAULT_KIND":   " Native ",
 		"GOS3_S3_ADDRESSING":     "virtual",
 		"GOS3_S3_PART_SIZE":      "16MiB",
 		"GOS3_S3_ACCESS_KEY":     "AK",
 		"GOS3_S3_SECRET_KEY":     "SK",
 		"GOS3_S3_ENCRYPTION_KEY": testKEK,
-		"GOS3_S3_GATEWAY":        "on",
 	}), nil)
 	if err != nil {
 		t.Fatal(err)
@@ -111,8 +118,8 @@ func TestS3DefaultBackingEnv(t *testing.T) {
 		t.Fatal(err)
 	}
 	s := *c.Storage.S3
-	want := S3Config{Endpoint: "https://s3.eu-west-1.amazonaws.com", Region: "eu-west-1", Bucket: "bkt", Prefix: "x/y/",
-		Addressing: "virtual", PartSize: 16 << 20, AccessKey: "AK", SecretKey: "SK", EncryptionKey: testKEK, Gateway: true,
+	want := S3Config{Endpoint: "https://s3.eu-west-1.amazonaws.com", Region: "eu-west-1", HomeBucket: "bkt", HomePrefix: "x/y/",
+		DefaultKind: BucketKindNative, Addressing: "virtual", PartSize: 16 << 20, AccessKey: "AK", SecretKey: "SK", EncryptionKey: testKEK,
 		fromEnv: s3FieldBit("access_key") | s3FieldBit("secret_key") | s3FieldBit("encryption_key")}
 	if s != want {
 		t.Fatalf("got %+v\nwant %+v", s, want)
@@ -128,15 +135,24 @@ func TestS3DefaultBackingEnv(t *testing.T) {
 	if err := c.Validate(); err == nil || !strings.HasPrefix(err.Error(), "storage.s3:") {
 		t.Fatalf("s3 block with fs backend: %v", err)
 	}
+	// An empty s3 block with another backend is ignored: no default kind
+	// is derived for it.
+	c, err = load(writeFile(t, "c.yaml", "storage:\n  s3: {}\n"), env(nil), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := c.Validate(); err != nil || c.Storage.S3.DefaultKind != "" {
+		t.Fatalf("empty s3 block with fs backend: %v %+v", err, *c.Storage.S3)
+	}
 }
 
 func TestS3BackingsYAMLAndEnvFamily(t *testing.T) {
 	vars := map[string]string{
 		"GOS3_STORAGE_BACKINGS":                 "fast=/mnt/nvme,cold-tier=s3",
 		"GOS3_BACKING_COLD_TIER_ENDPOINT":       "http://minio:9000",
-		"GOS3_BACKING_COLD_TIER_BUCKET":         "cold",
+		"GOS3_BACKING_COLD_TIER_HOME_BUCKET":    "cold",
 		"GOS3_BACKING_COLD_TIER_PART_SIZE":      "6MiB",
-		"GOS3_BACKING_COLD_TIER_GATEWAY":        "true",
+		"GOS3_BACKING_COLD_TIER_DEFAULT_KIND":   "native",
 		"GOS3_BACKING_COLD_TIER_ACCESS_KEY":     "envak",
 		"GOS3_BACKING_COLD_TIER_SECRET_KEY":     "envsk",
 		"GOS3_BACKING_COLD_TIER_ENCRYPTION_KEY": testKEK,
@@ -149,8 +165,9 @@ func TestS3BackingsYAMLAndEnvFamily(t *testing.T) {
 		t.Fatal(err)
 	}
 	b := c.Storage.Backings[1]
-	if b.Backend != BackendS3 || b.Path != "" || b.S3.Endpoint != "http://minio:9000" || b.S3.PartSize != 6<<20 ||
-		!b.S3.Gateway || b.S3.AccessKey != "envak" || !b.S3.isEnv("secret_key") || !b.S3.isEnv("encryption_key") || !b.S3.isEnv("access_key") {
+	if b.Backend != BackendS3 || b.Path != "" || b.S3.Endpoint != "http://minio:9000" || b.S3.PartSize != 6<<20 || b.S3.HomeBucket != "cold" ||
+		b.S3.DefaultKind != BucketKindNative || !b.S3.isEnv("default_kind") || !b.S3.isEnv("home_bucket") ||
+		b.S3.AccessKey != "envak" || !b.S3.isEnv("secret_key") || !b.S3.isEnv("encryption_key") || !b.S3.isEnv("access_key") {
 		t.Fatalf("backing %+v %+v", b, b.S3)
 	}
 
@@ -160,18 +177,19 @@ storage:
   backings:
     - name: cold-tier
       backend: s3
-      s3: {endpoint: "http://other:9000", bucket: yamlbucket, access_key: yamlak}
+      s3: {endpoint: "http://other:9000", home_bucket: yamlbucket, access_key: yamlak}
 `)
 	c, err = load(file, env(map[string]string{
-		"GOS3_BACKING_COLD_TIER_BUCKET":     "envbucket",
-		"GOS3_BACKING_COLD_TIER_ACCESS_KEY": "envak",
-		"GOS3_BACKING_COLD_TIER_SECRET_KEY": "envsk",
+		"GOS3_BACKING_COLD_TIER_HOME_BUCKET": "envbucket",
+		"GOS3_BACKING_COLD_TIER_ACCESS_KEY":  "envak",
+		"GOS3_BACKING_COLD_TIER_SECRET_KEY":  "envsk",
 	}), nil)
 	if err != nil {
 		t.Fatal(err)
 	}
 	s := c.Storage.Backings[0].S3
-	if s.Bucket != "yamlbucket" || s.AccessKey != "yamlak" || s.isEnv("access_key") || s.SecretKey != "envsk" || !s.isEnv("secret_key") {
+	if s.HomeBucket != "yamlbucket" || s.isEnv("home_bucket") || s.AccessKey != "yamlak" || s.isEnv("access_key") ||
+		s.SecretKey != "envsk" || !s.isEnv("secret_key") {
 		t.Fatalf("fill-empty: %+v", *s)
 	}
 	if err := c.Validate(); err != nil {
@@ -196,31 +214,54 @@ func TestBackingEnv(t *testing.T) {
 	if got := BackingEnv("cold-tier", "secret_key"); got != "GOS3_BACKING_COLD_TIER_SECRET_KEY" {
 		t.Errorf("BackingEnv = %q", got)
 	}
+	if got := BackingEnv("cold-tier", "home_bucket"); got != "GOS3_BACKING_COLD_TIER_HOME_BUCKET" {
+		t.Errorf("BackingEnv = %q", got)
+	}
 	if got := BackingEnv(DefaultBackingName, "encryption_key"); got != "GOS3_S3_ENCRYPTION_KEY" {
 		t.Errorf("default BackingEnv = %q", got)
 	}
 }
 
 func TestValidateS3(t *testing.T) {
+	dir := t.TempDir()
 	good := func() Config {
 		c := Default()
 		c.Storage.Backend = BackendS3
 		c.Storage.Path = ""
-		c.Storage.S3 = &S3Config{Endpoint: "http://minio:9000", Bucket: "main", AccessKey: "a", SecretKey: "s"}
+		c.Storage.S3 = &S3Config{Endpoint: "http://minio:9000", HomeBucket: "main", HomePrefix: "main/", AccessKey: "a", SecretKey: "s"}
 		c.Storage.Backings = []BackingConfig{
-			{Name: "cold", Backend: BackendS3, S3: &S3Config{Endpoint: "http://MINIO:9000", Bucket: "main", Prefix: "cold/", AccessKey: "a", SecretKey: "s"}},
-			{Name: "gw", Backend: BackendS3, S3: &S3Config{Endpoint: "https://s3.example.com", Bucket: "meta", AccessKey: "a", SecretKey: "s", Gateway: true}},
+			{Name: "cold", Backend: BackendS3, S3: &S3Config{Endpoint: "http://MINIO:9000", HomeBucket: "main", HomePrefix: "cold/", AccessKey: "a", SecretKey: "s"}},
+			{Name: "nat", Backend: BackendS3, S3: &S3Config{Endpoint: "https://s3.example.com", HomeBucket: "meta", AccessKey: "a", SecretKey: "s", DefaultKind: BucketKindNative}},
 		}
-		c.Storage.S3.Prefix = "main/"
 		return c
+	}
+	// local adds a backing without a home, which needs a system directory.
+	local := func(c *Config) {
+		c.Storage.Path = dir
+		c.Storage.Backings = append(c.Storage.Backings, BackingConfig{Name: "loc", Backend: BackendS3,
+			S3: &S3Config{Endpoint: "https://s3.example.com", AccessKey: "a", SecretKey: "s"}})
 	}
 	if err := good().Validate(); err != nil {
 		t.Fatalf("valid: %v", err)
 	}
-	ok := good()
-	ok.Storage.Replication.DefaultReplicas = []string{"cold"}
-	if err := ok.Validate(); err != nil {
-		t.Fatalf("valid replica: %v", err)
+	for name, mod := range map[string]func(c *Config){
+		"replica":                  func(c *Config) { c.Storage.Replication.DefaultReplicas = []string{"cold"} },
+		"replica with native kind": func(c *Config) { c.Storage.Replication.DefaultReplicas = []string{"nat"} },
+		"without home, system dir": local,
+		"homeless default native":  func(c *Config) { local(c); c.Storage.DefaultBacking = "loc" },
+		"homes in other buckets": func(c *Config) {
+			c.Storage.Backings[0].S3.HomeBucket, c.Storage.Backings[0].S3.HomePrefix = "other", ""
+		},
+		"homes on other services": func(c *Config) {
+			c.Storage.Backings[0].S3.Endpoint, c.Storage.Backings[0].S3.HomePrefix = "http://minio:9001", ""
+		},
+		"two backings without homes": func(c *Config) { local(c); local(c); c.Storage.Backings[3].Name = "loc2" },
+	} {
+		c := good()
+		mod(&c)
+		if err := c.Validate(); err != nil {
+			t.Errorf("%s: %v", name, err)
+		}
 	}
 	cases := []struct {
 		name string
@@ -234,14 +275,22 @@ func TestValidateS3(t *testing.T) {
 		{"endpoint scheme", func(c *Config) { c.Storage.S3.Endpoint = "ftp://minio" }, "storage.s3.endpoint"},
 		{"endpoint fragment", func(c *Config) { c.Storage.S3.Endpoint = "http://minio#x" }, "storage.s3.endpoint"},
 		{"region", func(c *Config) { c.Storage.S3.Region = "EU West" }, "storage.s3.region"},
-		{"no bucket", func(c *Config) { c.Storage.Backings[0].S3.Bucket = "" }, "storage.backings[0].s3.bucket: required (or set GOS3_BACKING_COLD_BUCKET)"},
-		{"bad bucket", func(c *Config) { c.Storage.S3.Bucket = "Bad_Bucket" }, "storage.s3.bucket"},
-		{"prefix slash", func(c *Config) { c.Storage.S3.Prefix = "/x/" }, "storage.s3.prefix"},
-		{"prefix dots", func(c *Config) { c.Storage.S3.Prefix = "a/../b/" }, "storage.s3.prefix"},
-		{"prefix dot", func(c *Config) { c.Storage.S3.Prefix = "./" }, "storage.s3.prefix"},
-		{"prefix empty segment", func(c *Config) { c.Storage.S3.Prefix = "a//" }, "storage.s3.prefix"},
-		{"prefix long", func(c *Config) { c.Storage.S3.Prefix = strings.Repeat("a", 513) + "/" }, "storage.s3.prefix"},
-		{"prefix utf8", func(c *Config) { c.Storage.S3.Prefix = "\xff/" }, "storage.s3.prefix"},
+		{"no home without system dir", func(c *Config) { c.Storage.Backings[0].S3.HomeBucket, c.Storage.Backings[0].S3.HomePrefix = "", "" },
+			"storage.backings[0].s3: an s3 backing without home_bucket keeps its records in the system directory; set storage.path or home_bucket"},
+		{"default without home or system dir", func(c *Config) { c.Storage.S3.HomeBucket, c.Storage.S3.HomePrefix = "", "" },
+			"storage.s3: an s3 backing without home_bucket"},
+		{"prefix without bucket", func(c *Config) { local(c); c.Storage.Backings[2].S3.HomePrefix = "x/" },
+			"storage.backings[2].s3.home_prefix: requires home_bucket (or set GOS3_BACKING_LOC_HOME_BUCKET)"},
+		{"bad bucket", func(c *Config) { c.Storage.S3.HomeBucket = "Bad_Bucket" }, "storage.s3.home_bucket"},
+		{"prefix slash", func(c *Config) { c.Storage.S3.HomePrefix = "/x/" }, "storage.s3.home_prefix"},
+		{"prefix dots", func(c *Config) { c.Storage.S3.HomePrefix = "a/../b/" }, "storage.s3.home_prefix"},
+		{"prefix dot", func(c *Config) { c.Storage.S3.HomePrefix = "./" }, "storage.s3.home_prefix"},
+		{"prefix empty segment", func(c *Config) { c.Storage.S3.HomePrefix = "a//" }, "storage.s3.home_prefix"},
+		{"prefix long", func(c *Config) { c.Storage.S3.HomePrefix = strings.Repeat("a", 513) + "/" }, "storage.s3.home_prefix"},
+		{"prefix utf8", func(c *Config) { c.Storage.S3.HomePrefix = "\xff/" }, "storage.s3.home_prefix"},
+		{"bad kind", func(c *Config) { c.Storage.S3.DefaultKind = "gateway" }, `storage.s3.default_kind: "gateway" is invalid (expected wrapped or native)`},
+		{"wrapped without home", func(c *Config) { local(c); c.Storage.Backings[2].S3.DefaultKind = BucketKindWrapped },
+			"storage.backings[2].s3.default_kind: wrapped buckets need a container: set home_bucket"},
 		{"addressing", func(c *Config) { c.Storage.S3.Addressing = "dns" }, "storage.s3.addressing"},
 		{"part size small", func(c *Config) { c.Storage.S3.PartSize = 1 << 20 }, "storage.s3.part_size"},
 		{"part size big", func(c *Config) { c.Storage.S3.PartSize = 6 << 30 }, "storage.s3.part_size"},
@@ -258,28 +307,39 @@ func TestValidateS3(t *testing.T) {
 			c.Storage.Backings = append(c.Storage.Backings, BackingConfig{Name: "f", Backend: BackendFS, Path: t.TempDir(), S3: &S3Config{}})
 		}, "storage.backings[2].s3: only allowed with backend s3"},
 		{"s3 on fs default", func(c *Config) { c.Storage.Backend, c.Storage.Path = BackendFS, t.TempDir() }, "storage.s3: only used with storage.backend s3"},
-		{"same prefix", func(c *Config) { c.Storage.Backings[0].S3.Prefix = "main/" }, "storage.backings[0].s3.prefix"},
-		{"nested prefix", func(c *Config) { c.Storage.Backings[0].S3.Prefix = "main/sub/" }, "overlaps storage.s3"},
+		{"same prefix", func(c *Config) { c.Storage.Backings[0].S3.HomePrefix = "main/" }, "storage.backings[0].s3.home_prefix"},
+		{"nested prefix", func(c *Config) { c.Storage.Backings[0].S3.HomePrefix = "main/sub/" }, "overlaps the home of storage.s3"},
 		{"default port", func(c *Config) {
 			c.Storage.Backings[1].S3.Endpoint = "https://s3.example.com:443"
-			c.Storage.Backings = append(c.Storage.Backings, BackingConfig{Name: "gw2", Backend: BackendS3,
-				S3: &S3Config{Endpoint: "https://S3.example.com", Bucket: "meta", Prefix: "x/", AccessKey: "a", SecretKey: "s"}})
-		}, "storage.backings[2].s3.prefix"},
+			c.Storage.Backings = append(c.Storage.Backings, BackingConfig{Name: "nat2", Backend: BackendS3,
+				S3: &S3Config{Endpoint: "https://S3.example.com", HomeBucket: "meta", HomePrefix: "x/", AccessKey: "a", SecretKey: "s"}})
+		}, "storage.backings[2].s3.home_prefix"},
 		{"env name clash", func(c *Config) {
 			c.Storage.Backings = append(c.Storage.Backings, BackingConfig{Name: "c-d", Backend: BackendS3,
-				S3: &S3Config{Endpoint: "http://x", Bucket: "b1", AccessKey: "a", SecretKey: "s"}},
-				BackingConfig{Name: "c_d", Backend: BackendS3, S3: &S3Config{Endpoint: "http://x", Bucket: "b2", AccessKey: "a", SecretKey: "s"}})
+				S3: &S3Config{Endpoint: "http://x", HomeBucket: "b1", AccessKey: "a", SecretKey: "s"}},
+				BackingConfig{Name: "c_d", Backend: BackendS3, S3: &S3Config{Endpoint: "http://x", HomeBucket: "b2", AccessKey: "a", SecretKey: "s"}})
 		}, "GOS3_BACKING_C_D_*"},
-		{"gateway replica", func(c *Config) { c.Storage.Replication.DefaultReplicas = []string{"gw"} }, "gateway"},
-		{"gateway default backing with replicas", func(c *Config) {
-			c.Storage.DefaultBacking = "gw"
+		{"homeless replica", func(c *Config) { local(c); c.Storage.Replication.DefaultReplicas = []string{"loc"} },
+			`default_replicas[0]: "loc" is an s3 backing without home_bucket`},
+		{"native default backing with replicas", func(c *Config) {
+			c.Storage.DefaultBacking = "nat"
 			c.Storage.Replication.DefaultReplicas = []string{"cold"}
-		}, "is an s3 gateway backing, whose buckets cannot be replicated"},
-		{"gateway default replica", func(c *Config) {
-			c.Storage.S3.Gateway = true
+		}, `new buckets on the default backing "nat" are native`},
+		{"homeless default backing with replicas", func(c *Config) {
+			local(c)
+			c.Storage.DefaultBacking = "loc"
+			c.Storage.Replication.DefaultReplicas = []string{"cold"}
+		}, `default backing "loc" are native`},
+		{"native default storage.s3 with replicas", func(c *Config) {
+			c.Storage.S3.DefaultKind = BucketKindNative
+			c.Storage.Replication.DefaultReplicas = []string{"cold"}
+		}, `default backing "default" are native`},
+		{"homeless storage.s3 as replica", func(c *Config) {
+			c.Storage.Path = dir
+			c.Storage.S3.HomeBucket, c.Storage.S3.HomePrefix = "", ""
 			c.Storage.DefaultBacking = "cold"
 			c.Storage.Replication.DefaultReplicas = []string{"default"}
-		}, "gateway"},
+		}, `"default" is an s3 backing without home_bucket`},
 	}
 	for _, tc := range cases {
 		c := good()
@@ -288,19 +348,6 @@ func TestValidateS3(t *testing.T) {
 		if err == nil || !strings.Contains(err.Error(), tc.want) {
 			t.Errorf("%s: Validate() = %v, want an error mentioning %q", tc.name, err, tc.want)
 		}
-	}
-	// Different buckets or services do not overlap.
-	c := good()
-	c.Storage.Backings[0].S3.Prefix = ""
-	c.Storage.Backings[0].S3.Bucket = "other"
-	if err := c.Validate(); err != nil {
-		t.Errorf("other bucket: %v", err)
-	}
-	c = good()
-	c.Storage.Backings[0].S3.Prefix = ""
-	c.Storage.Backings[0].S3.Endpoint = "http://minio:9001"
-	if err := c.Validate(); err != nil {
-		t.Errorf("other service: %v", err)
 	}
 }
 
@@ -332,14 +379,19 @@ func TestS3ConfigHelpers(t *testing.T) {
 	if nilCfg.Clone() != nil {
 		t.Error("nil Clone")
 	}
-	s := &S3Config{Bucket: "b"}
+	s := &S3Config{HomeBucket: "b"}
 	s.setEnv("secret_key", true)
 	cp := s.Clone()
-	cp.Bucket = "x"
-	if s.Bucket != "b" || !cp.isEnv("secret_key") {
+	cp.HomeBucket = "x"
+	if s.HomeBucket != "b" || !cp.isEnv("secret_key") {
 		t.Error("Clone is not a deep copy with provenance")
 	}
-	if !(S3Config{}).IsZero() || (S3Config{Gateway: true}).IsZero() {
+	for _, nz := range []S3Config{{DefaultKind: BucketKindNative}, {HomePrefix: "p/"}, {LegacyGateway: true}, {LegacyBucket: "b"}} {
+		if nz.IsZero() {
+			t.Errorf("IsZero(%+v)", nz)
+		}
+	}
+	if !(S3Config{}).IsZero() {
 		t.Error("IsZero")
 	}
 	if k, err := (S3Config{}).KEK(); k != nil || err != nil {
@@ -353,28 +405,41 @@ func TestS3ConfigHelpers(t *testing.T) {
 	if !(S3Config{Endpoint: "https://s3.amazonaws.com", Addressing: "path"}).PathStyle() {
 		t.Error("explicit path addressing")
 	}
+	home := S3Config{HomeBucket: "bk", HomePrefix: "p/"}
+	if !home.HasHome() || home.EffectiveDefaultKind() != BucketKindWrapped || home.Location() != "s3://bk/p/" {
+		t.Errorf("home: %v %q %q", home.HasHome(), home.EffectiveDefaultKind(), home.Location())
+	}
+	var local S3Config
+	if local.HasHome() || local.EffectiveDefaultKind() != BucketKindNative || local.Location() != "local:" {
+		t.Errorf("local: %v %q %q", local.HasHome(), local.EffectiveDefaultKind(), local.Location())
+	}
+	if k := (S3Config{HomeBucket: "bk", DefaultKind: BucketKindNative}).EffectiveDefaultKind(); k != BucketKindNative {
+		t.Errorf("explicit kind: %q", k)
+	}
 }
 
 func s3Def(name, bucket, prefix string) BackingDefinition {
 	return BackingDefinition{Name: name, Backend: BackendS3, S3: &S3Definition{
-		Endpoint: "http://minio:9000", Bucket: bucket, Prefix: prefix, AccessKey: "ak", SecretKey: "sk", EncryptionKey: testKEK}}
+		Endpoint: "http://minio:9000", HomeBucket: bucket, HomePrefix: prefix, AccessKey: "ak", SecretKey: "sk", EncryptionKey: testKEK}}
 }
 
 func TestBackingDefinitionRoundTrip(t *testing.T) {
 	d := s3Def("cold", "Cold", "p/")
-	d.S3.Gateway, d.S3.PartSize, d.S3.Region, d.S3.Addressing = true, 6<<20, "r1", "path"
+	d.S3.DefaultKind, d.S3.PartSize, d.S3.Region, d.S3.Addressing = BucketKindNative, 6<<20, "r1", "path"
 	back := DefinitionOf(d.Config())
 	if !back.Equal(d) || !back.S3.SecretKeyConfigured || !back.S3.EncryptionKeyConfigured || back.S3.SecretKeySource != "" {
 		t.Fatalf("round trip %+v", *back.S3)
 	}
-	if got := d.Identity(); got != "s3:cold/p/#gateway" {
+	if got := d.Identity(); got != "s3:home:cold/p/" {
 		t.Errorf("Identity = %q", got)
 	}
-	other := s3Def("cold", "cold", "p/")
-	other.S3.Gateway = true
-	other.S3.Endpoint, other.S3.SecretKey = "https://elsewhere", "other"
+	// Neither the connection nor the default kind is part of the identity.
+	other := s3Def("cold", "cold", "p")
+	other.S3.DefaultKind = BucketKindWrapped
+	other.S3.Endpoint, other.S3.SecretKey, other.S3.Region, other.S3.EncryptionKey = "https://elsewhere", "other", "r2", ""
+	other.S3.PartSize, other.S3.Addressing, other.S3.AccessKey = 8<<20, "virtual", "ak2"
 	if other.Identity() != d.Identity() {
-		t.Error("connection settings changed the identity")
+		t.Errorf("connection settings changed the identity: %q", other.Identity())
 	}
 	if other.Equal(d) {
 		t.Error("Equal ignores settings")
@@ -384,6 +449,43 @@ func TestBackingDefinitionRoundTrip(t *testing.T) {
 	if o2.Equal(d) {
 		t.Error("Equal ignores the secret")
 	}
+	o3 := DefinitionOf(d.Config())
+	o3.S3.DefaultKind = BucketKindWrapped
+	if o3.Equal(d) {
+		t.Error("Equal ignores the default kind")
+	}
+	// The home is: another bucket or prefix is other data.
+	for _, mod := range []func(*S3Definition){
+		func(s *S3Definition) { s.HomeBucket = "other" },
+		func(s *S3Definition) { s.HomePrefix = "elsewhere/" },
+		func(s *S3Definition) { s.HomeBucket, s.HomePrefix = "", "" },
+	} {
+		o := DefinitionOf(d.Config())
+		mod(o.S3)
+		if o.Identity() == d.Identity() {
+			t.Errorf("home change kept the identity %q", o.Identity())
+		}
+	}
+	// Without a home the records are local: the name is the identity.
+	loc := s3Def("cold", "", "")
+	if got := loc.Identity(); got != "s3:local:cold" {
+		t.Errorf("local Identity = %q", got)
+	}
+	loc.S3.Endpoint, loc.S3.DefaultKind = "https://elsewhere", BucketKindNative
+	if loc.Identity() != "s3:local:cold" {
+		t.Errorf("connection changed the local identity: %q", loc.Identity())
+	}
+	if got := (BackingDefinition{Name: "warm", Backend: BackendS3}).Identity(); got != "s3:local:warm" {
+		t.Errorf("identity without an s3 block = %q", got)
+	}
+	// Deprecated keys count as their replacements.
+	legacy := s3Def("cold", "", "")
+	legacy.S3.LegacyBucket, legacy.S3.LegacyPrefix, legacy.S3.LegacyGateway = "Cold", "p/", true
+	legacy.S3.PartSize, legacy.S3.Region, legacy.S3.Addressing = 6<<20, "r1", "path"
+	if legacy.Identity() != d.Identity() || !legacy.Equal(d) || !d.Equal(legacy) {
+		t.Errorf("legacy definition: identity %q, equal %v", legacy.Identity(), legacy.Equal(d))
+	}
+
 	if (BackingDefinition{Name: "m", Backend: BackendMemory}).Identity() != "memory:m" {
 		t.Error("memory identity")
 	}
@@ -410,6 +512,16 @@ func TestBackingSettingsPublic(t *testing.T) {
 	if bytes.Contains(data, []byte(`"sk"`)) || bytes.Contains(data, []byte(testKEK)) || !bytes.Contains(data, []byte(`"secretKeyConfigured":true`)) {
 		t.Errorf("public JSON %s", data)
 	}
+	for _, want := range []string{`"homeBucket":"bk"`, `"homePrefix":"cold/"`, `"defaultKind":""`} {
+		if !bytes.Contains(data, []byte(want)) {
+			t.Errorf("public JSON lacks %s: %s", want, data)
+		}
+	}
+	for _, legacy := range []string{`"bucket"`, `"prefix"`, `"gateway"`} {
+		if bytes.Contains(data, []byte(legacy)) {
+			t.Errorf("public JSON has the deprecated key %s: %s", legacy, data)
+		}
+	}
 }
 
 func TestBackingSettingsApplyS3(t *testing.T) {
@@ -425,6 +537,9 @@ func TestBackingSettingsApplyS3(t *testing.T) {
 	}
 	if s := st.Backings[1].S3; s.SecretKey != "from-env" || !s.isEnv("secret_key") || !s.isEnv("encryption_key") || s.EncryptionKey != testKEK {
 		t.Fatalf("env fallback %+v", *s)
+	}
+	if s := st.Backings[0].S3; s.DefaultKind != BucketKindWrapped {
+		t.Fatalf("default kind not derived: %+v", *s)
 	}
 
 	// Blank secrets keep the stored values (and their provenance).
@@ -463,6 +578,20 @@ func TestBackingSettingsApplyS3(t *testing.T) {
 	if _, err := bad.Apply(base); err == nil || !strings.Contains(err.Error(), "no path") {
 		t.Fatalf("path accepted: %v", err)
 	}
+	// A backing without a home needs the system directory.
+	homeless := BackingSettings{DefaultBacking: "default", Backings: []BackingDefinition{s3Def("x", "", "")}}
+	if _, err := homeless.Apply(base); err == nil || !strings.Contains(err.Error(), "set storage.path or home_bucket") {
+		t.Fatalf("homeless backing without a system directory: %v", err)
+	}
+	withDir := base
+	withDir.Path = t.TempDir()
+	st4, err := homeless.Apply(withDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if s := st4.Backings[0].S3; s.DefaultKind != BucketKindNative || s.Location() != "local:" {
+		t.Fatalf("homeless backing %+v", *s)
+	}
 }
 
 func TestBackingSettingsSaveLoad(t *testing.T) {
@@ -473,6 +602,7 @@ func TestBackingSettingsSaveLoad(t *testing.T) {
 	c.Storage.Backings = []BackingConfig{{Name: "static", Backend: BackendMemory}, {Name: "two", Backend: BackendMemory}}
 	in := BackingSettings{DefaultBacking: "default", Backings: []BackingDefinition{s3Def("cold", "bk", "cold/"), s3Def("envy", "bk", "envy/")}}
 	in.Backings[1].S3.SecretKey, in.Backings[1].S3.AccessKey = "", ""
+	in.Backings[1].S3.DefaultKind = BucketKindNative
 	st, err := in.Apply(c.Storage)
 	if err != nil {
 		t.Fatal(err)
@@ -493,6 +623,17 @@ func TestBackingSettingsSaveLoad(t *testing.T) {
 	if bytes.Contains(data, []byte("from-env")) || bytes.Contains(data, []byte("env-ak")) || bytes.Contains(data, []byte("Source")) {
 		t.Errorf("env values saved: %s", data)
 	}
+	// Only the new keys are written, and the default kind only when it is
+	// not the default for the home.
+	if !bytes.Contains(data, []byte(`"homeBucket": "bk"`)) || !bytes.Contains(data, []byte(`"homePrefix": "cold/"`)) ||
+		bytes.Count(data, []byte(`"defaultKind": "native"`)) != 1 || bytes.Contains(data, []byte(`"wrapped"`)) {
+		t.Errorf("saved keys:\n%s", data)
+	}
+	for _, legacy := range []string{`"bucket"`, `"prefix"`, `"gateway"`} {
+		if bytes.Contains(data, []byte(legacy)) {
+			t.Errorf("deprecated key %s saved:\n%s", legacy, data)
+		}
+	}
 
 	// LoadBackings replaces the static backings (decoding into a fresh
 	// value: the static "static" memory backing must not leak into the
@@ -506,11 +647,17 @@ func TestBackingSettingsSaveLoad(t *testing.T) {
 	if s := c.Storage.Backings[1].S3; s.SecretKey != "from-env" || !s.isEnv("secret_key") || s.AccessKey != "env-ak" || !s.isEnv("access_key") {
 		t.Fatalf("env secrets after reload %+v", *s)
 	}
+	if a, b := c.Storage.Backings[0].S3.DefaultKind, c.Storage.Backings[1].S3.DefaultKind; a != BucketKindWrapped || b != BucketKindNative {
+		t.Fatalf("default kinds after reload: %q, %q", a, b)
+	}
+	if d := c.Deprecations(); len(d) != 0 {
+		t.Errorf("Deprecations = %v", d)
+	}
 
 	// A saved fs definition does not inherit fields of a static s3 one.
 	c2 := Default()
 	c2.Storage.Path = dir
-	c2.Storage.Backings = []BackingConfig{{Name: "cold", Backend: BackendS3, S3: &S3Config{Endpoint: "http://x", Bucket: "zz", AccessKey: "a", SecretKey: "s"}}}
+	c2.Storage.Backings = []BackingConfig{{Name: "cold", Backend: BackendS3, S3: &S3Config{Endpoint: "http://x", HomeBucket: "zz", AccessKey: "a", SecretKey: "s"}}}
 	fsDir := filepath.Join(t.TempDir(), "fs")
 	if err := (BackingSettings{DefaultBacking: "default", Backings: []BackingDefinition{{Name: "cold", Backend: BackendFS, Path: fsDir}}}).Save(c2.BackingsPath()); err != nil {
 		t.Fatal(err)
@@ -528,7 +675,8 @@ func TestWriteEnvTableBackingNote(t *testing.T) {
 	if err := WriteEnvTable(&buf); err != nil {
 		t.Fatal(err)
 	}
-	for _, want := range []string{"GOS3_S3_ENCRYPTION_KEY", "GOS3_BACKING_<NAME>_<FIELD>", "ENCRYPTION_KEY"} {
+	for _, want := range []string{"GOS3_S3_ENCRYPTION_KEY", "GOS3_S3_HOME_BUCKET", "GOS3_S3_DEFAULT_KIND", "GOS3_BACKING_<NAME>_<FIELD>",
+		"ENCRYPTION_KEY", "HOME_PREFIX", "DEFAULT_KIND=native"} {
 		if !strings.Contains(buf.String(), want) {
 			t.Errorf("env table lacks %q", want)
 		}
@@ -537,7 +685,7 @@ func TestWriteEnvTableBackingNote(t *testing.T) {
 
 func TestValidateS3EndpointRedactsUserinfo(t *testing.T) {
 	for _, ep := range []string{"http://AKIA:hunter2@minio:9000", "http://AKIA:hunter2@minio:9000/path", "http://AKIA:hun%zzter2@minio"} {
-		err := validateS3("storage.s3", DefaultBackingName, S3Config{Endpoint: ep, Bucket: "bk", AccessKey: "a", SecretKey: "s"})
+		err := validateS3("storage.s3", DefaultBackingName, S3Config{Endpoint: ep, HomeBucket: "bk", AccessKey: "a", SecretKey: "s"}, "")
 		if err == nil || strings.Contains(err.Error(), "hunter2") || strings.Contains(err.Error(), "hun%zz") || strings.Contains(err.Error(), "AKIA") {
 			t.Errorf("%s: %v", ep, err)
 		}
@@ -552,15 +700,15 @@ func TestValidateS3EndpointRedactsUserinfo(t *testing.T) {
 // change that sends them back unchanged.
 func TestBackingSettingsEnvFieldsNotSaved(t *testing.T) {
 	vars := map[string]string{
-		"GOS3_BACKING_COLD_ENDPOINT":   "http://minio:9000",
-		"GOS3_BACKING_COLD_REGION":     "eu-west-1",
-		"GOS3_BACKING_COLD_BUCKET":     "envbucket",
-		"GOS3_BACKING_COLD_PREFIX":     "p",
-		"GOS3_BACKING_COLD_ADDRESSING": "path",
-		"GOS3_BACKING_COLD_PART_SIZE":  "8MiB",
-		"GOS3_BACKING_COLD_GATEWAY":    "true",
-		"GOS3_BACKING_COLD_ACCESS_KEY": "envak",
-		"GOS3_BACKING_COLD_SECRET_KEY": "envsk",
+		"GOS3_BACKING_COLD_ENDPOINT":     "http://minio:9000",
+		"GOS3_BACKING_COLD_REGION":       "eu-west-1",
+		"GOS3_BACKING_COLD_HOME_BUCKET":  "envbucket",
+		"GOS3_BACKING_COLD_HOME_PREFIX":  "p",
+		"GOS3_BACKING_COLD_ADDRESSING":   "path",
+		"GOS3_BACKING_COLD_PART_SIZE":    "8MiB",
+		"GOS3_BACKING_COLD_DEFAULT_KIND": "native",
+		"GOS3_BACKING_COLD_ACCESS_KEY":   "envak",
+		"GOS3_BACKING_COLD_SECRET_KEY":   "envsk",
 	}
 	withLookupEnv(t, vars)
 	dir := t.TempDir()
@@ -576,7 +724,7 @@ func TestBackingSettingsEnvFieldsNotSaved(t *testing.T) {
 		t.Fatal(err)
 	}
 	def := BackingsFrom(c.Storage).Backings[0]
-	if got := strings.Join(def.S3.EnvFields, ","); got != "endpoint,region,bucket,prefix,addressing,part_size,access_key,secret_key,gateway" {
+	if got := strings.Join(def.S3.EnvFields, ","); got != "endpoint,region,home_bucket,home_prefix,addressing,part_size,access_key,secret_key,default_kind" {
 		t.Fatalf("EnvFields = %s", got)
 	}
 	// A live PUT of the public form, unchanged apart from a new region.
@@ -589,8 +737,8 @@ func TestBackingSettingsEnvFieldsNotSaved(t *testing.T) {
 		t.Fatal(err)
 	}
 	s := st.Backings[0].S3
-	if s.Region != "us-west-2" || s.isEnv("region") || !s.isEnv("endpoint") || !s.isEnv("bucket") || !s.isEnv("prefix") ||
-		!s.isEnv("part_size") || !s.isEnv("gateway") || !s.isEnv("access_key") || !s.isEnv("secret_key") {
+	if s.Region != "us-west-2" || s.isEnv("region") || !s.isEnv("endpoint") || !s.isEnv("home_bucket") || !s.isEnv("home_prefix") ||
+		!s.isEnv("part_size") || !s.isEnv("default_kind") || !s.isEnv("access_key") || !s.isEnv("secret_key") {
 		t.Fatalf("provenance after Apply: %v", s.EnvFields())
 	}
 	if err := os.MkdirAll(c.SystemDir(), 0o700); err != nil {
@@ -603,7 +751,7 @@ func TestBackingSettingsEnvFieldsNotSaved(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, leaked := range []string{"minio", "envbucket", `"p/"`, "envak", "envsk", `"gateway": true`, "8388608", `"addressing": "path"`, "envFields"} {
+	for _, leaked := range []string{"minio", "envbucket", `"p/"`, "envak", "envsk", `"native"`, "8388608", `"addressing": "path"`, "envFields"} {
 		if bytes.Contains(data, []byte(leaked)) {
 			t.Errorf("backings.json contains %s:\n%s", leaked, data)
 		}
@@ -618,18 +766,18 @@ func TestBackingSettingsEnvFieldsNotSaved(t *testing.T) {
 		t.Fatal(err)
 	}
 	s = c.Storage.Backings[0].S3
-	if s.Endpoint != "http://minio2:9000" || s.Bucket != "envbucket" || s.Prefix != "p/" || s.PartSize != 8<<20 || !s.Gateway ||
-		s.Region != "us-west-2" || s.SecretKey != "envsk" {
+	if s.Endpoint != "http://minio2:9000" || s.HomeBucket != "envbucket" || s.HomePrefix != "p/" || s.PartSize != 8<<20 ||
+		s.DefaultKind != BucketKindNative || s.Region != "us-west-2" || s.SecretKey != "envsk" {
 		t.Fatalf("reloaded %+v", *s)
 	}
 	// Changing an env-supplied value makes it explicit (and saved).
 	pub = BackingsFrom(c.Storage).Public()
-	pub.Backings[0].S3.Bucket = "typed"
+	pub.Backings[0].S3.HomeBucket = "typed"
 	st, err = pub.Apply(c.Storage)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if st.Backings[0].S3.isEnv("bucket") || !st.Backings[0].S3.isEnv("endpoint") {
+	if st.Backings[0].S3.isEnv("home_bucket") || !st.Backings[0].S3.isEnv("endpoint") {
 		t.Fatalf("provenance after change: %v", st.Backings[0].S3.EnvFields())
 	}
 }

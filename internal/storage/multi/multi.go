@@ -24,11 +24,36 @@
 //
 // Copies keep version IDs, LastModified times and the order of every key's
 // versions; this needs the storage.VersionImporter extension on the
-// backings receiving copies (fs, memory and s3 implement it; an s3
-// gateway backing does not, so it can neither receive copies nor, keeping
-// no version history, be the source of replicas or moves). Keys
+// buckets receiving copies. What a bucket supports can differ between the
+// buckets of one backing (storage.BucketCapabilities): an s3 backing holds
+// wrapped buckets, stored in gos3's format, which can be replicated, moved
+// and receive copies like the buckets of fs and memory backings, and
+// native buckets, stored as-is in a remote bucket, which can do none of
+// that (they keep the remote's version IDs, which are not copied).
+// Replicas and move targets are created with
+// storage.CreateBucketOptions.Import set, so that the backing picks a
+// bucket kind that imports versions; a move can name the kind and
+// location of the target (Move's target, persisted with the move). Keys
 // are copied by comparing their version lists (see syncKey), so copying is
 // idempotent and catching up after any failure is just another comparison.
+//
+// A bucket can also be released (ReleaseBucket): the router forgets a
+// single-copy bucket whose backing can let it go without deleting its
+// data (a native bucket keeps its remote bucket).
+//
+// For the layers above it (copy jobs, snapshot schedulers), the router
+// imports versions itself (storage.VersionImporter, into a bucket's
+// primary and in-sync active-active replicas; see import.go), reports the
+// changes made through it to subscribers (Subscribe), and answers for each
+// bucket's capabilities (storage.BucketCapabilities) and restic repository
+// (restic.Host) with those of its primary copy.
+//
+// A backing is marked unhealthy after a failure of the backing itself (see
+// isBackingError) or a failed health probe (storage.HealthProber, else
+// ListBuckets). A failure of one bucket's remote location
+// (storage.ErrBucketUnavailable) does not mark its backing unhealthy:
+// reads fall back to another copy and an active-active replica stops
+// receiving synchronous writes until it has caught up again.
 //
 // The placements are persisted in a JSON state file (Options.StatePath).
 // Changes waiting to be copied to a replica are only kept in memory: after
@@ -82,15 +107,15 @@ const (
 type Backing struct {
 	Name string
 	Kind string // "fs", "memory" or "s3" (informational)
-	// Mode is "gateway" for an s3 gateway backing (which stores no
-	// versions and cannot hold replicas or receive moves) and "" otherwise
-	// (informational).
-	Mode string
 	Path string // data directory ("" for memory and s3)
 	// Location says where an s3 backing's data lives, without secrets
 	// (e.g. "s3://bucket/prefix/"); "" for fs and memory (informational).
 	Location string
-	Backend  storage.Backend
+	// Backend stores the backing's buckets. The bucket kinds it offers
+	// (storage.KindReporter) are reported by Router.Backings, and what each
+	// bucket supports (storage.BucketCapabilities) decides where copies can
+	// be made from and to.
+	Backend storage.Backend
 }
 
 // Options configure a Router.
@@ -187,6 +212,10 @@ type Router struct {
 	keys keyLocks
 	jobs *workQueue
 
+	// changes are the subscribers to the changes made through the router
+	// (see Subscribe).
+	changes changeFeed
+
 	ctx    context.Context // canceled by Close
 	cancel context.CancelFunc
 	wg     sync.WaitGroup
@@ -224,6 +253,9 @@ var (
 	_ storage.ConfigViewer           = (*Router)(nil)
 	_ storage.UploadWalker           = (*Router)(nil)
 	_ storage.CompressingBackend     = (*Router)(nil)
+	_ storage.VersionImporter        = (*Router)(nil)
+	_ storage.CompressingImporter    = (*Router)(nil)
+	_ storage.BucketCapabilities     = (*Router)(nil)
 )
 
 // Open builds a Router over opts.Backings: it loads the state file,
@@ -306,20 +338,19 @@ func Open(ctx context.Context, opts Options) (_ *Router, err error) {
 	if !opts.NewBucketMode.Valid() || (opts.NewBucketMode == ModeSingle) != (len(opts.NewBucketReplicas) == 0) {
 		return nil, fmt.Errorf("%w: new bucket mode %q with replicas %v", ErrInvalidPlacement, opts.NewBucketMode, opts.NewBucketReplicas)
 	}
+	replicas := make([]*backing, 0, len(opts.NewBucketReplicas))
 	for i, name := range opts.NewBucketReplicas {
-		if topology.backings[name] == nil {
+		b := topology.backings[name]
+		if b == nil {
 			return nil, fmt.Errorf("%w: new bucket replica %q", ErrUnknownBacking, name)
 		}
 		if name == topology.def.Name || slices.Contains(opts.NewBucketReplicas[:i], name) {
 			return nil, fmt.Errorf("%w: new bucket replica %q is the default backing or listed twice", ErrInvalidPlacement, name)
 		}
-		if !canImport(topology.backings[name]) {
-			return nil, fmt.Errorf("%w: new bucket replica: %s", ErrInvalidPlacement, errNoImport(name))
-		}
+		replicas = append(replicas, b)
 	}
-	if len(opts.NewBucketReplicas) > 0 && !canImport(topology.def) {
-		return nil, fmt.Errorf("%w: new buckets cannot have replicas: the default backing %q is an S3 gateway backing, "+
-			"which keeps no version history to copy", ErrInvalidPlacement, topology.def.Name)
+	if err := checkNewBucketReplicas(ctx, topology.def, replicas); err != nil {
+		return nil, err
 	}
 	r.opts = opts
 	st, err := loadState(opts.StatePath)
@@ -726,10 +757,12 @@ func (r *Router) AutoFailover() bool { return r.opts.AutoFailover }
 // isBackingError reports whether err (returned by a backing) indicates a
 // failure of the backing itself rather than an answer about the request
 // (not found, exists, precondition failed, an operation the backing does
-// not support, ...), a canceled request or a failure of one bucket's
-// encryption (a missing key, an unavailable restic repository), which
-// other buckets on the backing do not share. storage.ErrBackingUnavailable
-// (e.g. an unreachable remote service) is a backing error.
+// not support, a target it cannot honour, a refusal by a remote service,
+// ...), a canceled request or a failure that other buckets on the backing
+// do not share: one bucket's encryption (a missing key, an unavailable
+// restic repository) or one bucket's remote location
+// (storage.ErrBucketUnavailable). storage.ErrBackingUnavailable (e.g. an
+// unreachable remote service) is a backing error.
 func isBackingError(err error) bool {
 	if err == nil {
 		return false
@@ -740,7 +773,8 @@ func isBackingError(err error) bool {
 		storage.ErrPartNotFound, storage.ErrConfigNotFound, storage.ErrPreconditionFailed,
 		storage.ErrInvalidName, storage.ErrStopWalk, context.Canceled, context.DeadlineExceeded,
 		errors.ErrUnsupported, storage.ErrEncryptionUnavailable, storage.ErrNotSupported,
-		storage.ErrInvalidBacking,
+		storage.ErrInvalidBacking, storage.ErrBucketUnavailable, storage.ErrRemoteDenied,
+		storage.ErrRemoteRejected, storage.ErrInvalidTarget,
 	} {
 		if errors.Is(err, s) {
 			return false
@@ -803,10 +837,16 @@ func (r *Router) requestProbe(b *backing) {
 // probeTimeout bounds one health probe.
 const probeTimeout = 5 * time.Second
 
-// probe checks backing b by listing its buckets.
+// probe checks backing b with its own health check
+// (storage.HealthProber), or else by listing its buckets.
 func (r *Router) probe(b *backing) {
 	ctx, cancel := context.WithTimeout(r.ctx, probeTimeout)
-	_, err := b.Backend.ListBuckets(ctx)
+	var err error
+	if hp, ok := b.Backend.(storage.HealthProber); ok {
+		err = hp.ProbeHealth(ctx)
+	} else {
+		_, err = b.Backend.ListBuckets(ctx)
+	}
 	cancel()
 	if r.ctx.Err() != nil {
 		return

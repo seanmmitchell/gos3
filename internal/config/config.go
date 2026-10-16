@@ -35,6 +35,8 @@ type Config struct {
 	Lifecycle   LifecycleConfig   `yaml:"lifecycle"`
 	Metrics     MetricsConfig     `yaml:"metrics"`
 	Compression CompressionConfig `yaml:"compression"`
+	Jobs        JobsConfig        `yaml:"jobs"`
+	Restic      ResticConfig      `yaml:"restic"`
 }
 
 // ServerConfig configures the HTTP listener and identity.
@@ -237,6 +239,48 @@ type CompressionConfig struct {
 	// Default DefaultSkipContentTypes. Objects with a Content-Encoding
 	// such as gzip are never compressed again.
 	SkipContentTypes []string `yaml:"skip_content_types"`
+}
+
+// JobsConfig sizes the background job engine (internal/jobs) that runs copy
+// and mirror jobs and whole-bucket restic snapshots, restores and prunes.
+// The jobs themselves are managed through the admin API. Static: changes
+// take effect at the next start.
+type JobsConfig struct {
+	// Workers is the number of jobs that run at once, of every kind
+	// (default DefaultJobsWorkers, 1-MaxJobsWorkers). Further jobs wait in
+	// the queued state.
+	Workers int `yaml:"workers"`
+}
+
+// ResticConfig configures gos3's use of restic beyond the per-version
+// archive (which needs no settings).
+type ResticConfig struct {
+	// Snapshots configures the runs of whole-bucket snapshots.
+	Snapshots ResticSnapshotsConfig `yaml:"snapshots"`
+}
+
+// ResticSnapshotsConfig configures the runs of whole-bucket restic
+// snapshots (internal/resticsnap). The snapshot schedules themselves are
+// bucket configuration documents managed through the admin API. Static.
+type ResticSnapshotsConfig struct {
+	// Workers is the number of snapshot, restore and prune jobs that run
+	// restic at once (default DefaultSnapshotWorkers, 1-MaxJobsWorkers).
+	// Each such job also takes one of jobs.workers, so a value above
+	// jobs.workers has no effect.
+	Workers int `yaml:"workers"`
+	// StageDir is where snapshot runs stage buckets, one subdirectory per
+	// repository and bucket, kept between runs ("" = <system
+	// dir>/restic-stage, or a directory in the temporary directory without
+	// a system directory).
+	StageDir string `yaml:"stage_dir"`
+	// SpoolBytes is the object data a run writes to the stage before it
+	// saves a partial snapshot and continues from it (default
+	// DefaultSnapshotSpoolBytes, at least MinSnapshotSpoolBytes).
+	SpoolBytes int64 `yaml:"spool_bytes"`
+	// Incremental stages objects unchanged since the parent snapshot as
+	// sparse placeholders, which restic takes from the parent without
+	// reading them (default true). False reads every object at every run.
+	Incremental bool `yaml:"incremental"`
 }
 
 // Settings is the runtime-editable subset of configuration, exposed via the

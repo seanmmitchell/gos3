@@ -94,6 +94,7 @@ describe('AdminClient storage endpoints', () => {
     const { admin, calls } = makeAdmin(c => json(placement(), c.method === 'POST' ? 202 : 200))
     await admin.moveBucket('photos', 'archive')
     await admin.moveBucket('photos', 'archive', 'fast')
+    await admin.moveBucket('photos', 'cold', undefined, 'c-7f3a')
     await admin.cancelBucketMove('photos')
     await admin.promoteReplica('photos', 'fast')
     await admin.promoteReplica('photos', 'fast', true)
@@ -103,6 +104,7 @@ describe('AdminClient storage endpoints', () => {
     expect(sent).toEqual([
       ['POST', '/move', '{"to":"archive"}'],
       ['POST', '/move', '{"to":"archive","from":"fast"}'],
+      ['POST', '/move', '{"to":"cold","container":"c-7f3a"}'],
       ['DELETE', '/move', ''],
       ['POST', '/promote', '{"backing":"fast"}'],
       ['POST', '/promote', '{"backing":"fast","force":true}'],
@@ -237,17 +239,20 @@ describe('placement helpers', () => {
 describe('s3 backings in placement', () => {
   const S3 = [
     backing('default', { default: true }),
-    backing('cold', { kind: 's3', path: '', location: 's3://gos3-cold/data/' }),
-    backing('aws', { kind: 's3', mode: 'gateway', path: '', location: 's3://' })
+    backing('cold', {
+      kind: 's3', path: '', location: 's3://gos3-cold/data/', kinds: ['native', 'wrapped'], defaultKind: 'wrapped',
+      account: { home: { bucket: 'gos3-cold', prefix: 'data/' }, records: 'home', defaultKind: 'wrapped', defaultContainer: 'home', kinds: ['native', 'wrapped'], nativeBuckets: 0, wrappedBuckets: 0, containers: [{ id: 'home', location: { bucket: 'gos3-cold', prefix: 'data/' }, role: 'home', default: true, buckets: 0, state: 'ready' }] }
+    }),
+    backing('aws', { kind: 's3', path: '', location: 'local:', kinds: ['native'], defaultKind: 'native' })
   ]
   const single = placement({ mode: 'single', members: [member('default', { role: 'primary' })] })
 
-  it('offers s3 backings as replicas and move targets, but not gateway ones', () => {
+  it('offers s3 backings as replicas and move targets, but not those without a container', () => {
     expect(replicaChoices(S3, single).map(c => c.value)).toEqual(['cold'])
-    expect(moveTargets(S3, single).map(t => [t.value, t.disabledReason])).toEqual([['aws', 'gateway backing'], ['cold', undefined]])
+    expect(moveTargets(S3, single).map(t => [t.value, t.disabledReason])).toEqual([['aws', 'no container'], ['cold', undefined]])
   })
 
-  it('keeps a gateway backing that somehow holds a replica selectable', () => {
+  it('keeps a backing without a container that somehow holds a replica selectable', () => {
     const p = placement({ members: [member('default', { role: 'primary' }), member('aws')] })
     expect(replicaChoices(S3, p).map(c => c.value)).toEqual(['aws', 'cold'])
   })
@@ -256,7 +261,7 @@ describe('s3 backings in placement', () => {
 describe('AdminClient backing configuration', () => {
   it('sends the s3 section of a PUT as given', async () => {
     const config = {
-      backings: [{ name: 'cold', backend: 's3' as const, path: '', s3: { endpoint: 'https://s3.example.com', region: '', bucket: 'gos3-cold', prefix: '', addressing: '' as const, gateway: true, accessKey: 'AK', secretKey: 'SK' } }],
+      backings: [{ name: 'cold', backend: 's3' as const, path: '', s3: { endpoint: 'https://s3.example.com', region: '', homeBucket: 'gos3-cold', homePrefix: '', defaultKind: 'native' as const, addressing: '' as const, accessKey: 'AK', secretKey: 'SK' } }],
       defaultBacking: 'default',
       revision: 'r1',
       persistent: true

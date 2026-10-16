@@ -24,8 +24,9 @@ import (
 // bucket's ID, info, configuration documents and uploads, followed by
 // object chunks (scope "o", at most snapChunkKeys keys each), all with the
 // LSN read under the bucket's lock while the bucket was copied; and one
-// chunk (scope "a") per gateway aux namespace. On load, a record applies to
-// a bucket (or aux namespace) only when its LSN is above that chunk LSN.
+// chunk (scope "a") per aux namespace (AuxState). On load, a record
+// applies to a bucket (or aux namespace) only when its LSN is above that
+// chunk LSN.
 
 // Record operations.
 const (

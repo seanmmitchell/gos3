@@ -379,7 +379,6 @@ func TestEncryptionProvidersMatrix(t *testing.T) {
 			rt.LookPath = func(string) (string, error) { return "", os.ErrNotExist }
 		}, []string{storage.EncryptionAES256}},
 		{"KEK without credentials", func(o *Options) { o.AccessKey, o.SecretKey = "", "" }, nil, []string{storage.EncryptionAES256}},
-		{"gateway", func(o *Options) { o.Gateway = true }, nil, []string{}},
 	}
 	for i, c := range cases {
 		opts := v.kekOptions(string(rune('a'+i)) + "/")

@@ -3,6 +3,7 @@ package server
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -14,6 +15,7 @@ import (
 	"github.com/seanmmitchell/gos3/internal/config"
 	"github.com/seanmmitchell/gos3/internal/s3client/s3clienttest"
 	"github.com/seanmmitchell/gos3/internal/storage"
+	"github.com/seanmmitchell/gos3/internal/storage/localstate"
 	"github.com/seanmmitchell/gos3/internal/storage/multi"
 )
 
@@ -32,60 +34,79 @@ func remoteKeys(t *testing.T, remote *s3clienttest.Remote, bucket string) []stri
 	return keys
 }
 
-// A gateway backing refuses gos3 buckets named like the remote bucket of
-// another s3 backing (or its own metadata bucket): it would adopt that
-// backing's data as objects.
-func TestGatewayRefusesBackingBuckets(t *testing.T) {
+// Remote locations are claimed server-wide: no native bucket can use the
+// home of another s3 backing (or a remote bucket another native bucket
+// uses), whichever backing asks, so that gos3 never serves a backing's
+// data as objects.
+func TestS3ClaimsRefuseUsedLocations(t *testing.T) {
 	remote := s3clienttest.Start(t)
 	remote.CreateBucket(t, "coldstore")
-	remote.CreateBucket(t, "gwmeta")
 	cfg := testConfig()
 	cfg.Storage.Backend = config.BackendFS
 	cfg.Storage.Path = t.TempDir()
-	gw := s3Settings(remote, "gwmeta", "")
-	gw.Gateway = true
 	cfg.Storage.Backings = []config.BackingConfig{
 		{Name: "cold", Backend: config.BackendS3, S3: s3Settings(remote, "coldstore", "cold/")},
-		{Name: "gw", Backend: config.BackendS3, S3: gw},
+		{Name: "edge", Backend: config.BackendS3, S3: s3Settings(remote, "", "")},
 	}
 	srv := start(t, cfg)
-	mustStatus(t, "create on cold", do(t, "PUT", srv.url+"/frozen", nil, &rootCreds, map[string]string{"x-gos3-backing": "cold"}), 200)
+	createOn(t, srv.url, "frozen", "cold", nil)
 	mustStatus(t, "put on cold", do(t, "PUT", srv.url+"/frozen/k", []byte("ice"), &rootCreds, nil), 200)
+	createOn(t, srv.url, "native", "edge", nil)
 	before := remoteKeys(t, remote, "coldstore")
 
-	for _, name := range []string{"coldstore", "gwmeta"} {
-		res := do(t, "PUT", srv.url+"/"+name, nil, &rootCreds, map[string]string{"x-gos3-backing": "gw"})
-		if res.status != http.StatusConflict && res.status != http.StatusBadRequest {
-			t.Fatalf("create %s on gw: %d %s", name, res.status, res.body)
+	// Through the S3 API: a native bucket whose remote bucket is cold's
+	// home, or another native bucket's remote bucket.
+	for _, c := range []struct{ bucket, remoteBucket, backing string }{
+		{"coldstore", "", "edge"}, {"other", "coldstore", "edge"}, {"copycat", "native", "edge"},
+		{"viacold", "coldstore", "cold"}, {"native2", "native", "cold"},
+	} {
+		hdr := map[string]string{"x-gos3-backing": c.backing, "x-gos3-bucket-kind": "native"}
+		if c.remoteBucket != "" {
+			hdr["x-gos3-remote-bucket"] = c.remoteBucket
 		}
-		mustStatus(t, "HEAD "+name, do(t, "HEAD", srv.url+"/"+name, nil, &rootCreds, nil), 404)
+		res := do(t, "PUT", srv.url+"/"+c.bucket, nil, &rootCreds, hdr)
+		mustStatusIn(t, "create "+c.bucket+" on "+c.backing, res, http.StatusBadRequest, http.StatusConflict)
+		mustStatus(t, "HEAD "+c.bucket, do(t, "HEAD", srv.url+"/"+c.bucket, nil, &rootCreds, nil), 404)
 	}
+	// Through the admin API: adopting them is a conflict.
+	for _, rb := range []string{"coldstore", "native"} {
+		res := adminDo(t, srv.url, "POST", "/backings/edge/buckets", map[string]any{
+			"bucket": "adopted-" + rb, "kind": "native", "remoteBucket": rb, "adopt": true,
+		})
+		mustStatus(t, "adopt "+rb, res, http.StatusConflict)
+	}
+	// A container inside cold's home is a conflict too.
+	res := adminDo(t, srv.url, "POST", "/backings/edge/containers", map[string]any{"bucket": "coldstore", "prefix": "cold/inner/"})
+	mustStatus(t, "container inside cold's home", res, http.StatusConflict)
+
 	if after := remoteKeys(t, remote, "coldstore"); !slices.Equal(before, after) {
 		t.Fatalf("cold's remote bucket changed:\nbefore %v\nafter  %v", before, after)
 	}
 	getBody(t, srv.url+"/frozen/k", "ice")
-	// Other names still work on the gateway.
-	mustStatus(t, "create on gw", do(t, "PUT", srv.url+"/native", nil, &rootCreds, map[string]string{"x-gos3-backing": "gw"}), 200)
+	// Other names still work.
+	createOn(t, srv.url, "fresh", "edge", nil)
+	headBucket(t, srv.url, "fresh", "edge", "native")
 }
 
-// The connection settings of a gateway backing whose metadata store has
-// not loaded change only when no bucket is placed on it.
-func TestGatewayReconfigureWhileUnloaded(t *testing.T) {
+// The connection settings of an s3 backing whose home has not loaded
+// (wrong settings, an unreachable service) change in place, also while
+// buckets are placed on it; so do those of a backing without a home.
+func TestS3ReconfigureWhileUnloaded(t *testing.T) {
 	remote := s3clienttest.Start(t)
-	remote.CreateBucket(t, "gwa-meta")
-	remote.CreateBucket(t, "gwb-meta")
+	remote.CreateBucket(t, "cold-home")
 	cfg := testConfig()
 	cfg.Storage.Backend = config.BackendFS
 	cfg.Storage.Path = t.TempDir()
-	gwa, gwb := s3Settings(remote, "gwa-meta", ""), s3Settings(remote, "gwb-meta", "")
-	gwa.Gateway, gwb.Gateway = true, true
 	cfg.Storage.Backings = []config.BackingConfig{
-		{Name: "gwa", Backend: config.BackendS3, S3: gwa},
-		{Name: "gwb", Backend: config.BackendS3, S3: gwb},
+		{Name: "cold", Backend: config.BackendS3, S3: s3Settings(remote, "cold-home", "")},
+		{Name: "edge", Backend: config.BackendS3, S3: s3Settings(remote, "", "")},
 	}
 	cfg.Storage.Replication.HealthInterval = time.Second
 	srv := start(t, cfg)
-	mustStatus(t, "create on gwa", do(t, "PUT", srv.url+"/inuse", nil, &rootCreds, map[string]string{"x-gos3-backing": "gwa"}), 200)
+	createOn(t, srv.url, "inuse", "cold", nil)
+	mustStatus(t, "put", do(t, "PUT", srv.url+"/inuse/k", []byte("kept"), &rootCreds, nil), 200)
+	createOn(t, srv.url, "nearby", "edge", nil)
+	mustStatus(t, "put", do(t, "PUT", srv.url+"/nearby/k", []byte("close"), &rootCreds, nil), 200)
 	if err := srv.stop(); err != nil {
 		t.Fatal(err)
 	}
@@ -100,10 +121,10 @@ func TestGatewayReconfigureWhileUnloaded(t *testing.T) {
 	}
 	remote.Fail.Store(&down)
 	srv = start(t, cfg)
-	st := backingStatuses(t, srv.url)
-	if st["gwa"].Healthy || st["gwb"].Healthy || st["gwa"].Buckets != 1 {
+	if st := backingStatuses(t, srv.url); st["cold"].Healthy || st["cold"].Buckets != 1 {
 		t.Fatalf("backings while down: %+v", st)
 	}
+	mustStatus(t, "get while down", do(t, "GET", srv.url+"/inuse/k", nil, &rootCreds, nil), 503)
 	const endpoint = "/_gos3/admin/v1/backings/config"
 	localhost := strings.Replace(remote.URL, "127.0.0.1", "localhost", 1)
 	change := func(name string) response {
@@ -117,18 +138,49 @@ func TestGatewayReconfigureWhileUnloaded(t *testing.T) {
 		raw, _ := json.Marshal(in)
 		return do(t, "PUT", srv.url+endpoint, raw, &rootCreds, nil)
 	}
-	mustStatus(t, "change gwa (a bucket is placed on it)", change("gwa"), 409)
-	mustStatus(t, "change gwb (no bucket on it)", change("gwb"), 200)
-	waitFor(t, 60*time.Second, "gwb healthy", func() bool { return backingStatuses(t, srv.url)["gwb"].Healthy })
-	// gwb's gateway store uses the new endpoint too: once gwa has been
-	// loaded (so that its buckets are known), a bucket can be created on
-	// gwb while the old name is still unreachable.
-	remote.Fail.Store(nil)
-	waitFor(t, 60*time.Second, "gwa healthy", func() bool { return backingStatuses(t, srv.url)["gwa"].Healthy })
-	remote.Fail.Store(&down)
-	mustStatus(t, "create on gwb", do(t, "PUT", srv.url+"/fresh", nil, &rootCreds, map[string]string{"x-gos3-backing": "gwb"}), 200)
-	mustStatus(t, "put on gwb", do(t, "PUT", srv.url+"/fresh/k", []byte("new"), &rootCreds, nil), 200)
-	getBody(t, srv.url+"/fresh/k", "new")
+	mustStatus(t, "change cold (a bucket is placed on it)", change("cold"), 200)
+	waitFor(t, 60*time.Second, "cold healthy", func() bool { return backingStatuses(t, srv.url)["cold"].Healthy })
+	getBody(t, srv.url+"/inuse/k", "kept")
+	mustStatus(t, "put after the change", do(t, "PUT", srv.url+"/inuse/k2", []byte("new"), &rootCreds, nil), 200)
+	createOn(t, srv.url, "fresh", "cold", nil)
+
+	mustStatus(t, "change edge", change("edge"), 200)
+	waitFor(t, 60*time.Second, "edge healthy", func() bool { return backingStatuses(t, srv.url)["edge"].Healthy })
+	getBody(t, srv.url+"/nearby/k", "close")
+	createOn(t, srv.url, "fresh-native", "edge", nil)
+	if !remoteHas(remote, "fresh-native") {
+		t.Fatal("no remote bucket for the new native bucket")
+	}
+}
+
+// The records of an s3 backing without a home are locked while the server
+// runs: a second process cannot open them.
+func TestS3LocalRecordsLocked(t *testing.T) {
+	remote := s3clienttest.Start(t)
+	cfg := testConfig()
+	cfg.Storage.Backend = config.BackendS3
+	cfg.Storage.Path = t.TempDir()
+	cfg.Storage.S3 = s3Settings(remote, "", "")
+	srv := start(t, cfg)
+	if b := backingStatuses(t, srv.url)["default"]; b.Location != "local:" || b.DefaultKind != "native" || !b.Healthy {
+		t.Fatalf("default backing: %+v", b)
+	}
+	mustStatus(t, "create", do(t, "PUT", srv.url+"/native", nil, &rootCreds, nil), 200)
+	headBucket(t, srv.url, "native", "default", "native")
+	dir := S3RecordsDir(filepath.Join(cfg.Storage.Path, config.SystemDirName), config.DefaultBackingName)
+	db, err := localstate.Open(dir, localstate.Options{LockTimeout: 100 * time.Millisecond})
+	if err == nil {
+		_ = db.Close()
+		t.Fatal("the records of a running backing could be opened")
+	}
+	if !errors.Is(err, localstate.ErrLocked) {
+		t.Fatalf("opening the records of a running backing: %v", err)
+	}
+	if err := srv.stop(); err != nil {
+		t.Fatal(err)
+	}
+	srv = start(t, cfg)
+	headBucket(t, srv.url, "native", "default", "native")
 }
 
 // Temporary directories of s3 backings are removed when the backing is
@@ -175,10 +227,8 @@ func TestS3BackingTempDirs(t *testing.T) {
 		raw, _ := json.Marshal(in)
 		return do(t, "PUT", srv.url+endpoint, raw, &rootCreds, nil)
 	}
-	def := config.BackingDefinition{Name: "cold", Backend: config.BackendS3, S3: &config.S3Definition{
-		Endpoint: remote.URL, Bucket: "live", Prefix: "cold/", Addressing: "path",
-		AccessKey: s3clienttest.AccessKey, SecretKey: "wrong-secret-key-000000000000000000000",
-	}}
+	def := s3Definition(remote, "cold", "live", "cold/")
+	def.S3.SecretKey = "wrong-secret-key-000000000000000000000"
 	mustStatus(t, "add with a wrong secret", put(def), 400)
 	if d := ours(); len(d) != 0 {
 		t.Fatalf("temporary directories after a refused open: %v", d)

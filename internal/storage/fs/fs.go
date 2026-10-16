@@ -18,6 +18,10 @@
 //	keys/<bucket-id>.restic.json    a bucket's restic repository location and
 //	                                password (secret)
 //	restic/<bucket-id>/             a bucket's restic repository
+//	keys/aux/<name>[.restic.json]   key and recovery record of an aux
+//	                                repository (secret; see restic_host.go)
+//	restic-aux/<name>/              an aux restic repository: whole-bucket
+//	                                snapshots of buckets kept elsewhere
 //	restic-cache/                   restic's local repository cache
 //
 // Keys, recovery records and repositories are kept when a bucket is
@@ -384,6 +388,10 @@ func (b *Backend) Close() error {
 	}
 	b.cancel()
 	b.wg.Wait()
+	// Restores of canceled restic reads finish in the background (and
+	// remove their temporary files); wait for them before the data
+	// directory is released.
+	b.resticRuntime().Wait()
 	if err := b.db.Close(); err != nil {
 		return fmt.Errorf("fs: close metadata database: %w", err)
 	}

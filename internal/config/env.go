@@ -45,14 +45,17 @@ var envVars = []EnvVar{
 	{"GOS3_STORAGE_BACKEND", "storage.backend", "fs, memory or s3", str(func(c *Config) *string { return &c.Storage.Backend })},
 	{"GOS3_S3_ENDPOINT", "storage.s3.endpoint", "s3 backend: service URL, http(s)://host[:port]", s3str(func(s *S3Config) *string { return &s.Endpoint })},
 	{"GOS3_S3_REGION", "storage.s3.region", "s3 backend: signing region (default us-east-1)", s3str(func(s *S3Config) *string { return &s.Region })},
-	{"GOS3_S3_BUCKET", "storage.s3.bucket", "s3 backend: remote bucket", s3str(func(s *S3Config) *string { return &s.Bucket })},
-	{"GOS3_S3_PREFIX", "storage.s3.prefix", "s3 backend: key prefix in the bucket", s3str(func(s *S3Config) *string { return &s.Prefix })},
+	{"GOS3_S3_HOME_BUCKET", "storage.s3.home_bucket", "s3 backend: remote bucket of the home (records and shared container; empty = records in the system directory)", s3str(func(s *S3Config) *string { return &s.HomeBucket })},
+	{"GOS3_S3_HOME_PREFIX", "storage.s3.home_prefix", "s3 backend: key prefix of the home in its bucket", s3str(func(s *S3Config) *string { return &s.HomePrefix })},
+	{"GOS3_S3_DEFAULT_KIND", "storage.s3.default_kind", "s3 backend: kind of new buckets, wrapped or native (default: wrapped with a home, native without)", s3str(func(s *S3Config) *string { return &s.DefaultKind })},
 	{"GOS3_S3_ADDRESSING", "storage.s3.addressing", "s3 backend: auto, path or virtual", s3str(func(s *S3Config) *string { return &s.Addressing })},
 	{"GOS3_S3_PART_SIZE", "storage.s3.part_size", "s3 backend: upload part size, bytes or 16MiB-style (5MiB-5GiB)", s3size(func(s *S3Config) *int64 { return &s.PartSize })},
 	{"GOS3_S3_ACCESS_KEY", "storage.s3.access_key", "s3 backend: access key", s3str(func(s *S3Config) *string { return &s.AccessKey })},
 	{"GOS3_S3_SECRET_KEY", "storage.s3.secret_key", "s3 backend: secret key", s3str(func(s *S3Config) *string { return &s.SecretKey })},
 	{"GOS3_S3_ENCRYPTION_KEY", "storage.s3.encryption_key", "s3 backend: key-encryption key, base64 of 32 bytes (enables AES256 and restic)", s3str(func(s *S3Config) *string { return &s.EncryptionKey })},
-	{"GOS3_S3_GATEWAY", "storage.s3.gateway", "s3 backend: store objects natively in same-named remote buckets (bool)", s3bool(func(s *S3Config) *bool { return &s.Gateway })},
+	{"GOS3_S3_BUCKET", "storage.s3.bucket", "deprecated alias of GOS3_S3_HOME_BUCKET", s3str(func(s *S3Config) *string { return &s.LegacyBucket })},
+	{"GOS3_S3_PREFIX", "storage.s3.prefix", "deprecated alias of GOS3_S3_HOME_PREFIX", s3str(func(s *S3Config) *string { return &s.LegacyPrefix })},
+	{"GOS3_S3_GATEWAY", "storage.s3.gateway", "deprecated: true is GOS3_S3_DEFAULT_KIND=native (bool)", s3bool(func(s *S3Config) *bool { return &s.LegacyGateway })},
 	{"GOS3_FSYNC", "storage.fsync_data", "fsync object data on commit (bool)", boolean(func(c *Config) *bool { return &c.Storage.FsyncData })},
 	{"GOS3_STORAGE_BACKINGS", "storage.backings", "extra backings, comma-separated name=/path (fs), name=memory or name=s3 (see GOS3_BACKING_<NAME>_*)", backingsList},
 	{"GOS3_DEFAULT_BACKING", "storage.default_backing", "backing new buckets are created on", str(func(c *Config) *string { return &c.Storage.DefaultBacking })},
@@ -94,6 +97,11 @@ var envVars = []EnvVar{
 	{"GOS3_COMPRESSION_LEVEL", "compression.level", "DEFLATE level, 1 (fastest) to 9 (smallest)", integer(func(c *Config) *int { return &c.Compression.Level })},
 	{"GOS3_COMPRESSION_MIN_SIZE", "compression.min_size", "store smaller objects uncompressed, bytes or 4KiB-style", size(func(c *Config) *int64 { return &c.Compression.MinSize })},
 	{"GOS3_COMPRESSION_SKIP_CONTENT_TYPES", "compression.skip_content_types", "media types stored uncompressed (\"video/*\" wildcards), comma-separated", list(func(c *Config) *[]string { return &c.Compression.SkipContentTypes })},
+	{"GOS3_JOBS_WORKERS", "jobs.workers", "background jobs (copy, mirror, snapshots) running at once, 1-64", integer(func(c *Config) *int { return &c.Jobs.Workers })},
+	{"GOS3_RESTIC_SNAPSHOTS_WORKERS", "restic.snapshots.workers", "whole-bucket snapshot, restore and prune jobs running restic at once, 1-64", integer(func(c *Config) *int { return &c.Restic.Snapshots.Workers })},
+	{"GOS3_RESTIC_SNAPSHOTS_STAGE_DIR", "restic.snapshots.stage_dir", "stage directory of snapshot runs (default: restic-stage in the system directory)", str(func(c *Config) *string { return &c.Restic.Snapshots.StageDir })},
+	{"GOS3_RESTIC_SNAPSHOTS_SPOOL_BYTES", "restic.snapshots.spool_bytes", "data a snapshot run stages before a partial snapshot, bytes or 8GiB-style (at least 64MiB)", size(func(c *Config) *int64 { return &c.Restic.Snapshots.SpoolBytes })},
+	{"GOS3_RESTIC_SNAPSHOTS_INCREMENTAL", "restic.snapshots.incremental", "stage unchanged objects as sparse placeholders (bool)", boolean(func(c *Config) *bool { return &c.Restic.Snapshots.Incremental })},
 }
 
 // EnvVars returns the documented GOS3_* environment variables.
@@ -151,9 +159,10 @@ func WriteEnvTable(w io.Writer) error {
 // (see BackingEnv) below the table.
 const backingEnvNote = `s3 backings in storage.backings (or GOS3_STORAGE_BACKINGS=<name>=s3) take each s3 setting that
 is not configured from GOS3_BACKING_<NAME>_<FIELD> (NAME upper-cased, '-' as '_'), FIELD one of
-ENDPOINT, REGION, BUCKET, PREFIX, ADDRESSING, PART_SIZE, ACCESS_KEY, SECRET_KEY, ENCRYPTION_KEY
-and GATEWAY, with the same formats as the GOS3_S3_* variables above. Values from the environment
-are never written to backings.json.`
+ENDPOINT, REGION, HOME_BUCKET, HOME_PREFIX, DEFAULT_KIND, ADDRESSING, PART_SIZE, ACCESS_KEY,
+SECRET_KEY and ENCRYPTION_KEY, with the same formats as the GOS3_S3_* variables above (BUCKET,
+PREFIX and GATEWAY=true are deprecated aliases of HOME_BUCKET, HOME_PREFIX and DEFAULT_KIND=native).
+Values from the environment are never written to backings.json.`
 
 // applyEnv applies every set GOS3_* variable to c. Empty values are applied
 // too (e.g. GOS3_DOMAINS= clears the list), except for GOS3_CONFIG.

@@ -812,7 +812,7 @@ func (s *Server) handlePutBucketReplication(w http.ResponseWriter, r *http.Reque
 	if err := c.validate(); err != nil {
 		return err
 	}
-	unlock := lockBucketState(rc.bucket)
+	unlock := s.lockBucketState(rc.bucket)
 	defer unlock()
 	bi, err := s.lookupBucket(ctx, rc.bucket)
 	if err != nil {
@@ -831,7 +831,7 @@ func (s *Server) handlePutBucketReplication(w http.ResponseWriter, r *http.Reque
 
 // handleDeleteBucketReplication implements DeleteBucketReplication (204).
 func (s *Server) handleDeleteBucketReplication(w http.ResponseWriter, r *http.Request, rc *reqContext) error {
-	unlock := lockBucketState(rc.bucket)
+	unlock := s.lockBucketState(rc.bucket)
 	defer unlock()
 	return s.deleteBucketConfigResponse(w, r, rc, storage.ConfigReplication)
 }

@@ -5,13 +5,14 @@ import { S3Error } from '~/utils/s3/errors'
 /**
  * Object lock (?object-lock): status, enabling on a versioned bucket
  * (irreversible) and the default retention (mode + days or years). Buckets
- * on a gos3 gateway backing (`unsupported`) and servers answering
- * NotImplemented get an explanation instead.
+ * that cannot be versioned (`unsupported`) and servers answering
+ * NotImplemented (e.g. a native bucket whose remote S3 service has no
+ * object lock) get an explanation instead.
  */
 const props = defineProps<{
   bucket: string
   versioning: VersioningStatus | null
-  /** The bucket's storage cannot lock objects (gos3 gateway backing). */
+  /** The bucket's storage cannot keep versions, so it cannot lock objects either. */
   unsupported?: boolean
 }>()
 const emit = defineEmits<{ changed: [] }>()
@@ -139,11 +140,11 @@ async function onSave() {
       v-if="unavailable && !enabled"
       color="neutral"
       variant="subtle"
-      :icon="unsupported ? 'i-lucide-cloud-cog' : 'i-lucide-info'"
-      :title="unsupported ? 'Not available on a gateway backing' : 'Not supported'"
+      :icon="unsupported ? 'i-lucide-cloud-off' : 'i-lucide-info'"
+      title="Not supported"
       :description="unsupported
-        ? 'This bucket’s objects are stored directly in a remote S3 service, which gos3 cannot lock. Object lock cannot be enabled.'
-        : 'This server does not support object lock for this bucket.'"
+        ? 'The server cannot keep versions for this bucket (for example a native bucket whose remote S3 service does not support versioning), so object lock cannot be enabled.'
+        : 'This server does not support object lock for this bucket (for example a native bucket whose remote S3 service has no object lock).'"
     />
     <CommonErrorAlert v-else-if="loader.error.value" :error="loader.error.value" title="Could not load object lock configuration" retryable @retry="loader.refresh" />
     <USkeleton v-else-if="loader.loading.value && !original" class="h-32 w-full" />

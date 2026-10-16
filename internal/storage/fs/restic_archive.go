@@ -28,14 +28,14 @@ func (b *Backend) newResticWriter(ctx context.Context, id, bucket, key string) (
 	if _, err := b.bucketKey(id, true); err != nil {
 		return nil, err
 	}
-	if err := b.prepareRestic(ctx, id); err != nil {
+	if err := b.prepareResticFor(ctx, id, bucket); err != nil {
 		return nil, err
 	}
 	loc, err := b.resticLocation(id)
 	if err != nil {
 		return nil, err
 	}
-	return &resticWriter{b: b, id: id, a: b.resticRuntime().NewArchiver(ctx, loc, bucket, key)}, nil
+	return &resticWriter{b: b, id: id, a: b.resticRuntime().NewArchiverWith(ctx, loc, restic.ArchiveOptions{Bucket: bucket, BucketID: id, Key: key})}, nil
 }
 
 func (w *resticWriter) Write(p []byte) (int, error) {

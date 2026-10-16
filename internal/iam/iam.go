@@ -38,7 +38,7 @@ const (
 	PolicyReadWrite   = "readwrite"   // s3:* on all buckets/objects
 	PolicyReadOnly    = "readonly"    // s3:Get*, s3:List*, s3:HeadBucket-equivalents
 	PolicyWriteOnly   = "writeonly"   // s3:PutObject, multipart upload actions, s3:ListBucketMultipartUploads
-	PolicyDiagnostics = "diagnostics" // admin:ServerInfo, admin:GetStats, admin:GetDiscovery, admin:ListBackings, admin:GetBucketPlacement
+	PolicyDiagnostics = "diagnostics" // admin:ServerInfo, admin:GetStats, admin:GetDiscovery, admin:ListBackings, admin:GetBucketPlacement, admin:ListJobs, admin:GetJob, admin:GetBucketSnapshots
 )
 
 // Key status values.
@@ -171,7 +171,7 @@ type AuthzRequest struct {
 	Bucket string
 	Key    string
 	// Resource is the resource of admin actions: AdminUserARN,
-	// AdminPolicyARN or AdminBucketARN of the target, or "" for
+	// AdminPolicyARN, AdminBucketARN or AdminBackingARN of the target, or "" for
 	// service-level admin actions, which match only the policy resources
 	// "*" and "arn:gos3:admin:::*". s3 actions ignore it. s3 ARNs never
 	// match admin resources and admin ARNs never match s3 resources.

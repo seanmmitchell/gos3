@@ -257,6 +257,9 @@ func TestFailures(t *testing.T) {
 			restictest.Install(t, "current")
 			loc, snapshots := kind.location(t)
 			rt := &Runtime{TempDir: t.TempDir()}
+			// The canceled read below leaves its restore to finish in the
+			// background; let it end before TempDir is removed.
+			t.Cleanup(rt.Wait)
 			if err := rt.Prepare(t.Context(), "b1", loc, &memRecords{}); err != nil {
 				t.Fatal(err)
 			}

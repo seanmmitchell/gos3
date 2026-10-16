@@ -209,7 +209,7 @@ func (rt *Runtime) acquireSpool(ctx context.Context, loc Location, snapshot stri
 		dumpCtx, cancel := context.WithCancel(context.Background())
 		sp = &spool{id: k, done: make(chan struct{}), cancel: cancel}
 		rt.spools[k] = sp
-		go rt.runSpool(dumpCtx, sp, loc, snapshot, size)
+		rt.restores.Go(func() { rt.runSpool(dumpCtx, sp, loc, snapshot, size) })
 	}
 	sp.refs++
 	rt.mu.Unlock()

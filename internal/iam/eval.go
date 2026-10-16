@@ -1,6 +1,7 @@
 package iam
 
 import (
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -18,10 +19,14 @@ const adminARNPrefix = "arn:gos3:admin:::"
 
 // Types of per-target admin resources (arn:gos3:admin:::<type>/<name>).
 const (
-	adminTypeUser   = "user"
-	adminTypePolicy = "policy"
-	adminTypeBucket = "bucket"
+	adminTypeUser    = "user"
+	adminTypePolicy  = "policy"
+	adminTypeBucket  = "bucket"
+	adminTypeBacking = "backing"
 )
+
+// adminTypes are the types of per-target admin resources.
+var adminTypes = []string{adminTypeUser, adminTypePolicy, adminTypeBucket, adminTypeBacking}
 
 // CondAdminPolicyName is the multi-valued condition key holding the policy
 // names an admin:CreateUser or admin:UpdateUser request attaches (absent
@@ -40,9 +45,16 @@ func AdminPolicyARN(name string) string { return adminARNPrefix + adminTypePolic
 // (arn:gos3:admin:::bucket/<name>).
 func AdminBucketARN(name string) string { return adminARNPrefix + adminTypeBucket + "/" + name }
 
+// AdminBackingARN returns the admin resource of a storage backing
+// (arn:gos3:admin:::backing/<name>): the remote buckets and containers of
+// an s3 backing (admin:ListRemoteBuckets, admin:CreateRemoteBucket,
+// admin:AdoptRemoteBucket, admin:ManageContainers).
+func AdminBackingARN(name string) string { return adminARNPrefix + adminTypeBacking + "/" + name }
+
 // ValidAdminRequestResource reports whether r is a resource an admin
 // request can be evaluated against: "" (service level) or
-// arn:gos3:admin:::{user,policy,bucket}/<name> with a non-empty name.
+// arn:gos3:admin:::{user,policy,bucket,backing}/<name> with a non-empty
+// name.
 func ValidAdminRequestResource(r string) bool {
 	if r == "" {
 		return true
@@ -55,11 +67,7 @@ func ValidAdminRequestResource(r string) bool {
 	if !ok || name == "" {
 		return false
 	}
-	switch typ {
-	case adminTypeUser, adminTypePolicy, adminTypeBucket:
-		return true
-	}
-	return false
+	return slices.Contains(adminTypes, typ)
 }
 
 // s3ServiceARN is the resource that service-level s3 actions (Bucket == "",

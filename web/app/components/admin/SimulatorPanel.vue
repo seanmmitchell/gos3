@@ -1,13 +1,14 @@
 <script setup lang="ts">
 import type { Decision } from '~/types/admin'
-import { ADMIN_SERVICE_ARN, adminArn, adminConditionKeys, adminResourceType, buildSimulateRequest, isAdminAction, parseConditionLines, SIMULATOR_ACTIONS, validateAdminResource } from './-policies'
+import { ADMIN_SERVICE_ARN, adminArn, adminConditionKeys, adminResourceType, buildSimulateRequest, isAdminAction, parseConditionLines, SIMULATOR_ACTIONS, validateAdminResource, type AdminResourceType } from './-policies'
 
 /**
  * Authorization simulator (POST /authz/simulate): "may <user> do <action>
  * on <bucket>/<key>?" — evaluates identity policies, the bucket policy and
  * canned ACLs exactly like a real request. Admin actions take an admin
  * resource instead of a bucket/key (arn:gos3:admin:::user/<name>,
- * …:::policy/<name>, …:::bucket/<name>; empty = service level).
+ * …:::policy/<name>, …:::bucket/<name>, …:::backing/<name>; empty = service
+ * level).
  *
  *   <AdminSimulatorPanel :users="['alice', 'bob']" />
  *   <AdminSimulatorPanel fixed-user="alice" />
@@ -53,7 +54,8 @@ const actionItems = computed(() => [...SIMULATOR_ACTIONS])
 const conditions = computed(() => parseConditionLines(conditionsText.value))
 const adminAction = computed(() => isAdminAction(action.value))
 const resourceType = computed(() => adminResourceType(action.value))
-const resourcePlaceholder = computed(() => (resourceType.value ? adminArn(resourceType.value, resourceType.value === 'user' ? 'alice' : resourceType.value === 'policy' ? 'readonly' : 'photos') : ADMIN_SERVICE_ARN))
+const RESOURCE_EXAMPLES: Record<AdminResourceType, string> = { user: 'alice', policy: 'readonly', bucket: 'photos', backing: 'cloud' }
+const resourcePlaceholder = computed(() => (resourceType.value ? adminArn(resourceType.value, RESOURCE_EXAMPLES[resourceType.value]) : ADMIN_SERVICE_ARN))
 const resourceHelp = computed(() => resourceType.value
   ? `Empty = service level. ${action.value.trim()} is evaluated against ${adminArn(resourceType.value, '<name>')}.`
   : 'Empty = service level (this action has no per-target resource).')

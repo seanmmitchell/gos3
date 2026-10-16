@@ -69,16 +69,20 @@ var builtinPolicies = map[string]*NamedPolicy{
 	},
 	PolicyDiagnostics: {
 		Name:        PolicyDiagnostics,
-		Description: "View server information, statistics and discovery state.",
+		Description: "View server information, statistics, discovery state, storage placement, background jobs and snapshot schedules.",
 		Builtin:     true,
 		// Read-only on purpose: admin:ProbeNetwork and admin:ScanNetwork
-		// make the server open outbound connections and are not granted.
+		// make the server open outbound connections and are not granted,
+		// nor is admin:GetResticCredentials (repository passwords).
 		Document: PolicyDocument{
 			Version: PolicyVersion2012,
 			Statement: []Statement{{
-				Sid:      "Diagnostics",
-				Effect:   "Allow",
-				Action:   StringOrSlice{"admin:ServerInfo", "admin:GetStats", "admin:GetDiscovery", "admin:ListBackings", "admin:GetBucketPlacement"},
+				Sid:    "Diagnostics",
+				Effect: "Allow",
+				Action: StringOrSlice{
+					"admin:ServerInfo", "admin:GetStats", "admin:GetDiscovery", "admin:ListBackings", "admin:GetBucketPlacement",
+					"admin:ListJobs", "admin:GetJob", "admin:GetBucketSnapshots",
+				},
 				Resource: StringOrSlice{AdminResourceARN},
 			}},
 		},

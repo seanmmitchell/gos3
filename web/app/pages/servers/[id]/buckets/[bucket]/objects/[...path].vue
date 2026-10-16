@@ -16,6 +16,8 @@ import type { BrowserEntry, BrowserRowAction, BrowserSort } from '~/composables/
 import type { CollectResult, DroppedFile } from '~/composables/useBrowserDrop'
 import type { OpTarget, TransferDone } from '~/composables/useBrowserOps'
 import { S3Error } from '~/utils/s3/errors'
+import { canManageJobs } from '~/components/admin/-capabilities'
+import CopyBucketModal from '~/components/jobs/CopyBucketModal.vue'
 
 definePageMeta({
   key: route => `${String(route.params.id)}::${String(route.params.bucket)}`
@@ -71,6 +73,14 @@ watch([s3, bucket], async ([client, b]) => {
   }
 }, { immediate: true })
 const versioned = computed(() => versioning.value === 'Enabled' || versioning.value === 'Suspended')
+
+// "Copy / Mirror…" (gos3, admin:CreateCopyJob): a copy or mirror job of the whole bucket.
+const { capabilities } = useWhoAmI()
+const canCopyBucket = computed(() => canManageJobs(connection.value?.kind, capabilities.value))
+const copyOverlay = useOverlay()
+function openCopyBucket() {
+  void copyOverlay.create(CopyBucketModal, { destroyOnClose: true }).open({ bucket: bucket.value, versioning: versioning.value, serverId: serverId.value })
+}
 
 // ---------------------------------------------------------------------------
 // Listing
@@ -632,6 +642,16 @@ const emptyFolder = computed(() => listing.loaded && !listing.loading && !listin
             variant="outline"
             label="Settings"
             class="hidden sm:inline-flex"
+          />
+          <UButton
+            v-if="canCopyBucket"
+            icon="i-lucide-copy-plus"
+            color="neutral"
+            variant="outline"
+            label="Copy / Mirror…"
+            class="hidden md:inline-flex"
+            data-testid="copy-bucket"
+            @click="openCopyBucket"
           />
           <UButton
             icon="i-lucide-folder-plus"

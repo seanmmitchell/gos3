@@ -138,8 +138,11 @@ func (b *Backend) loadBucketKey(bucketID string, create bool) ([]byte, error) {
 			return nil, fmt.Errorf("fs: write encryption key: %w", err)
 		}
 	case errors.Is(err, os.ErrNotExist):
-		// A per-bucket condition, not a failure of the backend.
-		return nil, fmt.Errorf("%w: encryption key %s is missing: %w", storage.ErrEncryptionUnavailable, path, err)
+		// A per-bucket condition, not a failure of the backend. The file
+		// error is not wrapped: a lost key must never read as "nothing
+		// created yet" (fs.ErrNotExist) to callers such as the restic
+		// recovery information.
+		return nil, fmt.Errorf("%w: encryption key %s is missing: %v", storage.ErrEncryptionUnavailable, path, err)
 	default:
 		return nil, fmt.Errorf("fs: read encryption key: %w", err)
 	}
@@ -173,6 +176,14 @@ func (b *Backend) protectKeys() {
 	b.tightenPerm(dir)
 	for _, e := range entries {
 		b.tightenPerm(filepath.Join(dir, e.Name()))
+		if e.IsDir() && e.Name() == auxKeysDir {
+			// Keys and records of aux repositories (restic_host.go).
+			if sub, err := os.ReadDir(filepath.Join(dir, e.Name())); err == nil {
+				for _, s := range sub {
+					b.tightenPerm(filepath.Join(dir, e.Name(), s.Name()))
+				}
+			}
+		}
 	}
 }
 

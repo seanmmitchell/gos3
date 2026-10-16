@@ -180,11 +180,30 @@ describe('S3Client requests', () => {
     expect(calls[1]!.headers.authorization).not.toContain('x-gos3-backing')
   })
 
-  it('reports the bucket region and gos3 backing from HeadBucket', async () => {
-    const { client } = makeClient(() => new Response(null, { status: 200, headers: { 'x-amz-bucket-region': 'eu-west-1', 'x-gos3-backing': 'archive' } }))
-    expect(await client.headBucket('b')).toEqual({ region: 'eu-west-1', backing: 'archive' })
+  it('sends the bucket kind, remote bucket and container as signed headers', async () => {
+    const { client, calls } = makeClient(() => new Response(null, { status: 200 }))
+    await client.createBucket('photos', { backing: 'cloud', kind: 'native', remoteBucket: 'acme-photos' })
+    expect(calls[0]!.headers).toMatchObject({ 'x-gos3-backing': 'cloud', 'x-gos3-bucket-kind': 'native', 'x-gos3-remote-bucket': 'acme-photos' })
+    expect(calls[0]!.headers).not.toHaveProperty('x-gos3-container')
+    expect(calls[0]!.headers.authorization).toMatch(/SignedHeaders=[^,]*;x-gos3-bucket-kind;x-gos3-remote-bucket[;,]/)
+    await client.createBucket('docs', { kind: 'wrapped', container: 'c-7f3a' })
+    expect(calls[1]!.headers).toMatchObject({ 'x-gos3-bucket-kind': 'wrapped', 'x-gos3-container': 'c-7f3a' })
+    expect(calls[1]!.headers).not.toHaveProperty('x-gos3-remote-bucket')
+    expect(calls[1]!.headers.authorization).toMatch(/;x-gos3-container[;,]/)
+    // A field that contradicts the kind is never sent.
+    await client.createBucket('mixed', { kind: 'wrapped', remoteBucket: 'r', container: 'c' })
+    expect(calls[2]!.headers).not.toHaveProperty('x-gos3-remote-bucket')
+    await client.createBucket('mixed2', { kind: 'native', remoteBucket: 'r', container: 'c' })
+    expect(calls[3]!.headers).not.toHaveProperty('x-gos3-container')
+    await client.createBucket('plain')
+    for (const h of ['x-gos3-bucket-kind', 'x-gos3-remote-bucket', 'x-gos3-container']) expect(calls[4]!.headers).not.toHaveProperty(h)
+  })
+
+  it('reports the bucket region, gos3 backing and bucket kind from HeadBucket', async () => {
+    const { client } = makeClient(() => new Response(null, { status: 200, headers: { 'x-amz-bucket-region': 'eu-west-1', 'x-gos3-backing': 'archive', 'x-gos3-bucket-kind': 'native' } }))
+    expect(await client.headBucket('b')).toEqual({ region: 'eu-west-1', backing: 'archive', kind: 'native' })
     const plain = makeClient(() => new Response(null, { status: 200 }))
-    expect(await plain.client.headBucket('b')).toEqual({ region: undefined, backing: undefined })
+    expect(await plain.client.headBucket('b')).toStrictEqual({ region: undefined, backing: undefined, kind: undefined })
   })
 
   it('deleteObjects batches by 1000 with Content-MD5', async () => {

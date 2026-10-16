@@ -31,6 +31,11 @@ import (
 //
 // Object data is encrypted with crypt.ObjectDataKey(master, data ID) and
 // restic repositories use restic.PasswordFromKey(master).
+//
+// The keys of aux restic repositories (restic_host.go) have the same form,
+// in keys/aux/<name>.key with the additional data
+// "gos3-aux-key-v1/<backing-id>/<name>". Offline tools unwrap key objects
+// with UnwrapBucketKey and UnwrapAuxKey.
 
 const (
 	keyFileVersion = 1
@@ -47,7 +52,8 @@ type keyFile struct {
 	KEK     string `json:"kek"`
 }
 
-// keyEntry is the cached master key of one bucket.
+// keyEntry is the cached master key of one bucket (or the key of one aux
+// restic repository, see keyEntryOf).
 type keyEntry struct {
 	load sync.Mutex // serializes loading and creating the key
 	key  []byte     // written with load and Backend.keyMu held
@@ -61,9 +67,60 @@ func keyAAD(backingID, bucketID string) []byte {
 	return []byte("gos3-bucket-key-v1/" + backingID + "/" + bucketID)
 }
 
+// auxKeysDir (below keysDir) holds the keys and recovery records of aux
+// restic repositories.
+const auxKeysDir = "aux/"
+
+func auxKeyAAD(backingID, name string) []byte {
+	return []byte("gos3-aux-key-v1/" + backingID + "/" + name)
+}
+
+// keyObjectAAD returns the additional data of the key object
+// keys/<rel>.key: an aux repository's below auxKeysDir, a bucket's
+// otherwise.
+func keyObjectAAD(backingID, rel string) []byte {
+	if name, ok := strings.CutPrefix(rel, auxKeysDir); ok {
+		return auxKeyAAD(backingID, name)
+	}
+	return keyAAD(backingID, rel)
+}
+
+// UnwrapBucketKey returns the master key of the bucket with ID bucketID of
+// the s3 backing (home or container) whose marker names backingID: data is
+// the content of its key object <prefix>keys/<bucket-id>.key and kek the
+// backing's encryption_key. The password of the bucket's restic repository
+// is restic.PasswordFromKey of the result. It is meant for offline tools
+// (`gos3 restic env` with the server stopped); errors wrap
+// storage.ErrEncryptionUnavailable (and ErrWrongKEK for another KEK).
+func UnwrapBucketKey(data, kek []byte, backingID, bucketID string) ([]byte, error) {
+	return unwrapKeyFile(data, kek, keyAAD(backingID, bucketID), keysDir+bucketID+".key")
+}
+
+// UnwrapAuxKey is UnwrapBucketKey for the key object
+// <prefix>keys/aux/<name>.key of the aux restic repository name.
+func UnwrapAuxKey(data, kek []byte, backingID, name string) ([]byte, error) {
+	return unwrapKeyFile(data, kek, auxKeyAAD(backingID, name), keysDir+auxKeysDir+name+".key")
+}
+
 // errNoKEK reports a backing without a key-encryption key.
 func (b *Backend) errNoKEK(err error) error {
 	return fmt.Errorf("s3 backing %q has no encryption key configured: %w", b.opts.Name, err)
+}
+
+// keyEntryOf returns the cache entry of the key with ID id (a bucket ID,
+// or auxKeysDir+name for an aux repository's), adding an empty one.
+func (b *Backend) keyEntryOf(id string) *keyEntry {
+	b.keyMu.Lock()
+	defer b.keyMu.Unlock()
+	e := b.bucketKeys[id]
+	if e == nil {
+		if b.bucketKeys == nil {
+			b.bucketKeys = make(map[string]*keyEntry)
+		}
+		e = &keyEntry{}
+		b.bucketKeys[id] = e
+	}
+	return e
 }
 
 // bucketKey returns the master key of bk. With create, a bucket without a
@@ -93,15 +150,7 @@ func (b *Backend) bucketKey(ctx context.Context, bk *bucket, create bool) ([]byt
 	}
 	b.keyMu.RUnlock()
 	if e == nil {
-		b.keyMu.Lock()
-		if e = b.bucketKeys[id]; e == nil {
-			if b.bucketKeys == nil {
-				b.bucketKeys = make(map[string]*keyEntry)
-			}
-			e = &keyEntry{}
-			b.bucketKeys[id] = e
-		}
-		b.keyMu.Unlock()
+		e = b.keyEntryOf(id)
 	}
 	e.load.Lock()
 	defer e.load.Unlock()
@@ -153,6 +202,9 @@ func (b *Backend) loadBucketKey(ctx context.Context, id string, kek []byte, mark
 		case !create:
 			return nil, fmt.Errorf("%w: bucket has no encryption key (%s)", storage.ErrEncryptionUnavailable, obj)
 		}
+		if err := b.recordKEK(ctx, kek); err != nil {
+			return nil, err
+		}
 		key := make([]byte, crypt.KeySize)
 		_, _ = rand.Read(key)
 		wrapped, err := crypt.Wrap(kek, key, aad)
@@ -176,8 +228,30 @@ func (b *Backend) loadBucketKey(ctx context.Context, id string, kek []byte, mark
 	return nil, fmt.Errorf("%w: cannot create the encryption key %s", storage.ErrBackingUnavailable, obj)
 }
 
-// verifyKEK checks kek against the first bucket key object of the backing
-// (if any): a KEK that cannot unwrap it is ErrWrongKEK.
+// recordKEK makes sure the marker holds the check value of kek before kek
+// wraps a new key. A KEK configured by Open was recorded then; one
+// committed by PrepareConnection on a backing without a check value is
+// recorded here, at its first use. Another recorded value (a different
+// KEK configured elsewhere meanwhile) is ErrWrongKEK.
+func (b *Backend) recordKEK(ctx context.Context, kek []byte) error {
+	m := b.eng.Marker()
+	if m.KEKCheck == crypt.KeyCheck(kek) {
+		return nil
+	}
+	m, err := recordKEKCheck(ctx, b.client(), b.opts.Bucket, b.opts.Prefix, m.BackingID, kek)
+	switch {
+	case errors.Is(err, ErrWrongKEK):
+		return fmt.Errorf("%w: %w", storage.ErrEncryptionUnavailable, err)
+	case err != nil:
+		return b.mapErr(ctx, "record the encryption key check", err)
+	}
+	b.eng.noteMarker(m)
+	return nil
+}
+
+// verifyKEK checks kek against the first key object of the backing (a
+// bucket's or an aux repository's, if any): a KEK that cannot unwrap it is
+// ErrWrongKEK.
 func (b *Backend) verifyKEK(ctx context.Context, c *s3client.Client, backingID string, kek []byte) error {
 	dir := b.keys.prefix + keysDir
 	var obj string
@@ -198,8 +272,8 @@ func (b *Backend) verifyKEK(ctx context.Context, c *s3client.Client, backingID s
 	if err != nil {
 		return err
 	}
-	id := strings.TrimSuffix(strings.TrimPrefix(obj, dir), ".key")
-	if _, err := unwrapKeyFile(data, kek, keyAAD(backingID, id), obj); err != nil {
+	rel := strings.TrimSuffix(strings.TrimPrefix(obj, dir), ".key")
+	if _, err := unwrapKeyFile(data, kek, keyObjectAAD(backingID, rel), obj); err != nil {
 		return fmt.Errorf("%w: it cannot open %s: %w", ErrWrongKEK, obj, err)
 	}
 	return nil

@@ -7,8 +7,18 @@ import (
 
 // Prepare makes sure the repository loc of the bucket with ID id exists,
 // initializing a new one, and that the bucket's recovery record in store is
-// current. A repository found ready is not checked again by this process;
-// repositories are prepared independently of each other.
+// current. It is PrepareWith without a bucket name: the record keeps the
+// name it has.
+func (rt *Runtime) Prepare(ctx context.Context, id string, loc Location, store RecoveryStore) error {
+	return rt.PrepareWith(ctx, id, "", loc, store)
+}
+
+// PrepareWith makes sure the repository loc of the bucket with ID id
+// exists, initializing a new one, and that the bucket's recovery record in
+// store is current, recording bucket (when not "") as the bucket's name
+// (Record.Bucket). A repository found ready is not checked again by this
+// process (its record is only rewritten when called with another bucket
+// name); repositories are prepared independently of each other.
 //
 // The record is written before the repository is created, so that an
 // initialized repository never lacks one, and marked Initialized once the
@@ -16,11 +26,11 @@ import (
 // initializing, and only while the record does not say the repository was
 // initialized before: a wrong password, network or access errors, or a
 // repository that went missing never start a new, empty archive.
-func (rt *Runtime) Prepare(ctx context.Context, id string, loc Location, store RecoveryStore) error {
+func (rt *Runtime) PrepareWith(ctx context.Context, id, bucket string, loc Location, store RecoveryStore) error {
 	st := rt.repo(loc.Repository)
 	st.mu.Lock()
 	defer st.mu.Unlock()
-	if st.prepared {
+	if st.prepared && (bucket == "" || bucket == st.bucket) {
 		return nil
 	}
 	saved, err := store.Load(ctx, id)
@@ -29,9 +39,17 @@ func (rt *Runtime) Prepare(ctx context.Context, id string, loc Location, store R
 	}
 	// Retain recovery information independently of the bucket's metadata:
 	// deleting a bucket must not make its retained archive unrecoverable.
-	rec := Record{Initialized: saved.Initialized, Repository: loc.Repository}
+	rec := Record{Initialized: saved.Initialized || st.prepared, Repository: loc.Repository, Bucket: saved.Bucket}
+	if bucket != "" {
+		rec.Bucket = bucket
+	}
 	if err := store.Store(ctx, id, rec); err != nil {
 		return err
+	}
+	if st.prepared {
+		// Only the bucket name changed.
+		st.bucket = rec.Bucket
+		return nil
 	}
 	cmd, err := rt.Command(ctx, loc, "cat", "config")
 	if err != nil {
@@ -59,7 +77,7 @@ func (rt *Runtime) Prepare(ctx context.Context, id string, loc Location, store R
 	if err := store.Store(ctx, id, rec); err != nil {
 		return err
 	}
-	st.prepared = true
+	st.prepared, st.bucket = true, rec.Bucket
 	return nil
 }
 

@@ -8,6 +8,8 @@ import (
 	"path/filepath"
 	"slices"
 	"time"
+
+	"github.com/seanmmitchell/gos3/internal/storage"
 )
 
 // Mode is a bucket's replication mode.
@@ -72,6 +74,10 @@ type moveRecord struct {
 	From      string    `json:"from"`
 	To        string    `json:"to"`
 	StartedAt time.Time `json:"startedAt"`
+	// Target is the kind and location of the bucket created on To (nil:
+	// the backing's choice for copies). It is optional, so state files
+	// written before it existed load unchanged (same stateVersion).
+	Target *storage.BucketTarget `json:"target,omitempty"`
 }
 
 // purgeRecord is a bucket copy to delete from a backing.
@@ -85,8 +91,18 @@ func (p *placementRecord) clone() *placementRecord {
 	c.Members = slices.Clone(p.Members)
 	if p.Move != nil {
 		m := *p.Move
+		m.Target = cloneTarget(p.Move.Target)
 		c.Move = &m
 	}
+	return &c
+}
+
+// cloneTarget returns a copy of t (nil for nil).
+func cloneTarget(t *storage.BucketTarget) *storage.BucketTarget {
+	if t == nil {
+		return nil
+	}
+	c := *t
 	return &c
 }
 

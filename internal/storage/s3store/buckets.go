@@ -11,9 +11,6 @@ import (
 	"github.com/seanmmitchell/gos3/internal/storage"
 )
 
-// errGateway is returned for object operations of a gateway backing.
-var errGateway = fmt.Errorf("%w: objects of a gateway backing are stored by its data store", storage.ErrNotSupported)
-
 // ListBuckets returns all buckets sorted by name.
 func (b *Backend) ListBuckets(ctx context.Context) ([]storage.BucketInfo, error) {
 	st, err := b.current(ctx)
@@ -36,9 +33,6 @@ func (b *Backend) ListBuckets(ctx context.Context) ([]storage.BucketInfo, error)
 func (b *Backend) CreateBucket(ctx context.Context, name string, opts storage.CreateBucketOptions) error {
 	if err := validBucketName(name); err != nil {
 		return err
-	}
-	if b.opts.Gateway && opts.ObjectLockEnabled {
-		return fmt.Errorf("%w: object lock on a gateway backing", storage.ErrNotSupported)
 	}
 	st, err := b.current(ctx)
 	if err != nil {
@@ -130,9 +124,6 @@ func (b *Backend) SetBucketVersioning(ctx context.Context, name string, status s
 	default:
 		return fmt.Errorf("s3store: invalid versioning status %q", status)
 	}
-	if b.opts.Gateway && status != storage.VersioningUnversioned {
-		return fmt.Errorf("%w: versioning on a gateway backing", storage.ErrNotSupported)
-	}
 	bk, err := b.lockBucket(ctx, name)
 	if err != nil {
 		return err
@@ -150,9 +141,6 @@ func (b *Backend) SetBucketVersioning(ctx context.Context, name string, status s
 
 // SetBucketObjectLock sets the bucket's object-lock flag.
 func (b *Backend) SetBucketObjectLock(ctx context.Context, name string, enabled bool) error {
-	if b.opts.Gateway && enabled {
-		return fmt.Errorf("%w: object lock on a gateway backing", storage.ErrNotSupported)
-	}
 	bk, err := b.lockBucket(ctx, name)
 	if err != nil {
 		return err

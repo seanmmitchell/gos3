@@ -3,6 +3,7 @@ package s3client
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"sync"
@@ -22,6 +23,9 @@ type UploadOptions struct {
 	PartSize int64
 	// Concurrency is the number of parts uploaded in parallel (default 4).
 	Concurrency int
+	// PartMD5 sends Content-MD5 with every part (and with a single PUT when
+	// PutOptions.ContentMD5 is nil), computing it from the data.
+	PartMD5 bool
 }
 
 // partSizeFor returns the part size to use for an object of size bytes.
@@ -44,32 +48,61 @@ func partSizeFor(size, want int64) int64 {
 // whether a multipart upload was used (the ETag then is not the MD5 of the
 // content).
 func (c *Client) Upload(ctx context.Context, bucket, key string, r io.ReaderAt, size int64, opts UploadOptions) (etag string, multipart bool, err error) {
+	res, err := c.UploadObject(ctx, bucket, key, r, size, opts)
+	return res.ETag, res.Multipart, err
+}
+
+// UploadObject is Upload returning the version ID too (see Put). On
+// failure the result only reports whether a multipart upload was tried.
+func (c *Client) UploadObject(ctx context.Context, bucket, key string, r io.ReaderAt, size int64, opts UploadOptions) (WriteResult, error) {
 	partSize := partSizeFor(size, opts.PartSize)
 	if size <= partSize {
-		etag, err := c.PutObject(ctx, bucket, key, r, size, opts.PutOptions)
-		return etag, false, err
+		po := opts.PutOptions
+		if opts.PartMD5 && po.ContentMD5 == nil {
+			sum, err := md5Of(io.NewSectionReader(r, 0, size))
+			if err != nil {
+				return WriteResult{}, fmt.Errorf("s3client: PutObject: %w", err)
+			}
+			po.ContentMD5 = sum
+		}
+		res, err := c.Put(ctx, bucket, key, r, size, po)
+		if err != nil {
+			return WriteResult{}, err
+		}
+		return res, nil
 	}
+	failed := WriteResult{Multipart: true}
 	header := http.Header{}
 	for k, vs := range opts.Header {
 		header[http.CanonicalHeaderKey(k)] = vs
 	}
 	uploadID, err := c.CreateMultipartUpload(ctx, bucket, key, header)
 	if err != nil {
-		return "", true, err
+		return failed, err
 	}
 	parts, err := c.runParts(ctx, size, partSize, opts.Concurrency, func(ctx context.Context, n int, off, length int64) (string, error) {
-		return c.UploadPart(ctx, bucket, key, uploadID, n, io.NewSectionReader(r, off, length), length)
+		part := io.NewSectionReader(r, off, length)
+		var po PartOptions
+		if opts.PartMD5 {
+			sum, err := md5Of(part)
+			if err != nil {
+				return "", fmt.Errorf("s3client: UploadPart: %w", err)
+			}
+			po.ContentMD5 = sum
+		}
+		return c.UploadPartWith(ctx, bucket, key, uploadID, n, part, length, po)
 	})
+	var res WriteResult
 	if err == nil {
-		etag, err = c.CompleteMultipartUpload(ctx, bucket, key, uploadID, parts,
+		res, err = c.Complete(ctx, bucket, key, uploadID, parts,
 			CompleteOptions{IfNoneMatch: opts.IfNoneMatch, IfMatch: opts.IfMatch, NoRetry: opts.NoRetry})
 	}
 	if err != nil {
 		// Best effort, also when the caller's context is already done.
 		_ = c.AbortMultipartUpload(context.WithoutCancel(ctx), bucket, key, uploadID)
-		return "", true, err
+		return failed, err
 	}
-	return etag, true, nil
+	return res, nil
 }
 
 // runParts calls part for every part of an object of size bytes split into

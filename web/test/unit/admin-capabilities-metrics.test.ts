@@ -156,7 +156,8 @@ describe('capability gating', () => {
     expect(values('gos3', NO_CAPS)).toContain('compression')
     expect(values('s3', ALL)).not.toContain('compression')
     expect(values('gos3', old)).not.toContain('compression')
-    expect(values('s3', ALL)).toEqual(BUCKET_TABS.map(t => t.value).filter(v => v !== 'compression'))
+    // Generic S3 has neither of the gos3-only tabs (compression, Backup & archive).
+    expect(values('s3', ALL)).toEqual(BUCKET_TABS.map(t => t.value).filter(v => v !== 'compression' && v !== 'restic'))
   })
 })
 

@@ -31,6 +31,43 @@ const (
 // is decided by the backing holding the bucket and never replicates with it.
 type EncryptionSettings struct {
 	Provider string `json:"provider"`
+	// Scope says which writes use the provider: EncryptionScopeSSE ("",
+	// the default) only writes that request SSE (the bucket's default
+	// encryption or an explicit header), EncryptionScopeAll every write
+	// (the restic archive toggle: every object version becomes a restic
+	// snapshot). EncryptionScopeAll is only valid with EncryptionRestic.
+	// Builds before scopes ignore the field (their writes fall back to
+	// SSE-only).
+	Scope string `json:"scope,omitempty"`
+}
+
+// Encryption scopes (EncryptionSettings.Scope).
+const (
+	EncryptionScopeSSE = "sse"
+	EncryptionScopeAll = "all"
+)
+
+// ParseEncryptionSettings decodes and validates a stored
+// ConfigEncryptionProvider document (provider and scope). ParseEncryptionProvider
+// is ParseEncryptionSettings returning only the provider.
+func ParseEncryptionSettings(raw []byte) (EncryptionSettings, error) {
+	var doc EncryptionSettings
+	if err := json.Unmarshal(raw, &doc); err != nil {
+		return EncryptionSettings{}, fmt.Errorf("invalid encryption provider: %w", err)
+	}
+	if !ValidEncryptionProvider(doc.Provider) {
+		return EncryptionSettings{}, fmt.Errorf("invalid encryption provider %q", doc.Provider)
+	}
+	switch doc.Scope {
+	case "", EncryptionScopeSSE:
+	case EncryptionScopeAll:
+		if doc.Provider != EncryptionRestic {
+			return EncryptionSettings{}, fmt.Errorf("encryption scope %q needs provider %q", doc.Scope, EncryptionRestic)
+		}
+	default:
+		return EncryptionSettings{}, fmt.Errorf("invalid encryption scope %q", doc.Scope)
+	}
+	return doc, nil
 }
 
 // EncryptionBackend is implemented by backends that can store object data
@@ -69,12 +106,9 @@ func EncryptionProvider(ctx context.Context, b Backend, bucket string) (string, 
 // its validation, so a provider that writes would refuse is never shown as
 // valid.
 func ParseEncryptionProvider(raw []byte) (string, error) {
-	var doc EncryptionSettings
-	if err := json.Unmarshal(raw, &doc); err != nil {
-		return "", fmt.Errorf("invalid encryption provider: %w", err)
-	}
-	if !ValidEncryptionProvider(doc.Provider) {
-		return "", fmt.Errorf("invalid encryption provider %q", doc.Provider)
+	doc, err := ParseEncryptionSettings(raw)
+	if err != nil {
+		return "", err
 	}
 	return doc.Provider, nil
 }

@@ -33,17 +33,16 @@ interface BucketRow {
   usage?: BucketUsage | null
   /** Storage backing / replication (gos3 with storage backings). */
   placement?: PlacementSummary
+  /** s3 backings: native or wrapped. */
+  kind?: string
+  /** s3 backings: the remote bucket (native) or container (wrapped). */
+  location?: string
 }
 
-/** Kind / mode of a backing named in a placement (WhoAmI.backings). */
+/** Kind of a backing named in a placement (WhoAmI.backings). */
 function backingInfo(name: string) {
   const b = findBacking(name, whoami.value?.backings)
   return b ? backingKindInfo(b) : undefined
-}
-
-/** The bucket's primary copy is on a gateway backing (no versioning). */
-function onGateway(row: BucketRow): boolean {
-  return isGatewayBacking(findBacking(row.placement?.primary, whoami.value?.backings))
 }
 
 interface Listing {
@@ -71,7 +70,9 @@ async function load(): Promise<Listing> {
           objectLock: b.objectLock,
           public: b.public,
           usage: b.usage,
-          placement: b.placement
+          placement: b.placement,
+          kind: b.kind,
+          location: b.location
         }))
       }
     } catch (e) {
@@ -425,12 +426,14 @@ const isAccessDenied = computed(() => {
             </NuxtLink>
             <UBadge v-if="row.original.public" color="warning" variant="subtle" size="sm" label="Public" icon="i-lucide-globe" />
             <UBadge v-if="row.original.objectLock" color="info" variant="subtle" size="sm" label="Object lock" icon="i-lucide-lock" />
+            <UTooltip v-if="row.original.kind === 'native'" :text="row.original.location ? `Native bucket: objects stored as-is in ${row.original.location}` : bucketKindInfo('native').description">
+              <UBadge color="neutral" variant="subtle" size="sm" :label="bucketKindInfo('native').label" :icon="bucketKindInfo('native').icon" data-testid="native-badge" />
+            </UTooltip>
           </div>
         </template>
         <template #versioning-cell="{ row }">
           <UBadge v-if="row.original.versioning === 'Enabled'" color="success" variant="subtle" size="sm" label="Enabled" />
           <UBadge v-else-if="row.original.versioning === 'Suspended'" color="warning" variant="subtle" size="sm" label="Suspended" />
-          <span v-else-if="onGateway(row.original)" class="text-sm text-muted" title="Gateway backings do not support versioning">n/a</span>
           <span v-else class="text-sm text-muted">Off</span>
         </template>
         <template #placement-cell="{ row }">
@@ -490,6 +493,8 @@ const isAccessDenied = computed(() => {
       :default-region="connection?.region"
       :existing-names="data?.rows.map(r => r.name)"
       :backings="isGos3 ? whoami?.backings : null"
+      :server-id="serverId"
+      :can-adopt="isGos3 && can('adoptRemote') && can('viewStorage')"
       @created="onCreated"
     />
   </div>

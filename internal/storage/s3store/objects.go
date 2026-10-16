@@ -213,9 +213,6 @@ type contentWriter struct {
 // newContentWriter checks the options and starts the data of a new
 // version of bucket/key.
 func (b *Backend) newContentWriter(ctx context.Context, bucket, key string, opts storage.WriteOptions) (*contentWriter, error) {
-	if b.opts.Gateway {
-		return nil, errGateway
-	}
 	if err := b.checkWriteOptions(opts); err != nil {
 		return nil, err
 	}
@@ -388,9 +385,6 @@ func (b *Backend) appendChange(bk *bucket, ch index.Change[blobRef], rmUpload st
 // GetObjectInfo returns metadata for a version ("" = latest, which may be
 // a delete marker).
 func (b *Backend) GetObjectInfo(ctx context.Context, bucket, key, versionID string) (storage.ObjectInfo, error) {
-	if b.opts.Gateway {
-		return storage.ObjectInfo{}, errGateway
-	}
 	bk, err := b.rlockBucket(ctx, bucket)
 	if err != nil {
 		return storage.ObjectInfo{}, err
@@ -412,9 +406,6 @@ func (b *Backend) GetObjectInfo(ctx context.Context, bucket, key, versionID stri
 // for delete markers). The reader keeps reading that version's blob after
 // the version is overwritten or deleted: the blob's delete waits for it.
 func (b *Backend) OpenObject(ctx context.Context, bucket, key, versionID string) (storage.ObjectInfo, io.ReadSeekCloser, error) {
-	if b.opts.Gateway {
-		return storage.ObjectInfo{}, nil, errGateway
-	}
 	bk, err := b.rlockBucket(ctx, bucket)
 	if err != nil {
 		return storage.ObjectInfo{}, nil, err
@@ -529,9 +520,6 @@ func (b *Backend) UpdateObjectMetaIf(ctx context.Context, bucket, key, versionID
 }
 
 func (b *Backend) updateObjectMeta(ctx context.Context, bucket, key, versionID string, check func(storage.ObjectInfo) error, fn func(*storage.ObjectMeta) error) (storage.ObjectInfo, error) {
-	if b.opts.Gateway {
-		return storage.ObjectInfo{}, errGateway
-	}
 	if fn == nil {
 		return storage.ObjectInfo{}, errors.New("s3store: nil update function")
 	}
@@ -589,9 +577,6 @@ func (b *Backend) DeleteObjectChecked(ctx context.Context, bucket, key, versionI
 }
 
 func (b *Backend) deleteObject(ctx context.Context, bucket string, op func(*index.Bucket[blobRef]) (storage.DeleteResult, index.Change[blobRef], error)) (storage.DeleteResult, error) {
-	if b.opts.Gateway {
-		return storage.DeleteResult{}, errGateway
-	}
 	bk, err := b.lockBucket(ctx, bucket)
 	if err != nil {
 		return storage.DeleteResult{}, err
@@ -629,9 +614,6 @@ func (b *Backend) walkAcquire(ctx context.Context, bucket string) func() (*index
 // WalkObjects calls fn with the latest version of each key that is not a
 // delete marker (see storage.Backend). fn runs with no lock held.
 func (b *Backend) WalkObjects(ctx context.Context, bucket, prefix, after string, fn func(storage.ObjectInfo) error) error {
-	if b.opts.Gateway {
-		return errGateway
-	}
 	if fn == nil {
 		return errors.New("s3store: nil walk function")
 	}
@@ -641,9 +623,6 @@ func (b *Backend) WalkObjects(ctx context.Context, bucket, prefix, after string,
 // WalkVersions calls fn for every version and delete marker (see
 // storage.Backend). fn runs with no lock held.
 func (b *Backend) WalkVersions(ctx context.Context, bucket, prefix, keyMarker, versionIDMarker string, fn func(storage.ObjectInfo) error) error {
-	if b.opts.Gateway {
-		return errGateway
-	}
 	if fn == nil {
 		return errors.New("s3store: nil walk function")
 	}

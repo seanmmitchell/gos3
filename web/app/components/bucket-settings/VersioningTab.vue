@@ -4,13 +4,15 @@ import type { VersioningStatus } from '~/types/s3'
 /**
  * Bucket versioning: enable or suspend. A bucket can never return to
  * "unversioned"; buckets with object lock cannot suspend versioning, and
- * buckets on a gos3 gateway backing (`unsupported`) cannot be versioned.
+ * buckets whose storage cannot keep versions (`unsupported`: the server
+ * answered NotImplemented, e.g. a native bucket of an s3 backing whose
+ * remote S3 service has no versioning) cannot be versioned.
  */
 const props = defineProps<{
   bucket: string
   status: VersioningStatus | null
   objectLock: boolean
-  /** The bucket's storage cannot keep versions (gos3 gateway backing). */
+  /** The bucket's storage cannot keep versions (GetBucketVersioning answered NotImplemented). */
   unsupported?: boolean
 }>()
 
@@ -74,9 +76,9 @@ const color = computed(() => (props.status === 'Enabled' ? 'success' : props.sta
         v-if="unsupported"
         color="neutral"
         variant="subtle"
-        icon="i-lucide-cloud-cog"
-        title="Not available on a gateway backing"
-        description="This bucket’s objects are stored directly in a remote S3 service, which keeps no gos3 versions. Versioning cannot be enabled."
+        icon="i-lucide-cloud-off"
+        title="Not supported for this bucket"
+        description="The server cannot keep versions for this bucket, for example a native bucket whose remote S3 service does not support versioning. Versioning cannot be enabled."
       />
       <UAlert
         v-else-if="objectLock"
