@@ -1,0 +1,28 @@
+name: Do not merge
+
+# The DO NOT MERGE label blocks a pull request. The dev and main rulesets
+# require this check (docs/releasing.md), so it fails while the label is on
+# the pull request and passes again once the label is removed. It re-runs
+# when a label is added or removed and on every push.
+
+on:
+  pull_request:
+    types: [opened, labeled, unlabeled, synchronize, reopened]
+
+permissions: {}
+
+jobs:
+  label:
+    name: No DO NOT MERGE label
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    steps:
+      - name: The pull request is not labeled DO NOT MERGE
+        env:
+          BLOCKED: ${{ contains(github.event.pull_request.labels.*.name, 'DO NOT MERGE') }}
+        run: |
+          if [ "$BLOCKED" = true ]; then
+            echo "::error::This pull request is labeled DO NOT MERGE. Remove the label to merge it."
+            exit 1
+          fi
+          echo "No DO NOT MERGE label."
