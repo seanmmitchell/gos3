@@ -545,7 +545,8 @@ func (s *Service) defaultTarget(ctx context.Context, bucket, repo string) (Targe
 }
 
 // resolve returns the repository of target t of bucket, creating (and
-// preparing) it with create.
+// preparing) it with create. The info's Backing names the backing that
+// holds it.
 func (s *Service) resolve(ctx context.Context, bucket string, t Target, create bool) (restic.RepositoryInfo, restic.Location, error) {
 	switch t.Kind {
 	case TargetBucket:
@@ -559,7 +560,9 @@ func (s *Service) resolve(ctx context.Context, bucket string, t Target, create b
 		if !ok {
 			return restic.RepositoryInfo{}, restic.Location{}, fmt.Errorf("backing %q keeps no restic repositories: %w", t.Backing, errors.ErrUnsupported)
 		}
-		return h.ResticAuxRepository(ctx, t.Repo, create)
+		info, loc, err := h.ResticAuxRepository(ctx, t.Repo, create)
+		info.Backing = t.Backing
+		return info, loc, err
 	}
 	return restic.RepositoryInfo{}, restic.Location{}, fmt.Errorf("%w: unknown target kind %q", jobs.ErrInvalidSpec, t.Kind)
 }

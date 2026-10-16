@@ -23,7 +23,8 @@ var _ restic.Host = (*Router)(nil)
 // complete: it forwards to the primary's backend. A backend that keeps no
 // restic repositories yields an error wrapping errors.ErrUnsupported;
 // unknown buckets storage.ErrBucketNotFound. Each other copy has a
-// repository of its own on its backing (see ResticRepositories).
+// repository of its own on its backing (see ResticRepositories). The
+// info's Backing names the primary that answered.
 func (r *Router) ResticRepository(ctx context.Context, bucket string, create bool) (restic.RepositoryInfo, restic.Location, error) {
 	b, err := r.primary(bucket)
 	if err != nil {
@@ -33,7 +34,9 @@ func (r *Router) ResticRepository(ctx context.Context, bucket string, create boo
 	if err != nil {
 		return restic.RepositoryInfo{}, restic.Location{}, err
 	}
-	return h.ResticRepository(ctx, bucket, create)
+	info, loc, err := h.ResticRepository(ctx, bucket, create)
+	info.Backing = b.Name
+	return info, loc, err
 }
 
 // ResticAuxRepository implements restic.Host on the default backing (where

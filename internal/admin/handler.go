@@ -520,11 +520,12 @@ func requestConditions(r *http.Request, proxy clientip.Resolver) map[string][]st
 	if ip != "" {
 		c["aws:SourceIp"] = []string{ip}
 	}
+	// Truncated as on the S3 API: policies glob-match and substitute them.
 	if ua := r.UserAgent(); ua != "" {
-		c["aws:UserAgent"] = []string{ua}
+		c["aws:UserAgent"] = []string{iam.TruncateRequestValue(ua)}
 	}
 	if ref := r.Referer(); ref != "" {
-		c["aws:Referer"] = []string{ref}
+		c["aws:Referer"] = []string{iam.TruncateRequestValue(ref)}
 	}
 	return c
 }

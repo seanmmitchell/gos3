@@ -312,7 +312,15 @@ type restoreRun struct {
 	// privateACLs restores every version without its ACL (private): the
 	// snapshot's ACL guards are unknown (see applyACLGuards).
 	privateACLs bool
+
+	// locked counts the versions not restored because the target's version
+	// they would replace is locked (see lockedTarget).
+	locked int
 }
+
+// maxLockedWarnings bounds the status warnings naming versions a restore
+// skipped because of object lock; the rest are only counted.
+const maxLockedWarnings = 20
 
 // Index buckets of the temporary database.
 var (
@@ -923,6 +931,23 @@ func (r *restoreRun) write(ctx context.Context, e *entry, body io.Reader) error 
 		r.status.Keys++
 		return nil
 	}
+	if r.check {
+		why, err := r.lockedTarget(ctx, e)
+		if err != nil {
+			return restoreFailure(fmt.Errorf("resticsnap: restore %q: %w", e.Key, err))
+		}
+		if why != "" {
+			r.locked++
+			switch {
+			case r.locked <= maxLockedWarnings:
+				r.status.Warnings = append(r.status.Warnings, fmt.Sprintf(
+					"%q version %s not restored: the target's version it would replace is %s", e.Key, e.VersionID, why))
+			case r.locked == maxLockedWarnings+1:
+				r.status.Warnings = append(r.status.Warnings, "more versions not restored because of object lock")
+			}
+			return nil
+		}
+	}
 	oi := e.objectInfo()
 	if r.privateACLs {
 		oi.ACL = ""
@@ -938,6 +963,23 @@ func (r *restoreRun) write(ctx context.Context, e *entry, body io.Reader) error 
 	r.status.Bytes += w.Bytes
 	r.status.Materialized++
 	return nil
+}
+
+// lockedTarget says why the target's version that importing e would
+// replace (the one under e's mapped version ID, e.g. the null version) must
+// not be replaced: it is under a legal hold or unexpired retention ("" when
+// there is none or it is not locked). The S3 layer enforces object lock
+// for clients only; a restore writes below it, as the copier's syncer does,
+// so it checks the lock itself.
+func (r *restoreRun) lockedTarget(ctx context.Context, e *entry) (string, error) {
+	oi, err := r.s.router.GetObjectInfo(ctx, r.spec.Target.Bucket, e.Key, copier.MapVersionID(e.VersionID))
+	if errors.Is(err, storage.ErrVersionNotFound) || errors.Is(err, storage.ErrObjectNotFound) {
+		return "", nil
+	}
+	if err != nil {
+		return "", err
+	}
+	return copier.LockReason(oi, time.Now()), nil
 }
 
 // identical reports whether the target already holds e's version: the

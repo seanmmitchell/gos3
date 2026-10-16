@@ -315,7 +315,7 @@ func (r *Router) onIdle(ms *memberState) error {
 			if i <= 0 || p.Members[i].Synced {
 				return false
 			}
-			p.Members[i].Synced = true
+			p.Members[i].Synced, p.Members[i].Diverged = true, false
 			return true
 		})
 		r.adminMu.Unlock()
@@ -464,6 +464,7 @@ func (r *Router) cutover(target *memberState) error {
 		return fmt.Errorf("move source %q is no longer a member", mv.From)
 	}
 	wasPrimary := i == 0
+	diverged := next.Members[i].Diverged
 	source = bs.members[mv.From]
 	next.Members[i] = memberRecord{Backing: mv.To, Synced: true}
 	next.Move = nil
@@ -478,7 +479,7 @@ func (r *Router) cutover(target *memberState) error {
 		// copied from the new one from now on (identical content).
 		target.syncMode = false
 	}
-	r.addPurgeLocked(bs.name, mv.From)
+	r.addPurgeLocked(bs.name, mv.From, diverged)
 	r.mu.Unlock()
 	if source != nil {
 		r.cancelMember(source)
@@ -548,9 +549,10 @@ func (r *Router) promoteLocked(bs *bucketState, i int, forced bool) {
 	next := bs.rec.clone()
 	old := next.Members[0]
 	next.Members[0], next.Members[i] = next.Members[i], next.Members[0]
-	next.Members[0].Synced = true
+	next.Members[0].Synced, next.Members[0].Diverged = true, false
 	if forced {
 		next.Members[i].Synced = false
+		next.Members[i].Diverged = true
 	} else {
 		next.Members[i] = memberRecord{Backing: old.Backing, Synced: true}
 	}

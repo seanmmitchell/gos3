@@ -289,6 +289,10 @@ func mapStorageError(err error) error {
 		return s3err.ErrInvalidPart
 	case errors.Is(err, storage.ErrPreconditionFailed):
 		return s3err.ErrPreconditionFailed
+	case errors.Is(err, storage.ErrConflict):
+		// Optimistic retries exhausted under concurrent writes to the same
+		// object or upload: ask the client to back off and retry.
+		return s3err.ErrSlowDown
 	case errors.Is(err, storage.ErrInvalidName):
 		return s3err.ErrInvalidArgument.WithMessage("The specified name is not valid.")
 	case errors.Is(err, storage.ErrInvalidBacking):

@@ -227,7 +227,7 @@ func (c *evalCtx) evalKey(op condOp, policyVals []string, ctxVals []string, pres
 	pvs := c.expandPolicyValues(op.kind, policyVals)
 	matchOne := func(cv string) bool {
 		for _, pv := range pvs {
-			if matchCondValue(op.kind, pv, cv) {
+			if c.matchCondValue(op.kind, pv, cv) {
 				return true
 			}
 		}
@@ -288,7 +288,7 @@ func (c *evalCtx) expandPolicyValues(kind opKind, vals []string) []condValue {
 			out = append(out, condValue{s: v})
 			continue
 		}
-		if e, ok := expandVars(v, c.lookupVar, pattern); ok {
+		if e, ok := expandVars(v, c.lookupVar, pattern, c.budget); ok {
 			out = append(out, condValue{s: e, escaped: pattern})
 		}
 	}
@@ -297,7 +297,7 @@ func (c *evalCtx) expandPolicyValues(kind opKind, vals []string) []condValue {
 
 // matchCondValue applies the positive form of an operator to a policy value
 // pv and a request context value cv.
-func matchCondValue(kind opKind, v condValue, cv string) bool {
+func (c *evalCtx) matchCondValue(kind opKind, v condValue, cv string) bool {
 	pv := v.s
 	switch kind {
 	case opStringEquals:
@@ -305,7 +305,7 @@ func matchCondValue(kind opKind, v condValue, cv string) bool {
 	case opStringEqualsIgnoreCase:
 		return strings.EqualFold(pv, cv)
 	case opStringLike:
-		return globMatch(pv, cv, false, v.escaped)
+		return globMatchBudget(pv, cv, false, v.escaped, c.budget)
 	case opNumericEquals, opNumericLessThan, opNumericLessThanEquals, opNumericGreaterThan, opNumericGreaterThanEquals:
 		p, ok1 := parseNumber(pv)
 		v, ok2 := parseNumber(cv)
@@ -352,7 +352,7 @@ func matchCondValue(kind opKind, v condValue, cv string) bool {
 		addr, ok := parseAddr(cv)
 		return ok && pfx.Contains(addr)
 	case opArnLike:
-		return arnMatch(pv, cv, v.escaped)
+		return arnMatch(pv, cv, v.escaped, c.budget)
 	case opBinaryEquals:
 		want, err := base64.StdEncoding.DecodeString(pv)
 		if err != nil {
@@ -368,14 +368,14 @@ func matchCondValue(kind opKind, v condValue, cv string) bool {
 
 // arnMatch matches ARNs component-wise: wildcards in one of the first five
 // components never cross a ':' boundary.
-func arnMatch(pattern, arn string, escaped bool) bool {
+func arnMatch(pattern, arn string, escaped bool, b *budget) bool {
 	pp := strings.SplitN(pattern, ":", 6)
 	ap := strings.SplitN(arn, ":", 6)
 	if len(pp) != 6 || len(ap) != 6 {
 		return false
 	}
 	for i := range pp {
-		if !globMatch(pp[i], ap[i], false, escaped) {
+		if !globMatchBudget(pp[i], ap[i], false, escaped, b) {
 			return false
 		}
 	}

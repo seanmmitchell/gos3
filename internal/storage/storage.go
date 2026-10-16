@@ -69,6 +69,12 @@ var (
 	// would create a remote bucket that already exists (an administrator can
 	// adopt it instead). It wraps ErrBucketExists.
 	ErrRemoteBucketExists = fmt.Errorf("storage: remote bucket exists: %w", ErrBucketExists)
+	// ErrConflict is returned (wrapped) when an operation gave up after
+	// concurrent changes to the same object or upload kept invalidating
+	// it (optimistic retries exhausted). It is an answer about contention
+	// that clients cause, never a failure of the backing; retrying later
+	// may succeed.
+	ErrConflict = errors.New("storage: too much concurrent modification")
 )
 
 // NullVersionID is the version ID of objects written while versioning is

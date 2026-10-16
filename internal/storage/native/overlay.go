@@ -274,9 +274,10 @@ func (s *Store) pruneVersion(ctx context.Context, bucket, key, vid string, befor
 // pruneListed drops the overlays of bucket/key whose version a complete
 // version listing of the key (seen: the listed versions by gos3 version
 // ID), fetched from before on, does not have (or, for the null version,
-// has as another object).
-func (s *Store) pruneListed(ctx context.Context, bucket, key string, before time.Time, seen map[string]s3client.ObjectAttrs) {
-	s.pruneOverlays(ctx, bucket, key, before, false, func(vid string, o *overlay) bool {
+// has as another object). locked says the caller holds the object's lock
+// (see pruneOverlays).
+func (s *Store) pruneListed(ctx context.Context, bucket, key string, before time.Time, seen map[string]s3client.ObjectAttrs, locked bool) {
+	s.pruneOverlays(ctx, bucket, key, before, locked, func(vid string, o *overlay) bool {
 		e, ok := seen[vid]
 		return !ok || e.DeleteMarker || vid == storage.NullVersionID && !o.matches(vid, e.ETag, e.LastModified)
 	})
@@ -416,6 +417,6 @@ func (s *Store) sweepKey(ctx context.Context, t *target, key string) error {
 	if err != nil {
 		return err
 	}
-	s.pruneListed(ctx, t.bucket, key, before, seen)
+	s.pruneListed(ctx, t.bucket, key, before, seen, false)
 	return nil
 }

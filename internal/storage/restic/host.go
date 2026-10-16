@@ -32,6 +32,12 @@ type RepositoryInfo struct {
 	EnvNames []string `json:"envNames,omitempty"`
 	// Options are restic's -o options for the repository.
 	Options []string `json:"options,omitempty"`
+	// Backing names the backing that holds the repository, when the code
+	// that resolved it knows (the multi router, the snapshot service).
+	// Authorizing access to the repository's credentials against it, rather
+	// than against a separate lookup, cannot race with a placement or
+	// configuration change. It is not serialized.
+	Backing string `json:"-"`
 }
 
 // Host is implemented by backends (and the multi router) that keep restic

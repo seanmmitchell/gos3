@@ -439,7 +439,7 @@ func (b *Backend) CompleteMultipartUploadWith(ctx context.Context, bucket, key, 
 			continue
 		}
 		if errors.Is(err, errPartsChanged) {
-			return storage.ObjectInfo{}, fmt.Errorf("fs: complete upload %q: %w (too much contention)", uploadID, err)
+			return storage.ObjectInfo{}, fmt.Errorf("fs: complete upload %q: %w: %w", uploadID, storage.ErrConflict, err)
 		}
 		return info, err
 	}

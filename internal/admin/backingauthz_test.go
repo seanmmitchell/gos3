@@ -58,6 +58,41 @@ func TestSnapshotCredentialsNeedTargetBackingGrant(t *testing.T) {
 	e.do(&c, "POST", path, body).expectStatus(t, 200)
 }
 
+// The backing that authorizes snapshot credentials is the one the snapshot
+// service resolved them on, not a second reading of the configuration or
+// placement, which a concurrent forced promote or configuration change can
+// make differ (H-07).
+func TestSnapshotCredentialsAuthorizedOnResolvedBacking(t *testing.T) {
+	snaps := newFakeSnapshots()
+	e, _, logs := newResticEnv(t, func(d *Deps) { d.Snapshots = snaps })
+	// The configuration names fast; the credentials came from default.
+	snaps.setConfig("photos", `{"enabled":true,"target":{"kind":"backing","backing":"fast","repo":"snap-1"}}`)
+	snaps.mu.Lock()
+	snaps.resolvedOn = "default"
+	snaps.mu.Unlock()
+	e.putPolicy("fast-only", map[string]any{"Effect": "Allow", "Action": "admin:GetResticCredentials",
+		"Resource": []string{"arn:gos3:admin:::bucket/photos", "arn:gos3:admin:::backing/fast"}})
+	path := Prefix + "/buckets/photos/restic/credentials"
+	body := map[string]any{"purpose": "snapshots"}
+
+	c := e.addUser("fast-only", "fast-only")
+	r := e.do(&c, "POST", path, body)
+	if msg := r.expectError(t, 403, codeAccessDenied); !strings.Contains(msg, "backing/default") {
+		t.Fatalf("message %q", msg)
+	}
+	assertNoSecrets(t, "fast-only", r.body)
+	if strings.Contains(logs.String(), "disclosed") {
+		t.Fatalf("refused request logged as a disclosure: %s", logs.String())
+	}
+
+	// The audit log and the answer name the backing actually used.
+	var cr resticCredentials
+	e.root("POST", "/buckets/photos/restic/credentials", body).json(t, &cr)
+	if cr.Backing != "default" || !strings.Contains(logs.String(), "backing=default") {
+		t.Fatalf("credentials name backing %q; log: %s", cr.Backing, logs.String())
+	}
+}
+
 func TestSnapshotTargetNeedsBackingGrant(t *testing.T) {
 	e, snaps := newSnapshotsEnv(t)
 	e.putPolicy("bucket-only", map[string]any{"Effect": "Allow", "Action": "admin:PutBucketSnapshots",

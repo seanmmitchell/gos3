@@ -78,6 +78,8 @@ func (s *Service) Repository(ctx context.Context, bucket string) (*restic.Reposi
 // operator to run restic on it; storage.ErrConfigNotFound when the bucket
 // has no snapshot configuration, an error wrapping fs.ErrNotExist when the
 // repository was not created yet. Callers must never log the location.
+// The info's Backing names the backing the location was resolved on;
+// authorize access to the location against it.
 func (s *Service) Credentials(ctx context.Context, bucket string) (restic.Location, *restic.RepositoryInfo, error) {
 	t, ok, err := s.targetOf(ctx, bucket)
 	if err != nil {

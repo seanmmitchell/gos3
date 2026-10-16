@@ -51,7 +51,7 @@ func (s *Store) WalkObjects(ctx context.Context, bucket, prefix, after string, f
 	if !t.versioned() {
 		return s.walkCurrent(ctx, t, prefix, after, fn)
 	}
-	return s.walkVersions(ctx, t, prefix, after, "", func(e s3client.ObjectAttrs, first bool) error {
+	return s.walkVersions(ctx, t, prefix, after, "", "", func(e s3client.ObjectAttrs, first bool) error {
 		if !first || e.DeleteMarker {
 			return nil
 		}
@@ -71,6 +71,13 @@ func (s *Store) WalkVersions(ctx context.Context, bucket, prefix, keyMarker, ver
 	if err != nil {
 		return err
 	}
+	return s.walkVersionInfos(ctx, t, prefix, keyMarker, versionIDMarker, "", fn)
+}
+
+// walkVersionInfos implements WalkVersions on target t. held is a key
+// whose object lock the caller holds ("" for none): pruning its overlays
+// must not take the lock again (see walkVersions).
+func (s *Store) walkVersionInfos(ctx context.Context, t *target, prefix, keyMarker, versionIDMarker, held string, fn func(storage.ObjectInfo) error) error {
 	if !t.versioned() {
 		// Only null versions: every version-ID marker positions after
 		// keyMarker's null version, i.e. after keyMarker.
@@ -79,7 +86,7 @@ func (s *Store) WalkVersions(ctx context.Context, bucket, prefix, keyMarker, ver
 	if keyMarker == "" {
 		versionIDMarker = ""
 	}
-	return s.walkVersions(ctx, t, prefix, keyMarker, versionIDMarker, func(e s3client.ObjectAttrs, first bool) error {
+	return s.walkVersions(ctx, t, prefix, keyMarker, versionIDMarker, held, func(e s3client.ObjectAttrs, first bool) error {
 		info := s.listedInfo(t, e.Key, e)
 		info.IsLatest = e.IsLatest && first
 		return fn(info)
@@ -137,8 +144,9 @@ func (s *Store) walkCurrent(ctx context.Context, t *target, prefix, after string
 //
 // A key whose versions were all listed proves the versions it does not
 // have gone: their overlays are pruned (pruneListed) once the walk moved
-// past the key.
-func (s *Store) walkVersions(ctx context.Context, t *target, prefix, keyMarker, vidMarker string,
+// past the key. Pruning takes the key's object lock, except for held, a
+// key whose lock the caller holds already (the lock is not reentrant).
+func (s *Store) walkVersions(ctx context.Context, t *target, prefix, keyMarker, vidMarker, held string,
 	fn func(e s3client.ObjectAttrs, first bool) error) error {
 	var (
 		lastKey  string
@@ -149,7 +157,7 @@ func (s *Store) walkVersions(ctx context.Context, t *target, prefix, keyMarker, 
 	)
 	finish := func() {
 		if track != nil && track.complete {
-			s.pruneListed(ctx, t.bucket, track.key, track.since, track.seen)
+			s.pruneListed(ctx, t.bucket, track.key, track.since, track.seen, track.key == held)
 		}
 		track = nil
 	}

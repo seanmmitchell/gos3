@@ -11,7 +11,11 @@ on:
   workflow_call:
     inputs:
       ref:
-        description: Commit, branch or tag to build.
+        # A full SHA, never a branch or tag name: for a bare name
+        # actions/checkout prefers a branch over a tag, so a branch named
+        # like a release tag would be built in its place. Every job checks
+        # that it checked out exactly this commit.
+        description: Full 40-character commit SHA to build.
         required: true
         type: string
       version:
@@ -74,6 +78,12 @@ jobs:
         with:
           ref: ${{ env.REF }}
           persist-credentials: false
+      - name: Built commit is ${{ env.REF }}
+        run: |
+          if ! [[ $REF =~ ^[0-9a-f]{40}$ ]] || [ "$(git rev-parse HEAD)" != "$REF" ]; then
+            echo "::error::Checked out $(git rev-parse HEAD), expected the commit $REF."
+            exit 1
+          fi
       - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
         with:
           go-version-file: go.mod
@@ -96,6 +106,12 @@ jobs:
         with:
           ref: ${{ env.REF }}
           persist-credentials: false
+      - name: Built commit is ${{ env.REF }}
+        run: |
+          if ! [[ $REF =~ ^[0-9a-f]{40}$ ]] || [ "$(git rev-parse HEAD)" != "$REF" ]; then
+            echo "::error::Checked out $(git rev-parse HEAD), expected the commit $REF."
+            exit 1
+          fi
       - uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5.0.0
         with:
           node-version: ${{ env.NODE_VERSION }}
@@ -118,6 +134,12 @@ jobs:
         with:
           ref: ${{ env.REF }}
           persist-credentials: false
+      - name: Built commit is ${{ env.REF }}
+        run: |
+          if ! [[ $REF =~ ^[0-9a-f]{40}$ ]] || [ "$(git rev-parse HEAD)" != "$REF" ]; then
+            echo "::error::Checked out $(git rev-parse HEAD), expected the commit $REF."
+            exit 1
+          fi
       - uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5.0.0
         with:
           node-version: ${{ env.NODE_VERSION }}
@@ -158,6 +180,12 @@ jobs:
         with:
           ref: ${{ env.REF }}
           persist-credentials: false
+      - name: Built commit is ${{ env.REF }}
+        run: |
+          if ! [[ $REF =~ ^[0-9a-f]{40}$ ]] || [ "$(git rev-parse HEAD)" != "$REF" ]; then
+            echo "::error::Checked out $(git rev-parse HEAD), expected the commit $REF."
+            exit 1
+          fi
       - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
         with:
           go-version-file: go.mod
@@ -237,6 +265,12 @@ jobs:
         with:
           ref: ${{ env.REF }}
           persist-credentials: false
+      - name: Built commit is ${{ env.REF }}
+        run: |
+          if ! [[ $REF =~ ^[0-9a-f]{40}$ ]] || [ "$(git rev-parse HEAD)" != "$REF" ]; then
+            echo "::error::Checked out $(git rev-parse HEAD), expected the commit $REF."
+            exit 1
+          fi
       - name: Build metadata
         id: vars
         run: |

@@ -485,6 +485,11 @@ func (r *Router) reconcile(ctx context.Context, st *stateFile) ([]*backing, erro
 		}
 		r.purges[p] = &purgeJob{rec: p}
 	}
+	for _, p := range st.DivergedPurges {
+		if j := r.purges[p]; j != nil {
+			j.diverged = true
+		}
+	}
 
 	for name, rec := range st.Buckets {
 		rec = rec.clone()
@@ -540,7 +545,7 @@ func (r *Router) reconcile(ctx context.Context, st *stateFile) ([]*backing, erro
 			if r.topology.Load().backings[mv.To] == nil || rec.member(mv.From) < 0 || rec.member(mv.To) >= 0 {
 				r.log.Warn("dropping a bucket move that no longer applies", "bucket", name, "from", mv.From, "to", mv.To)
 				if r.topology.Load().backings[mv.To] != nil && rec.member(mv.To) < 0 && has(mv.To, name) {
-					r.addPurgeLocked(name, mv.To)
+					r.addPurgeLocked(name, mv.To, false)
 				}
 				rec.Move = nil
 			}
@@ -693,16 +698,21 @@ func (r *Router) save() error {
 	for name, bs := range r.buckets {
 		st.Buckets[name] = bs.rec
 	}
-	for p := range r.purges {
+	for p, j := range r.purges {
 		st.Purges = append(st.Purges, p)
+		if j.diverged {
+			st.DivergedPurges = append(st.DivergedPurges, p)
+		}
 	}
 	r.mu.RUnlock()
-	slices.SortFunc(st.Purges, func(a, b purgeRecord) int {
-		if a.Bucket != b.Bucket {
-			return cmpString(a.Bucket, b.Bucket)
-		}
-		return cmpString(a.Backing, b.Backing)
-	})
+	for _, ps := range [][]purgeRecord{st.Purges, st.DivergedPurges} {
+		slices.SortFunc(ps, func(a, b purgeRecord) int {
+			if a.Bucket != b.Bucket {
+				return cmpString(a.Bucket, b.Bucket)
+			}
+			return cmpString(a.Backing, b.Backing)
+		})
+	}
 	return writeState(r.opts.StatePath, st)
 }
 
@@ -759,7 +769,9 @@ func (r *Router) AutoFailover() bool { return r.opts.AutoFailover }
 // failure of the backing itself rather than an answer about the request
 // (not found, exists, precondition failed, an operation the backing does
 // not support, a target it cannot honour, a refusal by a remote service,
-// ...), a canceled request or a failure that other buckets on the backing
+// ...), contention between clients (storage.ErrConflict: any user can
+// cause it on their own objects, so it must never fail over other
+// buckets), a canceled request or a failure that other buckets on the backing
 // do not share: one bucket's encryption (a missing key, an unavailable
 // restic repository) or one bucket's remote location
 // (storage.ErrBucketUnavailable). storage.ErrBackingUnavailable (e.g. an
@@ -775,7 +787,7 @@ func isBackingError(err error) bool {
 		storage.ErrInvalidName, storage.ErrStopWalk, context.Canceled, context.DeadlineExceeded,
 		errors.ErrUnsupported, storage.ErrEncryptionUnavailable, storage.ErrNotSupported,
 		storage.ErrInvalidBacking, storage.ErrBucketUnavailable, storage.ErrRemoteDenied,
-		storage.ErrRemoteRejected, storage.ErrInvalidTarget,
+		storage.ErrRemoteRejected, storage.ErrInvalidTarget, storage.ErrConflict,
 	} {
 		if errors.Is(err, s) {
 			return false

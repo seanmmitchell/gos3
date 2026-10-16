@@ -392,8 +392,10 @@ func (s *Server) conditionContext(r *http.Request, rc *reqContext, t authzTarget
 			c["s3:TlsVersion"] = []string{"1.3"}
 		}
 	}
-	set("aws:UserAgent", r.UserAgent())
-	set("aws:Referer", r.Referer())
+	// Client-supplied free-form values are truncated: policies glob-match
+	// and substitute them.
+	set("aws:UserAgent", iam.TruncateRequestValue(r.UserAgent()))
+	set("aws:Referer", iam.TruncateRequestValue(r.Referer()))
 	id := rc.identity
 	switch {
 	case id.IsAnonymous:
@@ -428,7 +430,7 @@ func (s *Server) conditionContext(r *http.Request, rc *reqContext, t authzTarget
 	q := rc.query
 	for _, p := range [...]string{"prefix", "delimiter", "max-keys"} {
 		if q.Has(p) {
-			c["s3:"+p] = []string{q.Get(p)}
+			c["s3:"+p] = []string{iam.TruncateRequestValue(q.Get(p))}
 		}
 	}
 	set("s3:VersionId", t.VersionID)

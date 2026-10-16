@@ -336,47 +336,28 @@ func (a *api) archiveCredentials(ctx context.Context, bucket, backing string) (r
 }
 
 // snapshotCredentials returns the location of bucket's whole-bucket
-// snapshot repository and, when its schedule says, the backing holding it.
+// snapshot repository and the backing holding it ("" when unknown, which
+// requireBackingCredentials treats as needing the action on every
+// backing). The backing is the one the snapshot service resolved the
+// location on, never a separate lookup of the configuration or placement:
+// either could change in between (a forced promote, a new snapshot
+// target) and authorize one backing's credentials with a grant on another.
 func (a *api) snapshotCredentials(ctx context.Context, bucket string) (restic.Location, string, error) {
 	if a.d.Snapshots == nil {
 		return restic.Location{}, "", errSnapshotsUnavailable()
 	}
-	loc, _, err := a.d.Snapshots.Credentials(ctx, bucket)
+	loc, info, err := a.d.Snapshots.Credentials(ctx, bucket)
 	if errors.Is(err, storage.ErrConfigNotFound) || noResticRepository(err) {
 		return restic.Location{}, "", notFound("bucket %q has no whole-bucket snapshot repository", bucket)
 	}
 	if err != nil {
 		return restic.Location{}, "", err
 	}
-	return loc, a.snapshotBacking(ctx, bucket), nil
-}
-
-// snapshotBacking returns the backing holding bucket's whole-bucket
-// snapshots as its SnapshotConfig names it (a target of kind "backing"),
-// or the primary's for a target of kind "bucket"; "" when unknown.
-func (a *api) snapshotBacking(ctx context.Context, bucket string) string {
-	raw, err := a.d.Snapshots.Config(ctx, bucket)
-	if err != nil {
-		return ""
+	backing := ""
+	if info != nil {
+		backing = info.Backing
 	}
-	var cfg struct {
-		Target struct {
-			Kind    string `json:"kind"`
-			Backing string `json:"backing"`
-		} `json:"target"`
-	}
-	if json.Unmarshal(raw, &cfg) != nil {
-		return ""
-	}
-	switch cfg.Target.Kind {
-	case "backing":
-		return cfg.Target.Backing
-	case "", "bucket":
-		if members, err := a.resticMembers(ctx, bucket); err == nil && len(members) > 0 {
-			return members[0].backing
-		}
-	}
-	return ""
+	return loc, backing, nil
 }
 
 // credentialsError maps a failure to obtain a repository's credentials.
