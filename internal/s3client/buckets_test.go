@@ -129,6 +129,34 @@ func TestWalkBucketsPaging(t *testing.T) {
 	}
 }
 
+// TestListBucketsWithoutParameters checks that a service answering 501 to
+// the optional ListBuckets parameters (Cloudflare R2 to max-buckets) is
+// asked again without them.
+func TestListBucketsWithoutParameters(t *testing.T) {
+	var queries []string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		queries = append(queries, r.URL.RawQuery)
+		if r.URL.RawQuery != "" {
+			w.WriteHeader(http.StatusNotImplemented)
+			io.WriteString(w, `<Error><Code>NotImplemented</Code><Message>ListBuckets search parameter max-buckets not implemented</Message></Error>`)
+			return
+		}
+		io.WriteString(w, `<ListAllMyBucketsResult><Buckets><Bucket><Name>only</Name></Bucket></Buckets></ListAllMyBucketsResult>`)
+	}))
+	defer srv.Close()
+	c, err := s3client.New(s3client.Config{Endpoint: srv.URL, AccessKey: "a", SecretKey: "b", PathStyle: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	out, err := c.ListBuckets(t.Context(), s3client.ListBucketsInput{MaxBuckets: 1})
+	if err != nil || len(out.Buckets) != 1 || out.Buckets[0].Name != "only" || out.ContinuationToken != "" {
+		t.Fatalf("ListBuckets: %+v, %v", out, err)
+	}
+	if want := []string{"max-buckets=1", ""}; !slices.Equal(queries, want) {
+		t.Errorf("queries %q, want %q", queries, want)
+	}
+}
+
 func TestCreateAndDeleteBucket(t *testing.T) {
 	r := s3clienttest.Start(t)
 	c := r.Client(t)
