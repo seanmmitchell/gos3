@@ -46,13 +46,16 @@ type leaseState struct {
 	lastOK time.Time // local time of the last confirmed write
 }
 
-// leaseToken identifies the last lease an engine held: when the lease
-// still has this owner and ETag, the engine may take it over at once.
+// leaseToken identifies the last session an engine held. Once that
+// session has stopped, the engine may take over its owner and epoch at
+// once, even if a canceled renewal landed with an ETag it never observed.
+// The takeover still uses the freshly read ETag for its conditional PUT.
 type leaseToken struct {
-	owner, etag string
+	owner string
+	epoch uint64
 }
 
-func (l leaseState) token() leaseToken { return leaseToken{owner: l.doc.Owner, etag: l.etag} }
+func (l leaseState) token() leaseToken { return leaseToken{owner: l.doc.Owner, epoch: l.doc.Epoch} }
 
 // errLeaseLost reports a lease that could not be renewed in time.
 var errLeaseLost = errors.New("s3store: lease could not be renewed in time")
@@ -110,7 +113,7 @@ func (e *Engine) acquire(ctx context.Context) (*session, error) {
 				cur = leaseDoc{}
 			}
 			cond.IfMatch, epoch = attrs.ETag, max(cur.Epoch, top)+1
-			takeNow := cur.Released || (tok.etag != "" && tok.etag == attrs.ETag && tok.owner == cur.Owner)
+			takeNow := cur.Released || (tok.owner != "" && tok.owner == cur.Owner && tok.epoch == cur.Epoch)
 			if !takeNow {
 				if seenETag != "" && seenETag != attrs.ETag {
 					return nil, inUse(cur)
