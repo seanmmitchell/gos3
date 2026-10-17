@@ -37,7 +37,7 @@
     "@nuxt/test-utils": "^4.3.2",
     "@playwright/test": "^1.63.0",
     "@types/multicast-dns": "^7.2.4",
-    "@types/node": "^26.6.3",
+    "@types/node": "^26.6.4",
     "@vue/test-utils": "^2.5.1",
     "happy-dom": "^20.14.5",
     "typescript": "~6.0.3",
