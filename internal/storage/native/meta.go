@@ -32,10 +32,10 @@ import (
 //   - On buckets with object lock, retention and legal hold travel as
 //     x-amz-object-lock-* headers and are changed with the retention and
 //     legal hold APIs, so the remote enforces them. Elsewhere they are
-//     kept as gos3 metadata only ("contract" retention, which the S3
-//     layer enforces).
+//     kept in trusted overlay records ("contract" retention, which the
+//     S3 layer enforces).
 //
-// The ACL and the website redirect decide who may read an object and
+// The ACL, contract-only object locks and the website redirect decide who may read an object and
 // where browsers are sent, and anybody who can write the remote bucket
 // can set any header of its objects (or restore an older version with its
 // headers): they are therefore never read from the remote object, but
@@ -553,6 +553,11 @@ func encodeMeta(meta storage.ObjectMeta, o encodeOpts) encoded {
 	var over metaPatch
 	opt(&over.ACL, meta.ACL)
 	opt(&over.Redirect, meta.WebsiteRedirect)
+	// Contract-only lock state must have the same provenance as ACLs.
+	over.RetentionMode, x.RetentionMode = x.RetentionMode, nil
+	over.RetainUntil, x.RetainUntil = x.RetainUntil, nil
+	over.LegalHold, x.LegalHold = x.LegalHold, nil
+	v = encodeExt(&x)
 	if len(v) > limit && x.PartChecksums != nil {
 		over.PartChecksums, x.PartChecksums = x.PartChecksums, nil
 		v = encodeExt(&x)

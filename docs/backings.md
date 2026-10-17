@@ -545,6 +545,15 @@ older version (see [security.md](security.md#s3-backings)). Losing the
 backing's records therefore makes native objects private and drops their
 redirects.
 
+Contract-only retention and legal hold on a native bucket without remote
+object lock are also kept in trusted overlay records. Unsigned
+`gos3-meta` headers cannot establish these protections. Before upgrading
+from a build that stored contract locks only in that header, inventory
+them from a trusted source and reapply them through gos3 into overlay
+records; legacy header-only locks are ignored after this change. Native
+retention enforced by the remote service continues to use its object-lock
+APIs. Back up the backing's records to preserve contract-only protections.
+
 Writes send `Content-MD5`. `If-None-Match: *` is passed to the remote;
 `If-Match` is checked under a per-object lock and pinned to the remote
 ETag. Conditional writes and multipart completions are sent once: when
