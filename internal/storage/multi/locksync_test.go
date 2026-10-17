@@ -128,8 +128,10 @@ func TestLockedDeleteReplicates(t *testing.T) {
 	if _, err := r.DeleteObject(storage.WithGovernanceBypass(ctx), "vault", "k", v.VersionID); err != nil {
 		t.Fatal(err)
 	}
-	waitSame(t, "vault", a, b)
-	if hasVersion(t, a, "k", v.VersionID) || hasVersion(t, b, "k", v.VersionID) {
-		t.Fatal("a deleted locked version came back")
-	}
+	// Listing and then opening every version is not a snapshot: the
+	// replication worker can delete a listed version before it is opened.
+	// Check the intended outcome directly while waiting for replication.
+	waitFor(t, "the locked version to be deleted from both copies", func() bool {
+		return !hasVersion(t, a, "k", v.VersionID) && !hasVersion(t, b, "k", v.VersionID)
+	})
 }

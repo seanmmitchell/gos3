@@ -15,6 +15,7 @@ import (
 
 	"github.com/seanmmitchell/gos3/internal/auth"
 	"github.com/seanmmitchell/gos3/internal/config"
+	"github.com/seanmmitchell/gos3/internal/iam"
 	"github.com/seanmmitchell/gos3/internal/s3err"
 )
 
@@ -22,6 +23,7 @@ import (
 // headers, panic recovery, metrics and access log around routing, CORS,
 // authentication, authorization and dispatch to the operation handler.
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	r = r.WithContext(iam.WithAuthorizationBudget(r.Context()))
 	start := s.now()
 	rc := &reqContext{requestID: newRequestID(), start: start, opName: opUnknown}
 	rw := &responseWriter{ResponseWriter: w}

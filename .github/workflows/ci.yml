@@ -78,8 +78,11 @@ jobs:
       # Run the restic repository tests here too (process handling, paths
       # and file locking differ).
       - uses: ./.github/actions/setup-restic
+      # Durable filesystem suites perform thousands of disk flushes. On
+      # Windows runners these can exceed Go's default 10-minute package
+      # timeout; keep all tests enabled within the 30-minute job budget.
       - name: Unit tests
-        run: go test -count=1 ./cmd/... ./internal/...
+        run: go test -timeout=20m -count=1 ./cmd/... ./internal/...
       - name: End-to-end tests
         run: go test -count=1 ./test/e2e/...
 

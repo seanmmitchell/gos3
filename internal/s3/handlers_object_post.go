@@ -198,6 +198,11 @@ type postResponse struct {
 // streamed into the bucket with the metadata given by the fields.
 func (s *Server) handlePostObject(w http.ResponseWriter, r *http.Request, rc *reqContext) error {
 	ctx := r.Context()
+	// A signed POST form does not authenticate the HTTP Host. Refuse an
+	// unknown host before bucket lookup or parsing attacker-controlled fields.
+	if unknownHost(ctx) {
+		return s3err.ErrAccessDenied
+	}
 	bi, err := s.bucketInfo(ctx, rc)
 	if err != nil {
 		return err
