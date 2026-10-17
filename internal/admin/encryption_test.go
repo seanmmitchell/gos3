@@ -292,13 +292,10 @@ func TestEmptyBucketKeepsEncryptionConfig(t *testing.T) {
 	if err := e.api.emptyBucket(ctx, "photos", &lockGuard{bucket: "photos", now: time.Now()}); err != nil {
 		t.Fatal(err)
 	}
-	for _, key := range []string{storage.ConfigEncryptionProvider, storage.ConfigEncryption} {
+	for _, key := range []string{storage.ConfigEncryptionProvider, storage.ConfigEncryption, storage.ConfigTagging} {
 		if _, err := e.backend.GetBucketConfig(ctx, "photos", key); err != nil {
 			t.Fatalf("%s removed before the bucket: %v", key, err)
 		}
-	}
-	if _, err := e.backend.GetBucketConfig(ctx, "photos", storage.ConfigTagging); !errors.Is(err, storage.ErrConfigNotFound) {
-		t.Fatalf("tagging not removed: %v", err)
 	}
 	e.root("DELETE", "/buckets/photos?force=true", nil).expectStatus(t, 204)
 }

@@ -283,6 +283,9 @@ func (a *api) forgetSnapshot(rc *reqCtx) (int, any, error) {
 type restoreTarget struct {
 	Target struct {
 		Bucket string `json:"bucket"`
+		Create *struct {
+			Backing string `json:"backing"`
+		} `json:"create"`
 	} `json:"target"`
 }
 
@@ -309,6 +312,11 @@ func (a *api) restoreSnapshot(rc *reqCtx) (int, any, error) {
 	target := req.Target.Bucket
 	if err := a.requireAction(rc, actionCreateCopyJob, iam.AdminBucketARN(target), nil); err != nil {
 		return 0, nil, err
+	}
+	if req.Target.Create != nil {
+		if body, err = a.authorizeJobBacking(rc, body, req.Target.Create.Backing); err != nil {
+			return 0, nil, err
+		}
 	}
 	if target == "" {
 		return 0, nil, badRequest("\"target\": {\"bucket\": …} is required")

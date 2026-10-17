@@ -202,11 +202,25 @@ const s3ARN = "arn:aws:s3:::"
 //     every copied key). Policies whose meaning cannot be mapped (s3:prefix
 //     conditions, NotResource) are not copied.
 func rewritePolicy(data []byte, sp *Spec) ([]byte, string) {
+	if _, err := iam.ParseBucketPolicy(data, sp.Source.Bucket); err != nil {
+		return nil, err.Error()
+	}
+	// Object prefixes are literal strings, whereas policy resources interpret
+	// * and ? as wildcards. IAM has no escaping for these literal key bytes.
+	if strings.ContainsAny(sp.Source.Prefix+sp.Target.Prefix, "*?") || strings.Contains(sp.Source.Prefix+sp.Target.Prefix, "${") {
+		return nil, "literal prefixes containing policy syntax cannot be represented safely"
+	}
 	dec := json.NewDecoder(bytes.NewReader(data))
 	dec.UseNumber()
 	var doc map[string]any
 	if err := dec.Decode(&doc); err != nil {
 		return nil, "it is not a JSON object"
+	}
+	// Inspect decoded strings, so Unicode JSON escapes cannot hide a
+	// variable from the conservative prefix-policy check.
+	canonical, _ := json.Marshal(doc)
+	if (sp.Source.Prefix != "" || sp.Target.Prefix != "") && bytes.Contains(canonical, []byte("${")) {
+		return nil, "policy variables cannot be mapped to literal prefixes safely"
 	}
 	var stmts []any
 	single := false
@@ -275,6 +289,7 @@ func rewriteScoped(stmts []any, sp *Spec) ([]any, string) {
 			return nil, "a statement has an s3:prefix condition, which cannot be mapped to the target prefix"
 		}
 		allow := !strings.EqualFold(fmt.Sprint(st["Effect"]), "Deny")
+		ambiguousResource := false
 		keep := mapResources(st, "Resource", func(arn string) (string, bool) {
 			path, isObj := strings.CutPrefix(arn, srcObj)
 			switch {
@@ -285,7 +300,11 @@ func rewriteScoped(stmts []any, sp *Spec) ([]any, string) {
 				}
 				return s3ARN + sp.Target.Bucket, true
 			case !isObj:
-				return arn, true // another bucket's: refused by validation
+				// A wildcard bucket ARN can validate for both source and
+				// target while granting outside the copied prefix. Refuse
+				// the whole policy: dropping a Deny could also broaden it.
+				ambiguousResource = true
+				return "", false
 			}
 			lit := path
 			if i := strings.IndexAny(path, "*?"); i >= 0 {
@@ -308,6 +327,9 @@ func rewriteScoped(stmts []any, sp *Spec) ([]any, string) {
 			}
 			return dstAll, true // a Deny may
 		})
+		if ambiguousResource {
+			return nil, "a resource does not name the source bucket literally"
+		}
 		if keep {
 			out = append(out, st)
 		}

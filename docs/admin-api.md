@@ -66,7 +66,7 @@ ARNs, policy variables such as `${aws:username}` included):
 | `arn:gos3:admin:::user/<name>` | CreateUser (the new user's name), GetUser, UpdateUser, DeleteUser, CreateAccessKey (the target user; choosing the access key ID also needs it at service level), UpdateAccessKey / DeleteAccessKey (the key's owner; an unknown key is evaluated at service level) |
 | `arn:gos3:admin:::policy/<name>` | GetPolicy, PutPolicy, DeletePolicy |
 | `arn:gos3:admin:::bucket/<name>` | GetBucket, CreateBucket, ForceDeleteBucket, ReleaseBucket, GetBucketCompression, PutBucketCompression, GetBucketEncryption, PutBucketEncryption, GetBucketPlacement, UpdateBucketPlacement, GetResticCredentials, GetBucketSnapshots, PutBucketSnapshots, RunBucketSnapshot, RestoreBucketSnapshot; CreateCopyJob, GetJob, UpdateJob (the job's source and target buckets) |
-| `arn:gos3:admin:::backing/<name>` | ListRemoteBuckets, CreateRemoteBucket, AdoptRemoteBucket, ManageContainers (s3 backings, see [Remote buckets and containers](#remote-buckets-and-containers-s3-backings)); also, besides the bucket, UpdateBucketPlacement (a backing that receives a new replica or a move), PutBucketSnapshots (a snapshot target's backing) and GetResticCredentials (the backing whose S3 keys the credentials carry) |
+| `arn:gos3:admin:::backing/<name>` | ListRemoteBuckets, CreateRemoteBucket, AdoptRemoteBucket, ManageContainers (s3 backings, see [Remote buckets and containers](#remote-buckets-and-containers-s3-backings)); also, besides the bucket, UpdateBucketPlacement (a backing that receives a new replica or a move), CreateCopyJob (a copy, mirror or restore with `target.create`), PutBucketSnapshots (a snapshot target's backing) and GetResticCredentials (the backing whose S3 keys the credentials carry) |
 | service level | every other action (list actions, config, stats, discovery, simulate, self-service) |
 
 The policy resources `*` and `arn:gos3:admin:::*` match every admin
@@ -677,7 +677,11 @@ GetJob and UpdateJob are evaluated against (every one of them; a job
 without bucket labels at service level). An unknown job ID is evaluated at
 service level too, so a caller whose grants name buckets gets 403 rather
 than telling unknown IDs from other buckets' jobs. `POST /jobs` evaluates
-CreateCopyJob on both buckets before it validates anything else; only
+CreateCopyJob on both buckets before it validates anything else. When
+`target.create` is present, it also requires CreateCopyJob on
+`arn:gos3:admin:::backing/<backing>` (the effective default when omitted),
+including dry runs. The authorized backing is saved in the job spec so
+changing the default later cannot redirect the job. Only
 kinds `copy` and `mirror` can be submitted (other kinds 400: restic jobs
 come from the snapshot endpoints). `dryRun` (matched like any member,
 case-insensitively) is removed from the spec the job keeps. Responses
@@ -805,7 +809,12 @@ per-version archive snapshots.
 
 The restore's `target.bucket` is read like the snapshot service reads the
 body, and CreateCopyJob on it is evaluated before the service validates the
-request. An unknown bucket is 404 on every snapshot endpoint.
+request. With `target.create`, CreateCopyJob is also required on the
+effective target backing, which is pinned in the submitted spec as for
+copy jobs. A restore limited by either the request's prefix or the
+snapshot's own prefix skips the bucket policy with a warning; it cannot
+install permissions for unrelated keys. An unknown bucket is 404 on every
+snapshot endpoint.
 
 Identity capabilities (WhoAmI): `viewJobs` (admin:ListJobs), `manageJobs`
 (admin:CreateCopyJob), `updateJobs` (admin:UpdateJob), `manageSnapshots`

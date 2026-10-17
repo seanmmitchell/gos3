@@ -102,6 +102,23 @@ func TestPolicyRewritePrefix(t *testing.T) {
 	if !strings.Contains(string(out), `"arn:aws:s3:::data-copy/bak/*"`) || allowed(out, "bak/x") || allowed(out, "other") {
 		t.Errorf("a partial Deny must cover every copied key: %s", out)
 	}
+	// A wildcard bucket resource validates for both source and target but
+	// must not bypass prefix scoping.
+	global := `{"Statement":[{"Effect":"Allow","Principal":"*","Action":"s3:GetObject","Resource":"arn:aws:s3:::*/*"}]}`
+	out, reason = rewritePolicy([]byte(global), spec("internal/", "bak/"))
+	if reason == "" && allowed(out, "outside/secret") {
+		t.Fatalf("global resource escaped prefix: %s (%s)", out, reason)
+	}
+	for _, prefixes := range [][2]string{{"internal/", "*/"}, {"internal/", "?/"}, {"*/", "bak/"}} {
+		if out, reason := rewritePolicy([]byte(global), spec(prefixes[0], prefixes[1])); reason == "" {
+			t.Errorf("literal wildcard prefix became a policy pattern: %s", out)
+		}
+	}
+	variableDeny := `{"Statement":[{"Effect":"Allow","Principal":"*","Action":"s3:GetObject","Resource":"arn:aws:s3:::data/*"},
+{"Effect":"Deny","Principal":"*","Action":"s3:GetObject","Resource":"arn:aws:s3:::data/internal/\u0024{aws:username}/*"}]}`
+	if out, reason := rewritePolicy([]byte(variableDeny), spec("internal/bob/", "bak/")); reason == "" {
+		t.Fatalf("variable-based Deny could be dropped: %s", out)
+	}
 }
 
 // A mirror's target loses the policy it copied once the source's policy
