@@ -993,7 +993,10 @@ func (s *Server) deleteObjectVersion(ctx context.Context, r *http.Request, rc *r
 	if bypass {
 		ctx = storage.WithGovernanceBypass(ctx)
 	}
-	if ifMatch != "" || (vid != "" && bi.ObjectLockEnabled) || pinned {
+	// Every permanent version delete checks the current version's lock
+	// metadata. The bucket snapshot may predate enabling object lock while
+	// a bulk request was still being received or processing earlier entries.
+	if ifMatch != "" || vid != "" || pinned {
 		var checkErr error
 		check := func(info storage.ObjectInfo) error {
 			checkErr = nil

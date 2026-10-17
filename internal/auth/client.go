@@ -86,7 +86,7 @@ func signRequest(r *http.Request, c Credentials, region, service, payloadHash st
 	names := []string{"host"}
 	for k := range r.Header {
 		lk := strings.ToLower(k)
-		if strings.HasPrefix(lk, "x-amz-") || lk == "content-type" || lk == "content-md5" {
+		if strings.HasPrefix(lk, "x-amz-") || strings.HasPrefix(lk, "x-gos3-") || lk == "content-type" || lk == "content-md5" {
 			names = append(names, lk)
 		}
 	}

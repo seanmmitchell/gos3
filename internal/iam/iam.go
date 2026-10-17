@@ -248,7 +248,15 @@ func (m *Manager) LookupCredentials(accessKey string) (string, auth.Identity, er
 // otherwise an Allow from any identity policy, the bucket policy (principal
 // match, incl. "*" for anonymous) or a canned ACL allows; default deny.
 func (m *Manager) Authorize(ctx context.Context, req AuthzRequest) Decision {
-	return m.authorize(req)
+	if err := ctx.Err(); err != nil {
+		return Decision{ExplicitDeny: true, Reason: "authorization context canceled"}
+	}
+	if shared, ok := ctx.Value(requestBudgetKey{}).(*requestBudget); ok {
+		shared.mu.Lock()
+		defer shared.mu.Unlock()
+		return m.authorize(req, shared.b)
+	}
+	return m.authorize(req, nil)
 }
 
 // ListUsers returns all users sorted by name (secrets are never included).

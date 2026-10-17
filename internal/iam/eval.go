@@ -451,7 +451,7 @@ func limitDecision(where string) Decision {
 }
 
 // authorize implements Manager.Authorize.
-func (m *Manager) authorize(req AuthzRequest) Decision {
+func (m *Manager) authorize(req AuthzRequest, shared *budget) Decision {
 	id := req.Identity
 	if id.IsRoot && !id.IsAnonymous {
 		return Decision{Allowed: true, Reason: "root user"}
@@ -480,6 +480,12 @@ func (m *Manager) authorize(req AuthzRequest) Decision {
 	}
 
 	c := newEvalCtx(&req, m.now())
+	if shared != nil {
+		c.budget = shared
+		if shared.exceeded {
+			return limitDecision("request")
+		}
+	}
 	c.principalKey = principalKey
 	allowReason := ""
 	for _, p := range policies {

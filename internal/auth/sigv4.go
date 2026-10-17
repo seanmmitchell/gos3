@@ -173,14 +173,14 @@ func parseSignedHeaders(s string, kind authKind) ([]string, map[string]bool, err
 	return names, set, nil
 }
 
-// checkUnsignedAmzHeaders rejects requests carrying x-amz-* headers that are
+// checkUnsignedAmzHeaders rejects requests carrying x-amz-* or x-gos3-* headers that are
 // not covered by the signature (as AWS does), so a captured signature cannot
 // be replayed with e.g. an added x-amz-acl.
 func checkUnsignedAmzHeaders(h http.Header, signed map[string]bool) error {
 	var missing []string
 	for k := range h {
 		lk := strings.ToLower(k)
-		if !strings.HasPrefix(lk, "x-amz-") || signed[lk] {
+		if (!strings.HasPrefix(lk, "x-amz-") && !strings.HasPrefix(lk, "x-gos3-")) || signed[lk] {
 			continue
 		}
 		switch lk {
