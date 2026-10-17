@@ -208,6 +208,14 @@ func TestLockedConflictNeverMarksMemberSynced(t *testing.T) {
 		t.Fatal(err)
 	}
 	waitSame(t, "vault", a, b)
+	r.mu.RLock()
+	memberState := r.buckets["vault"].members["b"]
+	r.mu.RUnlock()
+	waitFor(t, "the initial replica worker to finish", func() bool {
+		memberState.mu.Lock()
+		defer memberState.mu.Unlock()
+		return !memberState.running
+	})
 	put(t, a, "vault", "k", "primary", storage.ObjectMeta{})
 	put(t, b, "vault", "k", "conflict", storage.ObjectMeta{LegalHold: true})
 	r.mu.Lock()
