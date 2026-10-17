@@ -404,6 +404,10 @@ func (b *Bucket[P]) Import(key string, info storage.ObjectInfo, c Content[P]) (s
 	ch := Change[P]{Key: key, Added: v}
 	if obj, ok := b.objects.Get(key); ok {
 		if i := obj.indexByID(v.ID); i >= 0 {
+			old := obj.versions[i]
+			if old.Meta.LegalHold || (old.Meta.RetentionMode != "" && old.Meta.RetainUntil.After(time.Now())) {
+				return storage.ObjectInfo{}, Change[P]{}, fmt.Errorf("%w: imported version %q is protected by object lock", storage.ErrPreconditionFailed, v.ID)
+			}
 			ch.Removed = []*Version[P]{obj.versions[i]}
 		}
 	}

@@ -227,8 +227,10 @@ type Router struct {
 
 // bucketState is the runtime state of one bucket.
 type bucketState struct {
-	name string
-	gate gate
+	// configMu serializes full configuration copies with client writes.
+	configMu sync.Mutex
+	name     string
+	gate     gate
 	// Guarded by Router.mu:
 	rec     *placementRecord        // current placement (immutable snapshot)
 	members map[string]*memberState // members and the move target, by backing name
@@ -512,6 +514,11 @@ func (r *Router) reconcile(ctx context.Context, st *stateFile) ([]*backing, erro
 				name, memberNames(rec.Members), r.opts.StatePath)
 		}
 		if kept[0].Backing != rec.Members[0].Backing {
+			i := slices.IndexFunc(kept, func(m memberRecord) bool { return m.Synced && !m.Diverged && has(m.Backing, name) })
+			if i < 0 {
+				return nil, fmt.Errorf("bucket %q has no synchronized replica to replace its missing primary", name)
+			}
+			kept[0], kept[i] = kept[i], kept[0]
 			r.log.Warn("the primary backing of a bucket is no longer configured: promoting a replica",
 				"bucket", name, "old_primary", rec.Members[0].Backing, "new_primary", kept[0].Backing)
 		}
@@ -519,8 +526,11 @@ func (r *Router) reconcile(ctx context.Context, st *stateFile) ([]*backing, erro
 		// The primary must hold the bucket; else promote a member that
 		// does, or forget the bucket when none does.
 		if !has(rec.primary(), name) {
-			i := slices.IndexFunc(rec.Members, func(m memberRecord) bool { return has(m.Backing, name) })
+			i := slices.IndexFunc(rec.Members, func(m memberRecord) bool { return m.Synced && !m.Diverged && has(m.Backing, name) })
 			if i < 0 {
+				if slices.ContainsFunc(rec.Members, func(m memberRecord) bool { return has(m.Backing, name) }) {
+					return nil, fmt.Errorf("bucket %q has no synchronized replica to replace its missing primary", name)
+				}
 				r.log.Warn("forgetting a bucket that none of its backings holds any more",
 					"bucket", name, "backings", memberNames(rec.Members))
 				continue

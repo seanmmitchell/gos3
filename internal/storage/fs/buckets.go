@@ -175,6 +175,9 @@ func (b *Backend) SetBucketVersioning(ctx context.Context, name string, status s
 		return fmt.Errorf("fs: invalid versioning status %q", status)
 	}
 	return b.modifyBucket(ctx, name, func(rec *bucketRecord) error {
+		if rec.ObjectLockEnabled && status != storage.VersioningEnabled {
+			return errors.New("fs: object lock requires enabled versioning")
+		}
 		if status == storage.VersioningUnversioned && rec.Versioning != storage.VersioningUnversioned {
 			return errors.New("fs: a versioned bucket cannot become unversioned")
 		}

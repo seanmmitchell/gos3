@@ -188,6 +188,11 @@ func (r *Router) checkNewMembers(ctx context.Context, bucket string, bs *bucketS
 		return r.observe(primary, err)
 	}
 	for _, b := range added {
+		if _, err := b.Backend.GetBucket(ctx, bucket); err == nil {
+			return fmt.Errorf("%w: backing %q already holds a bucket named %q; refusing to overwrite unrelated data", ErrInvalidPlacement, b.Name, bucket)
+		} else if !errors.Is(err, storage.ErrBucketNotFound) {
+			return r.observe(b, err)
+		}
 		if err := importTarget(ctx, b, target); err != nil {
 			return err
 		}

@@ -69,12 +69,11 @@ type memberRecord struct {
 	// true for the primary). A replica that is not Synced never serves
 	// reads and cannot be promoted without force.
 	Synced bool `json:"synced"`
-	// Diverged is set on the old primary by a forced promote or a
-	// failover: its copy may hold acknowledged writes the new primary never
-	// received. Until its next full copy completes (it is not Synced
-	// meanwhile), the versions it has under object lock that the primary
-	// lacks are copied back to the primary rather than deleted (see
-	// syncKey), also when the copy is removed (see purgeLocked).
+	// Diverged is set on every remaining copy after a forced promotion or
+	// failover: any may hold acknowledged writes or lock metadata the new
+	// primary never received. Stronger protection on identical versions is
+	// merged; missing locked content is retained as an explicit conflict,
+	// including during purge. A conflict cannot clear Diverged or set Synced.
 	Diverged bool `json:"diverged,omitempty"`
 }
 

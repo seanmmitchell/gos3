@@ -14,6 +14,7 @@ func bucketTests() []testCase {
 	return []testCase{
 		{"CreateAndGet", testBucketCreateAndGet},
 		{"CreateWithObjectLock", testBucketCreateWithObjectLock},
+		{"ObjectLockRequiresVersioning", testObjectLockRequiresVersioning},
 		{"CreateDuplicate", testBucketCreateDuplicate},
 		{"GetMissing", testBucketGetMissing},
 		{"ListOrder", testBucketListOrder},
@@ -26,6 +27,20 @@ func bucketTests() []testCase {
 		{"Versioning", testBucketVersioning},
 		{"ObjectLock", testBucketObjectLock},
 		{"MissingBucketOperations", testBucketMissingOps},
+	}
+}
+
+func testObjectLockRequiresVersioning(e *env) {
+	e.mkBucketOpts("locked", storage.CreateBucketOptions{ObjectLockEnabled: true})
+	for _, status := range []storage.VersioningStatus{storage.VersioningSuspended, storage.VersioningUnversioned} {
+		if err := e.b.SetBucketVersioning(e.ctx, "locked", status); err == nil {
+			e.t.Errorf("locked bucket accepted versioning %q", status)
+		}
+	}
+	got, err := e.b.GetBucket(e.ctx, "locked")
+	e.noErr("GetBucket", err)
+	if got.Versioning != storage.VersioningEnabled {
+		e.t.Fatalf("locked bucket versioning changed: %+v", got)
 	}
 }
 

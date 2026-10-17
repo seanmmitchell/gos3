@@ -285,6 +285,9 @@ func (b *Backend) SetBucketVersioning(ctx context.Context, name string, status s
 		return err
 	}
 	defer bk.mu.Unlock()
+	if bk.ix.Info.ObjectLockEnabled && status != storage.VersioningEnabled {
+		return errors.New("memory: object lock requires enabled versioning")
+	}
 	if status == storage.VersioningUnversioned && bk.ix.Info.Versioning != storage.VersioningUnversioned {
 		return errors.New("memory: a versioned bucket cannot become unversioned")
 	}
