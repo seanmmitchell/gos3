@@ -22,7 +22,7 @@
 # ---------------------------------------------------------------------------
 # Web UI: static SPA with base /_gos3/ui/ (web/.output/public)
 # ---------------------------------------------------------------------------
-FROM --platform=$BUILDPLATFORM node:23-bookworm-slim@sha256:86191b94d2a163be41f3dc7fe5e5fcaca8ba2f1be7275d98a06343483c17414a AS ui
+FROM --platform=$BUILDPLATFORM node:24-bookworm-slim@sha256:a5f4366e834695d5f363b920c104953a535d3a9864d1bdf74566a0ebe01daee5 AS ui
 ENV PNPM_HOME=/pnpm \
     COREPACK_ENABLE_DOWNLOAD_PROMPT=0 \
     NUXT_TELEMETRY_DISABLED=1 \
@@ -48,25 +48,7 @@ RUN --mount=type=cache,id=gos3-pnpm,target=/pnpm/store \
 # ---------------------------------------------------------------------------
 # Go binary with the UI embedded (internal/webui/dist)
 # ---------------------------------------------------------------------------
-FROM --platform=$BUILDPLATFORM golang:1.26-bookworm@sha256:d9c68c2c51161e12fd77e4c6320687c9cd86e1af1e3ad6e6cd63ff970641453c AS go-base
-ARG BUILDARCH
-ARG GO_VERSION=1.26.10
-# The pinned golang image still contains Go 1.26.9. Install the fixed
-# toolchain from go.dev with the published checksum on each build platform.
-# Replace this step with a newly pinned base image once one ships 1.26.10.
-RUN set -eu; \
-    case "$BUILDARCH" in \
-      amd64) sum=ccfe7ae822d2c2f41f4fe7c956199967a4dac22d0ee0d2b2bfdb440aab3b20c5 ;; \
-      arm64) sum=3f4227ce7b206a513e794f1393adb473a07b46e94d18bd15d1c684bbb7319797 ;; \
-      *) echo "no pinned Go $GO_VERSION checksum for $BUILDARCH" >&2; exit 1 ;; \
-    esac; \
-    archive="go${GO_VERSION}.linux-${BUILDARCH}.tar.gz"; \
-    curl -fsSL --retry 3 -o /tmp/go.tar.gz "https://go.dev/dl/$archive"; \
-    echo "$sum  /tmp/go.tar.gz" | sha256sum -c -; \
-    rm -rf /usr/local/go; \
-    tar -C /usr/local -xzf /tmp/go.tar.gz; \
-    rm /tmp/go.tar.gz; \
-    test "$(go env GOVERSION)" = "go$GO_VERSION"
+FROM --platform=$BUILDPLATFORM golang:1.27-bookworm@sha256:5cf287a799e6b94384bad13d16b14904c531f51ba65792237e122ce42b392f61 AS go-base
 ARG TARGETOS
 ARG TARGETARCH
 ARG VERSION=dev
@@ -127,7 +109,7 @@ RUN --mount=type=cache,target=/go/pkg/mod \
 # (whose tests check that it names this version). The golang image is reused
 # for curl and to decompress the .bz2 with Go's compress/bzip2.
 # ---------------------------------------------------------------------------
-FROM --platform=$BUILDPLATFORM golang:1.26-bookworm@sha256:d9c68c2c51161e12fd77e4c6320687c9cd86e1af1e3ad6e6cd63ff970641453c AS restic
+FROM --platform=$BUILDPLATFORM golang:1.27-bookworm@sha256:5cf287a799e6b94384bad13d16b14904c531f51ba65792237e122ce42b392f61 AS restic
 ARG TARGETOS
 ARG TARGETARCH
 ARG RESTIC_VERSION=0.19.1
