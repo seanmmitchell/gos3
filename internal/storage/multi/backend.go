@@ -251,6 +251,8 @@ func (r *Router) bucketWriteGated(ctx context.Context, bucket string, op func(b 
 		return err
 	}
 	defer leave()
+	rt.bs.configMu.Lock()
+	defer rt.bs.configMu.Unlock()
 	if err := op(rt.lead.Backend); err != nil {
 		return r.observe(rt.lead, err)
 	}

@@ -128,6 +128,10 @@ func (b *Backend) SetBucketVersioning(ctx context.Context, name string, status s
 	if err != nil {
 		return err
 	}
+	if bk.ix.Info.ObjectLockEnabled && status != storage.VersioningEnabled {
+		bk.mu.Unlock()
+		return errors.New("s3store: object lock requires enabled versioning")
+	}
 	if status == storage.VersioningUnversioned && bk.ix.Info.Versioning != storage.VersioningUnversioned {
 		bk.mu.Unlock()
 		return errors.New("s3store: a versioned bucket cannot become unversioned")

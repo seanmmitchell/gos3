@@ -235,7 +235,7 @@ func (s *Store) deleteVersionLocked(ctx context.Context, t *target, key, vid str
 		}
 	}
 	opts := s3client.DeleteOptions{VersionID: vid, BypassGovernance: storage.GovernanceBypass(ctx)}
-	if !v.info.DeleteMarker && v.attrs.VersionID == "" {
+	if !t.versioned() && !v.info.DeleteMarker && v.attrs.VersionID == "" {
 		// The current object of an unversioned remote: deleting it
 		// without a version ID works on services without versioning.
 		opts.VersionID = ""

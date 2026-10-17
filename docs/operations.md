@@ -224,6 +224,21 @@ writes in flight do not finish in time, the cutover is retried later.
 pending changes during a cutover first, so nothing is lost; a forced one
 (`"force": true`, for a failed primary) switches at once.
 
+After a forced promotion, every other copy is treated as potentially
+divergent. Stronger retention or legal holds on identical versions are
+preserved. A locked version missing from the new primary remains on its
+existing copy and produces a visible replication conflict; it is not
+automatically restored, because absence may represent an authorized
+deletion. Inspect and recover such versions explicitly. Background cleanup
+also retains ambiguous locked copies instead of importing them into a
+same-name bucket. A conflicted replica cannot become `in-sync` until the
+conflict is resolved.
+
+A new replica or move target must be reachable and must not already hold
+an unrelated bucket of the same name. Startup also refuses to replace a
+missing primary with an unsynchronized or divergent replica; restore the
+primary backing or recover a verified copy before restarting.
+
 Things to know:
 
 - In-progress multipart uploads live on the primary only. After the primary

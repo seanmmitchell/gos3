@@ -738,7 +738,7 @@ func apiError(status int, body []byte) error {
 		} `json:"error"`
 	}
 	if json.Unmarshal(body, &e) == nil && e.Error.Message != "" {
-		return fmt.Errorf("server: %s (%s, HTTP %d)", e.Error.Message, e.Error.Code, status)
+		return fmt.Errorf("server: %s (%s, HTTP %d)", commentSafe(e.Error.Message), commentSafe(e.Error.Code), status)
 	}
 	msg := strings.TrimSpace(string(body))
 	if len(msg) > 200 {

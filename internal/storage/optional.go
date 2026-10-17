@@ -179,7 +179,9 @@ type VersionWriter interface {
 	// info.ObjectMeta. info.Bucket, Key, Size and IsLatest are ignored: the
 	// size is that of the written data. An existing version with the same
 	// version ID (for NullVersionID: the key's null version or null delete
-	// marker) is replaced, wherever it is in the key's history. A delete
+	// marker) is replaced, wherever it is in the key's history, unless a
+	// legal hold or unexpired retention protects it (ErrPreconditionFailed).
+	// The lock check and replacement are atomic. A delete
 	// marker must have no data (otherwise ErrInvalidName). info.VersionID
 	// must be NullVersionID or 1-64 URL-safe characters ([A-Za-z0-9_.-]),
 	// otherwise ErrInvalidName. Returns the stored info (IsLatest true).

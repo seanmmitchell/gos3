@@ -52,6 +52,9 @@ func importVersion(bb *bbolt.Bucket, key string, rec *versionRecord) ([]string, 
 				return nil, err
 			}
 			if orec.VersionID == rec.VersionID {
+				if orec.Meta.LegalHold || (orec.Meta.RetentionMode != "" && orec.Meta.RetainUntil.After(time.Now())) {
+					return nil, fmt.Errorf("%w: imported version %q is protected by object lock", storage.ErrPreconditionFailed, rec.VersionID)
+				}
 				id, err := removeVersion(bb, key, ovk, &orec)
 				if err != nil {
 					return nil, err
