@@ -100,6 +100,9 @@ func (s *Store) applyMeta(ctx context.Context, t *target, key string, v version,
 		return want, nil
 	}
 	rvid := v.attrs.VersionID // "" on an unversioned remote
+	if t.versioned() && rvid == "" {
+		rvid = v.info.VersionID
+	}
 
 	if patch.Tags != nil && (v.ov == nil || v.ov.Meta.Tags == nil) {
 		tags := *patch.Tags

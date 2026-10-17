@@ -96,6 +96,9 @@ func (s *Store) walkVersionInfos(ctx context.Context, t *target, prefix, keyMark
 // walkCurrent walks an unversioned bucket's objects (ListObjectsV2) whose
 // key has the prefix and sorts after after, as null versions.
 func (s *Store) walkCurrent(ctx context.Context, t *target, prefix, after string, fn func(storage.ObjectInfo) error) error {
+	if impossiblePrefix(prefix) {
+		return nil
+	}
 	in := s3client.ListInput{Prefix: prefix[:validPrefixLen(prefix)], StartAfter: startAfter(after), MaxKeys: s.pageSize()}
 	for {
 		var page s3client.ListOutput
@@ -109,6 +112,9 @@ func (s *Store) walkCurrent(ctx context.Context, t *target, prefix, after string
 			return s.remoteErr("ListObjectsV2", t, "", bucketOp, err)
 		}
 		for _, o := range page.Objects {
+			if prefix != "" && o.Key > prefix && !strings.HasPrefix(o.Key, prefix) {
+				return nil
+			}
 			if !utf8.ValidString(o.Key) || !strings.HasPrefix(o.Key, prefix) || o.Key <= after {
 				continue
 			}
@@ -148,6 +154,9 @@ func (s *Store) walkCurrent(ctx context.Context, t *target, prefix, after string
 // key whose lock the caller holds already (the lock is not reentrant).
 func (s *Store) walkVersions(ctx context.Context, t *target, prefix, keyMarker, vidMarker, held string,
 	fn func(e s3client.ObjectAttrs, first bool) error) error {
+	if impossiblePrefix(prefix) {
+		return nil
+	}
 	var (
 		lastKey  string
 		haveLast bool
@@ -234,6 +243,10 @@ func (s *Store) walkVersions(ctx context.Context, t *target, prefix, keyMarker, 
 				}
 			}
 			for _, e := range page.Entries {
+				if prefix != "" && e.Key > prefix && !strings.HasPrefix(e.Key, prefix) {
+					finish()
+					return nil
+				}
 				if !keep(e.Key) {
 					continue
 				}
@@ -331,6 +344,13 @@ func (s *Store) pageSize() int {
 // that starts with base+maxCodePoint+... sorts below base+maxCodePoint
 // except base+maxCodePoint itself.
 const maxCodePoint = "\U0010FFFF"
+
+// impossiblePrefix rejects malformed bytes, while retaining byte-prefix
+// semantics for a prefix ending part-way through a valid UTF-8 rune.
+func impossiblePrefix(prefix string) bool {
+	i := validPrefixLen(prefix)
+	return i < len(prefix) && utf8.FullRuneInString(prefix[i:])
+}
 
 // validPrefixLen returns the length of the longest valid UTF-8 prefix of s.
 func validPrefixLen(s string) int {
