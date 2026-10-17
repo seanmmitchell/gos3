@@ -551,8 +551,10 @@ func (r *Router) promoteLocked(bs *bucketState, i int, forced bool) {
 	next.Members[0], next.Members[i] = next.Members[i], next.Members[0]
 	next.Members[0].Synced, next.Members[0].Diverged = true, false
 	if forced {
-		next.Members[i].Synced = false
-		next.Members[i].Diverged = true
+		for j := 1; j < len(next.Members); j++ {
+			next.Members[j].Synced = false
+			next.Members[j].Diverged = true
+		}
 	} else {
 		next.Members[i] = memberRecord{Backing: old.Backing, Synced: true}
 	}

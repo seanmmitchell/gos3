@@ -92,6 +92,11 @@ func (m Marker) validate(want string) error {
 	if m.Format != markerFormat || m.Kind != markerKind || m.BackingID == "" {
 		return fmt.Errorf("%w: format %d, kind %q", ErrMarkerMismatch, m.Format, m.Kind)
 	}
+	// The ID is later used as a cache path component. A remote marker is
+	// untrusted and must use the 128-bit lowercase hex form gos3 generates.
+	if len(m.BackingID) != 32 || strings.Trim(m.BackingID, "0123456789abcdef") != "" {
+		return fmt.Errorf("%w: invalid backing ID", ErrMarkerMismatch)
+	}
 	if want != "" && m.BackingID != want {
 		return fmt.Errorf("%w: the location holds backing %s, not %s", ErrMarkerMismatch, m.BackingID, want)
 	}

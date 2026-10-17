@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"net/http"
 	"net/url"
 	"strconv"
@@ -184,6 +185,9 @@ type GetOptions struct {
 
 // GetObject opens bucket/key for reading. The caller must close the body.
 func (c *Client) GetObject(ctx context.Context, bucket, key string, opts GetOptions) (io.ReadCloser, ObjectAttrs, error) {
+	if opts.Offset < 0 || opts.Length > 0 && opts.Offset > math.MaxInt64-(opts.Length-1) {
+		return nil, ObjectAttrs{}, errors.New("s3client: invalid byte range")
+	}
 	h := http.Header{}
 	if opts.Offset > 0 || opts.Length > 0 {
 		if opts.Length > 0 {
@@ -202,7 +206,51 @@ func (c *Client) GetObject(ctx context.Context, bucket, key string, opts GetOpti
 	if err != nil {
 		return nil, ObjectAttrs{}, err
 	}
+	if h.Get("Range") != "" {
+		if err := validateRangeResponse(resp, opts); err != nil {
+			_ = resp.Body.Close()
+			return nil, ObjectAttrs{}, err
+		}
+	} else if resp.StatusCode != http.StatusOK {
+		_ = resp.Body.Close()
+		return nil, ObjectAttrs{}, errors.New("s3client: unexpected partial object response")
+	}
 	return resp.Body, attrsFromHeader(key, resp), nil
+}
+
+// validateRangeResponse prevents a service or proxy that ignores Range from
+// feeding bytes from the wrong offset to seekable storage readers.
+func validateRangeResponse(resp *http.Response, opts GetOptions) error {
+	invalid := errors.New("s3client: response does not match the requested byte range")
+	if resp.StatusCode != http.StatusPartialContent {
+		return invalid
+	}
+	span, ok := strings.CutPrefix(resp.Header.Get("Content-Range"), "bytes ")
+	if !ok {
+		return invalid
+	}
+	ends, totalText, ok := strings.Cut(span, "/")
+	if !ok {
+		return invalid
+	}
+	firstText, lastText, ok := strings.Cut(ends, "-")
+	if !ok {
+		return invalid
+	}
+	first, e1 := strconv.ParseInt(firstText, 10, 64)
+	last, e2 := strconv.ParseInt(lastText, 10, 64)
+	total, e3 := strconv.ParseInt(totalText, 10, 64)
+	if e1 != nil || e2 != nil || e3 != nil || first < 0 || first != opts.Offset || last < first || total <= last {
+		return invalid
+	}
+	wantLast := total - 1
+	if opts.Length > 0 {
+		wantLast = min(wantLast, opts.Offset+opts.Length-1)
+	}
+	if last != wantLast || resp.ContentLength >= 0 && resp.ContentLength != last-first+1 {
+		return invalid
+	}
+	return nil
 }
 
 // deleteMarkerHeader reports x-amz-delete-marker: true.

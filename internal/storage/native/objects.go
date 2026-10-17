@@ -265,6 +265,11 @@ func (s *Store) describe(ctx context.Context, t *target, key string, a s3client.
 			"bucket", t.bucket, "key", key, "version", vid)
 		x.ACL, x.Redirect = nil, nil
 	}
+	// Contract-only object lock state is security metadata too: arbitrary
+	// remote writers cannot create legal holds or forge retention through ext.
+	if x := hm.ext; x != nil {
+		x.RetentionMode, x.RetainUntil, x.LegalHold = nil, nil, nil
+	}
 	m := hm.meta
 	hm.ext.apply(&m)
 	var ovMeta *metaPatch
@@ -276,7 +281,11 @@ func (s *Store) describe(ctx context.Context, t *target, key string, a s3client.
 		var tags map[string]string
 		err := s.call(ctx, t, func(c *s3client.Client) error {
 			var err error
-			tags, err = c.GetObjectTagging(ctx, t.b.Remote, key, a.VersionID)
+			rvid := a.VersionID
+			if t.versioned() && rvid == "" {
+				rvid = vid
+			}
+			tags, err = c.GetObjectTagging(ctx, t.b.Remote, key, rvid)
 			return err
 		})
 		switch {
@@ -821,9 +830,13 @@ func (s *Store) open(ctx context.Context, t *target, key, versionID string, byVe
 		_ = body.Close()
 		body = nil
 		var ha s3client.ObjectAttrs
+		rvid := a.VersionID
+		if byVersion && rvid == "" {
+			rvid = versionID
+		}
 		err := s.call(ctx, t, func(c *s3client.Client) error {
 			var err error
-			ha, err = c.HeadObjectWith(ctx, t.b.Remote, key, s3client.HeadOptions{VersionID: a.VersionID})
+			ha, err = c.HeadObjectWith(ctx, t.b.Remote, key, s3client.HeadOptions{VersionID: rvid})
 			return err
 		})
 		if err != nil || ha.ETag != a.ETag {
@@ -847,7 +860,11 @@ func (s *Store) open(ctx context.Context, t *target, key, versionID string, byVe
 			return fail(s.remoteErr("HeadObject", t, key, objectOp, lerr))
 		}
 	}
-	r := &reader{s: s, t: t, ctx: ctx, key: key, size: a.Size, vid: a.VersionID, etag: a.ETag, body: body}
+	rvid := a.VersionID
+	if t.versioned() && rvid == "" {
+		rvid = v.info.VersionID
+	}
+	r := &reader{s: s, t: t, ctx: ctx, key: key, size: a.Size, vid: rvid, etag: a.ETag, body: body}
 	return v.info, r, nil
 }
 

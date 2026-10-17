@@ -29,6 +29,12 @@ func TestLocationCheck(t *testing.T) {
 		want string
 	}{
 		{Location{}, "no repository"},
+		{Location{Repository: `\\attacker\share\repo`}, "network"},
+		{Location{Repository: `//attacker/share/repo`}, "network"},
+		{Location{Repository: `local:\\attacker\share\repo`}, "network"},
+		{Location{Repository: `local://attacker/share/repo`}, "network"},
+		{Location{Repository: `\\?\UNC\attacker\share`}, "network"},
+		{Location{Repository: `\/attacker/share`}, "network"},
 		{Location{Repository: "sftp:-oProxyCommand=id:/x"}, "repository"},
 		{Location{Repository: "rclone:remote:path"}, "repository"},
 		{Location{Repository: "rest:https://user:pw@host/"}, "repository"},

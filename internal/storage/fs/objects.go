@@ -67,10 +67,13 @@ func (b *Backend) commitObject(req commitReq) (storage.ObjectInfo, error) {
 				return err
 			}
 		}
+		// bbolt Batch may replay this callback. Each attempt starts with the
+		// caller's original metadata rather than a previous attempt's edits.
+		meta := cloneMeta(req.meta)
 		rec := versionRecord{
 			Size:        req.size,
 			DataID:      req.dataID,
-			Meta:        req.meta,
+			Meta:        meta,
 			Compression: req.compression,
 			StoredSize:  req.storedSize,
 		}
@@ -95,13 +98,13 @@ func (b *Backend) commitObject(req commitReq) (storage.ObjectInfo, error) {
 					current = &m
 				}
 				config := bb.Bucket(subConfig)
-				if err := req.opts.BeforePublish(&req.meta, current, created, func(key string) []byte {
+				if err := req.opts.BeforePublish(&meta, current, created, func(key string) []byte {
 					return config.Get([]byte(key))
 				}); err != nil {
 					return err
 				}
-				req.meta.Encryption = rec.Meta.Encryption
-				rec.Meta = req.meta
+				meta.Encryption = req.meta.Encryption
+				rec.Meta = meta
 			}
 			rec.LastModified = created
 			unlink, err = addVersion(br, bb, req.key, &rec)

@@ -39,8 +39,8 @@ func hasVersion(t *testing.T, b storage.Backend, key, id string) bool {
 }
 
 // A forced promote of a lagging replica must not make the full sync of
-// the old primary delete its object-locked versions; they are copied to
-// the new primary instead (H-06).
+// the old primary delete its object-locked versions. Ambiguous missing
+// versions stay on that copy with a visible conflict (H-06, J-09, J-10).
 func TestForcedPromoteKeepsLockedVersions(t *testing.T) {
 	r, a, b := lockedBucket(t)
 	ctx := context.Background()
@@ -53,25 +53,22 @@ func TestForcedPromoteKeepsLockedVersions(t *testing.T) {
 		RetentionMode: "COMPLIANCE", RetainUntil: time.Now().Add(time.Hour),
 	})
 	held := put(t, a, "vault", "held", "held", storage.ObjectMeta{LegalHold: true})
-	plain := put(t, a, "vault", "plain", "plain", storage.ObjectMeta{})
+	put(t, a, "vault", "plain", "plain", storage.ObjectMeta{})
 
 	if _, err := r.Promote(ctx, "vault", "b", true); err != nil {
 		t.Fatal(err)
 	}
-	waitState(t, r, "vault", StateInSync)
-	waitSame(t, "vault", a, b)
+	waitFor(t, "the locked divergence to be reported", func() bool {
+		st, err := r.Placement("vault")
+		return err == nil && st.Members[1].State != StateInSync && st.Members[1].LastError != ""
+	})
 	for _, v := range []storage.ObjectInfo{retained, held} {
-		if !hasVersion(t, a, v.Key, v.VersionID) || !hasVersion(t, b, v.Key, v.VersionID) {
+		if !hasVersion(t, a, v.Key, v.VersionID) || hasVersion(t, b, v.Key, v.VersionID) {
 			t.Fatalf("locked version %s/%s lost after a forced promote", v.Key, v.VersionID)
 		}
 	}
-	if got := read(t, r, "vault", "k", ""); got != "retained" {
+	if got := read(t, r, "vault", "k", ""); got != "replicated" {
 		t.Fatalf("current version after the restore = %q", got)
-	}
-	// An unlocked version the new primary never received is discarded,
-	// as before.
-	if hasVersion(t, a, "plain", plain.VersionID) {
-		t.Fatal("unlocked version of the old primary kept")
 	}
 }
 
@@ -97,9 +94,8 @@ func TestSyncKeyLockedNullConflict(t *testing.T) {
 }
 
 // Dropping the old primary right after a forced promote purges its copy,
-// but not a locked version the new primary lacks: that one is restored to
-// the primary first (H-06).
-func TestPurgeRestoresLockedVersions(t *testing.T) {
+// but retains a locked version the new primary lacks for explicit recovery.
+func TestPurgeRetainsAmbiguousLockedVersions(t *testing.T) {
 	r, a, b := lockedBucket(t)
 	ctx := context.Background()
 	locked := put(t, a, "vault", "only-a", "locked", storage.ObjectMeta{
@@ -111,12 +107,11 @@ func TestPurgeRestoresLockedVersions(t *testing.T) {
 	if _, err := r.SetReplication(ctx, "vault", ModeSingle, nil); err != nil {
 		t.Fatal(err)
 	}
-	waitFor(t, "the copy on a to be purged", func() bool {
-		_, err := a.GetBucket(ctx, "vault")
-		return errors.Is(err, storage.ErrBucketNotFound)
-	})
-	if got := read(t, b, "vault", "only-a", locked.VersionID); got != "locked" {
-		t.Fatalf("restored version = %q", got)
+	if err := r.purge(ctx, purgeRecord{Bucket: "vault", Backing: "a"}, true); !errors.Is(err, errLockedConflict) {
+		t.Fatalf("purge = %v", err)
+	}
+	if !hasVersion(t, a, "only-a", locked.VersionID) || hasVersion(t, b, "only-a", locked.VersionID) {
+		t.Fatal("purge lost or resurrected a locked version")
 	}
 }
 

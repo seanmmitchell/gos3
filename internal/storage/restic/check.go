@@ -50,6 +50,12 @@ func (l Location) Check() error {
 // ':' or with a drive letter (C:\…) is a path; any other "name:" might
 // name another backend and is refused.
 func checkRepository(repo string) error {
+	local := strings.TrimPrefix(repo, "local:")
+	// Check on every OS: locations can be sent to a Windows client even
+	// when the server is Unix. Both slash spellings include UNC/device paths.
+	if strings.HasPrefix(strings.ReplaceAll(local, `\`, "/"), "//") {
+		return fmt.Errorf("restic: network and device repository paths are not allowed")
+	}
 	switch {
 	case repo == "":
 		return fmt.Errorf("restic: no repository")
