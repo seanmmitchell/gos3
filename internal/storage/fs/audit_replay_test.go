@@ -20,9 +20,23 @@ func TestBeforePublishReplayStartsWithOriginalMetadata(t *testing.T) {
 	}
 	// Queue the successful commit before a co-batched failure, forcing its
 	// publication callback to run once in the rolled-back batch and again.
-	b.commits.mu.Lock()
-	b.commits.running = true
-	b.commits.mu.Unlock()
+	// The loop goroutine of CreateBucket's commit may still be running (its
+	// caller is answered before the loop sees the empty queue and exits), and
+	// would drain the queue under us; take the committer over once idle.
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		b.commits.mu.Lock()
+		if !b.commits.running {
+			b.commits.running = true
+			b.commits.mu.Unlock()
+			break
+		}
+		b.commits.mu.Unlock()
+		if time.Now().After(deadline) {
+			t.Fatal("committer did not become idle")
+		}
+		time.Sleep(time.Millisecond)
+	}
 	result := make(chan error, 1)
 	calls := 0
 	go func() {
