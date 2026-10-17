@@ -162,6 +162,7 @@ func (s *Store) putOverlay(ctx context.Context, id overlayID, etag string, lastM
 	o.at = time.Now()
 	s.mu.Lock()
 	s.setOverlayLocked(id, o)
+	delete(s.pendingOverlays, id)
 	s.mu.Unlock()
 	return nil
 }
@@ -194,15 +195,25 @@ func (s *Store) restoreOverlay(id overlayID, o *overlay) {
 }
 
 // forgetOverlay deletes the record of an overlay hidden by hideOverlay. A
-// record that cannot be deleted is logged: after a restart it applies only
-// to the remote object it was made for, which is gone.
+// record that cannot be deleted stays hidden and is retried by the sweep.
+// The caller holds the object's lock.
 func (s *Store) forgetOverlay(ctx context.Context, id overlayID, o *overlay) {
 	if o == nil {
 		return
 	}
 	if err := s.state.DeleteRecords(context.WithoutCancel(ctx), overlayKey(id)); err != nil {
+		s.mu.Lock()
+		if s.pendingOverlays == nil {
+			s.pendingOverlays = map[overlayID]bool{}
+		}
+		s.pendingOverlays[id] = true
+		s.mu.Unlock()
 		s.log.Warn("native: delete overlay record", "backing", s.name, "bucket", id.bucket, "key", id.key, "version", id.vid, "err", err)
+		return
 	}
+	s.mu.Lock()
+	delete(s.pendingOverlays, id)
+	s.mu.Unlock()
 }
 
 // dropOverlay forgets the overlay of a version that gos3 deleted. The
@@ -214,17 +225,53 @@ func (s *Store) dropOverlay(ctx context.Context, id overlayID) {
 // dropBucketOverlays forgets every overlay of bucket.
 func (s *Store) dropBucketOverlays(ctx context.Context, bucket string) error {
 	s.mu.Lock()
-	n := len(s.overlays)
-	maps.DeleteFunc(s.overlays, func(bk bucketKey, _ map[string]*overlay) bool { return bk.bucket == bucket })
-	dropped := n != len(s.overlays)
-	s.mu.Unlock()
-	if !dropped {
-		return nil
+	if s.pendingOverlays == nil {
+		s.pendingOverlays = map[overlayID]bool{}
 	}
+	for bk, vs := range s.overlays {
+		if bk.bucket == bucket {
+			for vid := range vs {
+				s.pendingOverlays[overlayID{bucket, bk.key, vid}] = true
+			}
+		}
+	}
+	maps.DeleteFunc(s.overlays, func(bk bucketKey, _ map[string]*overlay) bool { return bk.bucket == bucket })
+	s.mu.Unlock()
+	// Memory is hidden even on failure. Always retry durable deletion, even
+	// if a previous attempt already removed the in-memory entries.
 	if err := s.state.DeleteRecords(context.WithoutCancel(ctx), overlaysPrefix(bucket)); err != nil {
 		return fmt.Errorf("native %q: delete the overlay records of bucket %q: %w", s.name, bucket, err)
 	}
+	s.mu.Lock()
+	maps.DeleteFunc(s.pendingOverlays, func(id overlayID, _ bool) bool { return id.bucket == bucket })
+	s.mu.Unlock()
 	return nil
+}
+
+// retryOverlayDeletes takes the same object locks as writes, and checks
+// the queue again under each lock: a new overlay at the same ID must
+// never be removed by an old cleanup attempt.
+func (s *Store) retryOverlayDeletes(ctx context.Context) {
+	s.mu.Lock()
+	ids := slices.Collect(maps.Keys(s.pendingOverlays))
+	s.mu.Unlock()
+	for _, id := range ids {
+		if ctx.Err() != nil {
+			return
+		}
+		unlock := s.lockObject(id.bucket, id.key)
+		s.mu.Lock()
+		pending := s.pendingOverlays[id]
+		if s.getOverlayLocked(id) != nil {
+			delete(s.pendingOverlays, id)
+			pending = false
+		}
+		s.mu.Unlock()
+		if pending {
+			s.forgetOverlay(ctx, id, &overlay{})
+		}
+		unlock()
+	}
 }
 
 // pruneOverlays drops the overlays of bucket/key stored before before
@@ -334,6 +381,7 @@ func (s *Store) sweeper(ctx context.Context) {
 // the resolver does not know are skipped; a remote failure ends the
 // bucket's sweep (it is tried again at the next round).
 func (s *Store) sweepOverlays(ctx context.Context, force bool) {
+	s.retryOverlayDeletes(ctx)
 	now := time.Now()
 	s.mu.Lock()
 	byBucket := map[string][]string{}

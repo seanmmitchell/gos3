@@ -161,6 +161,9 @@ type copyJobHead struct {
 	} `json:"source"`
 	Target struct {
 		Bucket string `json:"bucket"`
+		Create *struct {
+			Backing string `json:"backing"`
+		} `json:"create"`
 	} `json:"target"`
 }
 
@@ -196,6 +199,11 @@ func (a *api) createJob(rc *reqCtx) (int, any, error) {
 	}
 	if target != source {
 		if err := a.requireAction(rc, rc.action, iam.AdminBucketARN(target), nil); err != nil {
+			return 0, nil, err
+		}
+	}
+	if head.Target.Create != nil {
+		if spec, err = a.authorizeJobBacking(rc, spec, head.Target.Create.Backing); err != nil {
 			return 0, nil, err
 		}
 	}
@@ -237,6 +245,33 @@ func (a *api) createJob(rc *reqCtx) (int, any, error) {
 	a.log.Info("admin: job created", "job", j.ID, "kind", j.Kind, "source", source, "target", target,
 		"by", describeIdentity(rc.id))
 	return http.StatusCreated, publicJob(j), nil
+}
+
+// Authorize the effective backing before validation or submission. Pin
+// requests using target.create to the same boundary as placement changes.
+func (a *api) authorizeJobBacking(rc *reqCtx, spec json.RawMessage, backing string) (json.RawMessage, error) {
+	if backing == "" {
+		r, err := a.router()
+		if err != nil {
+			return nil, err
+		}
+		backing = r.DefaultBacking()
+	}
+	if err := a.requireAction(rc, actionCreateCopyJob, iam.AdminBackingARN(backing), nil); err != nil {
+		return nil, err
+	}
+	// encoding/json merges duplicate struct members. Append an override so
+	// validation and the worker use the authorized backing even if the
+	// server's default changes while the job is queued. Preserve all other
+	// members verbatim, including their ordering and strict validation.
+	override, err := json.Marshal(map[string]any{"target": map[string]any{"create": map[string]string{"backing": backing}}})
+	if err != nil {
+		return nil, err
+	}
+	spec = bytes.TrimSpace(spec)
+	out := append([]byte(nil), spec[:len(spec)-1]...)
+	out = append(out, ',')
+	return append(out, override[1:]...), nil
 }
 
 // splitDryRun returns the JSON object body without its "dryRun" member and

@@ -57,6 +57,8 @@ type Store struct {
 	uploads  map[string]*upload                // upload ID -> upload
 	byBucket map[string][]*upload              // bucket -> uploads in listing order
 	overlays map[bucketKey]map[string]*overlay // by key, then version ID
+	// Hidden overlays whose durable deletion failed; retried by the sweep.
+	pendingOverlays map[overlayID]bool
 	// bound maps remote buckets (lower case) to the gos3 bucket bound to
 	// them, as learned from Resolve and AttachBucket.
 	bound map[string]string

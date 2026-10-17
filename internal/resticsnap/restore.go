@@ -28,13 +28,14 @@ import (
 // A restore (KindRestore) writes one of a bucket's snapshots into a target
 // bucket (created when the request says so):
 //
-//  1. the target is created (on the backing, kind and container asked; with
+//  1. the snapshot's manifest is indexed in a temporary bbolt database (by
+//     file path, for the keys with the request's prefix), establishing the
+//     snapshot's own prefix before any configuration is copied;
+//  2. the target is created (on the backing, kind and container asked; with
 //     object lock when asked, or else when the snapshot's bucket had it) and
 //     gets the snapshot bucket's versioning; with configs "safe" the
 //     snapshot's configuration documents are copied as a copy job copies
 //     them (never replication or restic-snapshots);
-//  2. the snapshot's manifest is indexed in a temporary bbolt database (by
-//     file path, for the keys with the request's prefix);
 //  3. `restic dump --archive tar` of the deepest directory holding those
 //     files is streamed, and each file is written with copier.WriteVersion:
 //     targets that import versions keep the version IDs and LastModified
@@ -312,6 +313,9 @@ type restoreRun struct {
 	// privateACLs restores every version without its ACL (private): the
 	// snapshot's ACL guards are unknown (see applyACLGuards).
 	privateACLs bool
+	// A snapshot can itself be limited to a prefix even when the restore
+	// request has none. Its bucket policy must not escape that scope either.
+	snapshotPrefix string
 
 	// locked counts the versions not restored because the target's version
 	// they would replace is locked (see lockedTarget).
@@ -360,9 +364,6 @@ func (r *restoreRun) run(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	if err := r.prepareTarget(ctx, doc); err != nil {
-		return restoreFailure(err)
-	}
 	r.check = r.retry || spec.OnExisting == onExistingMerge
 
 	r.h.SetPhase("indexing")
@@ -379,6 +380,9 @@ func (r *restoreRun) run(ctx context.Context) error {
 		return err
 	}
 
+	if err := r.prepareTarget(ctx, doc); err != nil {
+		return restoreFailure(err)
+	}
 	r.h.SetPhase("restoring")
 	if files > 0 {
 		if err := r.restoreFiles(ctx, top); err != nil {
@@ -608,6 +612,10 @@ func (r *restoreRun) copyConfigs(ctx context.Context, doc *bucketDoc) error {
 		}
 	}
 	if data := get(storage.ConfigPolicy); data != nil {
+		if r.spec.Prefix != "" || r.snapshotPrefix != "" {
+			r.status.Warnings = append(r.status.Warnings, "bucket policy not restored: a prefix restore cannot install bucket-wide permissions")
+			return nil
+		}
 		policy := rewritePolicy(string(data), src, target)
 		if _, err := iam.ParseBucketPolicy([]byte(policy), target); err != nil {
 			r.status.Warnings = append(r.status.Warnings, "bucket policy not restored: "+err.Error())
@@ -674,9 +682,11 @@ func (r *restoreRun) index(ctx context.Context, dir string) (files int64, top st
 		return 0, "", fmt.Errorf("resticsnap: %w", err)
 	}
 	defer in.close()
-	if _, err := readHeader(in); err != nil {
+	header, err := readHeader(in)
+	if err != nil {
 		return 0, "", jobs.Permanent(err)
 	}
+	r.snapshotPrefix = header.Prefix
 	type item struct {
 		markers bool
 		key     []byte

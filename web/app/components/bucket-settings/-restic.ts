@@ -177,6 +177,22 @@ function optionArgs(shell: Shell, options: readonly string[] | null | undefined)
   return (options ?? []).map(o => ` -o ${shellQuote(shell, o)}`).join('')
 }
 
+// Match internal/storage/restic Location.Check. Shell quoting alone does
+// not prevent restic from executing a backend command or password helper.
+const LOCATION_ENV = new Set(['AWS_ACCESS_KEY_ID', 'AWS_SECRET_ACCESS_KEY', 'AWS_SESSION_TOKEN', 'AWS_DEFAULT_REGION', 'AWS_REGION'])
+
+function safeSnippetLocation(input: SnippetInput): boolean {
+  const repo = input.repository
+  const local = repo.startsWith('local:') ? repo.slice(6) : repo
+  if (!repo || /[\x00-\x1f\x7f]/.test(repo) || local.replace(/\\/g, '/').startsWith('//')) return false
+  if (!(repo.startsWith('s3:') || repo.startsWith('local:') || !repo.includes(':') || /^[A-Za-z]:[\\/]/.test(repo))) return false
+  if ((input.options ?? []).some(o => {
+    const name = o.split('=', 1)[0]!
+    return !name.startsWith('s3.') || /[\x00-\x20\x7f]/.test(name)
+  })) return false
+  return [...(input.envNames ?? []), ...Object.keys(input.env ?? {})].every(name => LOCATION_ENV.has(name))
+}
+
 /**
  * Commands that list (and hint how to restore) the bucket's restic
  * snapshots with the restic CLI alone, for bash or PowerShell. Every
@@ -186,6 +202,7 @@ function optionArgs(shell: Shell, options: readonly string[] | null | undefined)
  * (--server, this server's URL) or offline on the server (--config).
  */
 export function resticSnippet(input: SnippetInput): string {
+  if (!safeSnippetLocation(input)) return comment('Recovery commands unavailable: the repository, options or environment contain unsupported restic settings.')
   const { shell } = input
   const lines: string[] = []
   lines.push(envLine(shell, 'RESTIC_REPOSITORY', input.repository))

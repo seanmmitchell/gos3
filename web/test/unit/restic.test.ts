@@ -6,6 +6,7 @@ import { spawnSync } from 'node:child_process'
 import { describe, expect, it, vi } from 'vitest'
 import { AdminClient } from '~/utils/admin/client'
 import type { Capabilities, ResticTags, SnapshotConfig } from '~/types/admin'
+import type { SnippetInput } from '~/components/bucket-settings/-restic'
 import { NO_CAPS, bucketSettingsTabs, resolveBucketTab, resticAccess, resticTabAvailable } from '~/components/admin/-capabilities'
 import {
   ARCHIVE_COST_WARNING,
@@ -61,6 +62,37 @@ function makeAdmin(responder: (c: Captured) => Response) {
 const json = (v: unknown, status = 200) => new Response(JSON.stringify(v), { status, headers: { 'content-type': 'application/json' } })
 
 const TAGS: ResticTags = { object: 'gos3-object', bucket: 'gos3-bucket:cGhvdG9z', bucketId: 'gos3-bucket-id:b1', snapshot: 'gos3-snapshot' }
+
+describe('recovery snippet trust boundary', () => {
+  for (const shell of ['bash', 'powershell'] as const) {
+    it(`${shell} refuses restic command execution settings`, () => {
+      const base = { shell, bucket: 'photos', purpose: 'archive' as const, repository: '/data/repo', password: 'pw', tags: TAGS }
+      const cases: Partial<SnippetInput>[] = [
+        { options: ['sftp.command=sh -c evil'] },
+        { options: ['rclone.program=evil'] },
+        { env: { RESTIC_PASSWORD_COMMAND: 'evil' } },
+        { env: { LD_PRELOAD: '/tmp/evil.so' } },
+        { env: { PATH: '/tmp/evil' } },
+        { env: { RESTIC_REPOSITORY: 'sftp:host:repo' } },
+        { envNames: ['RESTIC_PASSWORD_COMMAND'] },
+        { repository: 'sftp:host:repo' },
+        { repository: 'rclone:remote:repo' },
+        { repository: '\\\\host\\share' },
+        { repository: 'local://host/share' }
+      ]
+      for (const unsafe of cases) {
+        const snippet = resticSnippet({ ...base, ...unsafe })
+        expect(snippet).toMatch(/^# Recovery commands unavailable:/)
+        expect(snippet.split('\n')).toHaveLength(1)
+      }
+      for (const repository of ['/data/repo', 'local:/data/repo', 'C:\\data\\repo', 's3:https://example.com/bucket/repo']) {
+        const snippet = resticSnippet({ ...base, repository, options: ['s3.bucket-lookup=path'], env: { AWS_SESSION_TOKEN: 'token' } })
+        expect(snippet).toContain('restic snapshots')
+        expect(snippet).toContain('AWS_SESSION_TOKEN')
+      }
+    })
+  }
+})
 
 const CONFIG: SnapshotConfig = {
   enabled: true,

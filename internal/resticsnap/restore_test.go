@@ -43,6 +43,39 @@ func (e *testEnv) read(bucket, key string) (string, storage.ObjectInfo) {
 	return string(data), oi
 }
 
+func TestPrefixRestoreDoesNotInstallBucketPolicy(t *testing.T) {
+	for _, snapshotPrefix := range []string{"", "public/"} {
+		t.Run("snapshot-prefix="+snapshotPrefix, func(t *testing.T) {
+			e := newEnv(t, "mem", Options{Incremental: true})
+			e.createBucket("src", "", storage.VersioningEnabled)
+			e.put("src", "public/file", "public", storage.ObjectMeta{})
+			policy := []byte(`{"Statement":[{"Effect":"Allow","Principal":"*","Action":"s3:GetObject","Resource":"arn:aws:s3:::src/*"}]}`)
+			if err := e.router.PutBucketConfig(t.Context(), "src", storage.ConfigPolicy, policy); err != nil {
+				t.Fatal(err)
+			}
+			e.configure("src", `{"enabled":false,"prefix":"`+snapshotPrefix+`","target":{"kind":"backing","backing":"disk"}}`)
+			st := e.snapshot("src")
+			prefix := "public/"
+			if snapshotPrefix != "" {
+				prefix = ""
+			}
+			j := e.restore("src", st.Snapshot, `{"target":{"bucket":"dst","create":{"backing":"mem"}},"prefix":"`+prefix+`"}`)
+			if j.State != jobs.StateSucceeded {
+				t.Fatal(j.LastError)
+			}
+			if _, err := e.router.GetBucketConfig(t.Context(), "dst", storage.ConfigPolicy); !errors.Is(err, storage.ErrConfigNotFound) {
+				t.Fatalf("prefix restore installed policy: %v", err)
+			}
+			if !strings.Contains(string(j.Status), "bucket policy not restored") {
+				t.Fatalf("missing warning: %s", j.Status)
+			}
+			if data, _ := e.read("dst", "public/file"); data != "public" {
+				t.Fatal(data)
+			}
+		})
+	}
+}
+
 // A snapshot restored into a new bucket: content, metadata, version IDs
 // and modification times (the memory backend imports versions), delete
 // markers, versioning and configurations.

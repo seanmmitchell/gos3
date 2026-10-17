@@ -149,8 +149,11 @@ that the target cannot store fails the job.
 - **Bucket policy**: resources naming the source bucket are rewritten to
   the target (`arn:aws:s3:::<source>` becomes `arn:aws:s3:::<target>`).
   With prefixes, object ARNs inside the source prefix are mapped to the
-  target prefix and the others are dropped, and a policy using `s3:prefix`
-  conditions is skipped with a warning. A policy that is not valid for the
+  target prefix and the others are dropped. Policies using wildcard bucket
+  names, policy variables, or `s3:prefix` conditions are skipped with a
+  warning for prefix copies. Literal copy prefixes containing `*`, `?`, or
+  policy-variable syntax also prevent policy copying because IAM cannot
+  represent those prefixes literally. A policy that is not valid for the
   target after rewriting is skipped with a warning too (in the dry run and
   in the job's `warnings`).
 - **Object ACLs travel with their versions.** When the source neutralises
