@@ -89,7 +89,7 @@ Omit `--no-admin` to keep the management API enabled for a separate web UI.
 
 ```sh
 docker build -t gos3 .              # or: make docker (adds version build args)
-docker run --rm gos3 keygen > gos3.env   # random root keys (keep the file private)
+(umask 077; docker run --rm gos3 keygen > gos3.env)  # create a private file
 docker run -d --name gos3 -p 127.0.0.1:9000:9000 -v gos3-data:/data \
   --env-file gos3.env gos3
 docker logs gos3                    # banner: endpoints, UI URL, credentials source

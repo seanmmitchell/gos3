@@ -139,9 +139,11 @@ use `git describe`.
 
 If a run fails after the tag was created, run the workflow again: on a
 commit that already has a release tag whose release is not published yet,
-it rebuilds that release (completing the draft) instead of bumping the
-version. A published release is never rebuilt or changed; the workflow
-refuses.
+it rebuilds that tag instead of bumping the version. If the failed run
+already created a draft, inspect it and delete the draft release before
+retrying; keep the tag. The workflow refuses to reuse any pre-existing
+release, including a draft, so foreign notes and assets cannot be published
+by the release job. A published release is never rebuilt or changed.
 
 ## Verifying a release
 
