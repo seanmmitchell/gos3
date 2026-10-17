@@ -554,9 +554,10 @@ const EnvInsecureDemoCredentials = "GOS3_INSECURE_DEMO_CREDENTIALS"
 // and demo files (README, docs, docker-compose.yml) and in those of other
 // S3 servers, compared case-insensitively.
 var demoSecrets = []string{
-	"change-me-now",    // README / docs quickstart
-	"gos3admin-secret", // docker-compose.yml demo
-	"minioadmin",       // MinIO default
+	"change-me-now",                            // README / docs quickstart
+	"gos3admin-secret",                         // docker-compose.yml demo
+	"CHANGE-ME-secret-key-at-least-8-chars",    // Kubernetes example
+	"minioadmin",                               // MinIO default
 	"wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY", // AWS documentation example
 	"wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY",
 	"changeme", "change-me", "password", "secretkey", "secret-key",
