@@ -35,6 +35,17 @@ type mdnsPacket struct {
 	src     netip.AddrPort // source; IPv6 link-local addresses keep their zone
 	ifIndex int            // arrival interface, 0 when unknown
 	ttl     int            // IP TTL / IPv6 hop limit, 0 when unknown
+	// noTTL: the socket cannot report the TTL / hop limit, so spoofed
+	// off-link datagrams cannot be recognised.
+	noTTL bool
+}
+
+// newMDNSPacket describes a datagram read from a socket that reports
+// control messages when cmsg is set. A datagram without a reported TTL /
+// hop limit is treated as unchecked (noTTL) even on such a socket: the
+// RFC 6762 §11 check must not pass merely because the value is missing.
+func newMDNSPacket(data []byte, src netip.AddrPort, meta mdnsMeta, cmsg bool) mdnsPacket {
+	return mdnsPacket{data: data, src: src, ifIndex: meta.ifIndex, ttl: meta.ttl, noTTL: !cmsg || meta.ttl == 0}
 }
 
 // mdnsWriter sends the responder's answers on the socket the query arrived
@@ -69,7 +80,7 @@ func newMDNSResponder(logger *slog.Logger) *mdnsResponder {
 	return &mdnsResponder{
 		logger:        logger,
 		local:         hostNets,
-		limit:         newSourceLimiter(),
+		limit:         newSourceLimiter(sourceBurst, sourceRefill),
 		now:           time.Now,
 		lastMulticast: make(map[string]time.Time),
 	}
@@ -98,7 +109,7 @@ func (r *mdnsResponder) serve(s *mdnsSocket) {
 		if n > mdnsMaxPacket {
 			continue
 		}
-		r.handle(mdnsPacket{data: buf[:n], src: src, ifIndex: meta.ifIndex, ttl: meta.ttl}, s)
+		r.handle(newMDNSPacket(buf[:n], src, meta, s.cmsg), s)
 	}
 }
 
@@ -118,7 +129,10 @@ func (r *mdnsResponder) serve(s *mdnsSocket) {
 //   - answers go to the multicast group (TTL 255, at most once per second
 //     per answer set and interface), except for questions with the
 //     unicast-response bit (RFC 6762 §5.4) and legacy queries from a port
-//     other than 5353 (§6.7), which are answered by unicast to the sender;
+//     other than 5353 (§6.7), which are answered by unicast to the sender
+//     (by multicast instead when the socket cannot report the TTL and the
+//     sender is another host: its source address may be spoofed, and the
+//     link-local group never leaves the link);
 //   - every response is a single packet of at most mdnsMaxResponse bytes.
 func (r *mdnsResponder) handle(p mdnsPacket, w mdnsWriter) {
 	src := p.src.Addr()
@@ -138,6 +152,7 @@ func (r *mdnsResponder) handle(p mdnsPacket, w mdnsWriter) {
 		return
 	}
 	legacy := p.src.Port() != mdnsPort
+	unicastOK := !p.noTTL || r.local.isLocal(src)
 	var (
 		seen                     = make(map[string]bool)
 		uq, mq                   []dns.Question // answered questions, per transport
@@ -156,7 +171,7 @@ func (r *mdnsResponder) handle(p mdnsPacket, w mdnsWriter) {
 		if len(ans) == 0 {
 			continue
 		}
-		if legacy || qu.Qclass&(1<<15) != 0 {
+		if (legacy || qu.Qclass&(1<<15) != 0) && unicastOK {
 			uq = append(uq, qu)
 			uAns, uExtra = append(uAns, ans...), append(uExtra, extra...)
 		} else {

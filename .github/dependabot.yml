@@ -1,39 +1,43 @@
-# Weekly update pull requests for GitHub Actions, container base images, Go
-# modules, the web UI's npm packages and the compatibility suite's Python
-# packages. Like every change, they target dev (docs/releasing.md).
+# One combined weekly update pull request for GitHub Actions, container base
+# images, Go modules, the web UI's npm packages and the compatibility suite's
+# Python packages. Like every change, it targets dev (docs/releasing.md).
 #
-# Every ecosystem waits 14 days after a release before proposing it (the same
+# Updates normally wait 14 days after a release before proposing it (the same
 # supply-chain cooldown web/pnpm-workspace.yaml enforces with
 # minimumReleaseAge and test/compat/requirements.in documents for the
 # compiled Python lock), so freshly published, possibly malicious or broken
 # versions are never picked up automatically. Security updates are not
 # delayed by the cooldown.
 version: 2
-updates:
-  - package-ecosystem: github-actions
-    directory: /
+multi-ecosystem-groups:
+  weekly-dependencies:
     target-branch: dev
     schedule:
       interval: weekly
+    open-pull-requests-limit: 1
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    multi-ecosystem-group: weekly-dependencies
+    patterns: ["*"]
     cooldown:
       default-days: 14
   - package-ecosystem: docker
     directories: ["/", "/deploy/docker"]
-    target-branch: dev
-    schedule:
-      interval: weekly
+    multi-ecosystem-group: weekly-dependencies
+    patterns: ["*"]
     cooldown:
       default-days: 14
+      # Go point releases are mostly security fixes for the standard library
+      # that the image links in: propose them without waiting. (The
+      # Dockerfile rejects an image older than go.mod's go line.)
+      exclude: ["golang"]
   - package-ecosystem: gomod
     directory: /
-    target-branch: dev
-    schedule:
-      interval: weekly
+    multi-ecosystem-group: weekly-dependencies
+    patterns: ["*"]
     cooldown:
       default-days: 14
-    groups:
-      go-test-clients:
-        patterns: ["github.com/aws/*", "github.com/minio/*"]
     ignore:
       # v7.2+ declares its linter toolchain as module requirements, which adds
       # ~200 modules to gos3's module graph; minio-go is a test-only client.
@@ -41,22 +45,14 @@ updates:
         versions: [">= 7.2.0"]
   - package-ecosystem: npm
     directory: /web
-    target-branch: dev
-    schedule:
-      interval: weekly
+    multi-ecosystem-group: weekly-dependencies
+    patterns: ["*"]
     cooldown:
       default-days: 14
-    groups:
-      nuxt:
-        patterns: ["nuxt", "@nuxt/*", "vue", "vue-router", "vite", "vitest"]
+  # boto3 and botocore are released in lockstep; keep them in the same PR.
   - package-ecosystem: pip
     directory: /test/compat
-    target-branch: dev
-    schedule:
-      interval: weekly
+    multi-ecosystem-group: weekly-dependencies
+    patterns: ["*"]
     cooldown:
       default-days: 14
-    groups:
-      # boto3 and botocore are released in lockstep and must stay matched.
-      aws-clients:
-        patterns: ["awscli", "awscrt", "boto3", "botocore", "s3transfer"]

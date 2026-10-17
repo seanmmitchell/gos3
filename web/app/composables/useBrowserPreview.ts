@@ -10,6 +10,8 @@ export type PreviewKind = 'image' | 'video' | 'audio' | 'markdown' | 'json' | 't
 export const PREVIEW_MEDIA_MAX_BYTES = 50 * 1024 * 1024
 /** Bytes fetched (range GET) for text previews. */
 export const PREVIEW_TEXT_MAX_BYTES = 256 * 1024
+/** Deepest block quote nesting renderMarkdown renders as <blockquote>. */
+export const MARKDOWN_MAX_QUOTE_DEPTH = 16
 
 const IMAGE_EXT = new Set(['png', 'jpg', 'jpeg', 'gif', 'webp', 'avif', 'bmp', 'ico', 'svg'])
 const VIDEO_EXT = new Set(['mp4', 'webm', 'ogv', 'mov', 'm4v'])
@@ -86,7 +88,11 @@ function inline(escaped: string): string {
     codes.push(`<code>${c}</code>`)
     return `\u0000${codes.length - 1}\u0000`
   })
-  s = s.replace(/!?\[([^\]]*)\]\(([^)\s]+)(?:\s+&quot;[^&]*&quot;)?\)/g, (_m, label: string, url: string) => {
+  // The label cannot cross '[' and the URL holds at most one '(…)' group
+  // ('…/Foo_(bar)'): a failed match then stops at the next bracket, which
+  // keeps this linear in the input (with '[^\]]*' a run of '[' without ']'
+  // took quadratic time).
+  s = s.replace(/!?\[([^[\]]*)\]\(([^()\s]+(?:\([^()\s]*\))?)(?:\s+&quot;[^&]*&quot;)?\)/g, (_m, label: string, url: string) => {
     // url is escaped; unescape &amp; for the check, re-escape on output.
     const href = safeHref(url.replace(/&amp;/g, '&'))
     if (!href) return label
@@ -102,12 +108,52 @@ function inline(escaped: string): string {
   return s.replace(/\u0000(\d+)\u0000/g, (_m, i: string) => codes[Number(i)] ?? '')
 }
 
+/** A horizontal rule: three or more '-', '*' or '_'. */
+const HR = /^\s*([-*_])(\s*\1){2,}\s*$/
+
+type CellAlign = 'left' | 'center' | 'right' | undefined
+
+/**
+ * Splits a GFM table row into raw cell texts: one optional leading and
+ * trailing '|' is dropped, cells split on unescaped '|' and '\|' becomes a
+ * literal pipe.
+ */
+function tableCells(line: string): string[] {
+  let s = line.trim()
+  if (s.startsWith('|')) s = s.slice(1)
+  if (s.endsWith('|') && !s.endsWith('\\|')) s = s.slice(0, -1)
+  return s.split(/(?<!\\)\|/).map(c => c.replace(/\\\|/g, '|').trim())
+}
+
+/** Column alignments of a GFM delimiter row ('| :-- | :-: | --: |'), or null if it is not one. */
+function tableDelimiter(line: string): CellAlign[] | null {
+  // Checked cell by cell: one regex over the whole row backtracks badly on
+  // long runs of spaces.
+  const cells = tableCells(line)
+  if (!cells.every(c => /^:?-+:?$/.test(c))) return null
+  return cells.map((c) => {
+    const left = c.startsWith(':')
+    const right = c.endsWith(':')
+    return left && right ? 'center' : right ? 'right' : left ? 'left' : undefined
+  })
+}
+
+function tableRow(tag: 'th' | 'td', cells: string[], aligns: CellAlign[]): string {
+  // Rows are padded or cut to the header's width, as in GFM.
+  return `<tr>${aligns.map((a, i) => {
+    const style = a ? ` style="text-align:${a}"` : ''
+    return `<${tag}${style}>${inline(previewEscapeHtml(cells[i] ?? ''))}</${tag}>`
+  }).join('')}</tr>`
+}
+
 /**
  * Renders a practical Markdown subset (headings, paragraphs, emphasis, code
- * spans and fenced blocks, block quotes, lists, horizontal rules, links) to
- * safe HTML.
+ * spans and fenced blocks, block quotes, lists, GFM tables, horizontal rules,
+ * links) to safe HTML. Block quotes nest at most MARKDOWN_MAX_QUOTE_DEPTH levels;
+ * deeper quote markers are kept as text (a line of thousands of '>' would
+ * otherwise recurse once per marker and overflow the stack).
  */
-export function renderMarkdown(src: string): string {
+export function renderMarkdown(src: string, depth = 0): string {
   const lines = src.replace(/\r\n?/g, '\n').split('\n')
   const out: string[] = []
   let para: string[] = []
@@ -123,7 +169,7 @@ export function renderMarkdown(src: string): string {
     list = null
   }
   const flushQuote = () => {
-    if (quote.length) out.push(`<blockquote>${renderMarkdown(quote.join('\n'))}</blockquote>`)
+    if (quote.length) out.push(`<blockquote>${renderMarkdown(quote.join('\n'), depth + 1)}</blockquote>`)
     quote = []
   }
   const flushAll = () => {
@@ -144,7 +190,7 @@ export function renderMarkdown(src: string): string {
       out.push(`<pre${lang}><code>${previewEscapeHtml(body.join('\n'))}</code></pre>`)
       continue
     }
-    if (/^\s*>/.test(line)) {
+    if (depth < MARKDOWN_MAX_QUOTE_DEPTH && /^\s*>/.test(line)) {
       flushPara()
       flushList()
       quote.push(line.replace(/^\s*>\s?/, ''))
@@ -163,7 +209,24 @@ export function renderMarkdown(src: string): string {
       out.push(`<h${level}>${inline(previewEscapeHtml(h[2]!))}</h${level}>`)
       continue
     }
-    if (/^\s*([-*_])(\s*\1){2,}\s*$/.test(line)) {
+    // GFM table: a header row, then a delimiter row with as many cells; at
+    // least one of them needs a '|' (so 'text' over '---' stays a rule).
+    const aligns = i + 1 < lines.length ? tableDelimiter(lines[i + 1]!) : null
+    if (aligns && (line.includes('|') || lines[i + 1]!.includes('|')) && tableCells(line).length === aligns.length) {
+      flushAll()
+      const head = tableRow('th', tableCells(line), aligns)
+      const body: string[] = []
+      i += 2
+      // Body rows run until a blank line or the start of another block.
+      while (i < lines.length && lines[i]!.trim() && !/^\s*(>|#{1,6}\s|```|~~~)/.test(lines[i]!) && !HR.test(lines[i]!)) {
+        body.push(tableRow('td', tableCells(lines[i]!), aligns))
+        i++
+      }
+      i--
+      out.push(`<table><thead>${head}</thead>${body.length ? `<tbody>${body.join('')}</tbody>` : ''}</table>`)
+      continue
+    }
+    if (HR.test(line)) {
       flushAll()
       out.push('<hr>')
       continue

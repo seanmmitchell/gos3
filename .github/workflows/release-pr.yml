@@ -6,7 +6,9 @@ name: Release PR
 # edited, which covers changing its base branch to main.
 
 on:
-  pull_request:
+  # Use the base branch's workflow so a PR cannot rewrite its own source gate.
+  # This job never checks out or executes code from the pull request.
+  pull_request_target:
     branches: [main]
     types: [opened, edited, synchronize, reopened]
 
@@ -20,7 +22,7 @@ jobs:
     steps:
       - name: The head branch is dev of this repository
         env:
-          HEAD_REF: ${{ github.head_ref }}
+          HEAD_REF: ${{ github.event.pull_request.head.ref }}
           HEAD_REPO: ${{ github.event.pull_request.head.repo.full_name }}
         run: |
           if [ "$HEAD_REPO" != "$GITHUB_REPOSITORY" ] || [ "$HEAD_REF" != dev ]; then

@@ -1,12 +1,14 @@
 <script setup lang="ts">
 /**
  * Peer table of one gos3 server (GET /discovery) or of a scan result.
- * Peers already configured link to their connection; others offer "Add".
+ * Peers already configured (a connection at an address they were observed
+ * at) link to their connection; others offer "Add". A peer reporting a
+ * configured server's ID from another address is flagged, not linked.
  */
 import type { TableColumn } from '@nuxt/ui'
 import type { Peer } from '~/types/admin'
 import { useConnectionsStore } from '~/stores/connections'
-import { findConfigured } from './-aggregate'
+import { findConfigured, findIdClaim } from './-aggregate'
 
 withDefaults(defineProps<{
   peers: readonly Peer[]
@@ -18,6 +20,7 @@ const emit = defineEmits<{ add: [peer: Peer] }>()
 
 const store = useConnectionsStore()
 const configured = (p: Peer) => findConfigured(p, store.connections)
+const idClaim = (p: Peer) => findIdClaim(p, store.connections)
 
 const columns: TableColumn<Peer>[] = [
   { accessorKey: 'name', header: 'Server' },
@@ -38,8 +41,11 @@ const columns: TableColumn<Peer>[] = [
     </template>
     <template #name-cell="{ row }">
       <div class="min-w-40">
-        <p class="font-medium text-highlighted">
+        <p class="flex flex-wrap items-center gap-1.5 font-medium text-highlighted">
           {{ row.original.name || row.original.id }}
+          <UTooltip v-if="idClaim(row.original)" :text="`Reports the server ID of ${idClaim(row.original)!.name} (${idClaim(row.original)!.endpoint}) but was found at another address. Server IDs are not authenticated: it may be the same server under another address, or a host spoofing it.`">
+            <UBadge :label="`ID of ${idClaim(row.original)!.name}`" color="warning" variant="subtle" size="sm" icon="i-lucide-shield-question" data-testid="id-claim-badge" />
+          </UTooltip>
         </p>
         <p class="font-mono text-xs text-muted">
           {{ row.original.id }}

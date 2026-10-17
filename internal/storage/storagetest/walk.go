@@ -20,16 +20,23 @@ func walkTests() []testCase {
 		{"VersionsOrder", testWalkVersionsOrder},
 		{"VersionsMarkers", testWalkVersionsMarkers},
 		{"VersionsStopAndErrors", testWalkVersionsStop},
+		{"VersionsDeletedMarker", testWalkVersionsDeletedMarker},
 		{"VersionsLatestUnderMutation", testWalkVersionsLatestUnderMutation},
 	}
 }
 
 // walkKeySet is a key set chosen to expose byte-wise ordering bugs ('/' is
-// 0x2F, '-' 0x2D, '0' 0x30; multi-byte UTF-8 sorts after ASCII).
+// 0x2F, '-' 0x2D, '0' 0x30; multi-byte UTF-8 sorts after ASCII; NUL sorts
+// before everything, so "a\x00b" lies between "a" and "a-c"). Tests use it
+// through env.walkKeySet, which applies Options.NoControlKeys ("a!b" keeps
+// that position).
 var walkKeySet = []string{
 	"b", "a", "a/b", "a-c", "a0", "a/b/c", "a/", "ab", "A", "Z", "_", "~",
-	"é", "日本", "\U0001F600", "a/é", "a/z", "b/c/d", "b0",
+	"é", "日本", "\U0001F600", "a/é", "a/z", "b/c/d", "b0", "a\x00b", "a\x00",
 }
+
+// walkKeySet returns walkKeySet as the suite uses it (see env.key).
+func (e *env) walkKeySet() []string { return e.keys(walkKeySet...) }
 
 func sortedCopy(s []string) []string {
 	c := slices.Clone(s)
@@ -52,11 +59,12 @@ func testWalkEmpty(e *env) {
 
 func testWalkObjectsOrder(e *env) {
 	e.mkBucket("b")
-	for _, k := range walkKeySet {
+	keySet := e.walkKeySet()
+	for _, k := range keySet {
 		e.put("b", k, []byte("data:"+k))
 	}
 	objs := e.walkObjects("b", "", "")
-	want := sortedCopy(walkKeySet)
+	want := sortedCopy(keySet)
 	if got := keysOf(objs); !slices.Equal(got, want) {
 		e.t.Fatalf("WalkObjects order:\n got  %q\n want %q (byte-wise ascending)", got, want)
 	}
@@ -70,12 +78,13 @@ func testWalkObjectsOrder(e *env) {
 
 func testWalkObjectsPrefixAfter(e *env) {
 	e.mkBucket("b")
-	for _, k := range walkKeySet {
+	keySet := e.walkKeySet()
+	for _, k := range keySet {
 		e.put("b", k, []byte(k))
 	}
-	sorted := sortedCopy(walkKeySet)
+	sorted := sortedCopy(keySet)
 	prefixes := []string{"", "a", "a/", "a/b", "b", "é", "zz", "a-", "A"}
-	afters := append([]string{"", "0", "a", "a/", "a/a", "a.", "aa", "b/", "b/c/d", "zzz", "\U0010FFFF", "\U0010FFFF\U0010FFFF"}, walkKeySet...)
+	afters := append([]string{"", "0", "a", "a/", "a/a", "a.", "aa", "b/", "b/c/d", "zzz", "\U0010FFFF", "\U0010FFFF\U0010FFFF"}, keySet...)
 	for _, p := range prefixes {
 		for _, a := range afters {
 			var want []string
@@ -180,6 +189,11 @@ func (e *env) buildVersionedFixture(bucket string) []vref {
 	}
 	addDel("a")
 	add("a", e.put(bucket, "a", []byte("a-after-marker")), false)
+	// A NUL byte sorts between "a" and every other key starting with "a"
+	// (and so does its NoControlKeys substitute "a!b").
+	nul := e.key("a\x00b")
+	add(nul, e.put(bucket, nul, []byte("nul1")), false)
+	add(nul, e.put(bucket, nul, []byte("nul2")), false)
 	addDel("b")
 	add("c", e.put(bucket, "c", []byte("c1")), false)
 	add("d/e", e.put(bucket, "d/e", []byte("de")), false)
@@ -267,7 +281,7 @@ func testWalkVersionsMarkers(e *env) {
 	check("", "", "", all)
 
 	// Mode 2: keyMarker only: start strictly after all versions of keyMarker.
-	for _, km := range []string{"a", "b", "c", "c0", "d/", "d/e", "m", "zz", "é", "0", "\U0010FFFF"} {
+	for _, km := range e.keys("a", "a\x00", "a\x00b", "b", "c", "c0", "d/", "d/e", "m", "zz", "é", "0", "\U0010FFFF") {
 		check("", km, "", filter("", 0, func(v vref) bool { return v.Key > km }))
 		check("d/", km, "", filter("d/", 0, func(v vref) bool { return v.Key > km }))
 	}
@@ -307,6 +321,150 @@ func testWalkVersionsStop(e *env) {
 	}
 	if calls != 1 {
 		e.t.Errorf("WalkVersions invoked the callback %d times after an error, want 1", calls)
+	}
+}
+
+// testWalkVersionsDeletedMarker: the version named by a versionIDMarker may
+// be deleted between two pages, as in the usual loop that empties a
+// versioned bucket (list a page, delete what it returned, list the next page
+// from the returned markers). No remaining version may be skipped. A
+// generated version ID resumes at the position it occupied; "null" carries
+// no position, so a "null" marker of a key without a null version resumes
+// with the newest remaining version of that key (re-listing a version the
+// caller kept is acceptable, losing older ones is not). With
+// Options.OpaqueVersionIDs no ID carries a position: any deleted marker may
+// re-list the key's remaining newer versions.
+func testWalkVersionsDeletedMarker(e *env) {
+	// setup creates key "k" with three versions, the middle one null when
+	// nullMid, then key "l"; it returns them in walk order.
+	setup := func(bucket string, nullMid bool) []vref {
+		e.t.Helper()
+		e.mkVersioned(bucket, storage.VersioningEnabled)
+		var h []vref
+		add := func(info storage.ObjectInfo) {
+			h = append([]vref{{Key: "k", VersionID: info.VersionID}}, h...)
+		}
+		add(e.put(bucket, "k", []byte("v1")))
+		if nullMid {
+			e.setVersioning(bucket, storage.VersioningSuspended)
+			add(e.put(bucket, "k", []byte("null")))
+			e.setVersioning(bucket, storage.VersioningEnabled)
+		} else {
+			add(e.put(bucket, "k", []byte("v2")))
+		}
+		add(e.put(bucket, "k", []byte("v3")))
+		h[0].IsLatest = true
+		l := e.put(bucket, "l", []byte("l"))
+		return append(h, vref{Key: "l", VersionID: l.VersionID, IsLatest: true})
+	}
+	latest := func(v vref) vref { v.IsLatest = true; return v }
+	// check expects the walks from km/vm to deliver want. newer are the
+	// remaining versions of km that are newer than the deleted version vm
+	// (newest first): with Options.OpaqueVersionIDs the walk may re-deliver
+	// them (or the older ones among them) before want, since an opaque ID
+	// carries no position.
+	check := func(bucket, km, vm string, want []vref, newer ...vref) {
+		e.t.Helper()
+		accepted := [][]vref{want}
+		if e.suite.opaqueVersionIDs {
+			for i := range newer {
+				accepted = append(accepted, slices.Concat(newer[i:], want))
+			}
+		}
+		// mismatch returns "" when got is an accepted walk (with onlyKM,
+		// restricted to km's versions), else a description of the
+		// accepted walks.
+		mismatch := func(got []vref, onlyKM bool) string {
+			restrict := func(vs []vref) []vref {
+				if !onlyKM {
+					return vs
+				}
+				return slices.DeleteFunc(slices.Clone(vs), func(v vref) bool { return v.Key != km })
+			}
+			for _, w := range accepted {
+				if slices.Equal(got, restrict(w)) {
+					return ""
+				}
+			}
+			if len(accepted) > 1 {
+				return fmt.Sprintf("%v, or that preceded by a tail of %v", restrict(want), newer)
+			}
+			return fmt.Sprint(restrict(want))
+		}
+		got := refsOf(e.walkVersions(bucket, "", km, vm))
+		if w := mismatch(got, false); w != "" {
+			e.t.Errorf("%s: WalkVersions(keyMarker %q, versionIDMarker %q):\n got  %v\n want %s", bucket, km, vm, got, w)
+		}
+		got = refsOf(e.walkVersions(bucket, km, km, vm))
+		if w := mismatch(got, true); w != "" {
+			e.t.Errorf("%s: WalkVersions(prefix %q, keyMarker %q, versionIDMarker %q):\n got  %v\n want %s", bucket, km, km, vm, got, w)
+		}
+		res, err := storage.ListObjectVersions(e.ctx, e.b, bucket, storage.VersionListParams{KeyMarker: km, VersionIDMarker: vm})
+		e.noErr("ListObjectVersions", err)
+		got = refsOf(res.Versions)
+		if w := mismatch(got, false); w != "" || res.IsTruncated {
+			if w == "" {
+				w = fmt.Sprint(got)
+			}
+			e.t.Errorf("%s: ListObjectVersions(keyMarker %q, versionIDMarker %q):\n got  %v (truncated %v)\n want %s (not truncated)",
+				bucket, km, vm, got, res.IsTruncated, w)
+		}
+	}
+
+	for _, nullMid := range []bool{true, false} {
+		kind := "generated"
+		if nullMid {
+			kind = "null"
+		}
+
+		// The page's versions, including the marker, are deleted.
+		bucket := kind + "-page"
+		h := setup(bucket, nullMid)
+		res, err := storage.ListObjectVersions(e.ctx, e.b, bucket, storage.VersionListParams{MaxKeys: 2})
+		e.noErr("ListObjectVersions", err)
+		if got := refsOf(res.Versions); !slices.Equal(got, h[:2]) || !res.IsTruncated ||
+			res.NextKeyMarker != "k" || res.NextVersionIDMarker != h[1].VersionID {
+			e.t.Fatalf("%s: first page = %v truncated %v next %q/%q, want %v true k/%q",
+				bucket, got, res.IsTruncated, res.NextKeyMarker, res.NextVersionIDMarker, h[:2], h[1].VersionID)
+		}
+		e.del(bucket, "k", h[0].VersionID)
+		e.del(bucket, "k", h[1].VersionID)
+		check(bucket, "k", h[1].VersionID, []vref{latest(h[2]), h[3]})
+
+		// Only the marker version is deleted.
+		bucket = kind + "-kept"
+		h = setup(bucket, nullMid)
+		e.del(bucket, "k", h[1].VersionID)
+		if nullMid {
+			check(bucket, "k", storage.NullVersionID, []vref{h[0], h[2], h[3]})
+		} else {
+			check(bucket, "k", h[1].VersionID, []vref{h[2], h[3]}, h[0])
+		}
+	}
+
+	// The emptying loop removes everything whatever the page size.
+	for n := 1; n <= 4; n++ {
+		bucket := fmt.Sprintf("empty-%d", n)
+		setup(bucket, true)
+		var p storage.VersionListParams
+		p.MaxKeys = n
+		for pages := 0; ; pages++ {
+			if pages > 10 {
+				e.t.Fatalf("%s: emptying loop does not terminate", bucket)
+			}
+			res, err := storage.ListObjectVersions(e.ctx, e.b, bucket, p)
+			e.noErr("ListObjectVersions", err)
+			for _, v := range res.Versions {
+				e.del(bucket, v.Key, v.VersionID)
+			}
+			if !res.IsTruncated {
+				break
+			}
+			p.KeyMarker, p.VersionIDMarker = res.NextKeyMarker, res.NextVersionIDMarker
+		}
+		if left := refsOf(e.walkVersions(bucket, "", "", "")); len(left) != 0 {
+			e.t.Errorf("%s: deleting every listed version page by page (MaxKeys %d) left %v", bucket, n, left)
+		}
 	}
 }
 

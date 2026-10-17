@@ -17,7 +17,7 @@ supported, operation by operation, and where gos3 differs from AWS.
 | Signature Version 4, `Authorization` header | ✅ | Payload as hex SHA-256 or `UNSIGNED-PAYLOAD`. Allowed clock skew is 15 minutes. Signature comparison is constant-time. `SignedHeaders` listing a header twice is rejected (`AuthorizationHeaderMalformed`, or `AuthorizationQueryParametersError` for presigned URLs). `SignatureDoesNotMatch` echoes at most 16 KiB of `StringToSign` and `CanonicalRequest`. A signed `Expect: 100-continue` header also verifies over HTTP/2 (Go's HTTP/2 server removes that header before gos3 sees it). |
 | SigV4 streaming (`aws-chunked`) | ✅ | `STREAMING-AWS4-HMAC-SHA256-PAYLOAD`, `…-PAYLOAD-TRAILER` and `STREAMING-UNSIGNED-PAYLOAD-TRAILER` (the default of current AWS SDKs). Trailing checksums are verified. AWS's 8 KiB minimum chunk size is not enforced. |
 | Presigned URLs (SigV4 query) | ✅ | `X-Amz-Expires` up to 7 days. Other `x-amz-*` query parameters are covered by the signature and treated as the corresponding request headers, as the AWS SDK for JavaScript v3 presigner produces them (for example `x-amz-copy-source`, `x-amz-meta-*`, `x-amz-tagging`, `x-amz-acl`, `x-amz-storage-class` and `x-amz-object-lock-*`); a header actually sent takes precedence. Unlike AWS, the checksum value parameters (`x-amz-checksum-crc32`, `-crc32c`, `-crc64nvme`, `-sha1`, `-sha256`) and `x-amz-sdk-checksum-algorithm` are ignored, because presigners compute them over an empty body when the URL is created; `x-amz-checksum-algorithm`, `x-amz-checksum-type` and `x-amz-checksum-mode` are honoured like the other parameters. Parameter values containing control characters get `400 InvalidArgument`. |
-| Browser POST uploads (POST policy) | ✅ | V4 form fields, every policy condition including `content-length-range`, `${filename}`, `success_action_redirect` / `success_action_status`. |
+| Browser POST uploads (POST policy) | ✅ | V4 form fields, every policy condition including `content-length-range`, `${filename}`, `success_action_redirect` / `success_action_status`. An anonymous form without a POST policy is only redirected to the server's own origin (other targets get the `success_action_status` response). Form fields must be valid HTTP header names and values (`InvalidArgument`). |
 | Anonymous access | ✅ | Allowed only by a bucket policy with `"Principal": "*"` or by a public canned ACL. |
 | Region in the credential scope | ✅ | Any region is accepted unless `auth.strict_region` is set. Use `us-east-1` (or `server.region`). |
 | Signature Version 2 | ❌ | Rejected with `AccessDenied` and a message saying so. AWS CLI **v1** presigns with SigV2 unless configured otherwise; see the [README](../README.md#aws-cli). |
@@ -37,27 +37,58 @@ gets `400 InvalidArgument`, whether it is signed or not.
 | Operation | Status | Notes |
 |---|---|---|
 | ListBuckets | ✅ | `max-buckets`, `continuation-token`, `prefix`, `bucket-region`. Every bucket on the server is listed (one account); `BucketRegion` is always included. |
-| CreateBucket | ✅ | Name rules as AWS. `LocationConstraint` is stored as the bucket region (`EU` → `eu-west-1`). Supports `x-amz-acl` (canned), `x-amz-object-ownership` and `x-amz-bucket-object-lock-enabled`. Directory buckets ❌. New buckets do **not** get AWS's 2023 defaults (BucketOwnerEnforced, Block Public Access): canned ACLs work as in classic S3. |
-| DeleteBucket | ✅ | `BucketNotEmpty` also counts noncurrent versions and delete markers. In-progress multipart uploads do not keep a bucket alive; they are aborted with it, as on AWS. |
-| HeadBucket | ✅ | `x-amz-bucket-region`. |
+| CreateBucket | ✅ | Name rules as AWS. `LocationConstraint` is stored as the bucket region (`EU` → `eu-west-1`). Supports `x-amz-acl` (canned), `x-amz-object-ownership` and `x-amz-bucket-object-lock-enabled`, plus gos3 extension headers (see [below](#gos3-extension-headers-of-createbucket)) choosing the backing that stores the bucket (a local directory, memory or a remote S3 service, [backings.md](backings.md)) and, on s3 backings, the bucket's kind and location. Directory buckets ❌. New buckets do **not** get AWS's 2023 defaults (BucketOwnerEnforced, Block Public Access): canned ACLs work as in classic S3. |
+| DeleteBucket | ✅ | `BucketNotEmpty` also counts noncurrent versions and delete markers. In-progress multipart uploads do not keep a bucket alive; they are aborted with it, as on AWS. Deleting a [native bucket](backings.md#bucket-kinds) deletes its remote bucket too only when gos3 created it. |
+| HeadBucket | ✅ | `x-amz-bucket-region`, `x-gos3-backing` (gos3 extension: the backing holding the primary copy) and, for buckets of s3 backings, `x-gos3-bucket-kind` (`native` or `wrapped`). |
 | GetBucketLocation | ✅ | Empty `LocationConstraint` for `us-east-1`. |
 | ListObjects (v1) | ✅ | `prefix`, `delimiter`, `marker`, `max-keys` (≤ 1000), `encoding-type=url`. |
 | ListObjectsV2 | ✅ | Opaque continuation tokens, `start-after`, `fetch-owner`, `ChecksumAlgorithm` / `ChecksumType` per object. |
 | ListObjectVersions | ✅ | `key-marker` / `version-id-marker`; versions and delete markers interleaved in order. |
 | ListMultipartUploads | ✅ | `prefix`, `delimiter`, `key-marker`, `upload-id-marker`, `max-uploads`, `encoding-type`. |
 
+### gos3 extension headers of CreateBucket
+
+| Header | Value | Effect |
+|---|---|---|
+| `x-gos3-backing` | a backing name | The backing holding the bucket's primary copy (default: `storage.default_backing`). An unknown name is `400 InvalidArgument`. |
+| `x-gos3-bucket-kind` | `native` or `wrapped` (any case) | On an s3 backing, the [bucket kind](backings.md#bucket-kinds) (default: the backing's `default_kind`, or the kind the headers below imply). |
+| `x-gos3-container` | `home` or a container ID | A wrapped bucket's container (default: the backing's default container); implies `wrapped`. |
+| `x-gos3-remote-bucket` | a bucket name | The remote bucket a native bucket **creates** in the backing's account (default: the gos3 bucket's name); implies `native`. |
+
+- The remote bucket of a native bucket is always created; an existing one
+  is never adopted through the S3 API (adopting is an administrator action,
+  see [backings.md](backings.md#remote-bucket-browser)). When it exists,
+  CreateBucket answers `409 BucketAlreadyExists` ("an administrator can
+  adopt it"). It is created in the backing's region; the
+  `LocationConstraint` is the gos3 bucket's region, as for any bucket.
+  `x-amz-bucket-object-lock-enabled` creates it with object lock.
+- An invalid value, a container together with a remote bucket, or a
+  header contradicting `x-gos3-bucket-kind` is `400 InvalidArgument`. So is
+  a kind or location the backing cannot provide: an unknown container, or a
+  wrapped bucket on a backing without containers.
+- The remote service's answers: refused with `403` → `403 AccessDenied`;
+  any other refusal → `500 InternalError` (the message names the remote's
+  error code, nothing else); unreachable → `503 ServiceUnavailable`. Object
+  lock on a native bucket whose service does not offer it → `501
+  NotImplemented`. These answers carry fixed messages: what the backing and
+  the remote service said (remote bucket names, account IDs, ARNs) is
+  logged by the server with the request ID, never sent to the client.
+
+The AWS CLI cannot add request headers; use curl, an SDK middleware or the
+web UI (see [backings.md](backings.md#choosing-the-backing-of-a-bucket)).
+
 ## Bucket configuration
 
 | Subresource | Get / Put / Delete | Notes |
 |---|---|---|
-| `?versioning` | ✅ | Enabled / Suspended. MFA Delete ❌. Suspending is refused while object lock or replication is configured. |
+| `?versioning` | ✅ | Enabled / Suspended. MFA Delete ❌. Suspending is refused while object lock or replication is configured. [Native buckets](backings.md#native-buckets-versioning-and-object-lock): set on the remote bucket; `501 NotImplemented` when its service has no versioning or refuses the change. |
 | `?tagging` | ✅ | Up to 50 tags. |
 | `?cors` | ✅ | Bucket rules override the server-wide `cors` settings. |
 | `?policy`, `?policyStatus` | ✅ | IAM policy language with conditions (see [Authorization](#authorization)). Policies are stored byte for byte. `IsPublic` reflects anonymous access. |
-| `?lifecycle` | 🟡 | Every rule form is validated and stored. Executed by the lifecycle worker: Expiration (Days, Date, ExpiredObjectDeleteMarker), NoncurrentVersionExpiration (NoncurrentDays, NewerNoncurrentVersions) and AbortIncompleteMultipartUpload. Filters: prefix, tags, object size. **Transitions are stored but never executed** (there are no storage tiers). `x-amz-expiration` and `x-amz-abort-date` headers are reported. |
-| `?encryption` | 🟡 | Configuration stored and reported (AES256, aws:kms, aws:kms:dsse); objects get the matching `x-amz-server-side-encryption` headers. **gos3 does not encrypt data at rest**; use disk encryption. |
+| `?lifecycle` | 🟡 | Every rule form is validated and stored. Executed by the lifecycle worker: Expiration (Days, Date, ExpiredObjectDeleteMarker), NoncurrentVersionExpiration (NoncurrentDays, NewerNoncurrentVersions) and AbortIncompleteMultipartUpload. Filters: prefix (at most 1024 bytes), tags, object size. **Transitions are stored but never executed** (there are no storage tiers). `x-amz-expiration` and `x-amz-abort-date` headers are reported. |
+| `?encryption` | 🟡 | AES256 encrypts object data through native AES-256-GCM or the bucket’s restic provider. AWS KMS and SSE-C return 501. On an s3 backing both need the backing's encryption key and a wrapped bucket; native buckets store objects as they are (AES256 uploads return 501). Legacy objects are unchanged and do not advertise encryption. See [encryption.md](encryption.md). |
 | `?acl` | 🟡 | Canned ACLs (`private`, `public-read`, `public-read-write`, `authenticated-read`, `log-delivery-write`), as `x-amz-acl` or as an equivalent `AccessControlPolicy`; what each grants is listed under [Authorization](#authorization). Grants to individual users or e-mail addresses and `x-amz-grant-*` headers ❌. |
-| `?object-lock` | ✅ | Default retention (GOVERNANCE / COMPLIANCE, Days or Years). Lock can be enabled at creation or later on a versioned bucket. |
+| `?object-lock` | ✅ | Default retention (GOVERNANCE / COMPLIANCE, Days or Years). Lock can be enabled at creation or later on a versioned bucket. [Native buckets](backings.md#native-buckets-versioning-and-object-lock): enabled on, and the default retention mirrored to, the remote bucket; `501 NotImplemented` when its service does not offer it (some allow it only when the bucket is created). |
 | `?ownershipControls` | ✅ | `BucketOwnerEnforced` disables ACLs. |
 | `?publicAccessBlock` | ✅ | Enforced: `BlockPublicAcls`, `IgnorePublicAcls`, `BlockPublicPolicy`, `RestrictPublicBuckets`. |
 | `?website` | 🟡 | Stored and returned only; there is no website endpoint. |
@@ -73,12 +104,12 @@ gets `400 InvalidArgument`, whether it is signed or not.
 | Operation | Status | Notes |
 |---|---|---|
 | PutObject | ✅ | `Content-MD5`, `x-amz-checksum-*` (header or trailer), user metadata (≤ 2 KiB), `x-amz-tagging`, canned `x-amz-acl`, storage class (recorded only), object lock headers, `x-amz-website-redirect-location`, standard content headers. Conditional writes: `If-None-Match: *` and `If-Match: <etag>`, checked atomically. Size limit `server.max_object_size` (5 GiB). An ACL needs `s3:PutObjectAcl` and tags need `s3:PutObjectTagging` in addition to `s3:PutObject` (see [Authorization](#authorization)). |
-| GetObject | ✅ | `Range` (single range), `partNumber`, conditional headers (`If-Match`, `If-None-Match`, `If-Modified-Since`, `If-Unmodified-Since`, `If-Range` with a strong ETag or the exact `Last-Modified`; a mismatch serves the whole object with 200), `response-*` overrides (signed requests only), `versionId`, `x-amz-checksum-mode: ENABLED`. `partNumber=1` on a single-part object returns 206 with `Content-Range`; an empty part returns an empty 200. Responses carry `X-Content-Type-Options: nosniff` and, except for PDFs, `Content-Security-Policy: sandbox` (see [security.md](security.md#object-responses)). |
+| GetObject | ✅ | `Range` (single range), `partNumber`, conditional headers (`If-Match`, `If-None-Match`, `If-Modified-Since`, `If-Unmodified-Since`, `If-Range` with a strong ETag or the exact `Last-Modified`; a mismatch serves the whole object with 200), `response-*` overrides (signed requests only), `versionId`, `x-amz-checksum-mode: ENABLED`. `partNumber=1` on a single-part object returns 206 with `Content-Range`; an empty part returns an empty 200. Responses carry `X-Content-Type-Options: nosniff` and, except for PDFs, `Content-Security-Policy: sandbox`; PDFs are always sent with `Content-Disposition: attachment` (see [security.md](security.md#object-responses)). |
 | HeadObject | ✅ | Same as GetObject without a body. |
 | DeleteObject | ✅ | Versioning semantics (delete markers), `x-amz-bypass-governance-retention`, `If-Match`. The `If-Match` and object lock checks are atomic with the delete. |
-| DeleteObjects | ✅ | Up to 1000 keys (`MalformedXML` beyond, as AWS), `Quiet` mode, per-key `ETag` condition, object lock checks. The body may be at most about 6.2 MiB and must arrive within 60 s (see [Limits](#limits)). |
+| DeleteObjects | ✅ | Up to 1000 keys (`MalformedXML` beyond, as AWS), `Quiet` mode, per-key `ETag` condition, object lock checks. As on AWS, `Content-MD5` or an `x-amz-checksum-*` header (or trailer) is required (`InvalidRequest` without; the AWS SDKs, CLI, minio-go and the web UI send one). A `Key`, `VersionId` or `ETag` over 1024 bytes fails the whole request (`KeyTooLongError` / `InvalidArgument`). Large results are streamed (no `Content-Length`); `Deleted` and `Error` entries come in request order. The body may be at most about 6.2 MiB and must arrive within 60 s (see [Limits](#limits)). |
 | CopyObject | ✅ | Versioned sources, `x-amz-copy-source-if-*`, `x-amz-metadata-directive` / `x-amz-tagging-directive` (COPY / REPLACE), checksum recomputation. Like UploadPartCopy and CompleteMultipartUpload, a copy that takes longer than about 5 s sends `200` early with whitespace keep-alives and may then report an `<Error>` inside the 200 body, as AWS does; the copy stops when the client disconnects. An ACL or `REPLACE` tags need `s3:PutObjectAcl` / `s3:PutObjectTagging`; copying the tags of a tagged source (`COPY`, the default) needs tagging permissions too (see [Authorization](#authorization)). |
-| GetObjectAttributes | ✅ | ETag, Checksum, ObjectParts (paged), StorageClass, ObjectSize. |
+| GetObjectAttributes | ✅ | ETag, Checksum, ObjectParts (paged), StorageClass, ObjectSize. As on AWS, the caller needs both `s3:GetObjectAttributes` and `s3:GetObject` (`s3:GetObjectVersionAttributes` and `s3:GetObjectVersion` with `versionId`); the object's ACL can stand in for the read action only. |
 | Get/Put/DeleteObjectTagging | ✅ | Up to 10 tags; version-aware. PutObjectTagging evaluates `s3:RequestObjectTag/<key>` and `s3:RequestObjectTagKeys` from the XML body. |
 | Get/PutObjectAcl | 🟡 | Canned ACLs only (see bucket `?acl`). |
 | Get/PutObjectRetention | ✅ | GOVERNANCE (with bypass) and COMPLIANCE (can only be extended). |
@@ -125,6 +156,20 @@ ListObjectsV2, ListParts and GetObjectAttributes.
   `${aws:username}` variables, and condition operators `String*`, `Numeric*`,
   `Date*`, `Bool`, `IpAddress`/`NotIpAddress`, `Null`, `ArnLike`, `…IfExists`,
   `ForAnyValue:` / `ForAllValues:`.
+  Condition key names are case-insensitive, including the tag key of
+  tag-qualified keys (`s3:ExistingObjectTag/<key>`,
+  `s3:RequestObjectTag/<key>`, `aws:RequestTag/<key>`, ...), so
+  `s3:existingobjecttag/Public` also matches the tag key `public`. Values
+  retain the case sensitivity of the condition operator. Avoid tag keys
+  differing only in case: their values share a condition key. As on AWS,
+  a policy variable with no value
+  (such as `${aws:username}` for an anonymous caller) and no
+  `${key, 'default'}` is effectively null: positive operators
+  (`StringEquals`, `StringLike`, `ArnLike`, ...) do not match it, but negated
+  ones (`StringNotEquals`, `StringNotLike`, `ArnNotLike`, ...) do. An `Allow`
+  for `"Principal": "*"` with `StringNotEquals` against `${aws:username}`
+  therefore applies to anonymous callers; add a `Null` condition
+  (`"aws:username": "false"`) to exclude them.
 - **Bucket policies** are evaluated together with identity policies, and an
   explicit Deny wins (except for root). Supported condition keys include
   `aws:SourceIp`, `aws:SecureTransport`, `aws:username`, `aws:userid`,
@@ -188,8 +233,8 @@ ListObjectsV2, ListParts and GetObjectAttributes.
   operators on them evaluate to false, so `Allow` statements using them
   never grant and `Deny` statements using them never apply (use
   `…IfExists` or `Null` deliberately). gos3 has no account ID, so restrict
-  principals with the `Principal` / `NotPrincipal` element (which accepts
-  `arn:aws:iam::<any account>:user/<name>`) rather than with
+  principals with local user names in the `Principal` / `NotPrincipal`
+  element rather than with
   `aws:PrincipalArn` or `aws:PrincipalAccount` conditions.
 - **Where the object-attribute keys come from**, per operation:
   - PutObject, CreateMultipartUpload and CopyObject: the request headers.
@@ -235,15 +280,29 @@ ListObjectsV2, ListParts and GetObjectAttributes.
   as `s3:RequestObjectTag/<key>` keys. Untagged sources, and `REPLACE`
   without tags, need only `s3:GetObject` plus `s3:PutObject`.
 - **Principals** in bucket policies: `"*"`, `AWS` (user names, access key
-  IDs, `arn:<partition>:iam::<account>:user/[path/]<name>`, the account
-  principal) and `CanonicalUser` (matched like `AWS`). `Service` and
-  `Federated` principals are accepted and stored but match no gos3
+  IDs and the account principal) and `CanonicalUser` (matched like `AWS`).
+  `Service` and `Federated` principals are accepted and stored but match no gos3
   identity: a statement with only them never applies, and a `NotPrincipal`
   naming only them applies to everyone. Other principal types (for example
   OIDC) are rejected with `MalformedPolicy`.
+- A bare `AWS` entry names the user of that name, or the caller's own
+  access key with that ID. The two namespaces are kept apart so an entry is
+  never ambiguous: an access key ID cannot equal a user name, `root`,
+  `anonymous` or a 12-digit account ID, and a user name cannot equal an
+  access key ID or a 12-digit account ID (`400 InvalidName` / `409
+  Conflict` from the admin API). Keys in an `iam.json` written by an
+  earlier version that break this rule are refused at authentication
+  (`InvalidAccessKeyId`, with a warning in the log); delete them and create
+  new ones. User ARNs are not supported: gos3 has no account ID or IAM
+  path to compare with one. Replace any `Principal` or `NotPrincipal` user
+  ARN with the intended local user name before upgrading. After upgrading,
+  a stored policy containing one fails closed for non-root requests until
+  root replaces it; new policies containing one are rejected as
+  `MalformedPolicy`.
 - The **account principal** (`arn:<partition>:iam::<account>:root` or a
   12-digit account ID; the account number is not checked, because gos3 has
-  one account) is read in whichever way grants less:
+  one account; a bare 12-digit entry is never compared with user names or
+  access key IDs) is read in whichever way grants less:
   - `Deny` with `Principal` account: every authenticated IAM user (root is
     never denied).
   - `Allow` with `Principal` account: root only. It delegates to identity
@@ -251,7 +310,7 @@ ListObjectsV2, ListParts and GetObjectAttributes.
   - `Allow` with `NotPrincipal` account: only anonymous callers get the
     grant (the policy counts as public).
   - `Deny` with `NotPrincipal` account: does not exempt IAM users; list the
-    user's ARN or name as well.
+    user's local name as well.
 - IAM actions follow AWS (for example `s3:GetObjectVersion` when `versionId` is
   given, and `s3:ListBucket` for HeadBucket). Admin API actions are
   `admin:<Action>` on resource `arn:gos3:admin:::*` (see
@@ -276,8 +335,9 @@ ListObjectsV2, ListParts and GetObjectAttributes.
 | Item | Limit |
 |---|---|
 | Bucket name | 3–63 characters, lowercase letters, digits, `-` and `.`; starts and ends with a letter or digit; not an IP address; no `..`, no `xn--` prefix, no `-s3alias` / `--ol-s3` suffix |
-| Object key | 1–1024 bytes of UTF-8 |
+| Object key | 1–1024 bytes of UTF-8. Keys that objects are created at (PutObject, CopyObject, multipart uploads, POST uploads) must consist of XML 1.0 characters: no C0 control characters other than tab, LF and CR, and no U+FFFE / U+FFFF (`InvalidArgument`) |
 | User metadata | 2 KiB |
+| All metadata returned as headers (content headers, website redirect, user metadata) | 8 KiB (`MetadataTooLarge`) |
 | Object tags / bucket tags | 10 / 50 |
 | Single PUT | `server.max_object_size` (default 5 GiB, at most 5 TiB) |
 | Multipart | 10000 parts of 5 MiB – 5 GiB (the last may be smaller), 5 TiB in total |
@@ -294,16 +354,55 @@ ListObjectsV2, ListParts and GetObjectAttributes.
   bucket, and `BucketAlreadyOwnedByYou` is returned to the bucket's creator
   and to root, while other users get `BucketAlreadyExists`.
 - **Storage classes** are accepted and reported but have no effect.
+- **Compression** (a gos3 feature, see [operations.md](operations.md#compression))
+  is invisible to S3 clients: objects stored compressed return the same
+  bytes, ETag, checksums, sizes and ranges. It is configured through the
+  admin API and the web UI, not through an S3 API.
+- **Backings.** Each bucket is stored on one of the server's backings,
+  chosen with the `x-gos3-backing` header of CreateBucket (see
+  [backings.md](backings.md)). The buckets of an
+  [s3 backing](backings.md) answer `503 ServiceUnavailable` while that
+  backing's remote service is unreachable or the backing is still loading
+  at startup; buckets on other backings are unaffected. Until such a
+  backing has been listed once, an unknown bucket name answers `503`
+  instead of `404 NoSuchBucket`, and CreateBucket of a new name is refused
+  with `503`, because the bucket might exist on that backing. A bucket
+  whose own remote location fails (a native bucket's remote bucket deleted
+  or forbidden, a container that cannot be used) answers `503` alone. AES256
+  uploads to a bucket with a copy on an s3 backing without an encryption
+  key answer `501 NotImplemented`.
+- **Native buckets** of s3 backings are remote buckets used as they are
+  ([backings.md](backings.md#bucket-kinds)). Compared with other buckets:
+  version IDs, delete markers, retention and legal holds are the remote
+  bucket's (IDs of other services can be up to 1024 characters long, and
+  `null` in an unversioned bucket); versioning and object lock answer
+  `501 NotImplemented` when the remote service does not offer them;
+  objects written by other S3 clients appear in listings and can be read
+  and changed through gos3; listings carry no tags, so lifecycle rules
+  filtering on tags never match; AES256 uploads answer `501
+  NotImplemented` and compression is never applied; an object-level
+  refusal of the remote service (for example its object lock) answers
+  `403 AccessDenied`, and other refusals `500 InternalError` naming the
+  remote's error code (the details are in the server log only). A
+  GOVERNANCE bypass approved by gos3 is passed on to the remote service.
+  Conditional deletes are atomic only
+  within the gos3 server, and conditional writes only as far as the remote
+  service honours `If-None-Match` / `If-Match`. See
+  [backings.md](backings.md#limits-of-native-buckets).
 - **No replication between gos3 servers.** Every server stores its own data.
   Discovery only finds servers; it does not cluster them.
 - With slow CopyObject and CompleteMultipartUpload calls (over about 5 s),
   `x-amz-version-id` and `x-amz-expiration` are sent as HTTP trailers because
   the status line has already gone out. SDKs then do not report them.
 - Object keys containing characters that are invalid in XML 1.0 (C0 control
-  characters other than tab, LF and CR) appear as U+FFFD in XML responses:
-  listings without `encoding-type=url`, DeleteObjects results and the `Key`
-  element of errors. Use `encoding-type=url` for such keys (the web UI always
-  does for ListObjectsV2, ListObjectVersions and ListMultipartUploads).
+  characters other than tab, LF and CR, U+FFFE and U+FFFF) are refused when
+  an object would be created at them (`InvalidArgument`; AWS accepts them),
+  because XML responses would report them as U+FFFD. Objects stored under
+  such keys by older gos3 versions can still be read and deleted by key
+  (GET, HEAD, DeleteObject); list them with `encoding-type=url` (the web UI
+  always does for ListObjectsV2, ListObjectVersions and
+  ListMultipartUploads), since listings without it, DeleteObjects results and
+  the `Key` element of errors still show U+FFFD.
 - Request bodies that send no data for 60 s fail with `400 RequestTimeout`.
   The bodies gos3 must read before it can authorize the request
   (DeleteObjects, PutObjectTagging, PutObjectRetention, PutObjectLegalHold,

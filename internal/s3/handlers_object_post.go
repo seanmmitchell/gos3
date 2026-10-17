@@ -198,6 +198,11 @@ type postResponse struct {
 // streamed into the bucket with the metadata given by the fields.
 func (s *Server) handlePostObject(w http.ResponseWriter, r *http.Request, rc *reqContext) error {
 	ctx := r.Context()
+	// A signed POST form does not authenticate the HTTP Host. Refuse an
+	// unknown host before bucket lookup or parsing attacker-controlled fields.
+	if unknownHost(ctx) {
+		return s3err.ErrAccessDenied
+	}
 	bi, err := s.bucketInfo(ctx, rc)
 	if err != nil {
 		return err
@@ -223,7 +228,7 @@ func (s *Server) handlePostObject(w http.ResponseWriter, r *http.Request, rc *re
 			With("ArgumentName", "key")
 	}
 	key = strings.ReplaceAll(key, "${filename}", form.filename)
-	if err := validateObjectKey(key); err != nil {
+	if err := validateNewObjectKey(key); err != nil {
 		return err
 	}
 	fields["key"] = key
@@ -272,16 +277,19 @@ func (s *Server) handlePostObject(w http.ResponseWriter, r *http.Request, rc *re
 	acl := hdr.Get("X-Amz-Acl")
 	legalHoldSet := hdr.Get("X-Amz-Object-Lock-Legal-Hold") != ""
 	attrs := objectAttrConditions(meta, acl != "", legalHoldSet, tagging != "", s.now())
-	if err := s.authorizeTarget(ctx, r, rc, authzTarget{Action: "s3:PutObject", Bucket: rc.bucket, Key: key, ObjectAttrs: attrs}); err != nil {
+	putTarget := authzTarget{Action: "s3:PutObject", Bucket: rc.bucket, Key: key, ObjectAttrs: attrs}
+	if err := s.authorizeTarget(ctx, r, rc, putTarget); err != nil {
 		return err
 	}
-	if err := s.prepareNewObject(ctx, r, rc, bi, key, &meta, newObjectOpts{
+	objOpts := newObjectOpts{
 		legalHoldSet: legalHoldSet,
+		retentionSet: meta.RetentionMode != "",
 		acl:          meta.ACL,
 		aclSet:       acl != "",
 		tagsSet:      tagging != "",
 		attrs:        attrs,
-	}); err != nil {
+	}
+	if err := s.prepareNewObject(ctx, r, rc, bi, key, &meta, objOpts); err != nil {
 		return err
 	}
 
@@ -290,21 +298,35 @@ func (s *Server) handlePostObject(w http.ResponseWriter, r *http.Request, rc *re
 		auth: &auth.Result{DecodedContentLength: -1, Trailer: func() http.Header { return http.Header{} }},
 	}
 	opts := payloadOptions{}
-	if max := postPolicyMaxSize(policy); max > 0 && max < s.maxObjectSize {
+	if max := postPolicyMaxSize(policy); max >= 0 && max < s.maxObjectSize {
 		opts.MaxSize = max
+		opts.MaxSizeSet = true
 	}
 	p, err := s.newObjectPayload(&http.Request{Header: hdr}, prc, opts)
 	if err != nil {
 		return err
 	}
-	info, err := s.storeObject(ctx, rc.bucket, key, p, meta, storage.CommitOptions{}, func(m *storage.ObjectMeta) error {
+	cond := storage.CommitOptions{BeforePublish: func(m, _ *storage.ObjectMeta, created time.Time, config func(string) []byte) error {
+		return publishObjectRetention(m, created, config, objOpts.retentionSet)
+	}}
+	info, err := s.storeObject(ctx, rc.bucket, key, p, -1, meta, cond, func(m *storage.ObjectMeta) error {
 		if err := auth.CheckPostPolicy(policy, pform, p.Size()); err != nil {
 			return err
 		}
 		m.ETag = p.ETag()
 		m.Checksums = p.Checksums()
 		m.ChecksumType = p.ChecksumType()
-		return nil
+		// The file may have taken long: the policy's signer (or, for an
+		// anonymous form, the bucket's policy) must still allow it.
+		return s.revalidateWrite(rc, func() error {
+			conds := s.requestTimeConditions(r, rc, attrs)
+			again := putTarget
+			again.Conditions = conds
+			if err := s.authorizeTarget(ctx, r, rc, again); err != nil {
+				return err
+			}
+			return s.authorizeNewObject(ctx, r, rc, rc.bucket, key, m.Tags, objOpts, conds)
+		})
 	})
 	if err != nil {
 		return err
@@ -323,7 +345,8 @@ func (s *Server) handlePostObject(w http.ResponseWriter, r *http.Request, rc *re
 	if redirect == "" {
 		redirect = fields["redirect"]
 	}
-	if u, err := url.Parse(redirect); redirect != "" && err == nil && (u.Scheme == "http" || u.Scheme == "https") && u.Host != "" {
+	if u, err := url.Parse(redirect); redirect != "" && err == nil && (u.Scheme == "http" || u.Scheme == "https") && u.Host != "" &&
+		(policy != nil || s.sameOrigin(r, rc, u)) {
 		q := u.Query()
 		q.Set("bucket", rc.bucket)
 		q.Set("key", key)
@@ -344,6 +367,20 @@ func (s *Server) handlePostObject(w http.ResponseWriter, r *http.Request, rc *re
 		writeNoContent(w)
 	}
 	return nil
+}
+
+// sameOrigin reports whether u has the origin (scheme, host and port) of the
+// request r. PostObject only redirects an anonymous, unsigned form there
+// (success_action_redirect): a signed POST policy has to cover the
+// redirect field, but an unsigned form can be posted by any web page, which
+// could otherwise use the server to bounce its visitors anywhere after the
+// upload. The form then gets the success_action_status response.
+func (s *Server) sameOrigin(r *http.Request, rc *reqContext, u *url.URL) bool {
+	scheme := "http"
+	if rc.secure {
+		scheme = "https"
+	}
+	return u.Scheme == scheme && strings.EqualFold(u.Host, r.Host) && u.User == nil
 }
 
 // postObjectLocation returns the URL of an object uploaded by PostObject,

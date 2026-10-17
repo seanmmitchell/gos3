@@ -9,8 +9,25 @@
 minimumReleaseAge: 20160
 minimumReleaseAgeExclude:
   # Security fixes younger than the cooldown, pinned below in overrides.
-  - shell-quote
-  - source-map-js
+  # Exact versions only, so no other release of these packages skips the
+  # cooldown. Remove each entry once its version is older than 14 days
+  # (shell-quote 1.11.0: 2026-10-13, source-map-js 1.2.2: 2026-10-14).
+  - shell-quote@1.11.0
+  - source-map-js@1.2.2
+
+# Refuse a version published with weaker trust evidence (e.g. without the
+# provenance or trusted publisher of earlier releases): a typical sign of a
+# hijacked maintainer account.
+trustPolicy: no-downgrade
+trustPolicyExclude:
+  # Locked versions published without provenance by their long-standing
+  # maintainers (checked 2026-10-12): why-is-node-running 3.2.2 (jkoops,
+  # 2025-01, after 3.2.0/3.2.1 had provenance) and semver 6.3.1 (npm CLI
+  # team, 2023-07, after 7.x releases had provenance). Exact versions only.
+  - why-is-node-running@3.2.2
+  - semver@6.3.1
+# Only direct dependencies may come from git repositories or tarball URLs.
+blockExoticSubdeps: true
 
 # Patched versions of vulnerable transitive dependencies.
 overrides:
@@ -31,10 +48,26 @@ overrides:
   '@tailwindcss/oxide-wasm32-wasi': '-'
   '@parcel/watcher-wasm': '-'
 
-# Only these packages may run install scripts.
+# Known unpatched advisories, not overridden because no fixed release exists
+# (re-check and add an override once one does):
+#   - braces 3.0.3 (GHSA-vfj7-8cjw-p6xm, stack exhaustion on nested brace
+#     patterns): only build-time globbing (micromatch via fast-glob/globby)
+#     sees it, with patterns from this repository's config.
+#   - node-forge 1.4.0 (GHSA-86w9-cpqp-85rv, RSA signature forgery): only
+#     listhen's self-signed certificate for `nuxt dev --https`; nothing
+#     verifies signatures with it.
+# Neither is part of the shipped UI (see THIRD_PARTY_NOTICES).
+
+# Only these packages may run install scripts (the only locked packages that
+# need one: esbuild checks its platform binary). Any other dependency with an
+# install script fails the install until it is reviewed and listed here or
+# under ignoredBuiltDependencies.
 onlyBuiltDependencies:
   - esbuild
-  - '@parcel/watcher'
+strictDepBuilds: true
+# Install scripts that are not needed: vue-demi's postinstall only switches
+# to a Vue 2 build (its default is Vue 3), fsevents (macOS) ships a prebuilt
+# binary.
+ignoredBuiltDependencies:
   - vue-demi
-  - '@tailwindcss/oxide'
-  - unrs-resolver
+  - fsevents

@@ -138,6 +138,16 @@ func (a *api) createAccessKey(rc *reqCtx) (int, any, error) {
 	if err := rc.decodeBody(&req, true); err != nil {
 		return 0, nil, err
 	}
+	// The route authorized admin:CreateAccessKey on the target user only.
+	// Choosing the key ID additionally needs it at service level: a chosen
+	// ID could take over a bucket-policy principal that names a deleted
+	// user or key (bare principals match user names and key IDs), and the
+	// answer (409) would tell a delegated administrator which IDs exist.
+	if req.AccessKey != "" && !a.authorize(rc, rc.action, "", nil).Allowed {
+		return 0, nil, errorf(http.StatusForbidden, codeAccessDenied,
+			"%s is not allowed to choose the access key ID: that requires %s on %s (omit accessKey to generate one)",
+			describeIdentity(rc.id), rc.action, iam.AdminResourceARN)
+	}
 	k, err := a.d.IAM.CreateAccessKey(rc.ctx, rc.r.PathValue("name"), req.Description, req.AccessKey, req.SecretKey)
 	if err != nil {
 		return 0, nil, err
@@ -145,6 +155,11 @@ func (a *api) createAccessKey(rc *reqCtx) (int, any, error) {
 	return http.StatusCreated, k, nil
 }
 
+// updateAccessKey binds the change to the owner the route's action was
+// authorized against (rc.keyOwner): the body is read after that check, at
+// the client's pace, so the key may meanwhile have been deleted and
+// re-created under the same ID for a user outside the caller's scope. The
+// IAM store then answers ErrKeyNotFound (404) instead of changing it.
 func (a *api) updateAccessKey(rc *reqCtx) (int, any, error) {
 	var req struct {
 		Status string `json:"status"`
@@ -155,14 +170,29 @@ func (a *api) updateAccessKey(rc *reqCtx) (int, any, error) {
 	if req.Status != iam.KeyActive && req.Status != iam.KeyInactive {
 		return 0, nil, badRequest("status must be %q or %q", iam.KeyActive, iam.KeyInactive)
 	}
-	if err := a.d.IAM.UpdateAccessKey(rc.ctx, rc.r.PathValue("accessKey"), req.Status); err != nil {
+	ak := rc.r.PathValue("accessKey")
+	var err error
+	if rc.keyOwner != "" {
+		err = a.d.IAM.UpdateUserAccessKey(rc.ctx, rc.keyOwner, ak, req.Status)
+	} else {
+		err = a.d.IAM.UpdateAccessKey(rc.ctx, ak, req.Status) // authorized at service level
+	}
+	if err != nil {
 		return 0, nil, err
 	}
 	return http.StatusNoContent, nil, nil
 }
 
+// deleteAccessKey binds the deletion to rc.keyOwner like updateAccessKey.
 func (a *api) deleteAccessKey(rc *reqCtx) (int, any, error) {
-	if err := a.d.IAM.DeleteAccessKey(rc.ctx, rc.r.PathValue("accessKey")); err != nil {
+	ak := rc.r.PathValue("accessKey")
+	var err error
+	if rc.keyOwner != "" {
+		err = a.d.IAM.DeleteUserAccessKey(rc.ctx, rc.keyOwner, ak)
+	} else {
+		err = a.d.IAM.DeleteAccessKey(rc.ctx, ak) // authorized at service level
+	}
+	if err != nil {
 		return 0, nil, err
 	}
 	return http.StatusNoContent, nil, nil
@@ -267,7 +297,7 @@ func (a *api) simulate(rc *reqCtx) (int, any, error) {
 		}
 		if !iam.ValidAdminRequestResource(req.Resource) {
 			return 0, nil, badRequest("resource must be empty (service level) or arn:gos3:admin:::user/<name>, " +
-				"arn:gos3:admin:::policy/<name> or arn:gos3:admin:::bucket/<name>")
+				"arn:gos3:admin:::policy/<name>, arn:gos3:admin:::bucket/<name> or arn:gos3:admin:::backing/<name>")
 		}
 	} else if req.Resource != "" {
 		return 0, nil, badRequest("resource applies to admin actions; s3 actions take bucket and key")

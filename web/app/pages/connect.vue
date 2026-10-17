@@ -11,10 +11,27 @@
  * Credentials are validated before they are stored: GET /whoami for gos3,
  * ListBuckets for generic S3 (AccessDenied still counts as valid). Errors are
  * explained (CORS vs network vs wrong secret vs unknown key vs clock skew).
+ *
+ * Verified credentials are stored only with the endpoint they were verified
+ * against: a new connection, or an existing one for that same endpoint
+ * (reusableConnection). A link's ?endpoint=/&name= prefill is pointed out;
+ * when its host is neither this page's nor a configured server's, the user
+ * must confirm it before the form is submitted. Nothing is submitted
+ * automatically.
  */
 import type { Connection } from '~/types/connection'
 import { useConnectionsStore } from '~/stores/connections'
-import { emptyServerForm, formToInput, safeRedirect, validateServerForm, type KindChoice, type ServerFormModel } from '~/components/servers/-form'
+import {
+  emptyServerForm,
+  formToInput,
+  linkPrefillCheck,
+  reusableConnection,
+  safeRedirect,
+  validateRegion,
+  validateServerForm,
+  type KindChoice,
+  type ServerFormModel
+} from '~/components/servers/-form'
 import { detectKind, verifyAndDiagnose, type Diagnosis } from '~/components/servers/-test-connection'
 
 definePageMeta({ layout: 'blank' })
@@ -47,22 +64,45 @@ const showAdvanced = ref(false)
 const submitted = ref(false)
 const busy = ref(false)
 const diagnosis = ref<Diagnosis | null>(null)
+/** Endpoint and name the link's query string prefilled ('' when none). */
+const linkPrefill = ref({ endpoint: '', name: '' })
+/** The user confirmed the prefilled host (required when it is unknown). */
+const trustPrefill = ref(false)
 
 function reset() {
   const t = target.value
   model.value = emptyServerForm()
+  linkPrefill.value = { endpoint: '', name: '' }
   if (t) {
     model.value.accessKeyId = t.accessKeyId
     model.value.remember = t.remember
   } else {
-    model.value.endpoint = queryString(route.query.endpoint)
-    model.value.name = queryString(route.query.name)
+    linkPrefill.value = { endpoint: queryString(route.query.endpoint).trim(), name: queryString(route.query.name) }
+    model.value.endpoint = linkPrefill.value.endpoint
+    model.value.name = linkPrefill.value.name
+    // Show the prefilled display name (it lives under "More options").
+    if (linkPrefill.value.name) showAdvanced.value = true
   }
+  trustPrefill.value = false
   submitted.value = false
   diagnosis.value = null
   showSecret.value = false
 }
 watch(() => target.value?.id, reset, { immediate: true })
+
+/**
+ * The link's endpoint while it is still in the form: its host, and whether
+ * it is unknown (neither this page's host nor a configured server's).
+ */
+const prefillCheck = computed(() => {
+  const ep = linkPrefill.value.endpoint
+  if (mode.value !== 'new' || !ep || model.value.endpoint !== ep) return undefined
+  return linkPrefillCheck(ep, globalThis.location?.origin, store.connections)
+})
+// A confirmation is for the host it named.
+watch(() => model.value.endpoint, () => {
+  trustPrefill.value = false
+})
 
 const errors = computed(() => {
   if (mode.value === 'signin') {
@@ -71,7 +111,9 @@ const errors = computed(() => {
     if (!model.value.secretAccessKey) e.secretAccessKey = 'Enter the secret key'
     return e
   }
-  return validateServerForm(model.value, { requireCredentials: true })
+  const e = validateServerForm(model.value, { requireCredentials: true })
+  if (prefillCheck.value?.unknown && !trustPrefill.value) e.endpoint ??= `Confirm that you trust ${prefillCheck.value.origin}, or enter another address`
+  return e
 })
 const shown = computed(() => (submitted.value ? errors.value : {}))
 
@@ -127,7 +169,7 @@ async function connectNew() {
   const input = formToInput(model.value, detected?.kind)
   if (detected?.info) {
     input.name ??= detected.info.name
-    if (!model.value.region.trim() && detected.info.region) input.region = detected.info.region
+    if (!model.value.region.trim() && detected.info.region && !validateRegion(detected.info.region)) input.region = detected.info.region
     input.serverId = detected.info.id
   }
   const r = await verifyAndDiagnose({
@@ -141,13 +183,13 @@ async function connectNew() {
     diagnosis.value = r.diagnosis
     return
   }
-  const existing = (input.serverId ? store.findByServerId(input.serverId) : undefined) ?? store.findByEndpoint(input.endpoint)
-  let c: Connection
-  if (existing && (existing.accessKeyId === input.accessKeyId || !hasCredentials(existing))) {
-    c = store.setCredentials(existing.id, { accessKeyId: input.accessKeyId ?? '', secretAccessKey: input.secretAccessKey ?? '', remember: input.remember })
-  } else {
-    c = store.add({ ...input, source: 'user' })
-  }
+  // Only a connection for the endpoint just verified may take the keys: a
+  // stored connection that merely claims the same server ID (IDs are not
+  // authenticated) would sign them for its own, possibly hostile, host.
+  const existing = reusableConnection(store.connections, input)
+  const c: Connection = existing
+    ? store.setCredentials(existing.id, { accessKeyId: input.accessKeyId ?? '', secretAccessKey: input.secretAccessKey ?? '', remember: input.remember })
+    : store.add({ ...input, source: 'user' })
   void store.refreshStatus(c.id)
   toast.add({ title: `Connected to ${c.name}`, color: 'success', icon: 'i-lucide-circle-check' })
   await router.replace(redirect.value ?? appRoutes.server(c.id))
@@ -189,10 +231,41 @@ const others = computed(() => store.sorted.filter(c => c.id !== target.value?.id
       :description="`No connection “${queryServer}” exists in this browser. Enter its details below or pick it from the server list.`"
     />
 
+    <UAlert
+      v-if="prefillCheck"
+      :color="prefillCheck.unknown ? 'warning' : 'info'"
+      variant="subtle"
+      icon="i-lucide-link"
+      title="Prefilled by a link"
+      data-testid="link-prefill"
+    >
+      <template #description>
+        <p>
+          The link you followed filled in the server address <code class="font-mono">{{ prefillCheck.origin }}</code>{{ linkPrefill.name ? ` and the name “${linkPrefill.name}”` : '' }}.
+          <template v-if="prefillCheck.downgrade">
+            This host is otherwise reached over https: this link uses plain http, so your access key ID and signed requests would travel unencrypted. Only continue if you trust it.
+          </template>
+          <template v-else-if="prefillCheck.unknown">
+            It is neither this site nor one of your configured servers. Your access key ID and requests signed with your keys will go to this host: only continue if you trust it.
+          </template>
+          <template v-else>
+            Check that it is the server you expect.
+          </template>
+        </p>
+        <UCheckbox
+          v-if="prefillCheck.unknown"
+          v-model="trustPrefill"
+          class="mt-2"
+          :label="`I trust ${prefillCheck.origin}`"
+          data-testid="trust-prefill"
+        />
+      </template>
+    </UAlert>
+
     <form id="connect-form" class="space-y-4" novalidate @submit.prevent="submit">
       <template v-if="mode === 'new'">
         <UFormField label="Endpoint URL" :error="shown.endpoint" help="e.g. http://10.0.0.5:9000 or https://s3.eu-west-1.amazonaws.com" required>
-          <UInput v-model.trim="model.endpoint" class="w-full font-mono" placeholder="http://10.0.0.5:9000" inputmode="url" autocomplete="url" spellcheck="false" autofocus />
+          <UInput v-model.trim="model.endpoint" class="w-full font-mono" placeholder="http://10.0.0.5:9000" inputmode="url" autocomplete="url" spellcheck="false" :autofocus="!linkPrefill.endpoint" />
         </UFormField>
       </template>
 

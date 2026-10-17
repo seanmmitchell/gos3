@@ -1,0 +1,39 @@
+# Optional NetworkPolicy example: only the listed peers may connect to gos3
+# (port 9000). Without a NetworkPolicy every pod in the cluster can reach the
+# S3 API, the admin API and metrics. Needed before you rely on
+# metrics.public: true, or on trusted_proxies covering the pod network
+# (configmap.yaml, docs/deployment.md). Requires a CNI that enforces
+# NetworkPolicy (Calico, Cilium, ...).
+#
+# Adapt the namespace labels to your cluster, then enable it in
+# kustomization.yaml (resources) or `kubectl apply -f` it. Kubelet health
+# probes come from the node, which common CNIs always allow. Egress is not
+# restricted: discovery probes and DNS lookups go out from gos3.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: gos3
+  labels:
+    app.kubernetes.io/name: gos3
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: gos3
+  policyTypes: ["Ingress"]
+  ingress:
+    - from:
+        # The Ingress controller (clients from outside the cluster).
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: ingress-nginx
+        # Prometheus, for /_gos3/metrics.
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: monitoring
+        # Other gos3 pods (discovery through the headless Service).
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: gos3
+      ports:
+        - port: 9000
+          protocol: TCP

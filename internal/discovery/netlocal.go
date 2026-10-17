@@ -1,6 +1,7 @@
 package discovery
 
 import (
+	"log/slog"
 	"net"
 	"net/netip"
 	"sync"
@@ -20,6 +21,7 @@ type localNets struct {
 	mu       sync.Mutex
 	loadedAt time.Time
 	prefixes []netip.Prefix
+	warned   bool // the empty list was logged
 }
 
 // hostNets is the shared cache of this host's interface prefixes.
@@ -34,6 +36,14 @@ func (l *localNets) get() []netip.Prefix {
 			load = interfacePrefixes
 		}
 		l.prefixes, l.loadedAt = load(), time.Now()
+		switch {
+		case len(l.prefixes) == 0 && !l.warned:
+			l.warned = true
+			slog.Warn("discovery: network interfaces could not be listed; " +
+				"ignoring beacon and mDNS datagrams from other hosts until they can")
+		case len(l.prefixes) > 0:
+			l.warned = false
+		}
 	}
 	return l.prefixes
 }
@@ -54,7 +64,9 @@ func (l *localNets) isLocal(ip netip.Addr) bool {
 }
 
 // onLink reports whether ip is local or inside a directly connected subnet.
-// When the interfaces cannot be listed every address is accepted.
+// When the interfaces cannot be listed only loopback addresses are
+// accepted (fail closed): the subnets are unknown, and datagrams from
+// anywhere could otherwise make the server probe or answer them.
 func (l *localNets) onLink(ip netip.Addr) bool {
 	ip = ip.WithZone("").Unmap()
 	if !ip.IsValid() || ip.IsUnspecified() || ip.IsMulticast() {
@@ -63,11 +75,7 @@ func (l *localNets) onLink(ip netip.Addr) bool {
 	if ip.IsLoopback() {
 		return true
 	}
-	prefixes := l.get()
-	if len(prefixes) == 0 {
-		return true
-	}
-	for _, p := range prefixes {
+	for _, p := range l.get() {
 		if p.Contains(ip) {
 			return true
 		}
@@ -76,9 +84,10 @@ func (l *localNets) onLink(ip netip.Addr) bool {
 }
 
 // isBroadcast reports whether ip is the IPv4 limited broadcast address or
-// the directed broadcast address of a directly connected subnet (prefixes
-// up to /30). Such a source address is spoofed: replying to it would reach
-// every host of the link.
+// the directed broadcast or network address of a directly connected subnet
+// (prefixes up to /30). Such a source address is spoofed: replying to it
+// would reach every host of the link (some stacks treat the network
+// address as a broadcast address too).
 func (l *localNets) isBroadcast(ip netip.Addr) bool {
 	ip = ip.WithZone("").Unmap()
 	if !ip.Is4() {
@@ -91,10 +100,11 @@ func (l *localNets) isBroadcast(ip netip.Addr) bool {
 		if !p.Addr().Is4() || p.Bits() > 30 || !p.Contains(ip) {
 			continue
 		}
-		a := p.Masked().Addr().As4()
+		network := p.Masked().Addr()
+		a := network.As4()
 		host := uint32(1)<<(32-p.Bits()) - 1
 		n := (uint32(a[0])<<24 | uint32(a[1])<<16 | uint32(a[2])<<8 | uint32(a[3])) | host
-		if ip == netip.AddrFrom4([4]byte{byte(n >> 24), byte(n >> 16), byte(n >> 8), byte(n)}) {
+		if ip == network || ip == netip.AddrFrom4([4]byte{byte(n >> 24), byte(n >> 16), byte(n >> 8), byte(n)}) {
 			return true
 		}
 	}

@@ -1,14 +1,17 @@
 #!/usr/bin/env bash
 # Apply gos3's branch model to a GitHub repository with the GitHub CLI: the
 # repository's merge settings (dev as the default branch, squash merges into
-# dev, merge commits from dev into main, no rebase merges) and the rulesets in
-# this directory. Needs admin rights on the repository (`gh auth login`).
+# dev, merge commits from dev into main, no rebase merges), the rulesets in
+# this directory, and the "release" environment with the deploy key the
+# Release workflow pushes its tags with. Needs admin rights on the repository
+# (`gh auth login`) and ssh-keygen.
 #
 #   .github/rulesets/apply.sh [OWNER/REPO]
 #
 # Idempotent: a ruleset whose name matches its file name is updated in place,
-# a missing one is created. The JSON files can also be imported by hand under
-# Settings → Rules → Rulesets → New ruleset → Import a ruleset.
+# a missing one is created; an existing deploy key secret is kept. The JSON
+# files can also be imported by hand under Settings → Rules → Rulesets → New
+# ruleset → Import a ruleset.
 # See docs/releasing.md.
 set -euo pipefail
 
@@ -45,6 +48,30 @@ for file in "$here"/*.json; do
 		gh api --method POST "repos/$repo/rulesets" --input "$file" --silent
 	fi
 done
+
+# Only repository admins and deploy keys may create v* tags
+# (release-tag-creation.json). The Release workflow's tag job runs in the
+# "release" environment, which only main may use, and pushes with a write
+# deploy key stored there as RELEASE_DEPLOY_KEY.
+echo "==> $repo: environment release (main only)"
+gh api --method PUT "repos/$repo/environments/release" --silent --input - <<'JSON'
+{ "deployment_branch_policy": { "protected_branches": false, "custom_branch_policies": true } }
+JSON
+if ! gh api "repos/$repo/environments/release/deployment-branch-policies" \
+	--jq '.branch_policies[] | select(.type == "branch") | .name' | grep -qx main; then
+	gh api --method POST "repos/$repo/environments/release/deployment-branch-policies" \
+		--silent -f name=main -f type=branch
+fi
+if gh secret list --repo "$repo" --env release --json name --jq '.[].name' | grep -qx RELEASE_DEPLOY_KEY; then
+	echo "==> $repo: release deploy key already configured"
+else
+	echo "==> $repo: release deploy key"
+	tmp="$(mktemp -d)"
+	trap 'rm -rf "$tmp"' EXIT
+	ssh-keygen -q -t ed25519 -N '' -C "gos3 release tags" -f "$tmp/key"
+	gh repo deploy-key add "$tmp/key.pub" --repo "$repo" --allow-write --title "Release tags (environment release)"
+	gh secret set RELEASE_DEPLOY_KEY --repo "$repo" --env release <"$tmp/key"
+fi
 
 cat <<EOF
 Done. Also turn on release immutability (Settings → General → Releases), so

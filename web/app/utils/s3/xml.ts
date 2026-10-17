@@ -106,7 +106,12 @@ export function unquoteETag(etag: string | null | undefined): string | undefined
 // Builder
 // ---------------------------------------------------------------------------
 
-/** Escapes text for use in XML character data and attribute values. */
+/**
+ * Escapes text for use in XML character data and attribute values. Tab, LF
+ * and CR are written as character references, so line-ending and attribute
+ * whitespace normalization cannot change them. Characters XML 1.0 cannot
+ * represent at all (see hasXmlIllegalChars) are left as they are.
+ */
 export function escapeXml(value: string): string {
   return value
     .replace(/&/g, '&amp;')
@@ -114,7 +119,21 @@ export function escapeXml(value: string): string {
     .replace(/>/g, '&gt;')
     .replace(/"/g, '&quot;')
     .replace(/'/g, '&apos;')
+    .replace(/\t/g, '&#9;')
+    .replace(/\n/g, '&#10;')
     .replace(/\r/g, '&#13;')
+}
+
+/** A character outside the XML 1.0 Char production (lone surrogates included). */
+const XML_ILLEGAL_CHAR = /[^\t\n\r -퟿-�\u{10000}-\u{10FFFF}]/u
+
+/**
+ * True when value contains a character that XML 1.0 cannot carry, not even
+ * as a character reference (e.g. U+0001): a document containing it is
+ * rejected by the server's parser.
+ */
+export function hasXmlIllegalChars(value: string): boolean {
+  return XML_ILLEGAL_CHAR.test(value)
 }
 
 type Leaf = string | number | boolean | null | undefined

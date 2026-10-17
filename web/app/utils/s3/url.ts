@@ -23,6 +23,19 @@ export function hasDotSegment(key: string): boolean {
   return key.split('/').some(s => s === '.' || s === '..')
 }
 
+/**
+ * True when a bucket name cannot be put into a request URL safely: '.' or
+ * '..' (the URL parser would resolve the segment and address another path,
+ * e.g. the endpoint root or /_gos3/admin/v1/…), a name containing '/' or
+ * '\', or control characters. No S3 implementation accepts such names, so
+ * this does not restrict real buckets (legacy names with upper case or '_'
+ * still pass).
+ */
+export function isUnaddressableBucket(bucket: string): boolean {
+  // eslint-disable-next-line no-control-regex
+  return bucket === '.' || bucket === '..' || /[/\\\x00-\x1f\x7f]/.test(bucket)
+}
+
 const IPV4 = /^\d{1,3}(?:\.\d{1,3}){3}$/
 
 /** True when bucket can be used as a DNS label in virtual-hosted-style URLs over TLS. */
@@ -47,9 +60,13 @@ export interface UrlBuilderOptions {
 /**
  * Builds the request URL for bucket/key with query parameters. Query keys
  * with value '' are emitted as `name=` (S3 sub-resources like `?versioning`);
- * null/undefined values are skipped.
+ * null/undefined values are skipped. Throws TypeError for bucket names that
+ * would change the request path (isUnaddressableBucket) and for a key
+ * without a bucket; callers check keys with hasDotSegment.
  */
 export function buildS3Url(opts: UrlBuilderOptions, bucket?: string, key?: string, query?: Query): URL {
+  if (bucket !== undefined && isUnaddressableBucket(bucket)) throw new TypeError(`Invalid bucket name “${bucket}”`)
+  if (!bucket && key) throw new TypeError('An object key needs a bucket')
   const base = new URL(opts.endpoint)
   const basePath = base.pathname.replace(/\/+$/, '')
   let host = base.host

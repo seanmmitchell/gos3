@@ -58,10 +58,24 @@ export const NO_CAPABILITIES: Capabilities = Object.freeze({
   listUsers: false,
   managePolicies: false,
   manageBuckets: false,
+  viewStorage: false,
+  manageStorage: false,
   discovery: false,
   scan: false,
   probe: false,
-  createOwnKeys: false
+  createOwnKeys: false,
+  manageCompression: false,
+  browseRemote: false,
+  createRemote: false,
+  adoptRemote: false,
+  manageContainers: false,
+  viewJobs: false,
+  manageJobs: false,
+  manageSnapshots: false,
+  revealResticCredentials: false,
+  updateJobs: false,
+  runSnapshots: false,
+  restoreSnapshots: false
 })
 
 /**
@@ -440,28 +454,35 @@ export const useConnectionsStore = defineStore('connections', () => {
 
   // -- presets & embedded ---------------------------------------------------
 
-  /** Merges preset connections (from config / servers.json). */
+  /**
+   * Merges preset connections (from config / servers.json). Presets are
+   * served to every visitor of the UI, so a secret key in one is ignored
+   * (with a console warning); an access key ID only prefills the sign-in.
+   * When a preset's endpoint changes, the secret the user entered for the
+   * old endpoint is dropped instead of being signed for the new host.
+   */
   function applyPresets(list: ConnectionInput[]): number {
     let n = 0
-    for (const p of list) {
+    for (const raw of list) {
+      const { secretAccessKey: presetSecret, ...p } = raw
       const id = p.id ?? `preset-${endpointSlug(p.endpoint)}`
+      if (presetSecret) console.warn(`[gos3] preset "${id}" contains a secret key; ignoring it (anyone who can load the UI can read presets)`)
       if (dismissedPresets.value.includes(id)) continue
       const existing = byId(id)
       if (existing) {
         if (existing.source === 'preset') {
-          // Definition comes from the preset; credentials the user entered win.
-          const idx = connections.value.indexOf(existing)
-          connections.value[idx] = completeConnection({
-            ...existing,
+          // Definition comes from the preset; credentials the user entered win
+          // while the endpoint stays the same.
+          const moved = !sameEndpoint(existing.endpoint, p.endpoint)
+          update(id, {
             name: p.name ?? existing.name,
             endpoint: p.endpoint,
             region: p.region ?? existing.region,
             kind: p.kind ?? existing.kind,
             forcePathStyle: p.forcePathStyle ?? existing.forcePathStyle,
             color: p.color ?? existing.color,
-            accessKeyId: existing.accessKeyId || p.accessKeyId,
-            secretAccessKey: existing.secretAccessKey || p.secretAccessKey,
-            id
+            accessKeyId: existing.accessKeyId || p.accessKeyId || '',
+            ...(moved ? { secretAccessKey: '' } : {})
           })
         }
       } else {

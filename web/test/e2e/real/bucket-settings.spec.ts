@@ -135,7 +135,7 @@ test.describe('bucket settings', () => {
   test('default encryption', async ({ ui, api }) => {
     await open(ui, bucket, 'encryption')
     await page.getByRole('radio', { name: 'SSE-S3 (AES256)' }).check()
-    await page.getByRole('button', { name: 'Save', exact: true }).click()
+    await page.getByRole('button', { name: 'Save default encryption' }).click()
     await expect.poll(async () => (await api.getText(bucket, '', '?encryption')).text).toContain('<SSEAlgorithm>AES256</SSEAlgorithm>')
     // New objects report the bucket default.
     const put = await api.putObject(bucket, 'enc.txt', 'x')

@@ -16,6 +16,8 @@ type whoAmI struct {
 	Policies     []string       `json:"policies"`
 	Capabilities capabilities   `json:"capabilities"`
 	Server       discovery.Info `json:"server"`
+	// Backings lets every caller pick a backing when creating a bucket.
+	Backings backingChoices `json:"backings"`
 }
 
 // capabilities are derived by evaluating admin actions for the caller at
@@ -30,10 +32,30 @@ type capabilities struct {
 	ListUsers      bool `json:"listUsers"`      // admin:ListUsers (also granted to delegated user managers)
 	ManagePolicies bool `json:"managePolicies"` // admin:PutPolicy
 	ManageBuckets  bool `json:"manageBuckets"`  // admin:ForceDeleteBucket
+	ViewStorage    bool `json:"viewStorage"`    // admin:ListBackings
+	ManageStorage  bool `json:"manageStorage"`  // admin:UpdateBucketPlacement
 	Discovery      bool `json:"discovery"`      // admin:GetDiscovery
 	Scan           bool `json:"scan"`           // admin:ScanNetwork
 	Probe          bool `json:"probe"`          // admin:ProbeNetwork
 	CreateOwnKeys  bool `json:"createOwnKeys"`  // admin:CreateOwnAccessKey (never root)
+	// ManageCompression: admin:PutBucketCompression (bucket compression
+	// settings).
+	ManageCompression bool `json:"manageCompression"`
+	// Remote buckets and containers of s3 backings (granted on every
+	// backing: a grant on arn:gos3:admin:::backing/<name> does not show).
+	BrowseRemote     bool `json:"browseRemote"`     // admin:ListRemoteBuckets
+	CreateRemote     bool `json:"createRemote"`     // admin:CreateRemoteBucket
+	AdoptRemote      bool `json:"adoptRemote"`      // admin:AdoptRemoteBucket
+	ManageContainers bool `json:"manageContainers"` // admin:ManageContainers
+	// Background jobs and restic (granted on every bucket: a grant on
+	// arn:gos3:admin:::bucket/<name> does not show).
+	ViewJobs                bool `json:"viewJobs"`                // admin:ListJobs
+	ManageJobs              bool `json:"manageJobs"`              // admin:CreateCopyJob
+	ManageSnapshots         bool `json:"manageSnapshots"`         // admin:PutBucketSnapshots
+	RevealResticCredentials bool `json:"revealResticCredentials"` // admin:GetResticCredentials
+	RunSnapshots            bool `json:"runSnapshots"`            // admin:RunBucketSnapshot
+	RestoreSnapshots        bool `json:"restoreSnapshots"`        // admin:RestoreBucketSnapshot
+	UpdateJobs              bool `json:"updateJobs"`              // admin:UpdateJob
 }
 
 // adminActions are every admin:* action used by the API; "admin" in
@@ -43,7 +65,12 @@ var adminActions = []string{
 	"ListUsers", "CreateUser", "GetUser", "UpdateUser", "DeleteUser",
 	"CreateAccessKey", "UpdateAccessKey", "DeleteAccessKey",
 	"ListPolicies", "GetPolicy", "PutPolicy", "DeletePolicy", "SimulatePolicy",
-	"ListBuckets", "GetBucket", "ForceDeleteBucket",
+	"ListBuckets", "GetBucket", "CreateBucket", "ForceDeleteBucket", "ReleaseBucket",
+	"GetBucketCompression", "PutBucketCompression", "GetBucketEncryption", "PutBucketEncryption",
+	"ListBackings", "GetBucketPlacement", "UpdateBucketPlacement",
+	"ListRemoteBuckets", "CreateRemoteBucket", "AdoptRemoteBucket", "ManageContainers",
+	"ListJobs", "GetJob", "UpdateJob", "CreateCopyJob",
+	"GetResticCredentials", "GetBucketSnapshots", "PutBucketSnapshots", "RunBucketSnapshot", "RestoreBucketSnapshot",
 	"GetDiscovery", "ScanNetwork", "ProbeNetwork",
 }
 
@@ -73,21 +100,37 @@ func (a *api) whoami(rc *reqCtx) (int, any, error) {
 		IsRoot:    rc.id.IsRoot,
 		Policies:  names,
 		Capabilities: capabilities{
-			Admin:          anyAllowed,
-			ViewInfo:       allowed["ServerInfo"],
-			ViewStats:      allowed["GetStats"],
-			ManageConfig:   allowed["UpdateConfig"],
-			ManageUsers:    allowed["CreateUser"],
-			ListUsers:      allowed["ListUsers"],
-			ManagePolicies: allowed["PutPolicy"],
-			ManageBuckets:  allowed["ForceDeleteBucket"],
-			Discovery:      allowed["GetDiscovery"],
-			Scan:           allowed["ScanNetwork"],
-			Probe:          allowed["ProbeNetwork"],
+			Admin:             anyAllowed,
+			ViewInfo:          allowed["ServerInfo"],
+			ViewStats:         allowed["GetStats"],
+			ManageConfig:      allowed["UpdateConfig"],
+			ManageUsers:       allowed["CreateUser"],
+			ListUsers:         allowed["ListUsers"],
+			ManagePolicies:    allowed["PutPolicy"],
+			ManageBuckets:     allowed["ForceDeleteBucket"],
+			ViewStorage:       allowed["ListBackings"],
+			ManageStorage:     allowed["UpdateBucketPlacement"],
+			Discovery:         allowed["GetDiscovery"],
+			Scan:              allowed["ScanNetwork"],
+			Probe:             allowed["ProbeNetwork"],
+			ManageCompression: allowed["PutBucketCompression"],
+			BrowseRemote:      allowed["ListRemoteBuckets"],
+			CreateRemote:      allowed["CreateRemoteBucket"],
+			AdoptRemote:       allowed["AdoptRemoteBucket"],
+			ManageContainers:  allowed["ManageContainers"],
+			ViewJobs:          allowed["ListJobs"],
+			ManageJobs:        allowed["CreateCopyJob"],
+			ManageSnapshots:   allowed["PutBucketSnapshots"],
+			// The repository passwords: the UI offers "reveal" only then.
+			RevealResticCredentials: allowed["GetResticCredentials"],
+			RunSnapshots:            allowed["RunBucketSnapshot"],
+			RestoreSnapshots:        allowed["RestoreBucketSnapshot"],
+			UpdateJobs:              allowed["UpdateJob"],
 			// Root has no IAM keys to manage (POST /whoami/keys answers 400).
 			CreateOwnKeys: !rc.id.IsRoot && a.authorize(rc, actionCreateOwnKey, "", nil).Allowed,
 		},
-		Server: a.info(),
+		Server:   a.info(),
+		Backings: a.backingChoices(rc.ctx),
 	}, nil
 }
 
@@ -185,7 +228,8 @@ func (a *api) deleteOwnKey(rc *reqCtx) (int, any, error) {
 		return 0, nil, errorf(http.StatusConflict, codeConflict,
 			"cannot delete access key %q: it was used to sign this request", ak)
 	}
-	if err := a.d.IAM.DeleteAccessKey(rc.ctx, ak); err != nil {
+	// Ownership is checked again atomically with the deletion.
+	if err := a.d.IAM.DeleteUserAccessKey(rc.ctx, rc.id.User, ak); err != nil {
 		return 0, nil, err
 	}
 	return http.StatusNoContent, nil, nil

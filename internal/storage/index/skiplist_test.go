@@ -1,4 +1,4 @@
-package memory
+package index
 
 import (
 	"math/rand/v2"

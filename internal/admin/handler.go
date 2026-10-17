@@ -10,6 +10,7 @@ import (
 	"log/slog"
 	"net/http"
 	"path"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -18,8 +19,12 @@ import (
 	"github.com/seanmmitchell/gos3/internal/clientip"
 	"github.com/seanmmitchell/gos3/internal/discovery"
 	"github.com/seanmmitchell/gos3/internal/iam"
+	"github.com/seanmmitchell/gos3/internal/jobs"
 	"github.com/seanmmitchell/gos3/internal/s3err"
 	"github.com/seanmmitchell/gos3/internal/storage"
+	"github.com/seanmmitchell/gos3/internal/storage/restic"
+	"github.com/seanmmitchell/gos3/internal/storage/s3account"
+	"github.com/seanmmitchell/gos3/internal/storage/s3store"
 )
 
 // maxBodySize bounds JSON request bodies.
@@ -73,6 +78,17 @@ type reqCtx struct {
 	auth   *auth.Result
 	id     auth.Identity
 	action string // admin action, "" for endpoints open to any identity
+	// keyOwner is the owner of the {accessKey} path value that the route's
+	// action was authorized against (set by keyOwnerARN; "" when the key
+	// was unknown and the action was authorized at service level).
+	keyOwner string
+
+	start         time.Time // when the endpoint received the request
+	preAuthorized bool      // action was authorized on resource before the handler ran
+	resource      string    // the resource action was authorized against
+	// afterBody, when set, runs once readBody has read the whole body
+	// (api.revalidateAfterBody).
+	afterBody func() error
 }
 
 // handlerFunc is an authenticated endpoint. It returns the HTTP status and
@@ -113,11 +129,13 @@ func pathTarget(arn func(string) string, param string) target {
 
 // api is the admin API handler.
 type api struct {
-	d       Deps
-	log     *slog.Logger
-	mux     *http.ServeMux
-	started time.Time
-	now     func() time.Time
+	// configLocks serializes encryption provider changes per bucket.
+	configLocks keyedMutex
+	d           Deps
+	log         *slog.Logger
+	mux         *http.ServeMux
+	started     time.Time
+	now         func() time.Time
 
 	usage  *ttlCache[storage.BucketUsage] // per bucket
 	totals *ttlCache[storageTotals]       // key ""
@@ -156,6 +174,7 @@ func (a *api) routes() []route {
 	user := pathTarget(iam.AdminUserARN, "name")
 	policy := pathTarget(iam.AdminPolicyARN, "name")
 	bucket := pathTarget(iam.AdminBucketARN, "name")
+	backing := pathTarget(iam.AdminBackingARN, "name")
 	keyOwner := target{resource: a.keyOwnerARN}
 	return []route{
 		// Identity
@@ -187,6 +206,50 @@ func (a *api) routes() []route {
 		{"GET", "/buckets", "ListBuckets", service, a.listBuckets},
 		{"GET", "/buckets/{name}", "GetBucket", bucket, a.getBucket},
 		{"DELETE", "/buckets/{name}", "ForceDeleteBucket", bucket, a.deleteBucket},
+		{"POST", "/buckets/{name}/release", "ReleaseBucket", bucket, a.releaseBucket},
+		// Storage backings and bucket placement
+		{"GET", "/backings", "ListBackings", service, a.listBackings},
+		{"GET", "/backings/config", "GetConfig", service, a.getBackingConfig},
+		{"PUT", "/backings/config", "UpdateConfig", service, a.putBackingConfig},
+		{"GET", "/buckets/{name}/placement", "GetBucketPlacement", bucket, a.getPlacement},
+		{"PUT", "/buckets/{name}/placement", "UpdateBucketPlacement", bucket, a.putPlacement},
+		{"POST", "/buckets/{name}/placement/move", "UpdateBucketPlacement", bucket, a.startMove},
+		{"DELETE", "/buckets/{name}/placement/move", "UpdateBucketPlacement", bucket, a.cancelMove},
+		{"POST", "/buckets/{name}/placement/promote", "UpdateBucketPlacement", bucket, a.promote},
+		{"POST", "/buckets/{name}/placement/resync", "UpdateBucketPlacement", bucket, a.resync},
+		{"GET", "/buckets/{name}/encryption-provider", "GetBucketEncryption", bucket, a.getBucketEncryption},
+		{"PUT", "/buckets/{name}/encryption-provider", "PutBucketEncryption", bucket, a.putBucketEncryption},
+		{"GET", "/buckets/{name}/restic", "GetBucketEncryption", bucket, a.getResticInfo},
+		{"POST", "/buckets/{name}/restic/credentials", "GetResticCredentials", bucket, a.getResticCredentials},
+		// Whole-bucket restic snapshots
+		{"GET", "/buckets/{name}/restic/snapshots", "GetBucketSnapshots", bucket, a.getSnapshots},
+		{"POST", "/buckets/{name}/restic/snapshots", "RunBucketSnapshot", bucket, a.runSnapshot},
+		{"PUT", "/buckets/{name}/restic/snapshots/config", "PutBucketSnapshots", bucket, a.putSnapshotConfig},
+		{"DELETE", "/buckets/{name}/restic/snapshots/config", "PutBucketSnapshots", bucket, a.deleteSnapshotConfig},
+		{"DELETE", "/buckets/{name}/restic/snapshots/{id}", "PutBucketSnapshots", bucket, a.forgetSnapshot},
+		{"POST", "/buckets/{name}/restic/snapshots/{id}/restore", "RestoreBucketSnapshot", bucket, a.restoreSnapshot}, // + CreateCopyJob on the target
+		{"POST", "/buckets/{name}/restic/prune", "PutBucketSnapshots", bucket, a.pruneSnapshots},
+		{"GET", "/buckets/{name}/compression", "GetBucketCompression", bucket, a.getBucketCompression},
+		{"PUT", "/buckets/{name}/compression", "PutBucketCompression", bucket, a.putBucketCompression},
+		{"DELETE", "/buckets/{name}/compression", "PutBucketCompression", bucket, a.deleteBucketCompression},
+		// Remote buckets and containers (s3 backings)
+		{"GET", "/backings/{name}/remote-buckets", "ListRemoteBuckets", backing, a.listRemoteBuckets},
+		{"POST", "/backings/{name}/remote-buckets", "CreateRemoteBucket", backing, a.createRemoteBucket},
+		{"GET", "/backings/{name}/containers", "ListRemoteBuckets", backing, a.listContainers},
+		{"POST", "/backings/{name}/containers", "ManageContainers", backing, a.addContainer}, // + CreateRemoteBucket or AdoptRemoteBucket
+		{"PUT", "/backings/{name}/containers/default", "ManageContainers", backing, a.setDefaultContainer},
+		{"DELETE", "/backings/{name}/containers/{id}", "ManageContainers", backing, a.removeContainer},
+		{"POST", "/backings/{name}/buckets", "CreateBucket", inHandler, a.createBucketOnBacking}, // bucket/<body bucket>, + backing actions
+		// Jobs (GetJob and UpdateJob on the job's buckets, see authorizedJob)
+		{"GET", "/jobs", "ListJobs", service, a.listJobs},
+		{"POST", "/jobs", "CreateCopyJob", inHandler, a.createJob}, // bucket/<source> and bucket/<target>
+		{"GET", "/jobs/{id}", "GetJob", inHandler, a.getJob},
+		{"DELETE", "/jobs/{id}", "UpdateJob", inHandler, a.deleteJob},
+		{"POST", "/jobs/{id}/pause", "UpdateJob", inHandler, a.updateJob("paused", pauseJob)},
+		{"POST", "/jobs/{id}/resume", "UpdateJob", inHandler, a.updateJob("resumed", resumeJob)},
+		{"POST", "/jobs/{id}/cancel", "UpdateJob", inHandler, a.updateJob("canceled", cancelJob)},
+		{"POST", "/jobs/{id}/run", "UpdateJob", inHandler, a.updateJob("run", runJob)},
+		{"GET", "/buckets/{name}/jobs", "GetJob", bucket, a.listBucketJobs},
 		// Discovery
 		{"GET", "/discovery", "GetDiscovery", service, a.getDiscovery},
 		{"POST", "/discovery/probe", "ProbeNetwork", service, a.probe},
@@ -196,18 +259,27 @@ func (a *api) routes() []route {
 
 // keyOwnerARN is the target of the {accessKey} routes: the user owning the
 // key, or service level for unknown keys (so a delegated administrator
-// cannot tell unknown keys from other users' keys).
+// cannot tell unknown keys from other users' keys). It records the owner
+// in rc.keyOwner so the handler can bind the change to it (see
+// updateAccessKey).
 func (a *api) keyOwnerARN(rc *reqCtx) string {
 	owner, err := a.d.IAM.AccessKeyOwner(rc.ctx, rc.r.PathValue("accessKey"))
 	if err != nil {
 		return ""
 	}
+	rc.keyOwner = owner
 	return iam.AdminUserARN(owner)
 }
 
 // register installs the routes on the mux. Every path additionally gets a
 // method-less pattern answering 405 with the Allow header (more specific
 // method patterns win), and Prefix+"/" catches unknown paths with a JSON 404.
+//
+// A path that refines another one (a literal segment where the other has
+// a wildcard, e.g. /backings/{name}/containers/default and
+// /backings/{name}/containers/{id}) cannot have a method-less pattern:
+// net/http refuses it as ambiguous with the other path's method patterns.
+// It gets a 405 pattern per method it does not allow instead.
 func (a *api) register(routes []route) {
 	allowed := map[string][]string{}
 	var order []string
@@ -220,22 +292,50 @@ func (a *api) register(routes []route) {
 	}
 	for _, p := range order {
 		methods := allowed[p]
-		for _, m := range methods {
-			if m == http.MethodGet {
-				methods = append(methods, http.MethodHead)
-				break
-			}
+		if slices.Contains(methods, http.MethodGet) {
+			methods = append(methods, http.MethodHead)
 		}
-		allow := strings.Join(append(methods, http.MethodOptions), ", ")
-		a.mux.HandleFunc(Prefix+p, func(w http.ResponseWriter, r *http.Request) {
+		allow := strings.Join(append(slices.Clone(methods), http.MethodOptions), ", ")
+		notAllowed := func(w http.ResponseWriter, r *http.Request) {
 			w.Header().Set("Allow", allow)
 			writeError(w, errorf(http.StatusMethodNotAllowed, codeMethodNotAllowed,
 				"method %s is not allowed on %s (allowed: %s)", r.Method, r.URL.Path, allow))
-		})
+		}
+		if !slices.ContainsFunc(order, func(q string) bool { return refinesPath(p, q) }) {
+			a.mux.HandleFunc(Prefix+p, notAllowed)
+			continue
+		}
+		for _, m := range []string{http.MethodGet, http.MethodPost, http.MethodPut, http.MethodPatch, http.MethodDelete} {
+			if !slices.Contains(methods, m) {
+				a.mux.HandleFunc(m+" "+Prefix+p, notAllowed)
+			}
+		}
 	}
 	a.mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		writeError(w, notFound("unknown admin API path %s", r.URL.Path))
 	})
+}
+
+// refinesPath reports whether the route path p matches a subset of the
+// paths q matches: the same segments, except for at least one literal in p
+// where q has a wildcard ({…}).
+func refinesPath(p, q string) bool {
+	ps, qs := strings.Split(p, "/"), strings.Split(q, "/")
+	if len(ps) != len(qs) {
+		return false
+	}
+	wild := func(seg string) bool { return strings.HasPrefix(seg, "{") }
+	refined := false
+	for i := range ps {
+		switch {
+		case wild(ps[i]) && wild(qs[i]), ps[i] == qs[i]:
+		case wild(qs[i]):
+			refined = true
+		default:
+			return false
+		}
+	}
+	return refined
 }
 
 // ServeHTTP implements http.Handler.
@@ -299,16 +399,17 @@ func (a *api) endpoint(rt route) http.Handler {
 			writeError(w, e)
 			return
 		}
-		rc := &reqCtx{r: r, ctx: r.Context(), auth: res, id: res.Identity, action: action}
+		rc := &reqCtx{r: r, ctx: r.Context(), auth: res, id: res.Identity, action: action, start: a.now()}
+		rc.afterBody = func() error { return a.revalidateAfterBody(rc) }
 		if action != "" && !rt.res.inHandler {
-			resource := ""
 			if rt.res.resource != nil {
-				resource = rt.res.resource(rc)
+				rc.resource = rt.res.resource(rc)
 			}
-			if err := a.requireAction(rc, action, resource, nil); err != nil {
+			if err := a.requireAction(rc, action, rc.resource, nil); err != nil {
 				writeError(w, a.toAPIError(err))
 				return
 			}
+			rc.preAuthorized = true
 		}
 		status, body, err := rt.h(rc)
 		if err != nil {
@@ -419,11 +520,12 @@ func requestConditions(r *http.Request, proxy clientip.Resolver) map[string][]st
 	if ip != "" {
 		c["aws:SourceIp"] = []string{ip}
 	}
+	// Truncated as on the S3 API: policies glob-match and substitute them.
 	if ua := r.UserAgent(); ua != "" {
-		c["aws:UserAgent"] = []string{ua}
+		c["aws:UserAgent"] = []string{iam.TruncateRequestValue(ua)}
 	}
 	if ref := r.Referer(); ref != "" {
-		c["aws:Referer"] = []string{ref}
+		c["aws:Referer"] = []string{iam.TruncateRequestValue(ref)}
 	}
 	return c
 }
@@ -457,7 +559,25 @@ func (a *api) toAPIError(err error) *apiError {
 	}
 	msg := strings.TrimPrefix(err.Error(), "iam: ")
 	msg = strings.TrimPrefix(msg, "storage: ")
+	msg = strings.TrimPrefix(msg, "multi: ")
+	msg = strings.TrimPrefix(msg, "s3account: ")
+	msg = strings.TrimPrefix(msg, "jobs: ")
+	msg = strings.TrimPrefix(msg, "restic: ")
+	if pe := placementError(err, msg); pe != nil {
+		return pe
+	}
 	switch {
+	// jobs and restic (before storage: a runner may wrap a storage error
+	// in an invalid spec)
+	case errors.Is(err, jobs.ErrInvalidSpec), errors.Is(err, jobs.ErrUnknownKind),
+		errors.Is(err, restic.ErrForgetRefused):
+		return errorf(http.StatusBadRequest, codeInvalidRequest, "%s", msg)
+	case errors.Is(err, jobs.ErrConflict):
+		return errorf(http.StatusConflict, codeConflict, "%s", msg)
+	case errors.Is(err, jobs.ErrNotFound), errors.Is(err, restic.ErrSnapshotNotFound):
+		return errorf(http.StatusNotFound, codeNotFound, "%s", msg)
+	case errors.Is(err, jobs.ErrClosed):
+		return errorf(http.StatusServiceUnavailable, codeInternalError, "%s", msg)
 	// iam (order matters: some errors wrap others)
 	case errors.Is(err, iam.ErrUserNotFound), errors.Is(err, iam.ErrKeyNotFound), errors.Is(err, iam.ErrPolicyNotFound):
 		return errorf(http.StatusNotFound, codeNotFound, "%s", msg)
@@ -472,10 +592,53 @@ func (a *api) toAPIError(err error) *apiError {
 	// storage
 	case errors.Is(err, storage.ErrBucketNotFound):
 		return errorf(http.StatusNotFound, codeNotFound, "%s", msg)
-	case errors.Is(err, storage.ErrBucketNotEmpty):
+	case errors.Is(err, storage.ErrInvalidBacking):
+		return errorf(http.StatusNotFound, codeNotFound, "%s", msg)
+	case errors.Is(err, storage.ErrRemoteBucketExists):
+		// Checked before ErrBucketExists, which it wraps: the remote bucket
+		// a native bucket would create exists, not the gos3 bucket.
+		return errorf(http.StatusConflict, codeConflict, "%s (adopt the existing remote bucket instead)", msg)
+	case errors.Is(err, storage.ErrBucketExists), errors.Is(err, storage.ErrBucketNotEmpty),
+		errors.Is(err, s3store.ErrInUse), errors.Is(err, s3store.ErrFenced):
+		// ErrInUse / ErrFenced: a container location held by another
+		// gos3 server.
+		return errorf(http.StatusConflict, codeConflict, "%s", msg)
+	case errors.Is(err, s3account.ErrClaimed):
+		// Checked before ErrInvalidTarget, which it wraps: the remote
+		// location is used by another bucket, container or backing, or
+		// holds a gos3 store.
 		return errorf(http.StatusConflict, codeConflict, "%s", msg)
 	case errors.Is(err, storage.ErrInvalidName):
 		return errorf(http.StatusBadRequest, codeInvalidName, "%s", msg)
+	case errors.Is(err, storage.ErrBackingUnavailable):
+		// A backing that cannot be reached (e.g. an s3 backing added live
+		// whose service does not answer), or one bucket's remote location
+		// (storage.ErrBucketUnavailable, e.g. a container still loading).
+		return errorf(http.StatusServiceUnavailable, codeInternalError, "%s", msg)
+	case errors.Is(err, storage.ErrEncryptionUnavailable):
+		// A bucket's keys or restic installation or repository cannot
+		// serve the request now (restic missing, a repository locked or
+		// unreachable).
+		return errorf(http.StatusServiceUnavailable, codeInternalError, "%s", msg)
+	case errors.Is(err, storage.ErrInvalidTarget), errors.Is(err, storage.ErrNotSupported),
+		errors.Is(err, errors.ErrUnsupported):
+		// ErrUnsupported: e.g. a bucket whose backing keeps no restic
+		// repository.
+		return errorf(http.StatusBadRequest, codeInvalidRequest, "%s", msg)
+	case errors.Is(err, storage.ErrRemoteDenied), errors.Is(err, storage.ErrRemoteRejected):
+		// The remote service refused what the backing's credentials asked
+		// for: not the caller's lack of rights (403), but a remote bucket or
+		// a setting the administrator can correct; the message carries the
+		// remote error.
+		return errorf(http.StatusBadRequest, codeInvalidRequest, "%s", msg)
+	case errors.Is(err, s3store.ErrPrefixNotEmpty), errors.Is(err, s3store.ErrMarkerMismatch),
+		errors.Is(err, s3store.ErrUnmanagedPrefix), errors.Is(err, s3store.ErrWrongKEK),
+		errors.Is(err, s3store.ErrNoConditionalWrites):
+		// A container location that cannot be used as asked (not empty,
+		// another store's marker or none, gos3 data without a marker, a
+		// store of another encryption key, a service without conditional
+		// writes).
+		return errorf(http.StatusBadRequest, codeInvalidRequest, "%s", msg)
 	case errors.Is(err, context.Canceled), errors.Is(err, context.DeadlineExceeded):
 		return errorf(http.StatusServiceUnavailable, codeInternalError, "request canceled or timed out: %s", msg)
 	}
@@ -521,6 +684,8 @@ func writeJSON(w http.ResponseWriter, status int, v any) {
 
 // readBody reads the (verified) request body, bounded by maxBodySize.
 // Signature / payload hash failures surface here (auth verifies at EOF).
+// Once the body is read, rc.afterBody re-checks that the caller may still
+// make the request (see api.revalidateAfterBody).
 func (rc *reqCtx) readBody() ([]byte, error) {
 	if rc.auth == nil || rc.auth.Body == nil {
 		return nil, nil
@@ -538,6 +703,11 @@ func (rc *reqCtx) readBody() ([]byte, error) {
 	}
 	if len(data) > maxBodySize {
 		return nil, badRequest("request body exceeds %d bytes", maxBodySize)
+	}
+	if rc.afterBody != nil {
+		if err := rc.afterBody(); err != nil {
+			return nil, err
+		}
 	}
 	return data, nil
 }

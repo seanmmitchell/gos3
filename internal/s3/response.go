@@ -13,6 +13,7 @@ import (
 	"sort"
 	"strconv"
 
+	"github.com/seanmmitchell/gos3/internal/s3client"
 	"github.com/seanmmitchell/gos3/internal/s3err"
 	"github.com/seanmmitchell/gos3/internal/storage"
 )
@@ -204,9 +205,16 @@ func (s *Server) toS3Error(ctx context.Context, rc *reqContext, err error) *s3er
 			return s3err.ErrInternalError
 		}
 	}
-	if e.HTTPStatus >= 500 && !errors.Is(err, s3err.ErrNotImplemented) {
+	switch {
+	case e.HTTPStatus >= 500 && !errors.Is(err, s3err.ErrNotImplemented):
 		s.log.LogAttrs(ctx, slog.LevelError, "s3: server error",
 			slog.String("request_id", rc.requestID), slog.String("op", rc.opName), slog.String("error", err.Error()))
+	case errors.Is(err, storage.ErrRemoteDenied), errors.Is(err, storage.ErrInvalidTarget):
+		// The client got a generic message (see mapStorageError); the
+		// details are for the operator.
+		s.log.LogAttrs(ctx, slog.LevelWarn, "s3: request refused by the bucket's backing",
+			slog.String("request_id", rc.requestID), slog.String("op", rc.opName),
+			slog.String("bucket", rc.bucket), slog.String("key", rc.key), slog.String("error", err.Error()))
 	}
 	has := func(k string) bool { _, ok := e.Extra[k]; return ok }
 	switch e.Code {
@@ -240,9 +248,20 @@ func (s *Server) toS3Error(ctx context.Context, rc *reqContext, err error) *s3er
 // errors are returned unchanged (the core renders them as InternalError).
 // storage.ErrConfigNotFound has no generic mapping: handlers map it to the
 // configuration-specific code (NoSuchCORSConfiguration, NoSuchTagSet, ...).
+//
+// Errors of a bucket's remote location (ErrBackingUnavailable,
+// ErrRemoteDenied, ErrRemoteRejected, ErrInvalidTarget) get fixed messages:
+// their text names backings, remote buckets and keys and carries the remote
+// service's own message (on AWS: account IDs, ARNs, policy details), which
+// no S3 client, anonymous ones included, may see. They are returned as a
+// mappedStorageError, so toS3Error can still log them in full.
 func mapStorageError(err error) error {
 	if err == nil {
 		return nil
+	}
+	var m *mappedStorageError
+	if errors.As(err, &m) {
+		return m // mapped already: keep the cause for the log
 	}
 	var e *s3err.Error
 	if errors.As(err, &e) {
@@ -252,6 +271,10 @@ func mapStorageError(err error) error {
 	switch {
 	case errors.Is(err, storage.ErrBucketNotFound):
 		return s3err.ErrNoSuchBucket
+	case errors.Is(err, storage.ErrRemoteBucketExists):
+		// Before ErrBucketExists, which it wraps: the remote bucket a
+		// native bucket would create exists, not the gos3 bucket.
+		return s3err.ErrBucketAlreadyExists.WithMessage("The remote bucket already exists; an administrator can adopt it.")
 	case errors.Is(err, storage.ErrBucketExists):
 		return s3err.ErrBucketAlreadyOwnedByYou
 	case errors.Is(err, storage.ErrBucketNotEmpty):
@@ -266,15 +289,80 @@ func mapStorageError(err error) error {
 		return s3err.ErrInvalidPart
 	case errors.Is(err, storage.ErrPreconditionFailed):
 		return s3err.ErrPreconditionFailed
+	case errors.Is(err, storage.ErrConflict):
+		// Optimistic retries exhausted under concurrent writes to the same
+		// object or upload: ask the client to back off and retry.
+		return s3err.ErrSlowDown
 	case errors.Is(err, storage.ErrInvalidName):
 		return s3err.ErrInvalidArgument.WithMessage("The specified name is not valid.")
+	case errors.Is(err, storage.ErrInvalidBacking):
+		return s3err.ErrInvalidArgument.WithMessage("The requested backing is not configured on this server.")
+	case errors.Is(err, storage.ErrInvalidTarget):
+		return &mappedStorageError{s3: errInvalidTarget, cause: err}
+	case errors.Is(err, storage.ErrNotSupported):
+		return s3err.ErrNotImplemented.WithMessage("This operation is not supported by the bucket's backing.")
+	case errors.Is(err, storage.ErrBackingUnavailable):
+		// Also storage.ErrBucketUnavailable (one bucket's remote location),
+		// which wraps it.
+		return &mappedStorageError{s3: s3err.ErrServiceUnavailable, cause: err}
+	case errors.Is(err, storage.ErrRemoteDenied):
+		return &mappedStorageError{s3: errRemoteDenied, cause: err}
+	case errors.Is(err, storage.ErrRemoteRejected):
+		msg := "The remote storage service rejected the request."
+		if code := remoteErrorCode(err); code != "" {
+			msg = "The remote storage service rejected the request (" + code + ")."
+		}
+		return &mappedStorageError{s3: s3err.ErrInternalError.WithMessage("%s", msg), cause: err}
 	case errors.Is(err, context.DeadlineExceeded), errors.Is(err, context.Canceled),
 		errors.Is(err, os.ErrDeadlineExceeded): // a stalled request body (countingBody)
 		return s3err.ErrRequestTimeout
+	case errors.Is(err, storage.ErrEncryptionUnavailable):
+		// The details (restic's diagnostics) are in the server log only.
+		return s3err.ErrInternalError.WithMessage("The bucket's encryption provider is unavailable. Please try again later.")
+	case errors.Is(err, errors.ErrUnsupported):
+		return s3err.ErrNotImplemented.WithMessage("This storage backend does not support the requested operation.")
 	case errors.As(err, &maxBytes):
 		return s3err.ErrMaxMessageLengthExceeded
 	case errors.Is(err, io.ErrUnexpectedEOF):
 		return s3err.ErrIncompleteBody
 	}
 	return err
+}
+
+// The S3 errors of a bucket's remote location (see mapStorageError).
+var (
+	errRemoteDenied  = s3err.ErrAccessDenied.WithMessage("The remote storage service refused the request.")
+	errInvalidTarget = s3err.ErrInvalidArgument.WithMessage("The requested bucket kind, container or remote bucket cannot be used.")
+)
+
+// mappedStorageError is the S3 error mapStorageError made of a storage
+// error whose text must not reach clients. errors.As finds the S3 error,
+// which is all a client sees; errors.Is and Error see the storage error
+// (cause), so the server log keeps the details.
+type mappedStorageError struct {
+	s3    *s3err.Error
+	cause error
+}
+
+func (e *mappedStorageError) Error() string   { return e.s3.Code + ": " + e.cause.Error() }
+func (e *mappedStorageError) Unwrap() []error { return []error{e.s3, e.cause} }
+
+// maxRemoteErrorCode bounds the remote error codes remoteErrorCode reports.
+const maxRemoteErrorCode = 64
+
+// remoteErrorCode returns the S3 error code of the remote service's answer
+// in err's chain (an *s3client.Error), such as "InvalidRequest", when it
+// is a plain token of ASCII letters; "" otherwise. Only the code is safe to
+// show clients: the remote message may name accounts and resources.
+func remoteErrorCode(err error) string {
+	var re *s3client.Error
+	if !errors.As(err, &re) || re.Code == "" || len(re.Code) > maxRemoteErrorCode {
+		return ""
+	}
+	for i := 0; i < len(re.Code); i++ {
+		if c := re.Code[i]; !(c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z') {
+			return ""
+		}
+	}
+	return re.Code
 }

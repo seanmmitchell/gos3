@@ -1,22 +1,27 @@
 # Only cmd/, internal/, go.mod/go.sum, web/ (sources), LICENSE and
 # THIRD_PARTY_NOTICES are needed to build the images. Keep the context small
-# and free of local state and secrets.
+# and free of local state and secrets. Patterns without **/ only match at the
+# root of the context, so anything that may appear in any directory (web/.env
+# is read by `nuxt generate`) uses **/.
 .git
 .github
 .editorconfig
-*.log
-.env
-.env.*
+**/*.log
+**/.env
+**/.env.*
+!**/.env.example
+**/*.pem
+**/*.key
 **/.DS_Store
 
 # Go / local build output and runtime data
 bin/
 dist/
 data/
-*.db
-*.test
-*.out
-coverage.*
+**/*.db
+**/*.test
+**/*.out
+**/coverage.*
 
 # Docs, deployment manifests and the out-of-process test suites
 docs/

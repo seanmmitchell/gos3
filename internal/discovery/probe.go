@@ -40,28 +40,47 @@ var ErrNotGos3 = errors.New("discovery: not a gos3 server")
 var ErrBlockedAddress = errors.New("discovery: address not allowed")
 
 // metadataAddrs are the instance metadata endpoints of the big clouds (AWS
-// IMDS and the ECS/EKS credential endpoints; GCP, Azure and OpenStack share
-// 169.254.169.254; Alibaba uses 100.100.100.200). Other link-local addresses
-// stay allowed: zeroconf networks use them.
+// IMDS and the ECS/EKS credential endpoints, the EKS Pod Identity agent
+// also over IPv6; GCP, Azure, OCI and OpenStack
+// share 169.254.169.254; GCP's IPv6 endpoint; Tencent Cloud; the Azure
+// WireServer; OCI's legacy endpoint; Alibaba uses 100.100.100.200). It
+// matches the standalone UI's list (web/server/utils/discovery/netguard.ts).
+// Other link-local addresses stay allowed: zeroconf networks use them.
 var metadataAddrs = []netip.Addr{
 	netip.MustParseAddr("169.254.169.254"),
 	netip.MustParseAddr("169.254.170.2"),
 	netip.MustParseAddr("169.254.170.23"),
+	netip.MustParseAddr("169.254.0.23"),
+	netip.MustParseAddr("168.63.129.16"),
+	netip.MustParseAddr("192.0.0.192"),
 	netip.MustParseAddr("fd00:ec2::254"),
+	netip.MustParseAddr("fd00:ec2::23"),
+	netip.MustParseAddr("fd20:ce::254"),
 	netip.MustParseAddr("100.100.100.200"),
 }
 
-// nat64Prefix is the well-known NAT64 prefix: an address in it reaches the
-// embedded IPv4 address.
-var nat64Prefix = netip.MustParsePrefix("64:ff9b::/96")
+// ipv4CompatPrefix holds the deprecated IPv4-compatible IPv6 addresses
+// (RFC 4291 §2.5.5.1), checked like NAT64 addresses.
+var ipv4CompatPrefix = netip.MustParsePrefix("::/96")
+
+// nat64Prefixes are the well-known NAT64 prefix and the local-use NAT64
+// prefix (RFC 8215): an address in them reaches the IPv4 address in its
+// low 32 bits.
+var nat64Prefixes = []netip.Prefix{
+	netip.MustParsePrefix("64:ff9b::/96"),
+	netip.MustParsePrefix("64:ff9b:1::/48"),
+}
 
 // blockedProbeAddr reports whether discovery must never connect to ip:
 // metadata addresses, unspecified addresses (including 0.0.0.0/8),
 // multicast addresses and the IPv4 limited broadcast address, also in their
-// IPv4-mapped and NAT64 forms.
+// IPv4-mapped, IPv4-compatible and NAT64 forms.
 func blockedProbeAddr(ip netip.Addr) bool {
 	ip = ip.WithZone("").Unmap()
-	if nat64Prefix.Contains(ip) {
+	// NAT64 and deprecated IPv4-compatible (::a.b.c.d; not :: or ::1)
+	// addresses reach the IPv4 address in their low 32 bits.
+	compat := ipv4CompatPrefix.Contains(ip) && ip != netip.IPv6Unspecified() && ip != netip.IPv6Loopback()
+	if compat || slices.ContainsFunc(nat64Prefixes, func(p netip.Prefix) bool { return p.Contains(ip) }) {
 		b := ip.As16()
 		if blockedProbeAddr(netip.AddrFrom4([4]byte(b[12:]))) {
 			return true

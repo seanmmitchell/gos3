@@ -16,6 +16,8 @@ import type { BrowserEntry, BrowserRowAction, BrowserSort } from '~/composables/
 import type { CollectResult, DroppedFile } from '~/composables/useBrowserDrop'
 import type { OpTarget, TransferDone } from '~/composables/useBrowserOps'
 import { S3Error } from '~/utils/s3/errors'
+import { canManageJobs } from '~/components/admin/-capabilities'
+import CopyBucketModal from '~/components/jobs/CopyBucketModal.vue'
 
 definePageMeta({
   key: route => `${String(route.params.id)}::${String(route.params.bucket)}`
@@ -72,24 +74,21 @@ watch([s3, bucket], async ([client, b]) => {
 }, { immediate: true })
 const versioned = computed(() => versioning.value === 'Enabled' || versioning.value === 'Suspended')
 
+// "Copy / Mirror…" (gos3, admin:CreateCopyJob): a copy or mirror job of the whole bucket.
+const { capabilities } = useWhoAmI()
+const canCopyBucket = computed(() => canManageJobs(connection.value?.kind, capabilities.value))
+const copyOverlay = useOverlay()
+function openCopyBucket() {
+  void copyOverlay.create(CopyBucketModal, { destroyOnClose: true }).open({ bucket: bucket.value, versioning: versioning.value, serverId: serverId.value })
+}
+
 // ---------------------------------------------------------------------------
 // Listing
 // ---------------------------------------------------------------------------
 
 const showVersions = ref(false)
-const search = ref('')
-const searchMode = ref<'filter' | 'prefix'>('filter')
-const serverQuery = ref('')
-let searchTimer: ReturnType<typeof setTimeout> | undefined
-watch([search, searchMode], () => {
-  clearTimeout(searchTimer)
-  if (searchMode.value !== 'prefix') {
-    serverQuery.value = ''
-    return
-  }
-  searchTimer = setTimeout(() => (serverQuery.value = search.value), 350)
-})
-const listPrefix = computed(() => prefix.value + serverQuery.value)
+// Search text is cleared when another folder is opened (useBrowserSearch).
+const { search, mode: searchMode, serverQuery, listPrefix } = useBrowserSearch(prefix)
 
 const entries = shallowRef<BrowserEntry[]>([])
 const listing = reactive({
@@ -177,14 +176,15 @@ function loadMore() {
 // Declared before the listing watcher (which clears it); the getter is lazy.
 const selection = useBrowserSelection(() => visible.value.map(e => e.id))
 
-watch([s3, bucket, listPrefix, showVersions], () => {
+// Navigation can clear a search without changing listPrefix. The folder still
+// changes relative row names, placeholder visibility, and selection.
+watch([s3, bucket, prefix, listPrefix, showVersions], () => {
   selection.clear()
   void refresh()
 }, { immediate: true })
 
 onBeforeUnmount(() => {
   listAbort?.abort()
-  clearTimeout(searchTimer)
 })
 
 // Sorting + client-side filter.
@@ -642,6 +642,16 @@ const emptyFolder = computed(() => listing.loaded && !listing.loading && !listin
             variant="outline"
             label="Settings"
             class="hidden sm:inline-flex"
+          />
+          <UButton
+            v-if="canCopyBucket"
+            icon="i-lucide-copy-plus"
+            color="neutral"
+            variant="outline"
+            label="Copy / Mirror…"
+            class="hidden md:inline-flex"
+            data-testid="copy-bucket"
+            @click="openCopyBucket"
           />
           <UButton
             icon="i-lucide-folder-plus"

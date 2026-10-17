@@ -22,16 +22,17 @@ import (
 // env is the per-subtest environment: a fresh backend plus helpers that
 // report failures precisely through t.
 type env struct {
-	t       *testing.T
-	b       storage.Backend
-	ctx     context.Context
-	factory Factory
+	t     *testing.T
+	b     storage.Backend
+	ctx   context.Context
+	suite *suite
 }
 
-// newEnv creates a fresh backend from f and closes it when t finishes.
-func newEnv(t *testing.T, f Factory) *env {
+// newEnv creates a fresh backend from the suite's factory and closes it
+// when t finishes.
+func newEnv(t *testing.T, s *suite) *env {
 	t.Helper()
-	b := f(t)
+	b := s.factory(t)
 	if b == nil {
 		t.Fatal("storagetest: Factory returned a nil backend")
 	}
@@ -40,14 +41,15 @@ func newEnv(t *testing.T, f Factory) *env {
 			t.Errorf("Close: %v", err)
 		}
 	})
-	return &env{t: t, b: b, ctx: t.Context(), factory: f}
+	return &env{t: t, b: b, ctx: t.Context(), suite: s}
 }
 
 // run runs fn as a subtest sharing e's backend.
 func (e *env) run(name string, fn func(e *env)) {
 	e.t.Helper()
 	e.t.Run(name, func(t *testing.T) {
-		fn(&env{t: t, b: e.b, ctx: t.Context(), factory: e.factory})
+		e.suite.skipListed(t)
+		fn(&env{t: t, b: e.b, ctx: t.Context(), suite: e.suite})
 	})
 }
 
@@ -55,7 +57,8 @@ func (e *env) run(name string, fn func(e *env)) {
 func (e *env) runFresh(name string, fn func(e *env)) {
 	e.t.Helper()
 	e.t.Run(name, func(t *testing.T) {
-		fn(newEnv(t, e.factory))
+		e.suite.skipListed(t)
+		fn(newEnv(t, e.suite))
 	})
 }
 
@@ -110,7 +113,21 @@ func (e *env) mkBucket(name string) {
 
 func (e *env) mkBucketOpts(name string, opts storage.CreateBucketOptions) {
 	e.t.Helper()
-	e.noErr(fmt.Sprintf("CreateBucket(%q)", name), e.b.CreateBucket(e.ctx, name, opts))
+	err := e.b.CreateBucket(e.ctx, name, opts)
+	if opts.ObjectLockEnabled {
+		e.skipIfNotSupported(err)
+	}
+	e.noErr(fmt.Sprintf("CreateBucket(%q)", name), err)
+}
+
+// skipIfNotSupported skips the (sub)test when err says the backend cannot
+// do what the test needs (storage.ErrNotSupported, e.g. versioning or
+// object lock on a gateway backing); other errors are left to the caller.
+func (e *env) skipIfNotSupported(err error) {
+	e.t.Helper()
+	if errors.Is(err, storage.ErrNotSupported) {
+		e.t.Skipf("backend does not support this: %v", err)
+	}
 }
 
 // mkVersioned creates a bucket and sets its versioning status (no-op for
@@ -125,7 +142,47 @@ func (e *env) mkVersioned(name string, status storage.VersioningStatus) {
 
 func (e *env) setVersioning(name string, status storage.VersioningStatus) {
 	e.t.Helper()
-	e.noErr(fmt.Sprintf("SetBucketVersioning(%q, %q)", name, status), e.b.SetBucketVersioning(e.ctx, name, status))
+	err := e.b.SetBucketVersioning(e.ctx, name, status)
+	e.skipIfNotSupported(err)
+	e.noErr(fmt.Sprintf("SetBucketVersioning(%q, %q)", name, status), err)
+}
+
+// --- keys ---
+
+// key returns fixture key k as the suite uses it. With
+// Options.NoControlKeys every control character (below 0x20, and DEL)
+// becomes '!' (0x21), the lowest printable character after the space, so
+// a fixture key keeps its byte-wise order relative to the printable keys
+// around it (fixtures use control characters only to sort early).
+func (e *env) key(k string) string {
+	if !e.suite.noControlKeys {
+		return k
+	}
+	b := []byte(k) // byte-wise: control characters are never part of a multi-byte rune
+	for i, c := range b {
+		if c < 0x20 || c == 0x7f {
+			b[i] = '!'
+		}
+	}
+	return string(b)
+}
+
+// keys maps key over ks (into a new slice).
+func (e *env) keys(ks ...string) []string {
+	out := make([]string, len(ks))
+	for i, k := range ks {
+		out[i] = e.key(k)
+	}
+	return out
+}
+
+// skipIfControlKeys skips a subtest whose purpose is control-character
+// keys when Options.NoControlKeys is set.
+func (e *env) skipIfControlKeys() {
+	e.t.Helper()
+	if e.suite.noControlKeys {
+		e.t.Skip("NoControlKeys: the backend cannot store keys with control characters")
+	}
 }
 
 // --- objects ---
@@ -444,8 +501,14 @@ func (e *env) checkTime(what string, got, start time.Time) {
 
 // --- version IDs ---
 
+// maxOpaqueVersionID is the longest version ID the S3 layer accepts from
+// clients (and so the longest a backend may pass through).
+const maxOpaqueVersionID = 1024
+
 // checkVersionID verifies a generated version ID is valid: non-empty, never
-// "null", at most 64 characters and URL-safe (docs/ARCHITECTURE.md).
+// "null", at most 64 characters and URL-safe (docs/ARCHITECTURE.md). With
+// Options.OpaqueVersionIDs it applies the S3 layer's rule instead: at most
+// 1024 printable, non-space ASCII characters.
 func (e *env) checkVersionID(what, id string) {
 	e.t.Helper()
 	switch {
@@ -453,6 +516,12 @@ func (e *env) checkVersionID(what, id string) {
 		e.t.Errorf("%s: empty version ID", what)
 	case id == storage.NullVersionID:
 		e.t.Errorf("%s: version ID is %q, want a generated ID", what, id)
+	case e.suite.opaqueVersionIDs:
+		if len(id) > maxOpaqueVersionID {
+			e.t.Errorf("%s: version ID %.64q... is %d characters, want <= %d", what, id, len(id), maxOpaqueVersionID)
+		} else if i := strings.IndexFunc(id, func(r rune) bool { return r <= ' ' || r > '~' }); i >= 0 {
+			e.t.Errorf("%s: version ID %q has a character at offset %d that is not printable, non-space ASCII", what, id, i)
+		}
 	case len(id) > 64:
 		e.t.Errorf("%s: version ID %q is %d characters, want <= 64", what, id, len(id))
 	case url.QueryEscape(id) != id:

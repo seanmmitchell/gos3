@@ -6,7 +6,7 @@ import { clientAbortSignal, discoveryDisabled, errorResponse, localSlots, MAX_CO
 import { DEFAULT_WAIT_MS, discoverLocal, loadMdns, localDiscoveryEnabled, MAX_WAIT_MS, MIN_WAIT_MS } from '../../utils/discovery/local'
 
 export default defineEventHandler(async (event) => {
-  const foreign = rejectForeignRequest(event)
+  const foreign = rejectForeignRequest(event, { browserSignal: true })
   if (foreign) return foreign
   if (!localDiscoveryEnabled()) return discoveryDisabled(event)
   const q = getQuery(event)

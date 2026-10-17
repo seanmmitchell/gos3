@@ -1,0 +1,10 @@
+{
+  "server": { "address": ":9000", "region": "us-east-1" },
+  "storage": { "backend": "fs", "path": "./data" },
+  "admin": { "enabled": false },
+  "ui": { "enabled": false },
+  "discovery": {
+    "enabled": false, "advertise": false, "mdns": false,
+    "beacon": false, "allow_scan": false, "seeds": [], "dns_srv": []
+  }
+}

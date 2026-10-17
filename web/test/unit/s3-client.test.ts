@@ -1,7 +1,7 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import { choosePartSize, copySourceHeader, decodeHeaderValue, encodeHeaderValue, S3Client, S3Error } from '~/utils/s3/client'
 import { md5Base64 } from '~/utils/s3/hash'
-import { buildS3Url, encodeKey, hasDotSegment, normalizeEndpoint } from '~/utils/s3/url'
+import { buildS3Url, encodeKey, hasDotSegment, isUnaddressableBucket, normalizeEndpoint } from '~/utils/s3/url'
 
 const MiB = 1024 * 1024
 const NS = 'xmlns="http://s3.amazonaws.com/doc/2006-03-01/"'
@@ -170,6 +170,42 @@ describe('S3Client requests', () => {
     expect(calls[0]!.body).toContain('<LocationConstraint>eu-west-1</LocationConstraint>')
   })
 
+  it('sends the gos3 storage backing as a signed header only when given', async () => {
+    const { client, calls } = makeClient(() => new Response(null, { status: 200 }))
+    await client.createBucket('remote', { backing: 'aws' })
+    expect(calls[0]!.headers['x-gos3-backing']).toBe('aws')
+    expect(calls[0]!.headers.authorization).toMatch(/SignedHeaders=[^,]*;x-gos3-backing[;,]/)
+    await client.createBucket('plain')
+    expect(calls[1]!.headers).not.toHaveProperty('x-gos3-backing')
+    expect(calls[1]!.headers.authorization).not.toContain('x-gos3-backing')
+  })
+
+  it('sends the bucket kind, remote bucket and container as signed headers', async () => {
+    const { client, calls } = makeClient(() => new Response(null, { status: 200 }))
+    await client.createBucket('photos', { backing: 'cloud', kind: 'native', remoteBucket: 'acme-photos' })
+    expect(calls[0]!.headers).toMatchObject({ 'x-gos3-backing': 'cloud', 'x-gos3-bucket-kind': 'native', 'x-gos3-remote-bucket': 'acme-photos' })
+    expect(calls[0]!.headers).not.toHaveProperty('x-gos3-container')
+    expect(calls[0]!.headers.authorization).toMatch(/SignedHeaders=[^,]*;x-gos3-bucket-kind;x-gos3-remote-bucket[;,]/)
+    await client.createBucket('docs', { kind: 'wrapped', container: 'c-7f3a' })
+    expect(calls[1]!.headers).toMatchObject({ 'x-gos3-bucket-kind': 'wrapped', 'x-gos3-container': 'c-7f3a' })
+    expect(calls[1]!.headers).not.toHaveProperty('x-gos3-remote-bucket')
+    expect(calls[1]!.headers.authorization).toMatch(/;x-gos3-container[;,]/)
+    // A field that contradicts the kind is never sent.
+    await client.createBucket('mixed', { kind: 'wrapped', remoteBucket: 'r', container: 'c' })
+    expect(calls[2]!.headers).not.toHaveProperty('x-gos3-remote-bucket')
+    await client.createBucket('mixed2', { kind: 'native', remoteBucket: 'r', container: 'c' })
+    expect(calls[3]!.headers).not.toHaveProperty('x-gos3-container')
+    await client.createBucket('plain')
+    for (const h of ['x-gos3-bucket-kind', 'x-gos3-remote-bucket', 'x-gos3-container']) expect(calls[4]!.headers).not.toHaveProperty(h)
+  })
+
+  it('reports the bucket region, gos3 backing and bucket kind from HeadBucket', async () => {
+    const { client } = makeClient(() => new Response(null, { status: 200, headers: { 'x-amz-bucket-region': 'eu-west-1', 'x-gos3-backing': 'archive', 'x-gos3-bucket-kind': 'native' } }))
+    expect(await client.headBucket('b')).toEqual({ region: 'eu-west-1', backing: 'archive', kind: 'native' })
+    const plain = makeClient(() => new Response(null, { status: 200 }))
+    expect(await plain.client.headBucket('b')).toStrictEqual({ region: undefined, backing: undefined, kind: undefined })
+  })
+
   it('deleteObjects batches by 1000 with Content-MD5', async () => {
     const { client, calls } = makeClient(req => {
       const keys = [...req.body.matchAll(/<Key>(.*?)<\/Key>/g)].map(m => m[1])
@@ -185,6 +221,59 @@ describe('S3Client requests', () => {
     }
     expect(r.deleted).toHaveLength(2500)
     expect(r.errors).toHaveLength(0)
+  })
+
+  it('deleteObjects deletes keys XML cannot carry one by one (key in the URL)', async () => {
+    const { client, calls } = makeClient((req) => {
+      const u = new URL(req.url)
+      if (req.method === 'POST') {
+        const keys = [...req.body.matchAll(/<Key>(.*?)<\/Key>/g)].map(m => m[1])
+        return xml(`<DeleteResult ${NS}>${keys.map(k => `<Deleted><Key>${k}</Key></Deleted>`).join('')}</DeleteResult>`)
+      }
+      if (u.pathname === '/b/denied%01') return xml('<Error><Code>AccessDenied</Code><Message>Access Denied</Message></Error>', 403)
+      if (u.searchParams.get('versionId') === 'v1') return new Response(null, { status: 204, headers: { 'x-amz-version-id': 'v1' } })
+      return new Response(null, { status: 204, headers: { 'x-amz-version-id': 'dm1', 'x-amz-delete-marker': 'true' } })
+    })
+    const objects = [
+      ...Array.from({ length: 1000 }, (_, i) => ({ key: `k${i}` })),
+      { key: 'a\u0001b' },
+      { key: 'old\u001F', versionId: 'v1' },
+      { key: 'denied\u0001' },
+      { key: 'tab\tline\nbreak' }
+    ]
+    const r = await client.deleteObjects('b', objects)
+
+    const singles = calls.filter(c => c.method === 'DELETE')
+    expect(singles.map(c => c.url)).toEqual([
+      'http://localhost:9000/b/a%01b',
+      'http://localhost:9000/b/old%1F?versionId=v1',
+      'http://localhost:9000/b/denied%01'
+    ])
+    // The remaining 1001 keys (tab/LF are fine as character references) go in two batches.
+    const batches = calls.filter(c => c.method === 'POST')
+    expect(batches).toHaveLength(2)
+    expect(batches.some(c => /[\u0000-\u0008\u000B\u000C\u000E-\u001F]/.test(c.body))).toBe(false)
+    expect(batches[1]!.body).toContain('<Key>tab&#9;line&#10;break</Key>')
+
+    expect(r.deleted).toHaveLength(1000 + 1 + 2)
+    expect(r.deleted).toContainEqual({ key: 'a\u0001b', versionId: undefined, deleteMarker: true, deleteMarkerVersionId: 'dm1' })
+    expect(r.deleted).toContainEqual({ key: 'old\u001F', versionId: 'v1', deleteMarker: undefined, deleteMarkerVersionId: undefined })
+    expect(r.errors).toEqual([{ key: 'denied\u0001', versionId: undefined, code: 'AccessDenied', message: 'Access Denied' }])
+  })
+
+  it('deleteObjects still fails as a whole when a single delete cannot reach the server', async () => {
+    const { client, calls } = makeClient(() => {
+      throw new TypeError('Failed to fetch')
+    })
+    await expect(client.deleteObjects('b', [{ key: 'a\u0001' }, { key: 'b' }])).rejects.toMatchObject({ code: 'NetworkError' })
+    expect(calls).toHaveLength(1)
+  })
+
+  it('deleteObjects reports keys that fit neither a URL nor XML as per-key errors', async () => {
+    const { client, calls } = makeClient(() => new Response(null, { status: 204 }))
+    const r = await client.deleteObjects('b', [{ key: 'x/../\u0001' }])
+    expect(calls).toHaveLength(0)
+    expect(r.errors).toMatchObject([{ key: 'x/../\u0001', code: 'UnaddressableKey' }])
   })
 
   it('returns null / [] for missing configurations but rethrows other 404s', async () => {
@@ -443,5 +532,31 @@ describe('upload cancellation races (review fix)', () => {
     expect(calls.some(c => c.method === 'PUT')).toBe(false)
     expect(calls.some(c => c.method === 'POST' && c.url.includes('uploadId=UP9'))).toBe(false)
     expect(calls.some(c => c.method === 'DELETE' && c.url.includes('uploadId=UP9'))).toBe(true)
+  })
+})
+
+describe('bucket names that would change the request path (gap-2)', () => {
+  it('detects them', () => {
+    for (const b of ['.', '..', 'a/b', '../x', 'a\\b', 'a\nb', 'a\u0000']) expect(isUnaddressableBucket(b), JSON.stringify(b)).toBe(true)
+    for (const b of ['my.bucket', '...', 'a..b', 'Legacy_Bucket', '%2E%2E', 'b']) expect(isUnaddressableBucket(b), b).toBe(false)
+  })
+
+  it('buildS3Url refuses them instead of resolving to another path', () => {
+    // Before the fix '..' removed itself and the base path: /_gos3/admin/v1/... on the server root.
+    expect(() => buildS3Url({ endpoint: 'https://proxy/s3', forcePathStyle: true }, '..', '_gos3/admin/v1/users/alice')).toThrow(TypeError)
+    expect(() => buildS3Url({ endpoint: 'http://h:9000', forcePathStyle: true }, '.', 'k')).toThrow(TypeError)
+    expect(() => buildS3Url({ endpoint: 'http://h:9000', forcePathStyle: true }, '', 'k')).toThrow(TypeError)
+    // An encoded-looking name is just a name: its '%' is encoded, so nothing is resolved.
+    expect(buildS3Url({ endpoint: 'http://h:9000', forcePathStyle: true }, '%2E%2E', 'k').pathname).toBe('/%252E%252E/k')
+    expect(buildS3Url({ endpoint: 'http://h:9000', forcePathStyle: true }).pathname).toBe('/')
+  })
+
+  it('S3Client never sends requests for them', async () => {
+    const { client, calls } = makeClient(() => new Response(null, { status: 200 }))
+    expect(() => client.url('..', 'k')).toThrow(S3Error)
+    await expect(client.headObject('..', '_gos3/admin/v1/users/alice')).rejects.toMatchObject({ code: 'InvalidBucketName', status: 0 })
+    await expect(client.deleteObject('.', 'k')).rejects.toMatchObject({ code: 'InvalidBucketName' })
+    await expect(client.presignGetUrl('..', 'k')).rejects.toMatchObject({ code: 'InvalidBucketName' })
+    expect(calls).toHaveLength(0)
   })
 })

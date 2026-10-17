@@ -30,10 +30,21 @@ export class BlockedAddressError extends Error {
   }
 }
 
-/** Cloud metadata services (AWS IMDS / ECS / EKS pod identity, Alibaba). */
-const METADATA_V4 = ['169.254.169.254', '169.254.170.2', '169.254.170.23', '100.100.100.200']
-/** AWS IMDS over IPv6 (fd00:ec2::254). */
-const METADATA_V6 = 'fd00:0ec2:0000:0000:0000:0000:0000:0254'
+/**
+ * Cloud metadata services: AWS IMDS (also GCP, Azure, OCI, DigitalOcean,
+ * OpenStack), AWS ECS task metadata and EKS pod identity, Tencent Cloud,
+ * Azure WireServer, Oracle Cloud's legacy endpoint and Alibaba Cloud.
+ */
+const METADATA_V4 = ['169.254.169.254', '169.254.170.2', '169.254.170.23', '169.254.0.23', '168.63.129.16', '192.0.0.192', '100.100.100.200']
+/**
+ * Metadata services over IPv6: AWS IMDS (fd00:ec2::254), EKS Pod Identity
+ * (fd00:ec2::23) and GCP (fd20:ce::254).
+ */
+const METADATA_V6 = new Set([
+  'fd00:0ec2:0000:0000:0000:0000:0000:0254',
+  'fd00:0ec2:0000:0000:0000:0000:0000:0023',
+  'fd20:00ce:0000:0000:0000:0000:0000:0254'
+])
 
 function v4ToInt(s: string): number | undefined {
   const parts = s.split('.')
@@ -85,7 +96,7 @@ function isBlockedV4(n: number): boolean {
   return METADATA_V4_INTS.has(n)
 }
 
-/** IPv4 embedded in an IPv6 address that reaches it: mapped, compatible or NAT64. */
+/** IPv4 embedded in an IPv6 address that reaches it: mapped, compatible or NAT64 (well-known or local-use prefix). */
 function embeddedV4(b: Uint8Array): number | undefined {
   const v4 = ((b[12]! << 24) | (b[13]! << 16) | (b[14]! << 8) | b[15]!) >>> 0
   const zero = (from: number, to: number) => b.slice(from, to).every(x => x === 0)
@@ -95,6 +106,8 @@ function embeddedV4(b: Uint8Array): number | undefined {
   if (zero(0, 12) && v4 > 1) return v4
   // 64:ff9b::a.b.c.d (NAT64 well-known prefix)
   if (b[0] === 0x00 && b[1] === 0x64 && b[2] === 0xff && b[3] === 0x9b && zero(4, 12)) return v4
+  // 64:ff9b:1::/48 (RFC 8215 local-use NAT64), IPv4 in the low 32 bits
+  if (b[0] === 0x00 && b[1] === 0x64 && b[2] === 0xff && b[3] === 0x9b && b[4] === 0x00 && b[5] === 0x01) return v4
   return undefined
 }
 
@@ -113,7 +126,7 @@ export function isBlockedAddress(ip: string): boolean {
   if (b.every(x => x === 0)) return true // ::
   if (b[0] === 0xff) return true // ff00::/8 multicast
   const hex = Array.from({ length: 8 }, (_, i) => ((b[i * 2]! << 8) | b[i * 2 + 1]!).toString(16).padStart(4, '0')).join(':')
-  if (hex === METADATA_V6) return true
+  if (METADATA_V6.has(hex)) return true
   const v4 = embeddedV4(b)
   return v4 !== undefined && isBlockedV4(v4)
 }

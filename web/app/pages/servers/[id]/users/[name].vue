@@ -3,6 +3,7 @@ import type { AccessKey, User } from '~/types/admin'
 import { AdminError } from '~/utils/admin/client'
 import { canSimulate, identityPending, usersPageMode } from '~/components/admin/-capabilities'
 import { userDetailsUpdate } from '~/components/admin/-users'
+import { explainCreateKeyError } from '~/components/admin/-credentials'
 import CreateKeyModal from '~/components/admin/CreateKeyModal.vue'
 import NewAccessKeyModal from '~/components/admin/NewAccessKeyModal.vue'
 
@@ -126,9 +127,13 @@ const busyKey = ref<string | null>(null)
 const createKey = useAsyncAction(async () => {
   const req = await overlay.create(CreateKeyModal, { destroyOnClose: true }).open({ title: `Create access key for ${name.value}`, allowCustom: true })
   if (!req) return null
-  const key = await requireAdmin().createAccessKey(name.value, req)
-  void user.refresh()
-  return key
+  try {
+    const key = await requireAdmin().createAccessKey(name.value, req)
+    void user.refresh()
+    return key
+  } catch (e) {
+    throw explainCreateKeyError(e, !!req.accessKey)
+  }
 }, { errorTitle: 'Could not create access key' })
 
 async function onCreateKey() {

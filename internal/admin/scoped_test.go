@@ -264,7 +264,7 @@ func TestEveryActionRouteAuthorizes(t *testing.T) {
 		if rt.action == "" {
 			continue
 		}
-		path := strings.NewReplacer("{name}", "x", "{accessKey}", "NOSUCHKEY").Replace(rt.path)
+		path := strings.NewReplacer("{name}", "x", "{accessKey}", "NOSUCHKEY", "{id}", "0123abcd").Replace(rt.path)
 		var body any
 		if rt.method != "GET" && rt.method != "DELETE" {
 			body = map[string]any{}

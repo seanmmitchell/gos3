@@ -2,40 +2,18 @@ package memory
 
 import (
 	"context"
-	"encoding/binary"
 	"errors"
 	"fmt"
 	"slices"
-	"strings"
 	"sync"
-	"time"
 
 	"github.com/seanmmitchell/gos3/internal/storage"
+	"github.com/seanmmitchell/gos3/internal/storage/compress"
+	"github.com/seanmmitchell/gos3/internal/storage/index"
 )
 
 // MaxPartNumber is the largest part number accepted (S3 allows 1..10000).
 const MaxPartNumber = 10000
-
-// upload is an in-progress multipart upload. Guarded by its bucket's lock.
-type upload struct {
-	info  storage.UploadInfo
-	parts map[int]*part
-}
-
-// part is one committed part; data is immutable.
-type part struct {
-	info storage.PartInfo
-	data []byte
-}
-
-// findUpload returns the upload with the given ID if it belongs to key.
-func findUpload(bk *bucket, key, uploadID string) (*upload, error) {
-	u, ok := bk.uploads[uploadID]
-	if !ok || u.info.Key != key {
-		return nil, fmt.Errorf("%w: %q", storage.ErrUploadNotFound, uploadID)
-	}
-	return u, nil
-}
 
 // CreateMultipartUpload starts a multipart upload of bucket/key.
 func (b *Backend) CreateMultipartUpload(ctx context.Context, bucketName, key string, meta storage.ObjectMeta, initiator string) (storage.UploadInfo, error) {
@@ -47,23 +25,15 @@ func (b *Backend) CreateMultipartUpload(ctx context.Context, bucketName, key str
 		return storage.UploadInfo{}, err
 	}
 	defer bk.mu.Unlock()
-	id := newUploadID()
-	for _, dup := bk.uploads[id]; dup; _, dup = bk.uploads[id] {
-		id = newUploadID()
-	}
-	u := &upload{
-		info: storage.UploadInfo{
-			UploadID:  id,
-			Bucket:    bk.info.Name,
-			Key:       key,
-			Initiated: b.now().UTC(),
-			Meta:      cloneMeta(meta),
-			Initiator: initiator,
-		},
-		parts: make(map[int]*part),
-	}
-	bk.addUpload(u)
-	return cloneUpload(u.info), nil
+	u := bk.ix.AddUpload(storage.UploadInfo{
+		UploadID:  bk.ix.NewUploadID(),
+		Bucket:    bk.ix.Info.Name,
+		Key:       key,
+		Initiated: b.now().UTC(),
+		Meta:      meta,
+		Initiator: initiator,
+	})
+	return index.CloneUpload(u.Info), nil
 }
 
 // GetMultipartUpload returns an in-progress upload of bucket/key.
@@ -73,11 +43,11 @@ func (b *Backend) GetMultipartUpload(ctx context.Context, bucketName, key, uploa
 		return storage.UploadInfo{}, err
 	}
 	defer bk.mu.RUnlock()
-	u, err := findUpload(bk, key, uploadID)
+	u, err := bk.ix.Upload(key, uploadID)
 	if err != nil {
 		return storage.UploadInfo{}, err
 	}
-	return cloneUpload(u.info), nil
+	return index.CloneUpload(u.Info), nil
 }
 
 type partWriter struct {
@@ -101,7 +71,7 @@ func (b *Backend) NewPartWriter(ctx context.Context, bucketName, key, uploadID s
 	if err != nil {
 		return nil, err
 	}
-	_, err = findUpload(bk, key, uploadID)
+	_, err = bk.ix.Upload(key, uploadID)
 	bk.mu.RUnlock()
 	if err != nil {
 		return nil, err
@@ -137,22 +107,22 @@ func (w *partWriter) Commit(ctx context.Context, meta storage.PartMeta) (storage
 		return storage.PartInfo{}, err
 	}
 	defer w.bk.mu.Unlock()
-	u, err := findUpload(w.bk, w.key, w.uploadID)
+	u, err := w.bk.ix.Upload(w.key, w.uploadID)
 	if err != nil {
 		return storage.PartInfo{}, err
 	}
-	p := &part{
-		info: storage.PartInfo{
-			PartMeta:     clonePartMeta(meta),
+	p := &index.Part[[]byte]{
+		Info: storage.PartInfo{
+			PartMeta:     index.ClonePartMeta(meta),
 			PartNumber:   w.number,
 			Size:         int64(len(data)),
 			LastModified: w.b.now().UTC(),
 		},
-		data: data,
+		Data: data,
 	}
-	u.parts[w.number] = p
-	out := p.info
-	out.PartMeta = clonePartMeta(out.PartMeta)
+	u.PutPart(p)
+	out := p.Info
+	out.PartMeta = index.ClonePartMeta(out.PartMeta)
 	return out, nil
 }
 
@@ -171,17 +141,17 @@ func (b *Backend) ListParts(ctx context.Context, bucketName, key, uploadID strin
 		return nil, err
 	}
 	defer bk.mu.RUnlock()
-	u, err := findUpload(bk, key, uploadID)
+	u, err := bk.ix.Upload(key, uploadID)
 	if err != nil {
 		return nil, err
 	}
-	out := make([]storage.PartInfo, 0, len(u.parts))
-	for _, p := range u.parts {
-		pi := p.info
-		pi.PartMeta = clonePartMeta(pi.PartMeta)
+	parts := u.Parts()
+	out := make([]storage.PartInfo, 0, len(parts))
+	for _, p := range parts {
+		pi := p.Info
+		pi.PartMeta = index.ClonePartMeta(pi.PartMeta)
 		out = append(out, pi)
 	}
-	slices.SortFunc(out, func(a, c storage.PartInfo) int { return a.PartNumber - c.PartNumber })
 	return out, nil
 }
 
@@ -193,9 +163,10 @@ func (b *Backend) ListMultipartUploads(ctx context.Context, bucketName string) (
 		return nil, err
 	}
 	defer bk.mu.RUnlock()
-	out := make([]storage.UploadInfo, 0, len(bk.uploads))
-	for n := bk.uploadOrder.First(); n != nil; n = n.Next() {
-		out = append(out, cloneUpload(n.val.info))
+	uploads := bk.ix.Uploads()
+	out := make([]storage.UploadInfo, 0, len(uploads))
+	for _, u := range uploads {
+		out = append(out, index.CloneUpload(u.Info))
 	}
 	return out, nil
 }
@@ -208,49 +179,7 @@ func (b *Backend) WalkMultipartUploads(ctx context.Context, bucketName, prefix s
 	if fn == nil {
 		return errors.New("memory: nil walk function")
 	}
-	start := string(appendEscapedKey(nil, prefix))
-	cursor, inclusive := uploadSeekKey(after)
-	if cursor < start {
-		cursor, inclusive = start, true
-	}
-	batch := walkMinBatch
-	for {
-		bk, err := b.rlockBucket(ctx, bucketName)
-		if err != nil {
-			return err
-		}
-		var n *slNode[*upload]
-		if inclusive {
-			n = bk.uploadOrder.SeekGE(cursor)
-		} else {
-			n = bk.uploadOrder.SeekGT(cursor)
-		}
-		items := make([]storage.UploadInfo, 0, batch)
-		done := true
-		for ; n != nil && strings.HasPrefix(n.key, start); n = n.Next() {
-			if len(items) == batch {
-				done = false
-				break
-			}
-			cursor, inclusive = n.key, false
-			if strings.HasPrefix(n.val.info.Key, prefix) {
-				items = append(items, cloneUpload(n.val.info))
-			}
-		}
-		bk.mu.RUnlock()
-		for _, it := range items {
-			if err := fn(it); err != nil {
-				if errors.Is(err, storage.ErrStopWalk) {
-					return nil
-				}
-				return err
-			}
-		}
-		if done {
-			return nil
-		}
-		batch = nextBatch(batch)
-	}
+	return index.WalkUploads(ctx, b.walkAcquire(ctx, bucketName), prefix, after, fn)
 }
 
 // CompleteMultipartUpload concatenates the listed parts into a new object
@@ -258,45 +187,66 @@ func (b *Backend) WalkMultipartUploads(ctx context.Context, bucketName, prefix s
 // all its parts. If the commit preconditions fail the upload is kept, so the
 // client may retry.
 func (b *Backend) CompleteMultipartUpload(ctx context.Context, bucketName, key, uploadID string, partNumbers []int, meta storage.ObjectMeta, opts storage.CommitOptions) (storage.ObjectInfo, error) {
+	return b.CompleteMultipartUploadWith(ctx, bucketName, key, uploadID, partNumbers, meta, opts, storage.WriteOptions{})
+}
+
+// CompleteMultipartUploadWith is CompleteMultipartUpload with write
+// options: with wopts.Compression the concatenated parts are stored
+// compressed (see storage.CompressingBackend). The compression runs with
+// the bucket locked, like the concatenation.
+func (b *Backend) CompleteMultipartUploadWith(ctx context.Context, bucketName, key, uploadID string, partNumbers []int,
+	meta storage.ObjectMeta, opts storage.CommitOptions, wopts storage.WriteOptions) (storage.ObjectInfo, error) {
+	if err := checkCompression(wopts.Compression); err != nil {
+		return storage.ObjectInfo{}, err
+	}
 	bk, err := b.lockBucket(ctx, bucketName)
 	if err != nil {
 		return storage.ObjectInfo{}, err
 	}
 	defer bk.mu.Unlock()
-	u, err := findUpload(bk, key, uploadID)
+	u, err := bk.ix.Upload(key, uploadID)
+	if err != nil {
+		return storage.ObjectInfo{}, err
+	}
+	parts, err := u.SelectParts(partNumbers, opts.PartETags)
 	if err != nil {
 		return storage.ObjectInfo{}, err
 	}
 	var total int64
-	parts := make([]*part, 0, len(partNumbers))
-	if opts.PartETags != nil && len(opts.PartETags) != len(partNumbers) {
-		return storage.ObjectInfo{}, fmt.Errorf("memory: %d part ETags for %d parts", len(opts.PartETags), len(partNumbers))
+	for _, p := range parts {
+		total += int64(len(p.Data))
 	}
-	for i, n := range partNumbers {
-		p, ok := u.parts[n]
-		if !ok {
-			return storage.ObjectInfo{}, fmt.Errorf("%w: part %d of upload %q", storage.ErrPartNotFound, n, uploadID)
-		}
-		if opts.PartETags != nil && p.info.ETag != opts.PartETags[i] {
-			return storage.ObjectInfo{}, fmt.Errorf("%w: part %d of upload %q was replaced (ETag %q, want %q)",
-				storage.ErrPartNotFound, n, uploadID, p.info.ETag, opts.PartETags[i])
-		}
-		parts = append(parts, p)
-		total += int64(len(p.data))
-	}
-	obj, _ := bk.objects.Get(key)
-	if err := checkPreconditions(obj, opts); err != nil {
+	if err := bk.ix.CheckPreconditions(key, opts); err != nil {
 		return storage.ObjectInfo{}, err
 	}
-	data := make([]byte, 0, total)
-	for _, p := range parts {
-		data = append(data, p.data...)
+	var (
+		data []byte
+		enc  stored
+	)
+	if c := wopts.Compression; c.Enabled() && total > 0 {
+		zw, err := compress.NewWriter((*appendWriter)(&data), c.Level)
+		if err != nil {
+			return storage.ObjectInfo{}, err
+		}
+		for _, p := range parts {
+			_, _ = zw.Write(p.Data) // appending to a slice cannot fail
+		}
+		if err := zw.Close(); err != nil {
+			return storage.ObjectInfo{}, err
+		}
+		enc = stored{compression: c.Algorithm, size: total}
+	} else {
+		data = make([]byte, 0, total)
+		for _, p := range parts {
+			data = append(data, p.Data...)
+		}
 	}
-	info, err := b.commitLocked(bk, key, data, meta, opts)
+	meta.Encryption = wopts.Encryption
+	info, err := b.commitLocked(bk, key, data, enc, meta, opts)
 	if err != nil {
 		return storage.ObjectInfo{}, err
 	}
-	bk.removeUpload(u)
+	bk.ix.RemoveUpload(uploadID)
 	return info, nil
 }
 
@@ -307,64 +257,9 @@ func (b *Backend) AbortMultipartUpload(ctx context.Context, bucketName, key, upl
 		return err
 	}
 	defer bk.mu.Unlock()
-	u, err := findUpload(bk, key, uploadID)
-	if err != nil {
+	if _, err := bk.ix.Upload(key, uploadID); err != nil {
 		return err
 	}
-	bk.removeUpload(u)
+	bk.ix.RemoveUpload(uploadID)
 	return nil
-}
-
-// addUpload registers u (bucket lock held).
-func (bk *bucket) addUpload(u *upload) {
-	bk.uploads[u.info.UploadID] = u
-	bk.uploadOrder.Set(uploadOrderKey(u.info.Key, u.info.Initiated, u.info.UploadID), u)
-}
-
-// removeUpload unregisters u (bucket lock held).
-func (bk *bucket) removeUpload(u *upload) {
-	delete(bk.uploads, u.info.UploadID)
-	bk.uploadOrder.Delete(uploadOrderKey(u.info.Key, u.info.Initiated, u.info.UploadID))
-}
-
-// appendEscapedKey appends key with every 0x00 byte escaped as 0x00 0xFF.
-// Followed by a terminator starting with 0x00 and a byte below 0xFF, the
-// byte-wise order of escaped keys is the order of the keys and no escaped
-// key is a prefix of another key's terminated encoding.
-func appendEscapedKey(dst []byte, key string) []byte {
-	for i := 0; i < len(key); i++ {
-		dst = append(dst, key[i])
-		if key[i] == 0 {
-			dst = append(dst, 0xff)
-		}
-	}
-	return dst
-}
-
-// uploadOrderKey returns the uploadOrder key of an upload: the escaped
-// object key, the terminator 0x00 0x01, the initiation time (sign-flipped
-// big-endian Unix seconds and nanoseconds) and the upload ID, so that the
-// byte-wise order of keys is the listing order (key, Initiated, UploadID).
-func uploadOrderKey(key string, initiated time.Time, uploadID string) string {
-	b := make([]byte, 0, len(key)+14+len(uploadID))
-	b = appendEscapedKey(b, key)
-	b = append(b, 0x00, 0x01)
-	b = binary.BigEndian.AppendUint64(b, uint64(initiated.Unix())^(1<<63))
-	b = binary.BigEndian.AppendUint32(b, uint32(initiated.Nanosecond()))
-	return string(append(b, uploadID...))
-}
-
-// uploadSeekKey returns where a walk after position p starts: at the
-// returned key (inclusive) or strictly after it.
-func uploadSeekKey(p storage.UploadPosition) (key string, inclusive bool) {
-	switch {
-	case p == storage.UploadPosition{}:
-		return "", true
-	case p.AfterKey:
-		// 0x00 0x02 sorts after the terminator 0x00 0x01 of every upload of
-		// p.Key and before every escaped greater key.
-		return string(append(appendEscapedKey(nil, p.Key), 0x00, 0x02)), true
-	default:
-		return uploadOrderKey(p.Key, p.Initiated, p.UploadID), false
-	}
 }

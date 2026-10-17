@@ -13,6 +13,7 @@ import (
 	"encoding/base64"
 	"log/slog"
 	"net/http"
+	"sync"
 	"time"
 
 	"github.com/seanmmitchell/gos3/internal/auth"
@@ -72,6 +73,15 @@ type Server struct {
 	// public access block) keyed by bucket + document kind; entries are
 	// revalidated against the stored bytes on every use.
 	configs *configCache
+
+	// bucketStateLocks serialize the read-check-write sequences that keep
+	// related bucket settings consistent (versioning vs. object lock and
+	// replication, bucket ACL vs. object ownership, policy vs. public
+	// access block). Buckets hash onto a fixed set of mutexes. They belong
+	// to the server, not the package: a handler may hold one while the
+	// backend calls a remote S3 service, which in tests is another Server
+	// in the same process.
+	bucketStateLocks [64]sync.Mutex
 
 	// handlerOverride lets tests replace operation handlers; nil in
 	// production.

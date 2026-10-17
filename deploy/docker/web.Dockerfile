@@ -15,9 +15,10 @@
 # probe its networks. Turn them on only where every client is trusted (for
 # example a port published on 127.0.0.1):
 #   docker run -p 127.0.0.1:3000:3000 -e GOS3_UI_LOCAL_DISCOVERY=true gos3-ui
-# They answer only for requests to an IP address or localhost: add the DNS
-# names the UI is opened with to GOS3_UI_ALLOWED_HOSTS (comma separated),
-# e.g. -e GOS3_UI_ALLOWED_HOSTS=console.example.com
+# They answer only for requests to an IP address or localhost, and with
+# presets (NUXT_PUBLIC_SERVERS) the console answers 421 to public DNS names:
+# add the DNS names the UI is opened with to GOS3_UI_ALLOWED_HOSTS (comma
+# separated), e.g. -e GOS3_UI_ALLOWED_HOSTS=console.example.com
 # See docs/web-ui.md.
 
 # Base images are pinned by digest; Dependabot proposes updates. Change the

@@ -2,12 +2,13 @@
 /**
  * Discovery on one gos3 server: configuration + identity, the peer table
  * (GET /discovery, auto-refreshed), probing a URL (POST /discovery/probe) and
- * network scans (POST /discovery/scan). Every peer can be added as a server,
- * optionally reusing this connection's credentials.
+ * network scans (POST /discovery/scan). Every peer can be added as a server
+ * at the address it was observed at, optionally (after a warning naming the
+ * host) reusing this connection's credentials.
  */
 import type { ConnectionInput } from '~/types/connection'
 import type { Peer, ScanRequest, ScanResult } from '~/types/admin'
-import { prefillFromPeer } from '~/components/servers/-form'
+import { peerAdvertisedEndpoint, prefillFromPeer } from '~/components/servers/-form'
 import { suggestCidr } from '~/components/discovery/-scan-form'
 import { canProbe } from '~/components/admin/-capabilities'
 import { AdminError } from '~/utils/admin/client'
@@ -117,6 +118,7 @@ watch([id, isGos3], ([, gos3]) => {
 
 const addOpen = ref(false)
 const addPrefill = ref<ConnectionInput | undefined>()
+const addAdvertised = ref<string | undefined>()
 
 function addPeer(p: Peer) {
   const prefill = prefillFromPeer(p)
@@ -125,6 +127,7 @@ function addPeer(p: Peer) {
     return
   }
   addPrefill.value = prefill
+  addAdvertised.value = peerAdvertisedEndpoint(p, prefill.endpoint)
   addOpen.value = true
 }
 </script>
@@ -279,6 +282,6 @@ function addPeer(p: Peer) {
       </template>
     </div>
 
-    <ServersFormModal v-model:open="addOpen" :prefill="addPrefill" :credentials-from="connection" />
+    <ServersFormModal v-model:open="addOpen" :prefill="addPrefill" :credentials-from="connection" :advertised-endpoint="addAdvertised" />
   </div>
 </template>

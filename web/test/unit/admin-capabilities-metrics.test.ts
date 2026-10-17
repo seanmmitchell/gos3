@@ -2,7 +2,10 @@ import { describe, expect, it } from 'vitest'
 import type { Capabilities, MinuteBucket, OpStats } from '~/types/admin'
 import {
   BUCKET_TABS,
+  bucketCompressionAccess,
+  bucketTabs,
   canCreateOwnKeys,
+  canManageCompression,
   canListUsers,
   canForceDeleteBucket,
   canManageOwnKeys,
@@ -48,6 +51,8 @@ describe('capability gating', () => {
     expect(canForceDeleteBucket('s3', ALL)).toBe(false)
     expect(canShowBucketUsage('s3', ALL)).toBe(false)
     expect(canManageOwnKeys('s3', false, true)).toBe(false)
+    expect(canManageCompression('s3', caps({ manageCompression: true }))).toBe(false)
+    expect(bucketCompressionAccess('s3', caps({ manageCompression: true }))).toBe('unavailable')
   })
 
   it('selects the overview mode from stats/info capabilities', () => {
@@ -127,6 +132,32 @@ describe('capability gating', () => {
     expect(resolveBucketTab('nope')).toBe('overview')
     expect(resolveBucketTab(undefined)).toBe('overview')
     expect(new Set(BUCKET_TABS.map(t => t.value)).size).toBe(BUCKET_TABS.length)
+    // A tab the connection does not offer falls back to the overview.
+    expect(resolveBucketTab('compression', bucketTabs('s3', NO_CAPS))).toBe('overview')
+    expect(resolveBucketTab('compression', bucketTabs('gos3', NO_CAPS))).toBe('compression')
+  })
+
+  it('gates bucket compression on manageCompression, hiding it for generic S3 and older gos3', () => {
+    expect(canManageCompression('gos3', caps({ manageCompression: true }))).toBe(true)
+    expect(bucketCompressionAccess('gos3', caps({ manageCompression: true }))).toBe('manage')
+    // Not allowed server-wide: a bucket-scoped grant may still allow it, so
+    // the tab offers the controls and shows the server's 403.
+    expect(canManageCompression('gos3', caps({ admin: true }))).toBe(false)
+    expect(bucketCompressionAccess('gos3', caps({ admin: true }))).toBe('try')
+    expect(bucketCompressionAccess('gos3', NO_CAPS)).toBe('try')
+    expect(bucketCompressionAccess('gos3', null)).toBe('unavailable')
+    // A server without compression has no manageCompression in /whoami.
+    const { manageCompression: _m, ...old } = caps({ admin: true })
+    expect(bucketCompressionAccess('gos3', old)).toBe('unavailable')
+    expect(NO_CAPS.manageCompression).toBe(false)
+
+    const values = (kind: 'gos3' | 's3', c: Capabilities | null) => bucketTabs(kind, c).map(t => t.value)
+    expect(values('gos3', caps({ manageCompression: true }))).toEqual(BUCKET_TABS.map(t => t.value))
+    expect(values('gos3', NO_CAPS)).toContain('compression')
+    expect(values('s3', ALL)).not.toContain('compression')
+    expect(values('gos3', old)).not.toContain('compression')
+    // Generic S3 has neither of the gos3-only tabs (compression, Backup & archive).
+    expect(values('s3', ALL)).toEqual(BUCKET_TABS.map(t => t.value).filter(v => v !== 'compression' && v !== 'restic'))
   })
 })
 

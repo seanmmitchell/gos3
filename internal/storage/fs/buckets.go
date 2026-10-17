@@ -175,6 +175,9 @@ func (b *Backend) SetBucketVersioning(ctx context.Context, name string, status s
 		return fmt.Errorf("fs: invalid versioning status %q", status)
 	}
 	return b.modifyBucket(ctx, name, func(rec *bucketRecord) error {
+		if rec.ObjectLockEnabled && status != storage.VersioningEnabled {
+			return errors.New("fs: object lock requires enabled versioning")
+		}
 		if status == storage.VersioningUnversioned && rec.Versioning != storage.VersioningUnversioned {
 			return errors.New("fs: a versioned bucket cannot become unversioned")
 		}
@@ -218,6 +221,29 @@ func (b *Backend) GetBucketConfig(ctx context.Context, bucket, key string) ([]by
 		return nil
 	})
 	return data, err
+}
+
+// ViewBucketConfig calls fn with a stored configuration document inside a
+// read transaction, without copying it (see storage.ConfigViewer): data
+// points into the database's memory map and is only valid during the call.
+func (b *Backend) ViewBucketConfig(ctx context.Context, bucket, key string, fn func([]byte) error) error {
+	if err := b.begin(ctx); err != nil {
+		return err
+	}
+	return b.view(func(tx *bbolt.Tx) error {
+		_, bb, err := loadBucket(tx, bucket)
+		if err != nil {
+			return err
+		}
+		var v []byte
+		if validConfigKey(key) {
+			v = bb.Bucket(subConfig).Get([]byte(key))
+		}
+		if v == nil {
+			return fmt.Errorf("%w: %s/%.64s", storage.ErrConfigNotFound, bucket, key)
+		}
+		return fn(v)
+	})
 }
 
 // PutBucketConfig stores a copy of a configuration document.

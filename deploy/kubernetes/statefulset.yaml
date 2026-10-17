@@ -22,6 +22,8 @@ spec:
       # SIGTERM → graceful shutdown (server.shutdown_timeout, default 30s).
       terminationGracePeriodSeconds: 45
       enableServiceLinks: false
+      # gos3 never talks to the Kubernetes API: no service account token.
+      automountServiceAccountToken: false
       securityContext:
         runAsNonRoot: true
         runAsUser: 65532
@@ -32,9 +34,10 @@ spec:
           type: RuntimeDefault
       containers:
         - name: gos3
-          # No imagePullPolicy: Kubernetes pulls ":latest" on every start
-          # and a pinned tag only when it is missing.
-          image: ghcr.io/seanmmitchell/gos3:latest
+          # A release tag (set in kustomization.yaml), pulled only when the
+          # node does not have it. Pin the digest too (kustomization.yaml)
+          # so a re-pushed tag cannot change what runs.
+          image: ghcr.io/seanmmitchell/gos3:0.1.0
           args: ["serve"]
           ports:
             - name: gos3
@@ -60,23 +63,29 @@ spec:
             # cluster should follow it.
             - name: GOS3_PUBLIC_URL
               value: http://$(POD_NAME).gos3-headless.$(POD_NAMESPACE).svc.cluster.local:9000
+            # Other host names clients use, such as the Ingress host
+            # (comma-separated; or server.allowed_hosts in configmap.yaml).
+            # Without it, the web UI and anonymous reads through that host
+            # answer 421/403.
+            # - name: GOS3_ALLOWED_HOSTS
+            #   value: s3.example.com,gos3,gos3.$(POD_NAMESPACE).svc.cluster.local
             - name: GOS3_DISCOVERY_DNS_SRV
               value: gos3-headless.$(POD_NAMESPACE).svc.cluster.local
-            # Root keys from the Secret gos3-root-credentials (create it
-            # yourself, see secret.example.yaml). Without it, each server
-            # generates a pair on first start and logs it once.
+            # Root keys from the Secret gos3-root-credentials, which you
+            # create yourself (see secret.example.yaml). It is required: the
+            # pod does not start (CreateContainerConfigError) until it
+            # exists. Generated keys would only be stored on the volume,
+            # which the shell-less image gives no easy way to read.
             - name: GOS3_ROOT_ACCESS_KEY
               valueFrom:
                 secretKeyRef:
                   name: gos3-root-credentials
                   key: access-key
-                  optional: true
             - name: GOS3_ROOT_SECRET_KEY
               valueFrom:
                 secretKeyRef:
                   name: gos3-root-credentials
                   key: secret-key
-                  optional: true
           volumeMounts:
             - name: data
               mountPath: /data

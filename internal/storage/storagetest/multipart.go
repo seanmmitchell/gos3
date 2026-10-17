@@ -5,6 +5,7 @@ import (
 	"cmp"
 	"crypto/md5"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"maps"
 	"slices"
@@ -24,6 +25,7 @@ func multipartTests() []testCase {
 		{"CompleteSubsetAndOrder", testMultipartCompleteSubset},
 		{"CompleteMissingPart", testMultipartCompleteMissingPart},
 		{"CompleteChecksPartETags", testMultipartCompletePartETags},
+		{"CompleteBeforePublish", testMultipartBeforePublish},
 		{"CompleteLarge", testMultipartCompleteLarge},
 		{"CompleteEmptyPart", testMultipartCompleteEmptyPart},
 		{"UploadGoneAfterCompleteOrAbort", testMultipartGone},
@@ -429,6 +431,61 @@ func testMultipartCompletePartETags(e *env) {
 		storage.CommitOptions{PartETags: []string{one.ETag, etagOf([]byte("TWO"))}})
 	e.noErr("CompleteMultipartUpload with the current part ETags", err)
 	e.wantContent("b", "k", "", []byte("oneTWO"))
+}
+
+// A failed final check must leave the upload retryable and publish no object.
+// A successful check sees the current bucket config and exact version time.
+func testMultipartBeforePublish(e *env) {
+	e.mkBucket("b")
+	u := e.createUpload("b", "k", storage.ObjectMeta{})
+	e.part("b", "k", u.UploadID, 1, []byte("part"))
+	meta := completeMeta(storage.ObjectMeta{}, []byte("part"))
+	e.noErr("PutBucketConfig", e.b.PutBucketConfig(e.ctx, "b", storage.ConfigPublicAccessBlock, []byte("current")))
+	denied := errors.New("publication refused")
+	called := false
+	_, err := e.b.CompleteMultipartUpload(e.ctx, "b", "k", u.UploadID, []int{1}, meta,
+		storage.CommitOptions{BeforePublish: func(got, current *storage.ObjectMeta, created time.Time, config func(string) []byte) error {
+			called = true
+			if current != nil {
+				e.t.Errorf("BeforePublish saw a nonexistent current object: %+v", current)
+			}
+			if string(config(storage.ConfigPublicAccessBlock)) != "current" {
+				e.t.Errorf("BeforePublish saw stale bucket configuration")
+			}
+			return denied
+		}})
+	if !called {
+		e.t.Error("BeforePublish was not called")
+	}
+	e.wantErr("CompleteMultipartUpload denied by BeforePublish", err, denied)
+	_, err = e.b.GetObjectInfo(e.ctx, "b", "k", "")
+	e.wantErr("GetObjectInfo after denied completion", err, storage.ErrObjectNotFound)
+	if _, err := e.b.ListParts(e.ctx, "b", "k", u.UploadID); err != nil {
+		e.t.Fatalf("upload removed by denied completion: %v", err)
+	}
+	var created time.Time
+	info, err := e.b.CompleteMultipartUpload(e.ctx, "b", "k", u.UploadID, []int{1}, meta,
+		storage.CommitOptions{BeforePublish: func(got, current *storage.ObjectMeta, at time.Time, config func(string) []byte) error {
+			created = at
+			got.ContentType = "application/from-callback"
+			return nil
+		}})
+	e.noErr("CompleteMultipartUpload after retry", err)
+	if created.IsZero() || !info.LastModified.Equal(created) || info.ContentType != "application/from-callback" {
+		e.t.Errorf("BeforePublish changes were not stored with its version time: %+v, %v", info, created)
+	}
+	second := e.createUpload("b", "k", storage.ObjectMeta{})
+	e.part("b", "k", second.UploadID, 1, []byte("next"))
+	_, err = e.b.CompleteMultipartUpload(e.ctx, "b", "k", second.UploadID, []int{1},
+		completeMeta(storage.ObjectMeta{}, []byte("next")), storage.CommitOptions{
+			BeforePublish: func(got, current *storage.ObjectMeta, at time.Time, config func(string) []byte) error {
+				if current == nil || current.ContentType != "application/from-callback" {
+					e.t.Errorf("BeforePublish did not see current object metadata: %+v", current)
+				}
+				return nil
+			},
+		})
+	e.noErr("CompleteMultipartUpload replacing current object", err)
 }
 
 func testMultipartCompleteLarge(e *env) {

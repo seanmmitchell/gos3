@@ -64,6 +64,11 @@ func (s *Server) authorizeOp(ctx context.Context, r *http.Request, rc *reqContex
 func (s *Server) authorizeOpWith(ctx context.Context, r *http.Request, rc *reqContext, attrs map[string][]string) error {
 	op := rc.op
 	v := rc.versionID()
+	// Only operations with a version-specific action address the supplied
+	// version. A write creates the current object even with a dummy versionId.
+	if op.VersionAction == "" {
+		v = ""
+	}
 	t := authzTarget{
 		Action:         op.action(v),
 		VersionID:      v,
@@ -94,10 +99,28 @@ func (s *Server) authorizeOpWith(ctx context.Context, r *http.Request, rc *reqCo
 	if err := s.authorizeTarget(ctx, r, rc, t); err != nil {
 		return err
 	}
+	if err := s.authorizeObjectRead(ctx, r, rc, t); err != nil {
+		return err
+	}
 	// An AuthzByHandler handler has authorized the caller: the rest of its
 	// body (if any) is no longer read before authorization.
 	rc.clearPreAuthLimit()
 	return nil
+}
+
+// authorizeObjectRead completes the authorization of an operation with
+// RequiresObjectRead: t, already allowed for the operation's own action, is
+// asked again for reading the object (s3:GetObject, or s3:GetObjectVersion
+// for a versionId), with the object-ACL fallback. Both decisions must
+// allow, so an explicit Deny of either action, or no Allow for either,
+// yields AccessDenied. Other operations return nil.
+func (s *Server) authorizeObjectRead(ctx context.Context, r *http.Request, rc *reqContext, t authzTarget) error {
+	if !rc.op.RequiresObjectRead || t.Key == "" {
+		return nil
+	}
+	t.Action = objectReadAction(t.VersionID)
+	t.ObjectRead = true
+	return s.authorizeTarget(ctx, r, rc, t)
 }
 
 // authorize is the handler helper for secondary resources: it authorizes
@@ -140,6 +163,11 @@ func (s *Server) authorizeTarget(ctx context.Context, r *http.Request, rc *reqCo
 		rc.authzReason = "root user"
 		return nil
 	}
+	if id.IsAnonymous {
+		if err := s.checkAnonymousRequest(ctx, r, rc); err != nil {
+			return err
+		}
+	}
 	if s.iam == nil {
 		rc.authzReason = "no IAM manager configured"
 		return s3err.ErrAccessDenied
@@ -164,7 +192,11 @@ func (s *Server) authorizeTarget(ctx context.Context, r *http.Request, rc *reqCo
 	}
 	req.Conditions = s.conditionContext(r, rc, t)
 	if t.Key != "" && s.needsExistingTags(ctx, id, bz) {
-		if o := s.authzObject(ctx, rc, t.Bucket, t.Key, t.VersionID); o.found && !o.info.DeleteMarker {
+		o := s.authzObject(ctx, rc, t.Bucket, t.Key, t.VersionID)
+		if o.err != nil {
+			return mapStorageError(o.err)
+		}
+		if o.found && !o.info.DeleteMarker {
 			for k, v := range o.info.Tags {
 				req.Conditions["s3:ExistingObjectTag/"+k] = []string{v}
 			}
@@ -174,6 +206,9 @@ func (s *Server) authorizeTarget(ctx context.Context, r *http.Request, rc *reqCo
 	dec := s.iam.Authorize(ctx, req)
 	if !dec.Allowed && !dec.ExplicitDeny && t.ObjectRead && t.Key != "" && !bz.aclsDisabled {
 		o := s.authzObject(ctx, rc, t.Bucket, t.Key, t.VersionID)
+		if o.err != nil {
+			return mapStorageError(o.err)
+		}
 		if info := o.info; o.found && !info.DeleteMarker {
 			if acl := effectiveACL(info.ACL, bz.pab); acl != "" {
 				req.ACL = acl
@@ -202,7 +237,8 @@ type objectRef struct{ Bucket, Key, VersionID string }
 // decision.
 type authzObject struct {
 	info  storage.ObjectInfo
-	found bool // false: the lookup failed (no such object or version, or an error)
+	found bool  // false: the lookup failed (no such object or version, or an error)
+	err   error // unexpected storage failure; never treat it as absent tags
 }
 
 // authzObject returns the version of bucket/key (vid "" = latest) that
@@ -219,6 +255,9 @@ func (s *Server) authzObject(ctx context.Context, rc *reqContext, bucket, key, v
 	}
 	info, err := s.backend.GetObjectInfo(ctx, bucket, key, vid)
 	o := authzObject{info: info, found: err == nil}
+	if err != nil && !errors.Is(err, storage.ErrObjectNotFound) && !errors.Is(err, storage.ErrVersionNotFound) {
+		o.err = err
+	}
 	if rc.authzObjects == nil {
 		rc.authzObjects = map[objectRef]authzObject{}
 	}
@@ -369,8 +408,10 @@ func (s *Server) conditionContext(r *http.Request, rc *reqContext, t authzTarget
 			c["s3:TlsVersion"] = []string{"1.3"}
 		}
 	}
-	set("aws:UserAgent", r.UserAgent())
-	set("aws:Referer", r.Referer())
+	// Client-supplied free-form values are truncated: policies glob-match
+	// and substitute them.
+	set("aws:UserAgent", iam.TruncateRequestValue(r.UserAgent()))
+	set("aws:Referer", iam.TruncateRequestValue(r.Referer()))
 	id := rc.identity
 	switch {
 	case id.IsAnonymous:
@@ -405,7 +446,7 @@ func (s *Server) conditionContext(r *http.Request, rc *reqContext, t authzTarget
 	q := rc.query
 	for _, p := range [...]string{"prefix", "delimiter", "max-keys"} {
 		if q.Has(p) {
-			c["s3:"+p] = []string{q.Get(p)}
+			c["s3:"+p] = []string{iam.TruncateRequestValue(q.Get(p))}
 		}
 	}
 	set("s3:VersionId", t.VersionID)

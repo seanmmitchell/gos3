@@ -6,6 +6,8 @@ import (
 	"log/slog"
 	"net"
 	"net/netip"
+	"sync"
+	"sync/atomic"
 
 	"golang.org/x/net/ipv4"
 	"golang.org/x/net/ipv6"
@@ -16,35 +18,67 @@ import (
 // (responder, browser), or an ephemeral socket sending queries (browser).
 // Every datagram is sent with IP TTL / hop limit 255 (RFC 6762 §11), and
 // the arrival interface and TTL / hop limit of received datagrams are
-// reported when the platform supports it.
+// reported: through golang.org/x/net where it implements control messages,
+// with WSARecvMsg on Windows (where it does not). When neither works
+// (cmsg false), both are reported as 0 (unknown).
 type mdnsSocket struct {
 	v6     bool
 	conn   net.PacketConn
 	p4     *ipv4.PacketConn // !v6
 	p6     *ipv6.PacketConn // v6
 	ifaces []net.Interface  // multicast interfaces of this family
+
+	// cmsg: received datagrams report their arrival interface and TTL /
+	// hop limit.
+	cmsg bool
+	// xcm: golang.org/x/net handles control messages, including the
+	// outgoing interface of a send.
+	xcm bool
+	// recv reads a datagram with control messages when !xcm (Windows).
+	recv func([]byte) (int, netip.AddrPort, mdnsMeta, error)
+	// ifMu serialises switching the multicast interface for a send when
+	// !xcm.
+	ifMu sync.Mutex
 }
+
+// mdnsNoTTLWarned makes the missing TTL check be logged once per process.
+var mdnsNoTTLWarned atomic.Bool
 
 func newMDNSSocket(conn net.PacketConn, v6 bool, ifaces []net.Interface, logger *slog.Logger) *mdnsSocket {
 	s := &mdnsSocket{v6: v6, conn: conn, ifaces: ifaces}
+	var cmErr error
 	var errs []error
 	if v6 {
 		s.p6 = ipv6.NewPacketConn(conn)
+		cmErr = s.p6.SetControlMessage(ipv6.FlagInterface|ipv6.FlagHopLimit, true)
 		errs = append(errs,
-			s.p6.SetControlMessage(ipv6.FlagInterface|ipv6.FlagHopLimit, true),
 			s.p6.SetMulticastHopLimit(255),
 			s.p6.SetHopLimit(255),
 			s.p6.SetMulticastLoopback(true))
 	} else {
 		s.p4 = ipv4.NewPacketConn(conn)
+		cmErr = s.p4.SetControlMessage(ipv4.FlagInterface|ipv4.FlagTTL, true)
 		errs = append(errs,
-			s.p4.SetControlMessage(ipv4.FlagInterface|ipv4.FlagTTL, true),
 			s.p4.SetMulticastTTL(255),
 			s.p4.SetTTL(255),
 			s.p4.SetMulticastLoopback(true))
 	}
 	if err := errors.Join(errs...); err != nil {
 		logger.Debug("mDNS: socket options", "err", err)
+	}
+	switch {
+	case cmErr == nil:
+		s.cmsg, s.xcm = true, true
+	default:
+		recv, err := platformReader(conn, v6)
+		if err == nil {
+			s.recv, s.cmsg = recv, true
+			break
+		}
+		if mdnsNoTTLWarned.CompareAndSwap(false, true) {
+			logger.Warn("mDNS: the arrival TTL of datagrams cannot be read on this platform; "+
+				"answering other hosts by multicast only", "err", errors.Join(cmErr, err))
+		}
 	}
 	return s
 }
@@ -61,6 +95,9 @@ type mdnsMeta struct {
 // readFrom reads one datagram: its length, source (with the IPv6 zone),
 // arrival interface and TTL / hop limit.
 func (s *mdnsSocket) readFrom(buf []byte) (int, netip.AddrPort, mdnsMeta, error) {
+	if s.recv != nil {
+		return s.recv(buf)
+	}
 	var (
 		n    int
 		src  net.Addr
@@ -94,6 +131,9 @@ func (s *mdnsSocket) readFrom(buf []byte) (int, netip.AddrPort, mdnsMeta, error)
 // writeTo sends b to dst out of interface ifIndex (0: the system's choice).
 func (s *mdnsSocket) writeTo(b []byte, dst netip.AddrPort, ifIndex int) error {
 	ua := net.UDPAddrFromAddrPort(dst)
+	if !s.xcm && ifIndex > 0 && dst.Addr().IsMulticast() {
+		return s.writeMulticastVia(b, ua, ifIndex)
+	}
 	var err error
 	if s.v6 {
 		var cm *ipv6.ControlMessage
@@ -108,6 +148,36 @@ func (s *mdnsSocket) writeTo(b []byte, dst netip.AddrPort, ifIndex int) error {
 		}
 		_, err = s.p4.WriteTo(b, cm, ua)
 	}
+	return err
+}
+
+// writeMulticastVia sends b to the group address ua out of interface
+// ifIndex by switching the socket's multicast interface, for platforms
+// where a send cannot carry the interface in a control message.
+func (s *mdnsSocket) writeMulticastVia(b []byte, ua *net.UDPAddr, ifIndex int) error {
+	var ifi *net.Interface
+	for i := range s.ifaces {
+		if s.ifaces[i].Index == ifIndex {
+			ifi = &s.ifaces[i]
+			break
+		}
+	}
+	if ifi == nil {
+		var err error
+		if ifi, err = net.InterfaceByIndex(ifIndex); err != nil {
+			return err
+		}
+	}
+	s.ifMu.Lock()
+	defer s.ifMu.Unlock()
+	if s.v6 {
+		if err := s.p6.SetMulticastInterface(ifi); err != nil {
+			return err
+		}
+	} else if err := s.p4.SetMulticastInterface(ifi); err != nil {
+		return err
+	}
+	_, err := s.conn.WriteTo(b, ua)
 	return err
 }
 

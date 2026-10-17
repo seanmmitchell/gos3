@@ -332,7 +332,7 @@ func TestIAMGovernanceBypassPermission(t *testing.T) {
 }
 
 // TestBucketPolicyPrincipals grants access to specific IAM users through a
-// bucket policy (principal ARNs as the web UI templates write them) and
+// bucket policy (local user names as the web UI templates write them) and
 // checks authenticated-read ACLs.
 func TestBucketPolicyPrincipals(t *testing.T) {
 	t.Parallel()
@@ -344,8 +344,8 @@ func TestBucketPolicyPrincipals(t *testing.T) {
 	friend := e.s3Client(e.createUser(t, friendName))
 	stranger := e.s3Client(e.createUser(t, strangerName))
 	policy := `{"Version":"2012-10-17","Statement":[
-	  {"Effect":"Allow","Principal":{"AWS":["arn:aws:iam::000000000000:user/` + friendName + `"]},"Action":["s3:GetObject","s3:PutObject"],"Resource":"arn:aws:s3:::` + b + `/shared/*"},
-	  {"Effect":"Allow","Principal":{"AWS":"arn:aws:iam::000000000000:user/` + friendName + `"},"Action":"s3:ListBucket","Resource":"arn:aws:s3:::` + b + `"}]}`
+	  {"Effect":"Allow","Principal":{"AWS":["` + friendName + `"]},"Action":["s3:GetObject","s3:PutObject"],"Resource":"arn:aws:s3:::` + b + `/shared/*"},
+	  {"Effect":"Allow","Principal":{"AWS":"` + friendName + `"},"Action":"s3:ListBucket","Resource":"arn:aws:s3:::` + b + `"}]}`
 	_, err := e.root().PutBucketPolicy(ctx(t), &s3.PutBucketPolicyInput{Bucket: aws.String(b), Policy: aws.String(policy)})
 	must(t, err, "PutBucketPolicy")
 

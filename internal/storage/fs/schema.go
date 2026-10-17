@@ -54,6 +54,16 @@ import (
 //	         uploads in listing order (key, initiation time, upload ID).
 //	         Created and checked against "upl" at Open, so databases
 //	         written before it existed are indexed on first use.
+//	"imp"    importedKey(key, version ID) -> 8-byte inverted sequence of the
+//	         version: the positions of versions stored with a version ID
+//	         taken from another backend (storage.VersionImporter, see
+//	         import.go), which unlike generated IDs does not embed the
+//	         sequence. Every non-null imported version has an entry; null
+//	         imports use "null". Created by the first import into the
+//	         bucket (so it is optional: absent means no imported versions,
+//	         and databases written before it existed need no migration);
+//	         versionPosition consults it before parsing an ID and
+//	         removeVersion deletes the entry of a removed version.
 //
 // Record values are encoded as one format byte followed by the encoded
 // record struct:
@@ -66,6 +76,13 @@ import (
 //	                      with U+FFFD; gob stores strings byte-exactly.
 //	recordFormatVersionV1 (3): compact binary encoding, always used for
 //	                      versionRecord (see codec.go); read in bulk by walks.
+//	recordFormatVersionV2 (4): recordFormatVersionV1 plus the compression
+//	                      fields, used only for versions stored compressed
+//	                      (so other records stay readable by older builds).
+//	recordFormatVersionV3 (5): recordFormatVersionV2 plus the encryption
+//	                      provider, used only for versions stored encrypted
+//	                      (native AES256 or restic), compressed or not.
+//	                      Builds that predate it cannot read these records.
 //
 // The format byte also allows switching encodings later without migrating
 // existing values.
@@ -89,7 +106,11 @@ var (
 	subParts    = []byte("parts")
 	// subUploadOrder is the listing-order index of uploads (uploadindex.go).
 	subUploadOrder = []byte("upk")
+	// subImported indexes imported version IDs (import.go). It is created
+	// lazily by the first import, so it is not in perBucketSubs.
+	subImported = []byte("imp")
 
+	// perBucketSubs are the nested buckets created with every bucket.
 	perBucketSubs = [][]byte{subVersions, subCurrent, subNull, subData, subConfig, subUploads, subParts, subUploadOrder}
 
 	keyFormat = []byte("format")
@@ -139,6 +160,11 @@ type versionRecord struct {
 	LastModified time.Time          `json:"mtime"`
 	DataID       string             `json:"data,omitempty"` // "" for delete markers and empty objects
 	Meta         storage.ObjectMeta `json:"meta"`
+	// Compression is the algorithm the data file is compressed with ("" =
+	// stored as is); StoredSize is then the data file's size, while Size
+	// stays the size of the content.
+	Compression string `json:"cmp,omitempty"`
+	StoredSize  int64  `json:"ssize,omitempty"`
 }
 
 func (r *versionRecord) info(bucket, key string, latest bool) storage.ObjectInfo {
@@ -153,6 +179,7 @@ func (r *versionRecord) info(bucket, key string, latest bool) storage.ObjectInfo
 	}
 	if !r.DeleteMarker {
 		oi.ObjectMeta = r.Meta
+		oi.Compression, oi.StoredSize = r.Compression, r.StoredSize
 	}
 	return oi
 }
@@ -178,12 +205,18 @@ func (r *uploadRecord) info(bucket, uploadID string) storage.UploadInfo {
 
 // partRecord is the persisted form of an uploaded part.
 type partRecord struct {
+	// KeyID is the data ID the part file's stream key is derived from (see
+	// objectDataKey) when the part is stored encrypted, "" otherwise.
+	KeyID        string            `json:"keyID,omitempty"`
 	File         string            `json:"file"` // file name inside the upload directory
 	Size         int64             `json:"size"`
 	LastModified time.Time         `json:"mtime"`
 	ETag         string            `json:"etag"`
 	Checksums    map[string]string `json:"checksums,omitempty"`
 }
+
+// encrypted reports whether the part file is stored encrypted.
+func (r *partRecord) encrypted() bool { return r.KeyID != "" }
 
 func (r *partRecord) info(number int) storage.PartInfo {
 	return storage.PartInfo{
@@ -233,12 +266,12 @@ func decodeRecord(data []byte, v any) error {
 		err = json.Unmarshal(data[1:], v)
 	case recordFormatGob:
 		err = gob.NewDecoder(bytes.NewReader(data[1:])).Decode(v)
-	case recordFormatVersionV1:
+	case recordFormatVersionV1, recordFormatVersionV2, recordFormatVersionV3:
 		r, ok := v.(*versionRecord)
 		if !ok {
 			return fmt.Errorf("%w: version record format for %T", errCorrupt, v)
 		}
-		err = decodeVersionRecord(data[1:], r)
+		err = decodeVersionRecord(data[1:], r, data[0])
 	default:
 		return fmt.Errorf("%w: unknown record format %d", errCorrupt, data[0])
 	}
@@ -545,8 +578,16 @@ func latestVersion(bb *bbolt.Bucket, key string) (*versionRecord, []byte, error)
 	return &rec, bytes.Clone(k), nil
 }
 
+// importedKey returns the "imp" key of the imported version versionID of
+// key. Version IDs never contain a 0x00 byte, so the escaped, terminated key
+// prefix keeps entries of different keys apart.
+func importedKey(key, versionID string) []byte {
+	return append(keyVersionsPrefix(key), versionID...)
+}
+
 // versionPosition resolves a version ID of key to its "ver" key without
-// checking that the version exists. "null" is resolved via the null index.
+// checking that the version exists. "null" is resolved via the null index,
+// imported IDs via the "imp" index, other IDs by the sequence they embed.
 func versionPosition(bb *bbolt.Bucket, key, versionID string) ([]byte, bool) {
 	if versionID == storage.NullVersionID {
 		inv := bb.Bucket(subNull).Get([]byte(key))
@@ -554,6 +595,11 @@ func versionPosition(bb *bbolt.Bucket, key, versionID string) ([]byte, bool) {
 			return nil, false
 		}
 		return versionKey(key, binary.BigEndian.Uint64(inv)), true
+	}
+	if imp := bb.Bucket(subImported); imp != nil {
+		if inv := imp.Get(importedKey(key, versionID)); len(inv) == 8 {
+			return versionKey(key, binary.BigEndian.Uint64(inv)), true
+		}
 	}
 	inv, ok := parseVersionID(versionID)
 	if !ok {
@@ -604,6 +650,30 @@ func findVersion(bb *bbolt.Bucket, bucket, key, versionID string) (*versionRecor
 	return &rec, vk, bytes.Equal(latestKey, vk), nil
 }
 
+// newerVersions returns at most limit versions of key that are newer than
+// the one stored at vk, nearest first; the key's latest version has
+// IsLatest set (see storage.NewerVersionsDeleter).
+func newerVersions(bb *bbolt.Bucket, bucket, key string, vk []byte, limit int) ([]storage.ObjectInfo, error) {
+	p := keyVersionsPrefix(key)
+	c := bb.Bucket(subVersions).Cursor()
+	var newer []storage.ObjectInfo
+	c.Seek(vk)
+	k, v := c.Prev()
+	for ; k != nil && bytes.HasPrefix(k, p) && len(newer) < limit; k, v = c.Prev() {
+		var rec versionRecord
+		if err := decodeRecord(v, &rec); err != nil {
+			return nil, err
+		}
+		newer = append(newer, cloneInfo(rec.info(bucket, key, false)))
+	}
+	// Versions sort newest first: the last one collected is the latest
+	// when nothing of key precedes it.
+	if n := len(newer); n > 0 && (k == nil || !bytes.HasPrefix(k, p)) {
+		newer[n-1].IsLatest = true
+	}
+	return newer, nil
+}
+
 // refreshCurrent recomputes the "cur" entry of key from its newest version.
 func refreshCurrent(bb *bbolt.Bucket, key string) error {
 	cur := bb.Bucket(subCurrent)
@@ -623,8 +693,8 @@ func refreshCurrent(bb *bbolt.Bucket, key string) error {
 }
 
 // removeVersion deletes the version stored at vk (with record rec) of key,
-// maintaining the null and data indexes. It returns the data ID to unlink
-// after commit ("" if none). The caller refreshes "cur".
+// maintaining the null, imported-ID and data indexes. It returns the data ID
+// to unlink after commit ("" if none). The caller refreshes "cur".
 func removeVersion(bb *bbolt.Bucket, key string, vk []byte, rec *versionRecord) (string, error) {
 	if err := bb.Bucket(subVersions).Delete(vk); err != nil {
 		return "", err
@@ -632,6 +702,15 @@ func removeVersion(bb *bbolt.Bucket, key string, vk []byte, rec *versionRecord) 
 	if rec.VersionID == storage.NullVersionID {
 		if err := bb.Bucket(subNull).Delete([]byte(key)); err != nil {
 			return "", err
+		}
+	} else if imp := bb.Bucket(subImported); imp != nil {
+		// Only the entry that points at this version (generated IDs have
+		// none).
+		ik := importedKey(key, rec.VersionID)
+		if inv := imp.Get(ik); len(inv) == 8 && bytes.HasSuffix(vk, inv) {
+			if err := imp.Delete(ik); err != nil {
+				return "", err
+			}
 		}
 	}
 	if rec.DataID != "" {

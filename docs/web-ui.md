@@ -21,7 +21,11 @@ the internet.
 
 - **Dashboard** of all configured servers with status, version and usage.
 - **Buckets**: create and delete; versioning, policy editor with templates,
-  CORS, lifecycle, tags, object lock, default encryption and ACL settings.
+  CORS, lifecycle, tags, object lock, default encryption and ACL settings,
+  and (gos3 only) compression, restic encryption providers, the restic
+  archive, recovery information and whole-bucket snapshots
+  ([Backup & archive](#backup--archive)), and copying or mirroring a bucket
+  into another ([Jobs](#jobs)).
 - **Object browser**: folders, drag-and-drop uploads (multipart with parallel
   parts and progress), downloads, delete, rename and copy, metadata and tag
   editors, versions, and presigned share links.
@@ -29,8 +33,19 @@ the internet.
 - **Server overview and settings** (gos3 only): version, request metrics,
   storage and disk usage, and every runtime setting from
   [configuration.md](configuration.md#runtime-settings-settingsjson).
+  Server and bucket settings show one section at a time, picked with the
+  chips under the page header (kept in the URL as `?tab=`); on the server
+  settings page one Save covers every section, and the chips mark sections
+  with unsaved changes or invalid fields.
 - **Discovery** (gos3 only): peers seen by each connected server, network
   scans, local discovery from the UI host, and one-click "add server".
+- **Storage** (gos3 only): the server's storage backings (directories,
+  memory and S3 services, configurable live), for S3 backings the
+  account's remote buckets and the containers of wrapped buckets, and per
+  bucket its placement, replication, moves and promotions (see
+  [Storage backings and placement](#storage-backings-and-placement)).
+- **Jobs** (gos3 only): copy and mirror jobs and restic snapshot jobs,
+  with their progress (see [Jobs](#jobs)).
 
 Pages are shown according to the signed-in identity's permissions (from
 `GET /_gos3/admin/v1/whoami`). For example, Users appears only with
@@ -57,9 +72,57 @@ policies and clears that option.
   card says that `admin:ProbeNetwork` is missing instead. With a server that
   does not report `probe` yet, the UI falls back to `discovery`
   (`admin:GetDiscovery`), the permission such servers checked.
+- **Force delete and object lock.** Force delete (`admin:ForceDeleteBucket`,
+  bucket list and the bucket's Danger zone) is refused with a 409 while
+  versions are under legal hold or COMPLIANCE retention; the UI shows the
+  server's explanation. Versions under GOVERNANCE retention are deleted only
+  with "Bypass governance retention" (Danger zone checkbox, or the follow-up
+  confirmation on the bucket list), which sends
+  `bypassGovernanceRetention=true` and needs `s3:BypassGovernanceRetention`.
+- **Encryption.** The bucket's Encryption tab has two independently saved
+  cards. *Default encryption* (S3 API, every server) chooses whether uploads
+  without encryption headers are encrypted: None or SSE-S3, plus SSE-KMS with a
+  key ID and bucket key on generic S3. On gos3 an AWS KMS default stored by an
+  older version is flagged; gos3 applies it as SSE-S3, and the card pre-selects
+  SSE-S3 so saving replaces it. *SSE-S3 implementation* (gos3 admin API,
+  `admin:GetBucketEncryption` / `admin:PutBucketEncryption`) chooses native
+  AES-256-GCM or restic for default encryption and for uploads requesting
+  AES256. An implementation the server reports unavailable for the bucket is
+  disabled with the reason: native AES-256-GCM when an S3 backing holding
+  the bucket has no encryption key (set one under the server's Storage
+  settings), restic when it is not installed or a copy of the bucket is on a
+  memory backing or an S3 backing without an encryption key. Native buckets
+  of S3 backings offer neither: their objects are stored as they are. Users without
+  those admin permissions, and servers without the endpoint, see a note there
+  while default encryption keeps working. Restic repositories live on the
+  bucket's backings, with nothing to configure: on a filesystem backing in
+  its data directory, on an S3 backing in the container of the (wrapped)
+  bucket; replicas and moves use the destination backing. Repository passwords are
+  server-managed. This encrypts new writes; older objects are unchanged. See
+  [encryption.md](encryption.md). The card shows the provider's scope
+  (restic for every write: the per-version archive), warns when switching
+  to native AES-256-GCM would end the archive, and links to **Backup &
+  archive**, where the scope is changed and the repository's credentials
+  are shown (see [Backup & archive](#backup--archive)).
+- **Compression.** The server settings page has a Compression section where
+  the administrator chooses the mode (Optional, Enforced, Disabled), the
+  DEFLATE level, the minimum size and the media types to skip. A bucket's
+  Compression tab (gos3 servers that report the `manageCompression`
+  capability) shows whether new objects are compressed, the bucket's own
+  setting and the server mode; while the administrator enforces or disables
+  compression the switch is locked in the direction the server would refuse
+  (409), and "Reset to server default" removes the bucket's setting. The tab
+  is shown to everyone on such servers, since a grant of
+  `admin:PutBucketCompression` scoped to some buckets does not show in the
+  capabilities; a refused change shows the server's 403. Bucket lists, the
+  bucket overview and the server overview show the stored size and the
+  saving next to the size when compression saves space. See
+  [operations.md](operations.md#compression).
 - **Policy editor and simulator.** Admin actions are evaluated against
-  `arn:gos3:admin:::user/<name>`, `arn:gos3:admin:::policy/<name>` and
-  `arn:gos3:admin:::bucket/<name>` (see [admin-api.md](admin-api.md));
+  `arn:gos3:admin:::user/<name>`, `arn:gos3:admin:::policy/<name>`,
+  `arn:gos3:admin:::bucket/<name>` and `arn:gos3:admin:::backing/<name>`
+  (the remote buckets and containers of an S3 backing; see
+  [admin-api.md](admin-api.md#resources-and-condition-keys));
   `*` and `arn:gos3:admin:::*` match all of them. The policy editor lists
   these forms and the `admin:PolicyName` condition key (the policies a
   CreateUser / UpdateUser request attaches), and the "Manage some users"
@@ -68,6 +131,179 @@ policies and clears that option.
   (it lists all users; actions on users outside the pattern are refused by
   the server and shown as errors). For an admin action the simulator asks for an admin
   resource instead of a bucket and key (empty = service level).
+
+### Storage backings and placement
+
+On servers with several storage backings (see
+[admin-api.md](admin-api.md#storage-backings-and-bucket-placement)
+and [backings.md](backings.md)):
+
+- **Storage** (sidebar, needs `admin:ListBackings`, whoami capability
+  `viewStorage`) shows every backing with its kind (Disk, Memory or Remote
+  S3), its path or, for S3 backings, its home (`s3://bucket/prefix/`, or
+  "No home: records kept on this server"), the kind of new buckets and the
+  number of native and wrapped buckets, health (the last error of an
+  unhealthy one, for example an unreachable S3 service), last check, bucket
+  and replica counts and, for disks, disk usage. It refreshes every 10
+  seconds. S3 backings have a **Manage** button leading to the backing's
+  page (below).
+- **Configure backings** on the Storage page (shown with the
+  `manageConfig` capability, `admin:UpdateConfig`) adds, edits and removes additional backings and
+  picks the default backing for new buckets (see
+  [backings.md](backings.md#configuring-backings-live)). The backend is
+  Filesystem (a directory on the server), Memory or **S3 service**. The S3
+  form asks for the endpoint, region, home bucket and prefix (leave the
+  bucket empty to keep the backing's records on the server; wrapped
+  buckets then need a container added later), the **default bucket kind**
+  (Automatic: wrapped with a home, else native; Wrapped; Native), the
+  access key and the secret key. **Advanced** holds the addressing style,
+  the part size (MiB) and the encryption key, with **Show** and
+  **Generate** buttons and a warning that the key is needed for AES256 and
+  restic and that losing it makes encrypted objects unreadable. Saved
+  secrets are never shown: their fields say "Saved – leave blank to keep",
+  or name the `GOS3_BACKING_<NAME>_*` variable they come from. A saved
+  backing's name is fixed; while it holds buckets or replicas its backend,
+  directory and home are locked too (the connection settings, credentials
+  and default bucket kind stay editable) and it cannot be removed. A
+  warning says when the server has no data directory, so changes are lost
+  on restart.
+- **The backing's page** (Storage → **Manage** on an S3 backing; also
+  `viewStorage`) has three sections, picked with chips (kept in `?tab=`):
+  - **Overview**: the home (or that records are kept on the server), the
+    default bucket kind, the kinds offered, the default container, health,
+    and the counts of native and wrapped buckets and containers. A backing
+    without any container says that its new buckets are native.
+  - **Remote buckets** (`admin:ListRemoteBuckets` on the backing, whoami
+    capability `browseRemote`): the account's buckets, page by page with a
+    name prefix filter, each with its status (Native bucket, Home,
+    Container, Used elsewhere, gos3 data, Inaccessible, Unmanaged; see
+    [backings.md](backings.md#remote-bucket-browser)) and its uses, linking
+    to the gos3 bucket of a native one. **Check for gos3 data** looks into
+    every unmanaged bucket (one request each). Depending on the status and
+    the identity's capabilities, a row offers **Open bucket** and
+    **Release…** (native), **Adopt as native bucket…**, **Use as
+    container…** and **Create wrapped bucket in it…** (unmanaged), or
+    **Attach as container…** (gos3 data). The toolbar has **Create remote
+    bucket…** (`createRemote`) and **Adopt by name…** (`adoptRemote`), which
+    also works when the credentials cannot list the account's buckets (the
+    list then says it is incomplete).
+  - **Containers**: the home and the added containers with their location,
+    role, state and number of wrapped buckets. With `manageContainers`
+    (plus `createRemote` or `adoptRemote`) **Add container…** adds a new
+    dedicated remote bucket or a prefix of an existing one (empty, unless
+    **Attach an existing gos3 store** is ticked), each container can be
+    made the default of new wrapped buckets, and an empty container other
+    than the home and the default can be removed (gos3 forgets it; its
+    remote data stays). The page refreshes by itself while a container is
+    loading.
+
+  Container labels are shown to everyone who can create buckets; do not
+  put secrets in them.
+- **Bucket settings → Placement** (also `viewStorage`) shows the replication
+  mode and each member (primary, replicas, a move target) with its state
+  (`in sync`, `syncing`, `lagging`, `degraded`, `offline`), pending changes,
+  copy progress, last full sync and last error, and a banner while the
+  bucket moves. The tab polls every 3 seconds while a copy runs, changes are
+  pending or a move is in progress.
+- With `admin:UpdateBucketPlacement` (capability `manageStorage`) the tab
+  changes the mode (single, active-passive, active-active) and the replica
+  backings (removing a replica asks first, because its copy is deleted),
+  moves the bucket (or one replica) to a backing without a copy (on an S3
+  backing, into a chosen container, the default one preselected: copies
+  there are wrapped buckets), cancels a
+  move while it is copying, promotes a replica to primary and resyncs one or
+  all replicas. "Force promote" is offered when the replica is not in sync
+  or the primary is offline; it asks you to type the backing name, because
+  changes not yet copied to the replica are lost. Without the capability the
+  tab is read-only. A native bucket's tab only explains that native buckets
+  can be neither replicated nor moved.
+- The *Create bucket* dialog offers the backings (for every user, from
+  `whoami`) when there is more than one, with the default preselected. On
+  an S3 backing it asks for the **bucket kind** (the backing's default
+  preselected): a **wrapped** bucket picks its container (the default
+  container preselected; a backing without containers says that an
+  administrator can add one), a **native** bucket the remote bucket to
+  create (the bucket name by default). Versioning and object lock of a
+  native bucket are set on its remote bucket, and the server refuses them
+  (Not Implemented) when that service cannot. Identities that may adopt
+  remote buckets (`adoptRemote`) also get **Adopt an existing remote
+  bucket…**, which opens the backing's Remote buckets section prefilled.
+- **Bucket settings** shows a native or wrapped bucket's kind next to its
+  backing (with its location on hover). The Versioning and Object lock tabs
+  of a bucket whose storage cannot keep versions (a native bucket on a
+  service without versioning) say so. A native bucket's **Danger zone**
+  explains that deleting removes the remote bucket only when gos3 created
+  it, warns that force delete deletes the objects in the remote bucket
+  (also for other tools using it), and offers **Release** (gos3 forgets the
+  bucket and its settings; the remote bucket and its objects stay).
+- The bucket list shows the primary backing, the mode with the number of
+  copies (for example `AP ×2`) and `moving`, when the server reports
+  placement and the buckets are not all on one backing.
+- Servers that do not report `viewStorage` (older versions) show neither the
+  page nor the tab.
+
+### Jobs
+
+Copy and mirror jobs ([jobs.md](jobs.md)) and restic snapshot, restore
+and prune jobs:
+
+- **Jobs** (sidebar, whoami capability `viewJobs`, `admin:ListJobs`) lists
+  the jobs with their kind, source and target, state and phase, progress,
+  the estimated time left of a copy or the lag of a mirror, and the last
+  error, filtered by kind, state and bucket. It refreshes every 3 seconds
+  while a job is busy, otherwise every 15 seconds. With `updateJobs`
+  (`admin:UpdateJob`; the server checks it on both buckets of a job, and
+  a refused change shows its 403) jobs can be paused, resumed (failed jobs
+  too), run now (a waiting mirror or retry), canceled and, once finished,
+  deleted.
+- **Copy / Mirror…** (`manageJobs`, `admin:CreateCopyJob`) in a bucket's
+  settings header and in the object browser opens a wizard for the
+  bucket: the target, a new bucket (name, backing and, on an S3 backing,
+  its kind with its container or remote bucket, object lock) or an
+  existing one, each with an optional prefix, and the source prefix; the
+  [options](jobs.md#sources-and-targets) (versions, with *all* disabled
+  and explained when the target cannot keep them, bucket configuration, a
+  non-empty target, encryption, retention, compression, mirror options,
+  parallelism); and a review of the server's dry run, with the normalized
+  job and its warnings, before **Create job**.
+- A bucket's **Overview** tab has a Jobs card with the copy, mirror and
+  restic jobs whose source or target is the bucket (hidden without
+  `admin:GetJob` on it).
+
+### Backup & archive
+
+Bucket settings → **Backup & archive** (gos3 servers) gathers the restic
+features of a bucket ([encryption.md](encryption.md)):
+
+- **Archive**: the per-version archive toggle (restic provider with scope
+  *every write*, [Archiving every write](encryption.md#archiving-every-write)),
+  with whether the bucket can use it (the reason when not: restic not
+  installed, a native or memory bucket, an S3 backing without an
+  encryption key), a warning about its cost, and the current scope. Saving
+  needs `admin:PutBucketEncryption`.
+- **Recovery**: where each copy's archive repository and the snapshot
+  repository live, their recovery records and password sources, and
+  bash and PowerShell commands for the `restic` tool that list the
+  snapshots without gos3
+  ([Recovery without gos3](encryption.md#recovery-without-gos3)).
+  **Reveal credentials…** (whoami capability `revealResticCredentials`,
+  `admin:GetResticCredentials`) asks for confirmation, then shows the
+  password and the environment in a dialog; nothing is stored in the
+  browser, and the server logs every reveal.
+- **Snapshots** ([Whole-bucket snapshots](encryption.md#whole-bucket-snapshots)):
+  the schedule (interval, time of day, consistency, prefix, retention with
+  presets, the target repository, the bucket's own or a backing's aux
+  repository, and pruning, with a note when pruning would hold up the
+  bucket's archive writes); its status (last and next run, last error, the
+  running job); **Snapshot now**; **Prune**; and the snapshots with
+  **Restore to bucket…** and **Forget** (not for partial snapshots, which
+  cannot be restored). Changing the schedule, forgetting and pruning need
+  `manageSnapshots` (`admin:PutBucketSnapshots`), **Snapshot now**
+  `runSnapshots` (`admin:RunBucketSnapshot`), and restoring
+  `restoreSnapshots` (`admin:RestoreBucketSnapshot`) plus `manageJobs`
+  (`admin:CreateCopyJob` on the target). A new schedule leaves the
+  repository to the server unless one is chosen. The card polls while a
+  snapshot job runs.
 
 ### Object browser notes
 
@@ -79,6 +315,11 @@ policies and clears that option.
   The UI says so and still allows Copy, Move and Delete for them (their
   links use `?key=` / `?prefix=`). The UI itself never creates such keys:
   uploads, new folders, renames and copy/move destinations are validated.
+- Bucket names `.` and `..` (and names with `/`, `\` or control characters)
+  are refused before any request is sent, for the same reason.
+- The Markdown preview renders in linear time and nests block quotes at
+  most 16 levels deep (deeper `>` markers stay text); if rendering fails,
+  the raw text is shown.
 - Copy, move and rename refuse a destination inside the source folder, and
   ask before overwriting existing objects at the destination.
 - Uploads (including folder uploads and drag-and-drop) also ask before
@@ -136,6 +377,49 @@ where `kind` is `gos3` or `s3`.
   connections and remembered secrets). The active server and secrets kept
   only for the session stay per tab.
 - Downloads and share links are presigned URLs (up to 7 days).
+- Keys entered on the sign-in page ("Connect to a server") are checked
+  against the endpoint you typed and stored only with that endpoint: on a
+  new connection, or on an existing one for the same endpoint that has no
+  keys or the same access key. A stored connection that merely reports the
+  same server ID (server IDs are not authenticated) is never given them.
+- `/connect?endpoint=<url>&name=<name>` only prefills the form; it is never
+  submitted automatically. The page says that a link filled in the address
+  (and name). When its origin (scheme, host and port) is neither the UI's
+  own nor one of your configured servers', you must tick "I trust <origin>"
+  before connecting. Plain http for a host the UI or a configured server
+  reaches over https also needs the tick, and the page warns about it.
+  The post-login `?redirect=` accepts only in-app paths without `.`/`..`
+  segments, encoded slashes or backslashes.
+- **Adding discovered servers.** "Add as server" (Discover page and a
+  server's Discovery page) prefills the address the server was observed and
+  verified at, never the endpoint it advertises about itself, which is shown
+  only as an unverified hint. Credentials are never prefilled. "Use the same
+  credentials as <server>" is off by default; when it would sign requests
+  for another host, the form names that host, warns that discovery is
+  unauthenticated (and when the keys are root keys), and saves or tests
+  only after "I trust <host> with <server>'s keys" is ticked. A server
+  reporting the server ID of a configured connection at another address is
+  flagged and added as a separate connection; the configured one is not
+  changed.
+- On the Discover page, results from different sources are merged by
+  server ID only when they describe the same host (a shared address, or
+  each advertising the other's address). Otherwise the row keeps the first
+  record, is marked "ID conflict" and lists the other addresses as
+  conflicting, and it offers no credential reuse. Credentials are only
+  offered from a connected server whose own peer table lists the
+  prefilled address. An https endpoint is never replaced by an http one.
+  A discovered server counts as "Configured" (linked, and hidden by "hide
+  configured") only when a connection points at an address it was observed
+  at. One that only reports a configured server's ID is marked "ID of
+  <name>" and stays listed.
+- The `.env` and `~/.aws` snippets shown after creating an access key are
+  only offered when the returned access key ID, secret key, region and
+  endpoint have the expected format (no line breaks or control
+  characters); otherwise the dialog says so and offers no snippets or
+  downloads. Caller-chosen secret keys must be 16–128 printable characters.
+  Choosing the access key ID yourself needs `admin:CreateAccessKey` at
+  service level; admins scoped to some users get a 403 (the form says so)
+  and can create generated key pairs.
 
 ## Embedded mode
 
@@ -149,9 +433,16 @@ connection ("this server"). You only need to enter the access keys. It can
 manage other servers too, as long as their CORS settings allow the hosting
 server's origin.
 
-UI responses carry `X-Frame-Options: DENY`, `Content-Security-Policy:
-frame-ancestors 'none'`, `Referrer-Policy: no-referrer` and `nosniff`. Hashed
-assets are cached as immutable; everything else is revalidated.
+UI responses carry `X-Frame-Options: DENY`, `Referrer-Policy: no-referrer`,
+`nosniff` and a `Content-Security-Policy` with `default-src 'self'`,
+`object-src 'none'`, `base-uri 'none'`, `form-action 'none'` and
+`frame-ancestors 'none'`. Its `script-src` allows `'self'` plus the SHA-256
+hashes of the inline scripts in the embedded HTML (Nuxt's import map and
+runtime config, the color-mode bootstrap), which gos3 computes from the build
+at startup, so a rebuilt UI needs no extra step. `connect-src`, `img-src` and
+`media-src` allow any http(s) origin because the UI talks to, and previews
+objects from, any server you add. Hashed assets are cached as immutable;
+everything else is revalidated.
 
 ## Standalone mode
 
@@ -172,6 +463,14 @@ docker run -p 3000:3000 gos3-ui
 The `docker compose --profile ui` demo in the repository root runs it next to
 two gos3 nodes (see [deployment.md](deployment.md#docker-compose)).
 
+The Node server sends the embedded UI's headers on every response
+(`X-Frame-Options: DENY`, `Referrer-Policy: no-referrer`, `nosniff` and the
+same `Content-Security-Policy`) plus `Permissions-Policy` denying camera,
+microphone, geolocation, payment and USB. Because the runtime config it
+inlines comes from the environment, the `script-src` hashes of each page's
+inline scripts are computed when the page is rendered. `nuxt generate`
+ignores these settings; gos3 sends its own headers for the embedded build.
+
 ### Presets
 
 Ship a list of servers so that users only enter credentials:
@@ -180,7 +479,9 @@ Ship a list of servers so that users only enter credentials:
   `NUXT_PUBLIC_SERVERS='[{"name":"NAS","endpoint":"http://10.0.0.5:9000","kind":"gos3"}]'`.
 - **`servers.json`** (both modes, at build time): copy
   `web/public/servers.example.json` to `web/public/servers.json` **before**
-  building. It is served as `<base>/servers.json`. Adding the file to the build
+  building. It is served as `<base>/servers.json` (by the standalone Node
+  server from a route behind the Host check below, not as a static file;
+  `servers.example.json` is not served there). Adding the file to the build
   output afterwards has no effect, because both builds bundle `public/` at
   build time.
 
@@ -194,8 +495,30 @@ Ship a list of servers so that users only enter credentials:
 Accepted keys: `id`, `name`, `endpoint` (or `url`, required), `region`,
 `kind` (`gos3` or `s3`), `forcePathStyle` (or `pathStyle`), `color`,
 `accessKeyId` (or `accessKey`) and `secretAccessKey` (or `secretKey`). Presets
-are read-only in the UI apart from their credentials. **Do not put secret keys
-in presets**: anyone who can load the UI can read them.
+are read-only in the UI apart from their credentials. **Secret keys in presets
+are ignored** (with a browser console warning), because anyone who can load
+the UI can read presets; an `accessKeyId` only prefills the sign-in. When a
+preset's endpoint changes, the secret key a user entered for it is
+cleared, so it is never signed for the new host without the user signing
+in again. The embedded UI's
+`servers.json` is served without `secretAccessKey`/`secretKey` (gos3 strips
+them and logs a warning at startup, and does not serve a `servers.json` that
+is not valid JSON); gos3 also warns when a build has secrets baked in through
+`NUXT_PUBLIC_SERVERS`. `pnpm build` and `pnpm generate` fail when
+`public/servers.json` or `NUXT_PUBLIC_SERVERS` contains a non-empty
+`secretAccessKey`/`secretKey` (set `GOS3_UI_ALLOW_PRESET_SECRETS=true` to
+build anyway), and the Node server logs a warning when `NUXT_PUBLIC_SERVERS`
+holds one at runtime. `web/public/servers.json` is git-ignored.
+
+When presets are configured through `NUXT_PUBLIC_SERVERS`, and always for
+`servers.json`, the Node server answers `421 Misdirected Request` unless the
+`Host` (and any `X-Forwarded-Host` / `Forwarded: host=`) is an IP address,
+`localhost`, a name that cannot exist in public DNS (a single label, or
+`.local`, `.localhost`, `.internal`, `.home.arpa`, `.localdomain`, `.lan`,
+`.home`, `.corp`) or a name listed in `GOS3_UI_ALLOWED_HOSTS`. Otherwise a
+website could rebind its own name to the console's address and read the
+presets inlined into the page. If you open the console with presets through
+a public DNS name, list that name in `GOS3_UI_ALLOWED_HOSTS`.
 
 Other runtime variables of the Node server:
 
@@ -205,7 +528,8 @@ Other runtime variables of the Node server:
 | `NUXT_PUBLIC_SERVERS` | Preset connections (JSON array). |
 | `NUXT_PUBLIC_APP_NAME` | Display name (default `gos3`). |
 | `GOS3_UI_LOCAL_DISCOVERY` | `true` (also `1`, `on`, `yes`, `enabled`) turns on the local discovery routes below. They are off when it is unset or has any other value. |
-| `GOS3_UI_ALLOWED_HOSTS` | Extra host names (comma separated) under which the discovery routes below answer, for example `console.example.com`. IP addresses, `localhost` and `*.localhost` are always accepted as `Host`. A listed name is also accepted as the host name of the browser's `Origin` (any port), which matters behind a reverse proxy that rewrites `Host`. `*` only turns the `Host` check off; it does not accept any `Origin`. Set it whenever the UI is reached through a DNS name. |
+| `GOS3_UI_ALLOWED_HOSTS` | Extra host names (comma separated) under which the discovery routes below answer, and under which the console is served when presets are configured (see [Presets](#presets)), for example `console.example.com`. IP addresses, `localhost` and `*.localhost` are always accepted as `Host`. A listed name is also accepted as the host name of the browser's `Origin` (any port), which matters behind a reverse proxy that rewrites `Host`. `*` only turns the `Host` check off; it does not accept any `Origin`. Set it whenever the UI is reached through a DNS name. |
+| `GOS3_UI_ALLOW_PRESET_SECRETS` | Build time: `true` lets `pnpm build`/`generate` proceed although presets contain secret keys (not recommended). |
 
 ### Local discovery routes
 
@@ -240,9 +564,11 @@ seconds gets `408`, invalid JSON `400`.
 
 Probes, scans and the verification of discovered candidates never connect to
 cloud metadata addresses (`169.254.169.254`, `169.254.170.2`,
-`169.254.170.23`, `fd00:ec2::254`, `100.100.100.200`), unspecified
+`169.254.170.23`, `169.254.0.23`, `168.63.129.16`, `192.0.0.192`,
+`100.100.100.200`, `fd00:ec2::254`, `fd00:ec2::23`, `fd20:ce::254`), unspecified
 (`0.0.0.0/8`, `::`), multicast or broadcast addresses, including their
-IPv4-mapped IPv6 forms. IP literals are refused up front (a probe or an
+IPv4-mapped, IPv4-compatible and NAT64 (`64:ff9b::/96`, `64:ff9b:1::/48`)
+IPv6 forms. IP literals are refused up front (a probe or an
 explicit scan target answers `400`; such addresses inside a CIDR are
 skipped), and host names are checked against every address they resolve to
 when the connection is made, so DNS rebinding cannot bypass the check.
@@ -254,22 +580,55 @@ Protection against other websites:
   becomes same-origin), every `/api/discovery/*` route answers 403 unless
   the `Host` header is an IP address, `localhost` / `*.localhost`, or a name
   listed in `GOS3_UI_ALLOWED_HOSTS` (comma separated; `*` turns the check
-  off). Opening the console through an unlisted host name hides local
-  discovery.
+  off). The same applies to every `X-Forwarded-Host` and `Forwarded: host=`
+  value, so a reverse proxy that rewrites `Host` but forwards the original
+  name still lets the check see it. Opening the console through an unlisted
+  host name hides local discovery.
 - Requests with a foreign `Origin`, or with `Sec-Fetch-Site: cross-site` or
   `same-site`, are refused too. An `Origin` counts as foreign unless it
   matches the `Host` header or its host name is listed in
   `GOS3_UI_ALLOWED_HOSTS` (`*` does not count for `Origin`). Behind a
   reverse proxy that rewrites `Host` (nginx's default `proxy_pass`), either
   list the public name in `GOS3_UI_ALLOWED_HOSTS` or forward the original
-  host (`proxy_set_header Host $host;`); otherwise
-  `POST /api/discovery/probe` and `/scan` answer 403.
+  host (`proxy_set_header Host $host;` or
+  `proxy_set_header X-Forwarded-Host $host;`); otherwise
+  `POST /api/discovery/probe` and `/scan` answer 403. A proxy that rewrites
+  `Host` without forwarding the original name, and that also answers
+  requests for unknown host names, defeats the rebinding check for
+  `GET /api/discovery/local`: give it an explicit `server_name` and a
+  `default_server` that refuses other names (nginx: `return 444;`).
+- A browser `GET /api/discovery/local` without `Sec-Fetch-Site` (browsers
+  older than about 2023, such as Safari before 16.4) is refused unless it
+  carries an
+  `X-Gos3-Discovery` header, which a cross-site page cannot send without a
+  CORS preflight; non-browser clients are not affected.
 - POST routes require `Content-Type: application/json`, which a cross-site
   page cannot send without a CORS preflight that the server never approves.
 
-Probes read at most 64 KiB of an identity document (with or without
-`Content-Length`), and never follow redirects or use proxies. Local discovery keeps at most 2048 mDNS records and 1024
-beacon candidates, and verifies at most 256 URLs.
+Probes read at most 16 KiB of an identity document (with or without
+`Content-Length`), and never follow redirects or use proxies. Documents must
+carry `"service": "gos3"`, a valid server ID and a `name`; strings are
+cleaned of control and bidi characters and clipped, endpoints must be
+http(s) URLs or paths, and at most 64 features and 64 `endpoints.all`
+entries are kept (the probe route returns this sanitized document). Local
+discovery keeps at most 2048 mDNS records and 1024 beacon candidates (16 per
+sender), and verifies at most 256 URLs.
+
+Nothing in an mDNS answer or beacon is authenticated, so local discovery
+follows gos3's own rules ([discovery.md](discovery.md)): datagrams are
+accepted only from this host or a directly connected subnet (only from
+loopback when the interfaces cannot be listed), each sender's
+mDNS records are kept apart, and an advertised address is used only when it
+is the sender's own (or, for a sender on this host, a loopback or local
+address). Beacon URLs keep only scheme and port, with the sender's address
+as host; SRV target names are never resolved. When two addresses serve the
+same server ID in one result, the first verified one (mDNS before beacon,
+then arrival order) keeps the entry. The other address is added only when
+both were observed together or each document advertises the other's
+address; otherwise it is left out and, if it served a different identity
+document, the peer's `error` reports the claim.
+Socket errors appear in `errors` as fixed texts; details go to the server
+log.
 
 Multicast is often unavailable in containers (Kubernetes, Docker Desktop).
 Scans and probes still work there.
@@ -327,7 +686,7 @@ the request.
 ## Development
 
 ```sh
-make dev                    # in-memory gos3 on :9000, CORS for http://localhost:3000, keys gos3dev / gos3dev-secret
+make dev                    # in-memory gos3 on 127.0.0.1:9000, CORS for http://localhost:3000, prints its keys
 cd web && pnpm install && pnpm dev   # http://localhost:3000
 ```
 

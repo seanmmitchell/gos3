@@ -54,6 +54,11 @@ const (
 	// MaxTagKeyLength and MaxTagValueLength bound filter tags (characters).
 	MaxTagKeyLength   = 128
 	MaxTagValueLength = 256
+	// MaxPrefixLength bounds a rule's key prefix (Filter Prefix, And Prefix
+	// or the legacy rule Prefix) in bytes, as AWS does: object keys are at
+	// most 1024 bytes, so a longer prefix could never match, and unbounded
+	// prefixes would let a small configuration hold megabytes of strings.
+	MaxPrefixLength = 1024
 )
 
 // Rule status values.
@@ -344,6 +349,9 @@ func (r *Rule) validate() error {
 	if (r.Filter == nil) == (r.Prefix == nil) {
 		return s3err.ErrMalformedXML
 	}
+	if err := validatePrefix(r.Prefix); err != nil {
+		return err
+	}
 	if r.Filter != nil {
 		if err := r.Filter.validate(); err != nil {
 			return err
@@ -501,10 +509,22 @@ func validStorageClass(sc string) bool {
 	return false
 }
 
+// validatePrefix checks a key prefix against MaxPrefixLength.
+func validatePrefix(p *string) error {
+	if p != nil && len(*p) > MaxPrefixLength {
+		return s3err.ErrInvalidArgument.WithMessage("The prefix of a lifecycle rule must be at most %d bytes long.", MaxPrefixLength).
+			With("ArgumentName", "Prefix")
+	}
+	return nil
+}
+
 func (f *Filter) validate() error {
 	n := 0
 	if f.Prefix != nil {
 		n++
+		if err := validatePrefix(f.Prefix); err != nil {
+			return err
+		}
 	}
 	if f.Tag != nil {
 		n++
@@ -530,6 +550,9 @@ func (f *Filter) validate() error {
 	if a := f.And; a != nil {
 		if a.Prefix == nil && len(a.Tags) == 0 && a.ObjectSizeGreaterThan == nil && a.ObjectSizeLessThan == nil {
 			return s3err.ErrMalformedXML
+		}
+		if err := validatePrefix(a.Prefix); err != nil {
+			return err
 		}
 		keys := make(map[string]bool, len(a.Tags))
 		for i := range a.Tags {

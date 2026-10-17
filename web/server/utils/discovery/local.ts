@@ -7,10 +7,12 @@
 import { createSocket, type RemoteInfo, type Socket } from 'node:dgram'
 import { networkInterfaces } from 'node:os'
 import type { DiscoverySource, Peer } from '~/types/admin'
-import { BEACON_GROUP, BEACON_PORT, beaconCandidateUrls, decodeBeacon, encodeQuery, newNonce } from './beacon'
+import { BEACON_GROUP, BEACON_PORT, beaconCandidateUrls, decodeBeacon, encodeQuery, MAX_BEACON_URLS, newNonce } from './beacon'
 import { MDNS_SERVICE, missingMdnsNames, parseMdnsRecords, type MdnsRecord } from './mdns'
+import { blockedUrlHost } from './netguard'
+import { hostNets, type LocalNets } from './netlocal'
 import { mergePeers, peerFromInfo, peerFromSighting, type Sighting } from './peers'
-import { fetchInfo, runPool, VERIFY_TIMEOUT_MS, type FetchFn } from './probe'
+import { fetchInfo, ProbeError, runPool, VERIFY_TIMEOUT_MS, type FetchFn } from './probe'
 
 export const DEFAULT_WAIT_MS = 3000
 export const MIN_WAIT_MS = 500
@@ -20,7 +22,13 @@ export const MAX_WAIT_MS = 10000
  * (multicast answers are unauthenticated and may be spoofed or flooded).
  */
 export const MAX_MDNS_RECORDS = 2048
+/** Records looked at per mDNS response (as the gos3 server). */
+export const MAX_MDNS_RECORDS_PER_RESPONSE = 64
+/** Follow-up mDNS questions per browse. */
+export const MAX_MDNS_FOLLOW_UPS = 32
 export const MAX_BEACON_CANDIDATES = 1024
+/** Beacon candidates taken from one sender per discovery. */
+export const MAX_BEACON_CANDIDATES_PER_SOURCE = MAX_BEACON_URLS
 export const MAX_VERIFY_URLS = 256
 
 /** A candidate base URL with what we know about it before verification. */
@@ -67,6 +75,16 @@ function errText(e: unknown): string {
   return e instanceof Error ? e.message : String(e)
 }
 
+/**
+ * Reports a socket error: the response carries only the fixed text `what`
+ * (raw OS errors name bind addresses and interfaces); the details go to
+ * the server log.
+ */
+function socketError(errors: string[], what: string, e: unknown): void {
+  errors.push(what)
+  console.warn(`[gos3-ui] local discovery: ${what}: ${errText(e)}`)
+}
+
 /** Non-internal IPv4 addresses of this host (multicast send/join interfaces). */
 function ipv4Interfaces(): string[] {
   const out: string[] = []
@@ -91,37 +109,47 @@ function sleep(ms: number, signal?: AbortSignal): Promise<void> {
   })
 }
 
-/** mDNS browse for waitMs. Never throws. */
-export async function browseMdns(waitMs: number, signal?: AbortSignal): Promise<MechanismResult> {
+/**
+ * mDNS browse for waitMs. Never throws. Responses are accepted only from
+ * senders on this host or a directly connected subnet, and every sender's
+ * records are kept apart (see parseMdnsRecords): a host can only make the
+ * UI host probe its own address.
+ */
+export async function browseMdns(waitMs: number, signal?: AbortSignal, nets: LocalNets = hostNets): Promise<MechanismResult> {
   const errors: string[] = []
   const make = await loadMdns()
   if (!make) return { candidates: [], errors: ['mDNS: the multicast-dns module is not available'] }
   let m: ReturnType<MdnsFactory> | undefined
-  const records: MdnsRecord[] = []
+  const bySender = new Map<string, MdnsRecord[]>()
+  let total = 0
   const asked = new Set<string>()
   try {
     m = make({ multicast: true, reuseAddr: true, loopback: true })
-    m.on('error', (e: unknown) => {
-      errors.push(`mDNS: ${errText(e)}`)
-    })
+    m.on('error', (e: unknown) => socketError(errors, 'mDNS: socket error', e))
     m.on('warning', () => {
       // Non-fatal (e.g. one interface could not join the group).
     })
-    m.on('response', (packet) => {
-      const list = [...(packet.answers ?? []), ...(packet.additionals ?? [])] as unknown as MdnsRecord[]
-      if (!list.length || records.length >= MAX_MDNS_RECORDS) return
-      records.push(...list.slice(0, MAX_MDNS_RECORDS - records.length))
-      // Ask for what is still missing (SRV/TXT of instances, A of targets).
+    m.on('response', (packet, rinfo: RemoteInfo) => {
+      const src = rinfo?.address
+      if (!src || !nets.onLink(src)) return
+      const list = [...(packet.answers ?? []), ...(packet.additionals ?? [])].slice(0, MAX_MDNS_RECORDS_PER_RESPONSE) as unknown as MdnsRecord[]
+      if (!list.length || total >= MAX_MDNS_RECORDS) return
+      const records = bySender.get(src) ?? []
+      const take = list.slice(0, MAX_MDNS_RECORDS - total)
+      records.push(...take)
+      total += take.length
+      bySender.set(src, records)
+      // Ask for what this sender has not sent yet (SRV/TXT of instances, A of targets).
       const missing = missingMdnsNames(records)
       const questions: { name: string, type: 'SRV' | 'TXT' | 'A' }[] = []
       for (const n of missing.srv) {
-        if (!asked.has(`srv:${n}`)) {
+        if (!asked.has(`srv:${n}`) && asked.size < MAX_MDNS_FOLLOW_UPS) {
           asked.add(`srv:${n}`)
           questions.push({ name: n, type: 'SRV' }, { name: n, type: 'TXT' })
         }
       }
       for (const n of missing.a) {
-        if (!asked.has(`a:${n}`)) {
+        if (!asked.has(`a:${n}`) && asked.size < MAX_MDNS_FOLLOW_UPS) {
           asked.add(`a:${n}`)
           questions.push({ name: n, type: 'A' })
         }
@@ -138,7 +166,7 @@ export async function browseMdns(waitMs: number, signal?: AbortSignal): Promise<
       try {
         m?.query({ questions: [{ name: MDNS_SERVICE, type: 'PTR' }] })
       } catch (e) {
-        errors.push(`mDNS: ${errText(e)}`)
+        socketError(errors, 'mDNS: the query could not be sent', e)
       }
     }
     query()
@@ -147,7 +175,7 @@ export async function browseMdns(waitMs: number, signal?: AbortSignal): Promise<
     query()
     await sleep(waitMs - Math.min(1000, waitMs / 3), signal)
   } catch (e) {
-    errors.push(`mDNS: ${errText(e)}`)
+    socketError(errors, 'mDNS: socket error', e)
   } finally {
     try {
       m?.destroy()
@@ -156,9 +184,11 @@ export async function browseMdns(waitMs: number, signal?: AbortSignal): Promise<
     }
   }
   const candidates: Candidate[] = []
-  for (const c of parseMdnsRecords(records)) {
-    for (const url of c.urls) {
-      candidates.push({ url, source: 'mdns', id: c.txt.id, name: c.txt.name, version: c.txt.v, region: c.txt.region })
+  for (const [src, records] of bySender) {
+    for (const c of parseMdnsRecords(records, src, nets)) {
+      for (const url of c.urls) {
+        candidates.push({ url, source: 'mdns', id: c.txt.id || undefined, name: c.txt.name, version: c.txt.v, region: c.txt.region })
+      }
     }
   }
   return { candidates, errors: [...new Set(errors)] }
@@ -187,21 +217,27 @@ function closeSocket(sock: Socket | undefined): void {
 /**
  * Beacon query: sends a query from an ephemeral socket on every IPv4
  * interface and collects unicast announce replies plus announces multicast
- * to the group during waitMs. Never throws.
+ * to the group during waitMs. Never throws. Datagrams are accepted only
+ * from senders on this host or a directly connected subnet, their URLs only
+ * ever point at the sender (beaconCandidateUrls), and one sender yields at
+ * most MAX_BEACON_CANDIDATES_PER_SOURCE candidates.
  */
-export async function queryBeacon(waitMs: number, signal?: AbortSignal, group = BEACON_GROUP, port = BEACON_PORT): Promise<MechanismResult> {
+export async function queryBeacon(waitMs: number, signal?: AbortSignal, group = BEACON_GROUP, port = BEACON_PORT, nets: LocalNets = hostNets): Promise<MechanismResult> {
   const errors: string[] = []
   const candidates: Candidate[] = []
   const seen = new Set<string>()
+  const perSender = new Map<string, number>()
   const onMessage = (msg: Buffer, rinfo: RemoteInfo) => {
-    if (candidates.length >= MAX_BEACON_CANDIDATES) return
+    if (candidates.length >= MAX_BEACON_CANDIDATES || !nets.onLink(rinfo.address)) return
     const m = decodeBeacon(msg)
     if (!m || m.type !== 'announce') return
-    for (const url of beaconCandidateUrls(m.urls, rinfo.address)) {
+    for (const url of beaconCandidateUrls(m.urls, rinfo.address, ip => nets.isLocal(ip))) {
       // Servers announce periodically: keep each (server, URL) once.
-      const k = `${m.id ?? ''}\n${url}`
-      if (seen.has(k) || candidates.length >= MAX_BEACON_CANDIDATES) continue
+      const k = `${m.id}\n${url}`
+      const n = perSender.get(rinfo.address) ?? 0
+      if (seen.has(k) || candidates.length >= MAX_BEACON_CANDIDATES || n >= MAX_BEACON_CANDIDATES_PER_SOURCE) continue
       seen.add(k)
+      perSender.set(rinfo.address, n + 1)
       candidates.push({ url, source: 'beacon', id: m.id, name: m.name, version: m.version, region: m.region })
     }
   }
@@ -210,14 +246,14 @@ export async function queryBeacon(waitMs: number, signal?: AbortSignal, group = 
   let mconn: Socket | undefined
   try {
     uconn = createSocket({ type: 'udp4' })
-    uconn.on('error', e => errors.push(`beacon: ${errText(e)}`))
+    uconn.on('error', e => socketError(errors, 'beacon: socket error', e))
     uconn.on('message', onMessage)
     await bindSocket(uconn, 0)
     try {
       uconn.setMulticastTTL(1)
       uconn.setMulticastLoopback(true)
     } catch (e) {
-      errors.push(`beacon: ${errText(e)}`)
+      socketError(errors, 'beacon: cannot set multicast options', e)
     }
 
     // Also listen on the group port for periodic announces (best effort:
@@ -239,7 +275,7 @@ export async function queryBeacon(waitMs: number, signal?: AbortSignal, group = 
       }
       if (!joined) mconn.addMembership(group)
     } catch (e) {
-      errors.push(`beacon: cannot listen on ${group}:${port} (${errText(e)}); relying on query replies`)
+      socketError(errors, 'beacon: cannot listen on the group port; relying on query replies', e)
       closeSocket(mconn)
       mconn = undefined
     }
@@ -249,7 +285,7 @@ export async function queryBeacon(waitMs: number, signal?: AbortSignal, group = 
       const ifaces = ipv4Interfaces()
       const sendOne = () => new Promise<void>((resolve) => {
         uconn!.send(query, port, group, (e) => {
-          if (e) errors.push(`beacon: send failed (${errText(e)})`)
+          if (e) socketError(errors, 'beacon: the query could not be sent', e)
           resolve()
         })
       })
@@ -273,7 +309,7 @@ export async function queryBeacon(waitMs: number, signal?: AbortSignal, group = 
     await send() // repeat once: UDP is lossy
     await sleep(waitMs - Math.min(1000, waitMs / 3), signal)
   } catch (e) {
-    errors.push(`beacon: ${errText(e)}`)
+    socketError(errors, 'beacon: socket error', e)
   } finally {
     closeSocket(uconn)
     closeSocket(mconn)
@@ -283,12 +319,16 @@ export async function queryBeacon(waitMs: number, signal?: AbortSignal, group = 
 
 /**
  * Verifies candidates (each URL once, at most MAX_VERIFY_URLS URLs, bounded
- * concurrency). Verified identities become peers; candidates that announced
- * an ID but could not be verified are reported as unverified peers.
+ * concurrency; blocked IP literals are never probed). Verified identities
+ * become peers; candidates that announced an ID but could not be verified
+ * are reported as unverified peers. Observations of one ID are merged with
+ * mergePeers, so a host claiming the ID of a server verified earlier in the
+ * list (mDNS before beacon, in arrival order) cannot take over its entry.
  */
 export async function verifyCandidates(candidates: readonly Candidate[], opts: { timeoutMs?: number, signal?: AbortSignal, concurrency?: number, maxUrls?: number, fetch?: FetchFn } = {}): Promise<Peer[]> {
   const byUrl = new Map<string, Candidate[]>()
   for (const c of candidates) {
+    if (blockedUrlHost(c.url)) continue
     const list = byUrl.get(c.url)
     if (list) list.push(c)
     else if (byUrl.size < (opts.maxUrls ?? MAX_VERIFY_URLS)) byUrl.set(c.url, [c])
@@ -300,7 +340,7 @@ export async function verifyCandidates(candidates: readonly Candidate[], opts: {
       const info = await fetchInfo(url, { timeoutMs: opts.timeoutMs ?? VERIFY_TIMEOUT_MS, signal: opts.signal, fetch: opts.fetch })
       return { url, info }
     } catch (e) {
-      return { url, error: errText(e) }
+      return { url, error: e instanceof ProbeError ? e.message : 'unreachable' }
     }
   }, opts.signal)
 

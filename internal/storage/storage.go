@@ -16,6 +16,7 @@ package storage
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"time"
 )
@@ -33,9 +34,47 @@ var (
 	ErrConfigNotFound     = errors.New("storage: bucket config not found")
 	ErrPreconditionFailed = errors.New("storage: precondition failed")
 	ErrInvalidName        = errors.New("storage: invalid name")
+	// ErrInvalidBacking is returned by CreateBucket for a backing name that
+	// is not configured.
+	ErrInvalidBacking = errors.New("storage: unknown backing")
+	// ErrBackingUnavailable is returned (wrapped) when the backing that
+	// holds a bucket's data is not configured any more or cannot be
+	// reached (network failure or a 5xx answer from a remote S3 service).
+	ErrBackingUnavailable = errors.New("storage: backing unavailable")
+	// ErrNotSupported is returned when the bucket's backing cannot perform
+	// an operation (e.g. versioning on a gateway backing).
+	ErrNotSupported = errors.New("storage: not supported by the bucket's backing")
 	// ErrStopWalk may be returned by a Walk callback to stop iteration early;
 	// the Walk method then returns nil.
 	ErrStopWalk = errors.New("storage: stop walk")
+
+	// ErrBucketUnavailable is returned (wrapped) when one bucket's remote
+	// location cannot be used (its remote bucket was deleted, access to it is
+	// denied, a wrapped bucket's container cannot be loaded) while the rest
+	// of the backing works. It wraps ErrBackingUnavailable, so the S3 layer
+	// answers 503, but the multi router does not mark the backing down.
+	ErrBucketUnavailable = fmt.Errorf("storage: the bucket's remote location is unavailable: %w", ErrBackingUnavailable)
+	// ErrRemoteDenied is returned (wrapped) when a remote S3 service refused
+	// an object operation with 403 (object lock, a remote bucket policy,
+	// missing permissions of the backing's credentials).
+	ErrRemoteDenied = errors.New("storage: the remote service denied the request")
+	// ErrRemoteRejected is returned (wrapped) when a remote S3 service
+	// rejected a request with a 4xx answer gos3 has no better mapping for.
+	ErrRemoteRejected = errors.New("storage: the remote service rejected the request")
+	// ErrInvalidTarget is returned by CreateBucket (and placement changes)
+	// for a BucketTarget the backing cannot honour: an unknown container, a
+	// kind the backing does not offer, a remote location claimed elsewhere.
+	ErrInvalidTarget = errors.New("storage: invalid bucket target")
+	// ErrRemoteBucketExists is returned by CreateBucket when a native bucket
+	// would create a remote bucket that already exists (an administrator can
+	// adopt it instead). It wraps ErrBucketExists.
+	ErrRemoteBucketExists = fmt.Errorf("storage: remote bucket exists: %w", ErrBucketExists)
+	// ErrConflict is returned (wrapped) when an operation gave up after
+	// concurrent changes to the same object or upload kept invalidating
+	// it (optimistic retries exhausted). It is an answer about contention
+	// that clients cause, never a failure of the backing; retrying later
+	// may succeed.
+	ErrConflict = errors.New("storage: too much concurrent modification")
 )
 
 // NullVersionID is the version ID of objects written while versioning is
@@ -70,6 +109,14 @@ const (
 	ConfigReplication       = "replication"
 	ConfigAccelerate        = "accelerate"
 	ConfigRequestPayment    = "request-payment"
+	// ConfigCompression is the gos3 bucket compression setting (JSON, see
+	// the admin API), not an S3 configuration.
+	ConfigCompression = "compression"
+	// ConfigResticSnapshots is the gos3 schedule of whole-bucket restic
+	// snapshots of a bucket (JSON, see internal/resticsnap and the admin
+	// API), not an S3 configuration. It replicates with the bucket's
+	// copies; copy jobs never copy it.
+	ConfigResticSnapshots = "restic-snapshots"
 )
 
 // BucketInfo describes a bucket.
@@ -80,6 +127,49 @@ type BucketInfo struct {
 	Versioning        VersioningStatus
 	ObjectLockEnabled bool
 	Owner             string // IAM user name that created the bucket ("" = root)
+	// Backing names the backing holding the bucket's primary copy. The
+	// multi-backing router (internal/storage/multi) sets it; the backends
+	// behind it report "" (or what they were given). See docs/backings.md.
+	Backing string
+	// Kind and Location are reported by backings that hold buckets of
+	// several kinds (s3 backings, see BucketKind): the bucket's kind and a
+	// human-readable location such as "s3://remote-bucket" or
+	// "s3://container/prefix". Other backends leave them empty. They are
+	// output only: backends never persist them from their input.
+	Kind     BucketKind `json:",omitempty"`
+	Location string     `json:",omitempty"`
+}
+
+// BucketKind is how an s3 backing stores a bucket (see docs/backings.md).
+type BucketKind string
+
+const (
+	// BucketKindNative buckets map to one remote bucket whose objects are
+	// stored as-is; versioning and object lock are the remote bucket's.
+	BucketKindNative BucketKind = "native"
+	// BucketKindWrapped buckets are stored in gos3's own format inside a
+	// container (a remote bucket/prefix shared by many buckets), with every
+	// gos3 feature.
+	BucketKindWrapped BucketKind = "wrapped"
+)
+
+// BucketTarget chooses where a backing that offers several bucket kinds
+// creates a bucket. Backends without kinds refuse a non-nil target with
+// ErrInvalidTarget (the multi router checks this before calling them).
+type BucketTarget struct {
+	// Kind is the bucket kind ("" = the backing's default kind).
+	Kind BucketKind `json:"kind,omitempty"`
+	// RemoteBucket is the remote bucket of a native bucket ("" = the gos3
+	// bucket name) and RemoteRegion its region ("" = discovered or the
+	// backing's region).
+	RemoteBucket string `json:"remoteBucket,omitempty"`
+	RemoteRegion string `json:"remoteRegion,omitempty"`
+	// Container is the ID of the container of a wrapped bucket ("" = the
+	// backing's default container).
+	Container string `json:"container,omitempty"`
+	// Adopt makes a native bucket use an existing remote bucket instead of
+	// creating one. Only the admin API sets it.
+	Adopt bool `json:"adopt,omitempty"`
 }
 
 // CreateBucketOptions are passed to CreateBucket.
@@ -87,6 +177,19 @@ type CreateBucketOptions struct {
 	Region            string
 	ObjectLockEnabled bool // implies Versioning = Enabled
 	Owner             string
+	// Backing names the backing to create the bucket on (the
+	// x-gos3-backing header; "" = the default backing). The multi-backing
+	// router (internal/storage/multi) validates it, returning
+	// ErrInvalidBacking for unknown names, and passes "" to the backing it
+	// creates the bucket on; other backends ignore it.
+	Backing string
+	// Target chooses the bucket kind and location on backings that offer
+	// several (nil = the backing's defaults). See BucketTarget.
+	Target *BucketTarget
+	// Import tells the backing the bucket will receive imported versions
+	// (a replica or move target, a copy job target), so it must be created
+	// where VersionImporter works. Backends without kinds ignore it.
+	Import bool
 }
 
 // ObjectMeta is the metadata supplied by the S3 layer when committing an
@@ -111,7 +214,10 @@ type ObjectMeta struct {
 	// PartChecksums holds per-part checksums for multipart objects (same order
 	// as PartSizes) for GetObjectAttributes / GetObject?partNumber.
 	PartChecksums []map[string]string
-	// Server-side encryption as reported back to clients (gos3 records it).
+	// Encryption records the actual storage implementation. Empty on legacy
+	// objects whose SSE fields were only recorded, without encryption.
+	Encryption string
+	// Server-side encryption requested by the client.
 	SSE         string // "AES256", "aws:kms" or ""
 	SSEKMSKeyID string
 	// Object Lock
@@ -119,6 +225,11 @@ type ObjectMeta struct {
 	RetainUntil     time.Time // zero = none
 	LegalHold       bool
 	WebsiteRedirect string // x-amz-website-redirect-location
+	// MultipartRetentionSource is set only on an in-progress upload. "default"
+	// means its retention must be calculated when the version is published;
+	// "explicit" means the caller supplied the retention headers. It is
+	// cleared before the completed object's metadata is stored.
+	MultipartRetentionSource string
 }
 
 // ObjectInfo describes one object version (or delete marker).
@@ -131,6 +242,34 @@ type ObjectInfo struct {
 	DeleteMarker bool
 	Size         int64
 	LastModified time.Time
+	// Compression is the algorithm the backend stored the data with (see
+	// CompressingBackend; "" = stored as is). It is set by the backend
+	// and transparent to readers: Size and OpenObject are always about
+	// the uncompressed content.
+	Compression string
+	// StoredSize is the number of bytes the backend stores for the data
+	// when Compression is set (0 otherwise; see PhysicalSize).
+	StoredSize int64
+}
+
+// PhysicalSize is the number of data bytes the backend stores for the
+// version: the content's size, less when it is compressed, plus the
+// overhead of native encryption (EncryptionAES256; an empty object stores
+// nothing). Restic versions count their content size: their data lives in
+// a repository whose packs are deduplicated, compressed and shared between
+// snapshots, so it cannot be attributed to single versions (and the small
+// local snapshot reference is not counted). Usage figures therefore never
+// report restic data as compression savings. The memory backend keeps
+// AES256 data as is, so for it the encryption overhead is notional.
+func (o ObjectInfo) PhysicalSize() int64 {
+	n := o.Size
+	if o.Compression != "" && o.Encryption != EncryptionRestic {
+		n = o.StoredSize
+	}
+	if o.Encryption == EncryptionAES256 && n > 0 {
+		return EncryptedSize(n)
+	}
+	return n
 }
 
 // CommitOptions are atomic preconditions evaluated against the current latest
@@ -148,6 +287,12 @@ type CommitOptions struct {
 	// part was replaced after the caller validated it. The check is atomic
 	// with the commit.
 	PartETags []string
+	// BeforePublish runs after any data copy, under the backend's atomic
+	// bucket commit lock/transaction, with the current object's metadata (nil
+	// if absent or a delete marker), the new version's actual creation time,
+	// and current bucket configurations. It may update meta or refuse the
+	// commit. The callback must not call the same backend.
+	BeforePublish func(meta, current *ObjectMeta, created time.Time, config func(key string) []byte) error
 }
 
 // ObjectWriter streams the data of a new object version. Nothing becomes
@@ -278,6 +423,14 @@ type Backend interface {
 	//   - versionIDMarker == "": start strictly after all versions of keyMarker.
 	//   - otherwise: start with the version immediately following
 	//     versionIDMarker (older than it) within keyMarker.
+	// A versionIDMarker whose version was deleted (e.g. between pages) must
+	// not make the walk skip the remaining versions of keyMarker: an ID that
+	// encodes its position (as generated IDs may) resumes at that position;
+	// NullVersionID carries none, so a "null" marker of a key without a null
+	// version starts with the newest remaining version of keyMarker.
+	// Re-delivering a version the caller has already seen is acceptable;
+	// silently skipping one is not. Other IDs that are not versions of
+	// keyMarker start after all of its versions.
 	// A walk is not a snapshot when keys change concurrently, but IsLatest
 	// is only ever set on the first entry delivered for a key (and only if
 	// it was the newest version when read), never on a later entry of the

@@ -93,8 +93,8 @@ func TestConfigFlags(t *testing.T) {
 		t.Fatalf("overrides = %v", o)
 	}
 
-	// Positional arguments and unknown flags are usage errors.
-	if code, _, _ := runCmd(t, "serve", "extra"); code != 2 {
+	// Multiple directories and unknown flags are usage errors.
+	if code, _, _ := runCmd(t, "serve", "one", "two"); code != 2 {
 		t.Fatalf("positional arg: exit %d", code)
 	}
 	if code, _, _ := runCmd(t, "serve", "--bogus"); code != 2 {
@@ -212,7 +212,8 @@ func TestServeAndHealthcheck(t *testing.T) {
 		t.Fatalf("info = %+v", srv.Info())
 	}
 	banner := stderr.String()
-	for _, want := range []string{"S3 endpoint", srv.URL(), "Access key   serveaccesskey", "from the configuration", "fs at "} {
+	for _, want := range []string{"S3 endpoint", srv.URL(), "Access key   serveaccesskey", "from the configuration", "fs at ",
+		"Jobs         2 at once, state in " + filepath.Join(srv.DataPath(), ".gos3", "jobs")} {
 		if !strings.Contains(banner, want) {
 			t.Errorf("banner lacks %q:\n%s", want, banner)
 		}

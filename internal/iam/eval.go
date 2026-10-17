@@ -1,6 +1,7 @@
 package iam
 
 import (
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -18,10 +19,14 @@ const adminARNPrefix = "arn:gos3:admin:::"
 
 // Types of per-target admin resources (arn:gos3:admin:::<type>/<name>).
 const (
-	adminTypeUser   = "user"
-	adminTypePolicy = "policy"
-	adminTypeBucket = "bucket"
+	adminTypeUser    = "user"
+	adminTypePolicy  = "policy"
+	adminTypeBucket  = "bucket"
+	adminTypeBacking = "backing"
 )
+
+// adminTypes are the types of per-target admin resources.
+var adminTypes = []string{adminTypeUser, adminTypePolicy, adminTypeBucket, adminTypeBacking}
 
 // CondAdminPolicyName is the multi-valued condition key holding the policy
 // names an admin:CreateUser or admin:UpdateUser request attaches (absent
@@ -40,9 +45,16 @@ func AdminPolicyARN(name string) string { return adminARNPrefix + adminTypePolic
 // (arn:gos3:admin:::bucket/<name>).
 func AdminBucketARN(name string) string { return adminARNPrefix + adminTypeBucket + "/" + name }
 
+// AdminBackingARN returns the admin resource of a storage backing
+// (arn:gos3:admin:::backing/<name>): the remote buckets and containers of
+// an s3 backing (admin:ListRemoteBuckets, admin:CreateRemoteBucket,
+// admin:AdoptRemoteBucket, admin:ManageContainers).
+func AdminBackingARN(name string) string { return adminARNPrefix + adminTypeBacking + "/" + name }
+
 // ValidAdminRequestResource reports whether r is a resource an admin
 // request can be evaluated against: "" (service level) or
-// arn:gos3:admin:::{user,policy,bucket}/<name> with a non-empty name.
+// arn:gos3:admin:::{user,policy,bucket,backing}/<name> with a non-empty
+// name.
 func ValidAdminRequestResource(r string) bool {
 	if r == "" {
 		return true
@@ -55,11 +67,7 @@ func ValidAdminRequestResource(r string) bool {
 	if !ok || name == "" {
 		return false
 	}
-	switch typ {
-	case adminTypeUser, adminTypePolicy, adminTypeBucket:
-		return true
-	}
-	return false
+	return slices.Contains(adminTypes, typ)
 }
 
 // s3ServiceARN is the resource that service-level s3 actions (Bucket == "",
@@ -82,6 +90,15 @@ type evalCtx struct {
 	raw      map[string][]string
 	lower    map[string][]string // lazily built, lower-cased keys + derived keys
 	now      time.Time
+
+	// principalKey is the access key ID that bare principal entries may
+	// match: id.AccessKey, or "" when that ID is ambiguous (see
+	// usablePrincipalKey).
+	principalKey string
+
+	// budget limits the work of this decision; once it is exceeded the
+	// request is denied.
+	budget *budget
 }
 
 func newEvalCtx(req *AuthzRequest, now time.Time) *evalCtx {
@@ -92,6 +109,9 @@ func newEvalCtx(req *AuthzRequest, now time.Time) *evalCtx {
 		bucket:  req.Bucket,
 		raw:     req.Conditions,
 		now:     now,
+
+		principalKey: req.Identity.AccessKey,
+		budget:       newBudget(),
 	}
 	switch {
 	case c.isAdmin:
@@ -110,12 +130,12 @@ func hasPrefixFold(s, prefix string) bool {
 	return len(s) >= len(prefix) && strings.EqualFold(s[:len(prefix)], prefix)
 }
 
-// lookup returns the values of a condition key (exact match first, then
-// case-insensitive). present is false when the key is missing or empty.
+// lookup returns the values of a condition key, case-insensitively. This
+// includes tag-qualified keys: stored tags preserve case, but IAM condition
+// key names do not. Always use the folded index so an exact spelling cannot
+// hide values from another tag whose key differs only in case.
+// present is false when the key is missing or empty.
 func (c *evalCtx) lookup(key string) ([]string, bool) {
-	if v, ok := c.raw[key]; ok && len(v) > 0 {
-		return v, true
-	}
 	if c.lower == nil {
 		c.buildLower()
 	}
@@ -169,7 +189,7 @@ func (c *evalCtx) lookupVar(name string) (string, bool) {
 // (case-insensitive, with wildcards).
 func (c *evalCtx) actionMatches(patterns []string) bool {
 	for _, p := range patterns {
-		if globMatch(p, c.action, true, false) {
+		if globMatchBudget(p, c.action, true, false, c.budget) {
 			return true
 		}
 	}
@@ -199,7 +219,18 @@ func (c *evalCtx) resourceMatches(patterns []string) bool {
 			}
 			continue
 		}
-		if matchPattern(p, c.resource, false, c.lookupVar) {
+		if matchPattern(p, c.resource, false, c.lookupVar, c.budget) {
+			return true
+		}
+	}
+	return false
+}
+
+// namesNamespace reports whether some pattern is "*" or in the request's
+// namespace (admin ARNs for admin actions, any other pattern for s3).
+func (c *evalCtx) namesNamespace(patterns []string) bool {
+	for _, p := range patterns {
+		if p == "*" || strings.HasPrefix(p, adminARNPrefix) == c.isAdmin {
 			return true
 		}
 	}
@@ -224,7 +255,7 @@ func (c *evalCtx) principalMatches(p *Principal, broad bool) bool {
 		return true
 	}
 	for _, v := range p.AWS {
-		if principalEntryMatches(v, c.id, broad) {
+		if principalEntryMatches(v, c.id, c.principalKey, broad) {
 			return true
 		}
 	}
@@ -232,11 +263,12 @@ func (c *evalCtx) principalMatches(p *Principal, broad bool) bool {
 }
 
 // principalEntryMatches matches one principal entry: "*", a user name, an
-// access key ID, arn:<p>:iam::<any>:user/[path/]<name>, or an account
-// principal arn:<p>:iam::<any>:root / 12-digit account ID (the root
-// identity, or with broad every authenticated identity; see
-// principalMatches).
-func principalEntryMatches(v string, id auth.Identity, broad bool) bool {
+// access key ID (key, "" for none), or an account principal
+// arn:<p>:iam::<any>:root / 12-digit account ID
+// (the root identity, or with broad every authenticated identity; see
+// principalMatches). A 12-digit entry is only ever the account principal:
+// it is never compared with user names or access key IDs.
+func principalEntryMatches(v string, id auth.Identity, key string, broad bool) bool {
 	if v == "*" {
 		return true
 	}
@@ -251,19 +283,29 @@ func principalEntryMatches(v string, id auth.Identity, broad bool) bool {
 		if parts[5] == "root" {
 			return id.IsRoot || broad
 		}
-		name, ok := strings.CutPrefix(parts[5], "user/")
-		if !ok || id.IsRoot {
-			return false
-		}
-		if i := strings.LastIndexByte(name, '/'); i >= 0 {
-			name = name[i+1:]
-		}
-		return name != "" && name == id.User
+		// There is no local account ID or IAM path to compare with a user
+		// ARN. Never reduce an external ARN to its final user name.
+		return false
 	}
-	if isAccountID(v) && (id.IsRoot || broad) {
-		return true
+	if isAccountID(v) {
+		return id.IsRoot || broad
 	}
-	return v == id.User || v == id.AccessKey
+	return v == id.User || (key != "" && v == key)
+}
+
+// usablePrincipalKey returns the access key ID of id that bare principal
+// entries may match, or "" if the ID could be mistaken for another
+// principal (a user name, a reserved name or an account ID; only keys from
+// an older iam.json can be, see keyIDConflict) or belongs to another user.
+func usablePrincipalKey(st *state, id auth.Identity) string {
+	ak := id.AccessKey
+	if ak == "" || keyIDConflict(st, ak) != "" {
+		return ""
+	}
+	if k := st.keys[ak]; k != nil && k.User != id.User {
+		return ""
+	}
+	return ak
 }
 
 func isAccountID(s string) bool {
@@ -315,6 +357,14 @@ func (c *evalCtx) statementApplies(st *Statement, resourcePolicy bool) bool {
 		}
 	case len(st.NotResource) > 0:
 		if c.resourceMatches(st.NotResource) {
+			return false
+		}
+		// An Allow's NotResource only covers the namespaces it names
+		// (s3 or admin), so "all of S3 except bucket X" written with
+		// Action "*" grants no admin action (and an admin-only list no s3
+		// action). A Deny keeps the AWS reading and applies to everything
+		// not listed.
+		if st.Effect == "Allow" && !c.namesNamespace(st.NotResource) {
 			return false
 		}
 	default:
@@ -392,8 +442,16 @@ func IsPublicACL(acl string) bool {
 	return false
 }
 
+// limitDecision is the decision for a request whose evaluation exceeded
+// the work limits (see budget) at the statement where: whether that
+// statement applies is unknown, so the request is denied outright rather
+// than letting an Allow match or a Deny be skipped.
+func limitDecision(where string) Decision {
+	return Decision{ExplicitDeny: true, Reason: "policy evaluation limit exceeded at " + where}
+}
+
 // authorize implements Manager.Authorize.
-func (m *Manager) authorize(req AuthzRequest) Decision {
+func (m *Manager) authorize(req AuthzRequest, shared *budget) Decision {
 	id := req.Identity
 	if id.IsRoot && !id.IsAnonymous {
 		return Decision{Allowed: true, Reason: "root user"}
@@ -403,8 +461,10 @@ func (m *Manager) authorize(req AuthzRequest) Decision {
 	}
 
 	var policies []*NamedPolicy
+	principalKey := ""
 	if !id.IsAnonymous {
 		st := m.snapshot()
+		principalKey = usablePrincipalKey(st, id)
 		u := st.resolveUser(id)
 		if u != nil {
 			if u.Disabled {
@@ -420,6 +480,13 @@ func (m *Manager) authorize(req AuthzRequest) Decision {
 	}
 
 	c := newEvalCtx(&req, m.now())
+	if shared != nil {
+		c.budget = shared
+		if shared.exceeded {
+			return limitDecision("request")
+		}
+	}
+	c.principalKey = principalKey
 	allowReason := ""
 	for _, p := range policies {
 		for i := range p.Document.Statement {
@@ -427,7 +494,14 @@ func (m *Manager) authorize(req AuthzRequest) Decision {
 			if st.Effect == "Allow" && allowReason != "" {
 				continue // already allowed; only Deny statements matter now
 			}
-			if (st.Effect != "Allow" && st.Effect != "Deny") || !c.statementApplies(st, false) {
+			if st.Effect != "Allow" && st.Effect != "Deny" {
+				continue
+			}
+			applies := c.statementApplies(st, false)
+			if c.budget.exceeded {
+				return limitDecision("policy " + p.Name + " statement " + stmtLabel(st, i))
+			}
+			if !applies {
 				continue
 			}
 			if st.Effect == "Deny" {
@@ -442,7 +516,14 @@ func (m *Manager) authorize(req AuthzRequest) Decision {
 			if st.Effect == "Allow" && allowReason != "" {
 				continue
 			}
-			if (st.Effect != "Allow" && st.Effect != "Deny") || !c.statementApplies(st, true) {
+			if st.Effect != "Allow" && st.Effect != "Deny" {
+				continue
+			}
+			applies := c.statementApplies(st, true)
+			if c.budget.exceeded {
+				return limitDecision("bucket policy statement " + stmtLabel(st, i))
+			}
+			if !applies {
 				continue
 			}
 			if st.Effect == "Deny" {

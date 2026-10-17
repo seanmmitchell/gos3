@@ -12,11 +12,12 @@ const bucket = ref('')
 const cidr = ref('')
 const users = ref('')
 const policies = ref('')
+const backings = ref('')
 const touched = ref(false)
 
 const items = IAM_POLICY_TEMPLATES.map(t => ({ label: t.label, value: t.id, description: t.description }))
 const template = computed(() => IAM_POLICY_TEMPLATES.find(t => t.id === templateId.value)!)
-const params = computed(() => ({ bucket: bucket.value.trim(), cidr: cidr.value.trim(), users: users.value.trim(), policies: policies.value.trim() }))
+const params = computed(() => ({ bucket: bucket.value.trim(), cidr: cidr.value.trim(), users: users.value.trim(), policies: policies.value.trim(), backings: backings.value.trim() }))
 const errors = computed(() => templateParamErrors(template.value, params.value))
 
 watch(templateId, () => (touched.value = false))
@@ -78,6 +79,16 @@ function apply() {
           <UInput v-model="policies" class="w-full font-mono" placeholder="readonly, readwrite" autocomplete="off" @keydown.enter.prevent="apply" />
         </UFormField>
       </div>
+      <UFormField
+        v-else-if="template.params.includes('backings')"
+        label="Backings"
+        name="template-backings"
+        required
+        help="Backing name or pattern, e.g. cloud-* (arn:gos3:admin:::backing/…)"
+        :error="touched && errors.backings"
+      >
+        <UInput v-model="backings" class="w-full font-mono" placeholder="cloud" autocomplete="off" @keydown.enter.prevent="apply" />
+      </UFormField>
       <div v-else aria-hidden="true" />
       <div class="md:pt-6">
         <UButton icon="i-lucide-wand-sparkles" label="Apply template" color="neutral" variant="outline" @click="apply" />

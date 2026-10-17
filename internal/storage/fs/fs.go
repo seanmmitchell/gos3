@@ -12,19 +12,37 @@
 //	orphans/<run>/...               files the recovery pass found
 //	                                unreferenced, kept for a while (see
 //	                                Recovery)
+//	keys/<bucket-id>                a bucket's 32-byte encryption master key
+//	                                (secret; created when encryption is first
+//	                                prepared for the bucket)
+//	keys/<bucket-id>.restic.json    a bucket's restic repository location and
+//	                                password (secret)
+//	restic/<bucket-id>/             a bucket's restic repository
+//	keys/aux/<name>[.restic.json]   key and recovery record of an aux
+//	                                repository (secret; see restic_host.go)
+//	restic-aux/<name>/              an aux restic repository: whole-bucket
+//	                                snapshots of buckets kept elsewhere
+//	restic-cache/                   restic's local repository cache
 //
-// The schema of meta.db is documented in schema.go.
+// Keys, recovery records and repositories are kept when a bucket is
+// deleted, so that its restic archive stays recoverable.
+//
+// The schema of meta.db is documented in schema.go; encryption.go and
+// restic*.go describe encrypted and restic-archived data.
 //
 // # Write path
 //
-// Object data is streamed into a fresh file in tmp/ (optionally fsync'd,
+// Object data (already encrypted when the version is stored encrypted, see
+// encryption.go) is streamed into a fresh file in tmp/ (optionally fsync'd,
 // see Options.FsyncData), renamed to its final, never reused name under
 // data/ and only then is the metadata committed in a single bbolt write
 // transaction, which also evaluates conditional-write preconditions. The
 // bbolt write transaction is never held while streaming data. Data files of
 // versions replaced or deleted by a transaction are unlinked after it
 // commits; when a commit fails (precondition failed, bucket deleted, ...)
-// the new data file is removed. Empty objects have no data file.
+// the new data file is removed. Empty objects have no data file unless they
+// are archived in restic: the data file of a restic-archived version holds
+// only its snapshot ID (the content is in the bucket's restic repository).
 //
 // Multipart parts are written the same way into uploads/<upload-id>/ with a
 // unique file name per part upload, so re-uploading a part number never
@@ -33,10 +51,13 @@
 //
 // # Readers
 //
-// OpenObject returns an *os.File. Because data files are immutable and
-// unlinked (never rewritten) when superseded, an open reader keeps returning
-// the content of the version it opened even if the object is concurrently
-// overwritten or deleted (POSIX unlink semantics). On Windows an open file
+// OpenObject returns an *os.File, or a reader decrypting or decompressing
+// one for encrypted or compressed versions; a restic-archived version is
+// read from its snapshot (see restic.go). Because data files are immutable
+// and unlinked (never rewritten) when superseded, and snapshots are never
+// removed by gos3, an open reader keeps returning the content of the version
+// it opened even if the object is concurrently overwritten or deleted (POSIX
+// unlink semantics). On Windows an open file
 // cannot be deleted: unlinking a superseded data file that is still being
 // read fails, the failure is logged and the orphan is removed by the
 // recovery pass at the next start.
@@ -90,6 +111,7 @@ import (
 	berrors "go.etcd.io/bbolt/errors"
 
 	"github.com/seanmmitchell/gos3/internal/storage"
+	"github.com/seanmmitchell/gos3/internal/storage/crypt"
 )
 
 // ErrClosed is returned by every operation after Close.
@@ -123,6 +145,10 @@ const (
 
 // Backend is a filesystem storage.Backend. Create it with Open.
 type Backend struct {
+	// keyMu guards keys, the cache of bucket master keys by bucket ID
+	// (see bucketKey).
+	keyMu     sync.RWMutex
+	keys      map[string]*bucketKeyEntry
 	root      string
 	sysDir    string
 	dataDir   string
@@ -142,6 +168,7 @@ type Backend struct {
 
 	pending pendingSet
 	commits committer
+	restic  resticState // see restic.go
 
 	// commitFault, when set (tests only), replaces the result of every
 	// successful write transaction, simulating a commit that reports an
@@ -150,8 +177,9 @@ type Backend struct {
 }
 
 var (
-	_ storage.Backend            = (*Backend)(nil)
-	_ storage.ConditionalDeleter = (*Backend)(nil)
+	_ storage.Backend              = (*Backend)(nil)
+	_ storage.ConditionalDeleter   = (*Backend)(nil)
+	_ storage.NewerVersionsDeleter = (*Backend)(nil)
 )
 var (
 	_ storage.ConditionalDeleter = (*Backend)(nil)
@@ -190,7 +218,10 @@ func Open(root string, opts Options) (*Backend, error) {
 		if err := os.MkdirAll(d, dirPerm); err != nil {
 			return nil, fmt.Errorf("fs: create %s: %w", d, err)
 		}
+		b.tightenPerm(d)
 	}
+	b.tightenPerm(b.orphanDir)
+	b.protectKeys()
 
 	dbPath := filepath.Join(b.sysDir, "meta.db")
 	if err := b.checkMetadataPresent(dbPath); err != nil {
@@ -208,6 +239,7 @@ func Open(root string, opts Options) (*Backend, error) {
 		return nil, fmt.Errorf("fs: open metadata database %s: %w", dbPath, err)
 	}
 	b.db = db
+	b.tightenPerm(dbPath)
 	if err := b.initSchema(); err != nil {
 		_ = db.Close()
 		return nil, err
@@ -229,6 +261,33 @@ func Open(root string, opts Options) (*Backend, error) {
 		b.recover(ctx)
 	}()
 	return b, nil
+}
+
+// tightenPerm removes the group and other permission bits of path when it
+// exists with them set. MkdirAll and bbolt.Open only apply dirPerm/filePerm
+// when they create a path; a .gos3 directory or meta.db pre-created by an
+// operator or a container volume, or restored from a backup that did not
+// keep modes, would otherwise stay readable by other local users (meta.db
+// holds every key, metadata entry and bucket policy). A failure (e.g. a
+// mount point owned by another user) is logged, not fatal. Windows has no
+// mode bits to fix.
+func (b *Backend) tightenPerm(path string) {
+	if runtime.GOOS == "windows" {
+		return
+	}
+	fi, err := os.Stat(path)
+	if err != nil {
+		return
+	}
+	perm := fi.Mode().Perm()
+	if perm&0o077 == 0 {
+		return
+	}
+	if err := os.Chmod(path, perm&^0o077); err != nil {
+		b.log.Warn("fs: cannot restrict permissions; other local users may read it", "path", path, "mode", perm.String(), "err", err)
+		return
+	}
+	b.log.Warn("fs: restricted permissions that allowed access by other local users", "path", path, "was", perm.String(), "now", (perm &^ 0o077).String())
 }
 
 // checkMetadataPresent refuses to proceed when the metadata database is
@@ -330,6 +389,10 @@ func (b *Backend) Close() error {
 	}
 	b.cancel()
 	b.wg.Wait()
+	// Restores of canceled restic reads finish in the background (and
+	// remove their temporary files); wait for them before the data
+	// directory is released.
+	b.resticRuntime().Wait()
 	if err := b.db.Close(); err != nil {
 		return fmt.Errorf("fs: close metadata database: %w", err)
 	}
@@ -469,13 +532,19 @@ func (p *pendingSet) has(path string) bool {
 // is created lazily, when the buffer first overflows or at finish, so empty
 // objects never touch the filesystem.
 type tmpFile struct {
-	dir  string
-	f    *os.File
-	path string // f.Name() once created
-	buf  []byte
-	n    int // buffered bytes
-	size int64
-	err  error // sticky error
+	// cryptoID and key are set for an encrypted file: its data ID and
+	// stream key (see encryptedTemp). Everything written then goes
+	// through ew into f.
+	cryptoID string
+	key      []byte
+	ew       *crypt.Writer
+	dir      string
+	f        *os.File
+	path     string // f.Name() once created
+	buf      []byte
+	n        int // buffered bytes
+	size     int64
+	err      error // sticky error
 }
 
 const writeBufSize = 64 << 10
@@ -493,7 +562,12 @@ func (t *tmpFile) open() error {
 		return t.err
 	}
 	t.f, t.path = f, f.Name()
-	return nil
+	if t.key != nil {
+		if t.ew, t.err = crypt.NewWriter(f, t.key); t.err != nil {
+			t.err = fmt.Errorf("fs: encrypt data: %w", t.err)
+		}
+	}
+	return t.err
 }
 
 func (t *tmpFile) Write(p []byte) (int, error) {
@@ -507,7 +581,7 @@ func (t *tmpFile) Write(p []byte) (int, error) {
 			if err := t.open(); err != nil {
 				return written, err
 			}
-			n, err := t.f.Write(p)
+			n, err := t.writeDisk(p)
 			written += n
 			t.size += int64(n)
 			if err != nil {
@@ -541,7 +615,7 @@ func (t *tmpFile) flush() error {
 	if err := t.open(); err != nil {
 		return err
 	}
-	_, err := t.f.Write(t.buf[:t.n])
+	_, err := t.writeDisk(t.buf[:t.n])
 	t.n = 0
 	if err != nil {
 		t.err = fmt.Errorf("fs: write data: %w", err)
@@ -559,6 +633,12 @@ func (t *tmpFile) finish(sync, keepEmpty bool) error {
 	err := t.open()
 	if err == nil {
 		err = t.flush()
+	}
+	if err == nil && t.ew != nil {
+		// Seals the final chunk; f stays open.
+		if err = t.ew.Close(); err != nil {
+			err = fmt.Errorf("fs: write data: %w", err)
+		}
 	}
 	if err == nil && sync {
 		if serr := t.f.Sync(); serr != nil {
@@ -673,3 +753,12 @@ type emptyReader struct{ *bytes.Reader }
 func newEmptyReader() emptyReader { return emptyReader{bytes.NewReader(nil)} }
 
 func (emptyReader) Close() error { return nil }
+
+// writeDisk writes p to the file, through the encryption stream when the
+// file is encrypted.
+func (t *tmpFile) writeDisk(p []byte) (int, error) {
+	if t.ew != nil {
+		return t.ew.Write(p)
+	}
+	return t.f.Write(p)
+}

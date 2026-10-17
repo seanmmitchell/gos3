@@ -65,14 +65,16 @@ func TestHandlerServesFilesAndFallback(t *testing.T) {
 				t.Errorf("Cache-Control %q, want %q", got, tt.wantCache)
 			}
 			for k, v := range map[string]string{
-				"X-Content-Type-Options":  "nosniff",
-				"X-Frame-Options":         "DENY",
-				"Referrer-Policy":         "no-referrer",
-				"Content-Security-Policy": "frame-ancestors 'none'",
+				"X-Content-Type-Options": "nosniff",
+				"X-Frame-Options":        "DENY",
+				"Referrer-Policy":        "no-referrer",
 			} {
 				if w.Header().Get(k) != v {
 					t.Errorf("%s = %q, want %q", k, w.Header().Get(k), v)
 				}
+			}
+			if csp := w.Header().Get("Content-Security-Policy"); !strings.HasPrefix(csp, "default-src 'self'; script-src 'self';") || !strings.HasSuffix(csp, "; frame-ancestors 'none'") {
+				t.Errorf("Content-Security-Policy = %q", csp)
 			}
 		})
 	}
@@ -122,6 +124,12 @@ func TestFallbackToIndexWithout200(t *testing.T) {
 }
 
 func TestEmbeddedPlaceholder(t *testing.T) {
+	if FS() == nil {
+		if Built() || get(t, Handler(), "GET", "/_gos3/ui/", nil).Code != 404 {
+			t.Fatal("UI is available in a build without embedded assets")
+		}
+		return
+	}
 	// The committed tree holds the placeholder; a developer tree may hold a
 	// real build. Either way the root must answer with HTML.
 	w := get(t, Handler(), "GET", "/_gos3/ui/", nil)
