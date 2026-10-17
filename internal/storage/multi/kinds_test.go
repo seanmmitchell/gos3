@@ -570,13 +570,13 @@ func TestReleaseBucket(t *testing.T) {
 	if err := r.ReleaseBucket(ctx, "plain"); !errors.Is(err, storage.ErrNotSupported) {
 		t.Fatalf("release on a backing that cannot release: %v", err)
 	}
-	// Not during a move (the target is down, so the move stays).
+	// An unavailable target cannot be checked for unrelated same-name data.
 	f.down.Store(true)
-	if _, err := r.Move(ctx, "plain", "", "f", nil); err != nil {
-		t.Fatal(err)
+	if _, err := r.Move(ctx, "plain", "", "f", nil); err == nil {
+		t.Fatal("move accepted an unverified unavailable target")
 	}
-	if err := r.ReleaseBucket(ctx, "plain"); !errors.Is(err, ErrConflict) {
-		t.Fatalf("release during a move: %v", err)
+	if err := r.ReleaseBucket(ctx, "plain"); !errors.Is(err, storage.ErrNotSupported) {
+		t.Fatalf("failed move changed placement: %v", err)
 	}
 	if _, err := r.Placement("wr"); err != nil {
 		t.Fatalf("refused releases changed the placement: %v", err)
