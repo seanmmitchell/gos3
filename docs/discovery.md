@@ -26,7 +26,7 @@ Unauthenticated (unless `publicInfo` is disabled), `Access-Control-Allow-Origin:
   "service": "gos3",
   "id": "b3f1c2d4e5f60718",
   "name": "nas-gos3",
-  "version": "0.1.0",
+  "version": "v0.2.0",
   "apiVersion": "v1",
   "region": "us-east-1",
   "endpoints": {
