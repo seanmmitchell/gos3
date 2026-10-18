@@ -537,10 +537,17 @@ manager a longer stop timeout than `shutdown_timeout`; the systemd unit uses
 
 ## Upgrades
 
+For the first full release, follow the
+[0.2.0 upgrade checklist](releases/0.2.0.md#upgrading-from-010), including the
+discovery defaults, policy and credential changes. Development-build storage
+migrations are covered separately below.
+
 1. Read the release notes.
 2. Back up the data directory (see above).
-3. Verify the new archive or image with `gh attestation verify`
-   ([releasing.md](releasing.md#verifying-a-release)).
+3. Check archive checksums and verify the archive or image with
+   `gh attestation verify` when an attestation is available. Builds made
+   while the repository is private skip GitHub attestations; see
+   [verification and its limits](releasing.md#verifying-a-release).
 4. Replace the binary or image (on Kubernetes, raise `newTag`, and `digest`
    if you pin one, in `kustomization.yaml`), and restart.
 
