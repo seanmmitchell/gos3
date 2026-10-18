@@ -22,7 +22,7 @@
 # ---------------------------------------------------------------------------
 # Web UI: static SPA with base /_gos3/ui/ (web/.output/public)
 # ---------------------------------------------------------------------------
-FROM --platform=$BUILDPLATFORM node:22-bookworm-slim@sha256:c3de60bf2f9dd0ac6370e6117950ff62d6e339527e7472301c9c78a017978392 AS ui
+FROM --platform=$BUILDPLATFORM node:23-bookworm-slim@sha256:86191b94d2a163be41f3dc7fe5e5fcaca8ba2f1be7275d98a06343483c17414a AS ui
 ENV PNPM_HOME=/pnpm \
     COREPACK_ENABLE_DOWNLOAD_PROMPT=0 \
     NUXT_TELEMETRY_DISABLED=1 \
