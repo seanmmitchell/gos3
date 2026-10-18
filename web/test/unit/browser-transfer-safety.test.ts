@@ -15,6 +15,11 @@ function contentStore(objects: Record<string, string>, acls: Record<string, Cann
   const acl = new Map(Object.entries(acls))
   const heads: string[] = []
   const client: BrowserOpsClient & DestinationLookupClient = {
+    async deleteObject(_b: string, key: string, _versionId?: string, opts?: { ifMatch?: string }) {
+      if (opts?.ifMatch && opts.ifMatch !== data.get(key)) throw new Error('PreconditionFailed')
+      data.delete(key)
+      return {}
+    },
     async listObjectsV2(_b: string, params: ListObjectsV2Params = {}): Promise<ListResult> {
       const all = [...data.keys()].filter(k => k.startsWith(params.prefix ?? '')).sort()
       const start = params.continuationToken ? Number(params.continuationToken) : 0
@@ -40,7 +45,7 @@ function contentStore(objects: Record<string, string>, acls: Record<string, Cann
     async headObject(_b: string, key: string): Promise<HeadResult> {
       heads.push(key)
       if (!data.has(key)) throw Object.assign(new Error('Not Found'), { status: 404 })
-      return { contentLength: 1, metadata: {}, checksums: {}, headers: {} }
+      return { contentLength: 1, etag: data.get(key), metadata: {}, checksums: {}, headers: {} }
     }
   }
   return { client, data, acl, heads }
@@ -109,6 +114,20 @@ describe('existing destination objects', () => {
 })
 
 describe('ACLs of moved objects', () => {
+  it('keeps a concurrent overwrite at the source when a move copied the prior value', async () => {
+    const s = contentStore({ 'src.txt': 'old' })
+    const copy = s.client.copyObject.bind(s.client)
+    s.client.copyObject = async (src, dst, opts) => {
+      const result = await copy(src, dst, opts)
+      s.data.set('src.txt', 'new')
+      return result
+    }
+    const result = await runTransfer(s.client, [{ src: { bucket: 'b', key: 'src.txt' }, dstKey: 'dst.txt' }], 'b', { move: true })
+    expect(result.done).toBe(0)
+    expect(result.failures[0]?.message).toMatch(/copied, but the source could not be deleted.*PreconditionFailed/)
+    expect(Object.fromEntries(s.data)).toEqual({ 'src.txt': 'new', 'dst.txt': 'old' })
+  })
+
   it('keeps canned ACLs on move / rename, not on copy', async () => {
     const s = contentStore({ 'pub.txt': 'p', 'priv.txt': 'q' }, { 'pub.txt': 'public-read' })
     await runTransfer(s.client, [{ src: { bucket: 'b', key: 'pub.txt' }, dstKey: 'moved/pub.txt' }, { src: { bucket: 'b', key: 'priv.txt' }, dstKey: 'moved/priv.txt' }], 'b', { move: true })
