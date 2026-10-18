@@ -29,8 +29,10 @@ trustPolicyExclude:
 # Only direct dependencies may come from git repositories or tarball URLs.
 blockExoticSubdeps: true
 
-# Patched versions of vulnerable transitive dependencies.
+# Pinned and patched transitive dependencies.
 overrides:
+  # Retain the previously accepted release while Socket blocks 0.2.119.
+  lib0: 0.2.118
   # Nuxt devtools (disabled in nuxt.config.ts) pulls simple-git:
   # GHSA-x6jw-m9v5-85vh, GHSA-858h-whjf-mvg5, GHSA-v5rq-49vh-5v5c.
   simple-git: ^4.0.2

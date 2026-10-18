@@ -24,17 +24,18 @@
 # ---------------------------------------------------------------------------
 FROM --platform=$BUILDPLATFORM node:24-bookworm-slim@sha256:a5f4366e834695d5f363b920c104953a535d3a9864d1bdf74566a0ebe01daee5 AS ui
 ENV PNPM_HOME=/pnpm \
-    COREPACK_ENABLE_DOWNLOAD_PROMPT=0 \
     NUXT_TELEMETRY_DISABLED=1 \
     CI=true
 ENV PATH=$PNPM_HOME:$PATH
-RUN corepack enable
 WORKDIR /src/web
 # Dependencies first (cached until the lockfile changes). `pnpm fetch` only
 # needs the lockfile; the offline install below links from the store. Only
 # production dependencies are installed: `nuxt generate` needs none of the
 # devDependencies (test tools), so their code never runs in the image build.
 COPY web/package.json web/pnpm-lock.yaml web/pnpm-workspace.yaml ./
+# Node 25 no longer bundles Corepack; install the package manager pinned by
+# the project instead of relying on the base image to provide it.
+RUN npm install --global --ignore-scripts "$(node -p "require('./package.json').packageManager")"
 RUN --mount=type=cache,id=gos3-pnpm,target=/pnpm/store \
     pnpm config set store-dir /pnpm/store && \
     pnpm fetch --frozen-lockfile

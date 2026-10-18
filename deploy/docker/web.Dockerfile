@@ -26,13 +26,14 @@
 
 FROM node:25-bookworm-slim@sha256:81db02c4b671288a03915da9534dbd54f96d0e7c24d80ccc54f5b36b2e684370 AS build
 ENV PNPM_HOME=/pnpm \
-    COREPACK_ENABLE_DOWNLOAD_PROMPT=0 \
     NUXT_TELEMETRY_DISABLED=1 \
     CI=true
 ENV PATH=$PNPM_HOME:$PATH
-RUN corepack enable
 WORKDIR /src/web
 COPY web/package.json web/pnpm-lock.yaml web/pnpm-workspace.yaml ./
+# Node 25 no longer bundles Corepack; install the package manager pinned by
+# the project instead of relying on the base image to provide it.
+RUN npm install --global --ignore-scripts "$(node -p "require('./package.json').packageManager")"
 RUN --mount=type=cache,id=gos3-pnpm,target=/pnpm/store \
     pnpm config set store-dir /pnpm/store && \
     pnpm fetch --frozen-lockfile
