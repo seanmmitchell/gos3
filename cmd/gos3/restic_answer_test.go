@@ -72,19 +72,21 @@ func TestResticRefusesUnsafeAnswer(t *testing.T) {
 // Plain HTTP to another machine needs --allow-http.
 func TestResticPlainHTTP(t *testing.T) {
 	clearEnv(t)
-	base := []string{"restic", "env", "--bucket", "b", "--access-key", "AK", "--secret-key", "SK", "--timeout", "200ms"}
+	base := []string{"restic", "env", "--bucket", "b", "--access-key", "AK", "--secret-key", "SK"}
 	code, _, stderr := runCmd(t, append(base, "--server", "http://192.0.2.1:9000")...)
 	if code != 1 || !strings.Contains(stderr, "--allow-http") {
 		t.Fatalf("http to another machine: exit %d: %s", code, stderr)
 	}
 	// With the opt-in the request is made (and fails: nothing listens).
-	code, _, stderr = runCmd(t, append(base, "--server", "http://192.0.2.1:9000", "--allow-http")...)
+	code, _, stderr = runCmd(t, append(base, "--server", "http://192.0.2.1:9000", "--allow-http", "--timeout", "200ms")...)
 	if code != 1 || strings.Contains(stderr, "--allow-http") {
 		t.Fatalf("--allow-http: exit %d: %s", code, stderr)
 	}
-	// Loopback needs no opt-in.
+	// Loopback needs no opt-in. Allow time for localhost resolution and
+	// IPv6-to-IPv4 fallback on slower CI runners; this checks HTTP policy,
+	// not connection speed.
 	url := answerServer(t, map[string]any{"repository": "/srv/repo", "password": "pw"})
-	if code, _, stderr := runCmd(t, append(base, "--server", strings.Replace(url, "127.0.0.1", "localhost", 1))...); code != 0 {
+	if code, _, stderr := runCmd(t, append(base, "--server", strings.Replace(url, "127.0.0.1", "localhost", 1), "--timeout", "5s")...); code != 0 {
 		t.Fatalf("loopback: exit %d: %s", code, stderr)
 	}
 }
