@@ -19,8 +19,8 @@ The rulesets in [`.github/rulesets/`](../.github/rulesets) enforce this model:
 
 | Ruleset | Applies to | Enforces |
 |---|---|---|
-| `dev` | `dev` | no deletion or force push; changes only through pull requests, squash-merged, with resolved review threads; linear history; signed commits; required checks |
-| `main` | `main` | the same, but merge commits only (no linear history), plus the `Release PR source` check, which fails unless the pull request comes from `dev` of this repository |
+| `dev` | `dev` | no deletion or force push; changes only through pull requests, squash-merged, with resolved review threads; linear history; required checks |
+| `main` | `main` | the same, but merge commits only (no linear history), signed commits required, plus the `Release PR source` check, which fails unless the pull request comes from `dev` of this repository |
 | `release-tags` | tags `v*` | release tags cannot be deleted, moved or force-pushed |
 | `release-tag-creation` | tags `v*` | only repository admins and deploy keys may create release tags (the Release workflow pushes them with a deploy key, see [below](#release-tags-and-the-release-environment)) |
 | `release-branch-names` | branches `v*` | nobody may create a branch named like a release tag (see [Build integrity](#build-integrity)) |
@@ -43,9 +43,9 @@ Notes:
   not let authors approve their own pull requests. When a second maintainer
   joins, raise `required_approving_review_count` (and consider
   `require_last_push_approval`) in both branch rulesets.
-- **Signed commits.** The commits GitHub creates when it merges a pull
-  request are signed, so squash merges into `dev` and merge commits into
-  `main` pass; commits on pull request branches do not need signatures.
+- **Signed commits on main only.** `main` requires signed commits; `dev`
+  and feature branches do not. GitHub signs the commits it creates when
+  merging pull requests.
 - **No bypass.** No one, admins included, can push to `dev` or `main`
   directly or merge without the checks, or delete or move a release tag. An
   admin can still edit or disable a ruleset, which the audit log records.
