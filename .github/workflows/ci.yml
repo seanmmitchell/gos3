@@ -134,6 +134,11 @@ jobs:
           retention-days: 7
       - name: Embedded build
         run: pnpm generate:embed
+      - name: Standalone render smoke test
+        env:
+          E2E_UI_ONLY: "1"
+          E2E_REAL_ONLY: "1"
+        run: pnpm exec playwright test --project=standalone-setup
       # Both builds above record the npm packages they ship in web/.notices.
       - name: THIRD_PARTY_NOTICES is up to date
         working-directory: .

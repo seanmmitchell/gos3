@@ -25,7 +25,7 @@
 // newer (the embedded UI is not needed; bin/gos3 is the fallback if the
 // build fails). Overrides: GOS3_BIN=<path>, E2E_SKIP_UI_BUILD=1.
 import { spawn, spawnSync } from 'node:child_process'
-import { cpSync, existsSync, mkdirSync, mkdtempSync, readdirSync, renameSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs'
+import { cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, renameSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs'
 import { createServer } from 'node:net'
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
@@ -34,7 +34,7 @@ import {
   BUILD_DIR, CACHE_DIR, OUTPUT_DIR, PRESET_ENV_ID, PRESET_FILE_ENDPOINT, PRESET_FILE_ID, PRESET_OUTPUT_DIR, REPO_DIR, ROOT_ACCESS_KEY, ROOT_SECRET_KEY, STATE_FILE, WATCHDOG, WEB_DIR,
   type Gos3Instance, type StandaloneState, type UiInstance
 } from './env'
-import { stopAll } from './stop'
+import { stopAll, stopProcs } from './stop'
 
 /** Newest mtime (ms) of the files under paths accepted by filter. */
 function newestMtime(paths: string[], filter: (p: string) => boolean = () => true): number {
@@ -223,7 +223,8 @@ async function waitFor(what: string, logFile: string, check: () => Promise<strin
     }
     await new Promise(r => setTimeout(r, 200))
   }
-  throw new Error(`${what} did not become ready: ${last} (log: ${logFile})`)
+  const log = existsSync(logFile) ? readFileSync(logFile, 'utf8').slice(-8000) : ''
+  throw new Error(`${what} did not become ready: ${last} (log: ${logFile})\n${log}`)
 }
 
 function gos3Ready(s: Gos3Instance): Promise<string> {
@@ -237,7 +238,12 @@ function uiReady(u: UiInstance): Promise<string> {
   // 127.0.0.1: Node's fetch may resolve "localhost" to ::1 first.
   return waitFor(`standalone UI at ${u.url}`, u.logFile, async () => {
     const r = await fetch(`http://127.0.0.1:${u.port}/api/discovery/capabilities`)
-    return r.ok ? 'ok' : undefined
+    if (!r.ok) return undefined
+    // A working API does not guarantee that Nitro can render the SPA shell.
+    // Fail setup with the server log instead of timing out on missing UI controls.
+    const page = await fetch(`http://127.0.0.1:${u.port}/servers`)
+    if (!page.ok) throw new Error(`GET /servers returned HTTP ${page.status}`)
+    return 'ok'
   })
 }
 
@@ -247,6 +253,19 @@ setup('build and start the standalone UI and two gos3 instances', async () => {
 
   ensureStandaloneBuild()
   ensurePresetBuild()
+  // Exercise the production renderer in the web job before the full browser
+  // suite (which also needs the Go test job) can start. No browser or gos3
+  // process is needed to detect a broken standalone HTML response.
+  if (process.env.E2E_UI_ONLY === '1') {
+    const tmp = mkdtempSync(join(tmpdir(), 'gos3-standalone-smoke-'))
+    const ui = startUi(OUTPUT_DIR, await freePort(), join(tmp, 'ui.log'), { GOS3_UI_LOCAL_DISCOVERY: 'true' })
+    try {
+      await uiReady(ui)
+    } finally {
+      await stopProcs([ui])
+    }
+    return
+  }
   const binary = ensureBinary()
 
   const tmp = mkdtempSync(join(tmpdir(), 'gos3-standalone-'))
