@@ -24,6 +24,7 @@ type whoAmI struct {
 // service level: a grant scoped to some users, policies or buckets
 // (arn:gos3:admin:::user/team-*) does not show up here.
 type capabilities struct {
+	Proxy          bool `json:"proxy"`          // admin:ProxyRequest
 	Admin          bool `json:"admin"`          // any admin:* allowed
 	ViewInfo       bool `json:"viewInfo"`       // admin:ServerInfo
 	ViewStats      bool `json:"viewStats"`      // admin:GetStats
@@ -71,7 +72,7 @@ var adminActions = []string{
 	"ListRemoteBuckets", "CreateRemoteBucket", "AdoptRemoteBucket", "ManageContainers",
 	"ListJobs", "GetJob", "UpdateJob", "CreateCopyJob",
 	"GetResticCredentials", "GetBucketSnapshots", "PutBucketSnapshots", "RunBucketSnapshot", "RestoreBucketSnapshot",
-	"GetDiscovery", "ScanNetwork", "ProbeNetwork",
+	"GetDiscovery", "ScanNetwork", "ProbeNetwork", "ProxyRequest",
 }
 
 func (a *api) whoami(rc *reqCtx) (int, any, error) {
@@ -101,6 +102,7 @@ func (a *api) whoami(rc *reqCtx) (int, any, error) {
 		Policies:  names,
 		Capabilities: capabilities{
 			Admin:             anyAllowed,
+			Proxy:             allowed["ProxyRequest"],
 			ViewInfo:          allowed["ServerInfo"],
 			ViewStats:         allowed["GetStats"],
 			ManageConfig:      allowed["UpdateConfig"],

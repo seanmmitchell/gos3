@@ -30,6 +30,8 @@ export interface Connection {
   source: ConnectionSource
   /** gos3 server ID (Info.id) once known. */
   serverId?: string
+  /** Optional directly reachable gos3 connection used for automatic fallback. */
+  proxyConnectionId?: string
   /** Optional accent color name (Nuxt UI color or hex). */
   color?: string
 }
@@ -47,6 +49,8 @@ export interface ConnectionInput {
   remember?: boolean
   source?: ConnectionSource
   serverId?: string
+  /** Optional directly reachable gos3 connection used for automatic fallback. */
+  proxyConnectionId?: string
   color?: string
 }
 
@@ -63,6 +67,8 @@ export interface ConnectionStatus {
   /** Epoch ms of the last completed check. */
   checkedAt?: number
   latencyMs?: number
+  /** Relay actually in use; absent while requests are direct. */
+  proxyConnectionId?: string
 }
 
 /** Export file format (also accepted by import; a plain array works too). */

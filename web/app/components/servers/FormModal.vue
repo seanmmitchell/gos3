@@ -16,6 +16,8 @@
  *   before anything is signed for it. A server ID shared with a configured
  *   connection at another address is flagged, not treated as a duplicate.
  */
+import { completeConnection } from '~/utils/connections'
+import { ConnectionTransport } from '~/utils/transport'
 import type { Connection, ConnectionInput } from '~/types/connection'
 import { useConnectionsStore } from '~/stores/connections'
 import {
@@ -74,6 +76,15 @@ const editing = computed(() => !!props.connection)
 const locked = computed(() => isDefinitionLocked(props.connection))
 const lockedName = computed(() => props.connection?.source === 'preset')
 
+const relayItems = computed(() => [
+  { label: 'Disabled (direct only)', value: 'direct' },
+  ...store.connections.filter(c => c.id !== props.connection?.id && c.kind === 'gos3' && !c.proxyConnectionId && hasCredentials(c) && store.capabilitiesOf(c.id).proxy)
+    .map(c => ({ label: c.name, value: c.id }))
+])
+function testTransport(): ConnectionTransport {
+  return new ConnectionTransport(completeConnection({ ...formToInput(model.value), id: props.connection?.id ?? 'connection-form' }))
+}
+
 const kindItems: { label: string, value: KindChoice, description: string }[] = [
   { label: 'Auto-detect', value: 'auto', description: 'Probe /_gos3/info' },
   { label: 'gos3', value: 'gos3', description: 'S3 + admin API' },
@@ -83,6 +94,10 @@ const kindItems: { label: string, value: KindChoice, description: string }[] = [
 watch(open, (v) => {
   if (!v) return
   model.value = props.connection ? formFromConnection(props.connection) : formFromInput(props.prefill ?? {})
+  if (!props.connection && !props.prefill?.proxyConnectionId) {
+    const current = store.active
+    if (current && relayItems.value.some(item => item.value === current.id)) model.value.proxyConnectionId = current.id
+  }
   touched.value = {}
   submitted.value = false
   showSecret.value = false
@@ -144,7 +159,8 @@ async function detect(): Promise<DetectResult | null> {
   detectedFor = endpoint
   detecting.value = true
   try {
-    const r = await detectKind(endpoint)
+    const transport = testTransport()
+    const r = await detectKind(endpoint, { fetch: req => transport.send(req), timeoutMs: 15000 })
     if (seq !== detectSeq) return null
     detection.value = r
     return r
@@ -162,6 +178,7 @@ watch(() => model.value.endpoint, (endpoint) => {
   if (locked.value) return
   detectTimer = setTimeout(() => void detect(), 700)
 })
+watch(() => model.value.proxyConnectionId, () => { detectedFor = ''; detection.value = null; report.value = null; void detect() })
 onBeforeUnmount(() => {
   if (detectTimer) clearTimeout(detectTimer)
 })
@@ -206,6 +223,7 @@ async function runTest() {
   testing.value = true
   report.value = null
   try {
+    const transport = testTransport()
     report.value = await testConnection({
       endpoint: model.value.endpoint,
       region: model.value.region.trim() || (detectedInfo.value?.region && !validateRegion(detectedInfo.value.region) ? detectedInfo.value.region : 'us-east-1'),
@@ -213,7 +231,7 @@ async function runTest() {
       secretAccessKey: model.value.secretAccessKey,
       forcePathStyle: model.value.forcePathStyle,
       kind: model.value.kind
-    })
+    }, { fetch: req => transport.send(req), timeoutMs: 20000 })
   } finally {
     testing.value = false
   }
@@ -257,6 +275,7 @@ async function save() {
             forcePathStyle: input.forcePathStyle ?? c.forcePathStyle,
             remember: input.remember ?? false,
             color: input.color,
+            proxyConnectionId: input.proxyConnectionId,
             serverId: input.serverId ?? c.serverId
           }
       saved = store.update(c.id, patch)
@@ -334,6 +353,10 @@ const description = computed(() => editing.value
             :description="`This server reports the same server ID as ${idConflict.name} (${idConflict.endpoint}). Server IDs are not authenticated: any host can claim one. It is added as a separate server; ${idConflict.name} is not changed.`"
             data-testid="id-conflict"
           />
+
+          <UFormField label="Fallback relay" help="Try direct access first, then connect through this gos3 server if the browser cannot reach the destination.">
+            <USelect :model-value="model.proxyConnectionId ?? 'direct'" :items="relayItems" class="w-full" :disabled="locked" @update:model-value="model.proxyConnectionId = $event === 'direct' ? undefined : $event" />
+          </UFormField>
 
           <div class="grid gap-4 sm:grid-cols-2">
             <UFormField label="Display name" :error="fieldError('name')" :help="lockedName ? 'Defined by configuration.' : undefined">

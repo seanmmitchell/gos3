@@ -9,7 +9,7 @@ import (
 )
 
 // corsMethods are the methods the admin API accepts cross-origin.
-const corsMethods = "GET, POST, PUT, PATCH, DELETE, OPTIONS"
+const corsMethods = "GET, HEAD, POST, PUT, PATCH, DELETE, OPTIONS"
 
 // corsOriginAllowed reports whether origin matches one of the allowed
 // origins: "*" (any), an exact origin (scheme and host compared

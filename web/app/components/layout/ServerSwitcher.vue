@@ -27,6 +27,10 @@ const items = computed<Item[][]>(() => [
   ]
 ])
 
+const relayName = computed(() => {
+  const id = connection.value && store.statusOf(connection.value.id).proxyConnectionId
+  return id ? store.byId(id)?.name ?? 'relay' : undefined
+})
 const state = computed(() => (connection.value ? store.statusOf(connection.value.id).state : 'unknown'))
 </script>
 
@@ -51,6 +55,7 @@ const state = computed(() => (connection.value ? store.statusOf(connection.value
         <span v-if="!collapsed" class="min-w-0 text-left">
           <span class="block truncate text-sm font-medium text-highlighted">{{ connection?.name ?? 'No server selected' }}</span>
           <span v-if="connection" class="block truncate text-xs text-muted">{{ connection.endpoint }}</span>
+          <span v-if="relayName" class="block truncate text-xs text-muted">Connected through {{ relayName }}</span>
         </span>
       </span>
       <UIcon v-if="!collapsed" name="i-lucide-chevrons-up-down" class="size-4 shrink-0 text-dimmed" />

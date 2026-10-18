@@ -9,6 +9,7 @@
 // with `x-amz-content-sha256: UNSIGNED-PAYLOAD` (aws4fetch default for s3), so
 // bodies are never hashed in the browser. Bodies that S3 requires a checksum
 // for carry Content-MD5.
+import type { RequestTransport } from '../transport'
 import { AwsClient } from './signing'
 import type {
   AccessControlPolicy,
@@ -110,6 +111,7 @@ export const MAX_PRESIGN_SECONDS = 7 * 24 * 3600
 export type FetchLike = (input: Request) => Promise<Response>
 
 export interface S3ClientConfig {
+  transport?: RequestTransport
   endpoint: string
   /** Signing region (default us-east-1). */
   region?: string
@@ -394,6 +396,7 @@ export class S3Client {
   readonly forcePathStyle: boolean
   readonly accessKeyId: string
   private readonly aws: AwsClient
+  private readonly transport?: RequestTransport
   private readonly fetchFn: FetchLike
   private readonly datetime?: string
 
@@ -411,7 +414,8 @@ export class S3Client {
       region: this.region,
       retries: 0
     })
-    this.fetchFn = cfg.fetch ?? (req => globalThis.fetch(req))
+    this.transport = cfg.transport
+    this.fetchFn = cfg.transport ? req => cfg.transport!.send(req) : cfg.fetch ?? (req => globalThis.fetch(req))
   }
 
   // -------------------------------------------------------------------------
@@ -473,37 +477,34 @@ export class S3Client {
    */
   private async xhrSend(method: 'PUT' | 'POST', url: URL, headers: Record<string, string>, body: Blob, onProgress?: ProgressCallback, signal?: AbortSignal): Promise<{ status: number, headers: Headers, body: string }> {
     if (signal?.aborted) throw abortedError()
-    const req = await this.sign(url, { method, headers })
-    // The abort listener is attached below: an abort during signing would be missed.
-    if (signal?.aborted) throw abortedError()
-    return new Promise((resolve, reject) => {
-      const xhr = new XMLHttpRequest()
-      xhr.open(method, req.url)
-      req.headers.forEach((value, name) => {
-        if (name === 'host' || name === 'content-length') return
-        xhr.setRequestHeader(name, value)
+    const req = await this.sign(url, { method, headers, body, signal })
+    const send = async (request: Request): Promise<Response> => {
+      const payload = await request.blob()
+      if (request.signal.aborted) throw abortedError()
+      return new Promise((resolve, reject) => {
+        const xhr = new XMLHttpRequest()
+        xhr.open(request.method, request.url)
+        request.headers.forEach((value, name) => {
+          if (name !== 'host' && name !== 'content-length') xhr.setRequestHeader(name, value)
+        })
+        const onAbort = () => xhr.abort()
+        request.signal.addEventListener('abort', onAbort, { once: true })
+        const cleanup = () => request.signal.removeEventListener('abort', onAbort)
+        xhr.upload.onprogress = e => onProgress?.({ loaded: e.loaded, total: e.lengthComputable ? e.total : body.size })
+        xhr.onload = () => {
+          cleanup()
+          resolve(new Response(xhr.status === 204 || request.method === 'HEAD' ? null : xhr.responseText, { status: xhr.status, headers: parseXhrHeaders(xhr.getAllResponseHeaders()) }))
+        }
+        xhr.onerror = () => { cleanup(); reject(new TypeError('XMLHttpRequest failed')) }
+        xhr.ontimeout = xhr.onerror
+        xhr.onabort = () => { cleanup(); reject(abortedError()) }
+        xhr.send(payload)
       })
-      const onAbort = () => xhr.abort()
-      signal?.addEventListener('abort', onAbort, { once: true })
-      const cleanup = () => signal?.removeEventListener('abort', onAbort)
-      xhr.upload.onprogress = (e: ProgressEvent) => {
-        onProgress?.({ loaded: e.loaded, total: e.lengthComputable ? e.total : body.size })
-      }
-      xhr.onload = () => {
-        cleanup()
-        resolve({ status: xhr.status, headers: parseXhrHeaders(xhr.getAllResponseHeaders()), body: xhr.responseText ?? '' })
-      }
-      xhr.onerror = () => {
-        cleanup()
-        reject(networkError(new TypeError('XMLHttpRequest failed'), url.toString()))
-      }
-      xhr.ontimeout = xhr.onerror
-      xhr.onabort = () => {
-        cleanup()
-        reject(abortedError())
-      }
-      xhr.send(body)
-    })
+    }
+    try {
+      const response = this.transport ? await this.transport.send(req, send) : await send(req)
+      return { status: response.status, headers: response.headers, body: await response.text() }
+    } catch (error) { throw networkError(error, url.toString()) }
   }
 
   /** Presigned URL for any method (query-string SigV4). */
@@ -511,7 +512,7 @@ export class S3Client {
     const exp = Math.max(1, Math.min(MAX_PRESIGN_SECONDS, Math.floor(expiresSeconds)))
     const url = this.url(bucket, key, { ...query, 'X-Amz-Expires': exp })
     const req = await this.aws.sign(url.toString(), { method, aws: { signQuery: true, datetime: this.datetime } } as RequestInit)
-    return req.url
+    return method === 'GET' && this.transport ? this.transport.presign(req.url, exp) : req.url
   }
 
   // -------------------------------------------------------------------------

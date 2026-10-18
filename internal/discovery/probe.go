@@ -306,3 +306,14 @@ func withDefaultTimeout(ctx context.Context, d time.Duration) (context.Context, 
 	}
 	return context.WithTimeout(ctx, d)
 }
+
+// NewGuardedTransport returns an HTTP transport for authenticated management
+// relays. It applies the same DNS and dial-time address protections as probes,
+// allows private networks, and neither uses environment proxies nor decompresses
+// responses. The caller must disable redirects and close idle connections.
+func NewGuardedTransport() *http.Transport {
+	tr := newProber().client.Transport.(*http.Transport)
+	// Admin operations may wait on remote storage for up to 90 seconds.
+	tr.ResponseHeaderTimeout = 90 * time.Second
+	return tr
+}

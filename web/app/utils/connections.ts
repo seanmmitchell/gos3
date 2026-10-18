@@ -71,6 +71,7 @@ export function toConnectionInput(raw: unknown): ConnectionInput | undefined {
     remember: typeof o.remember === 'boolean' ? o.remember : undefined,
     source,
     serverId: str(o.serverId),
+    proxyConnectionId: str(o.proxyConnectionId),
     color: str(o.color)
   }
 }
@@ -108,6 +109,7 @@ export function completeConnection(input: ConnectionInput, defaults: Partial<Con
     remember: input.remember ?? defaults.remember ?? false,
     source: input.source ?? defaults.source ?? 'user',
     serverId: input.serverId ?? defaults.serverId,
+    proxyConnectionId: input.proxyConnectionId ?? defaults.proxyConnectionId,
     color: input.color ?? defaults.color
   }
 }
@@ -152,7 +154,7 @@ export type ImportAddReason = 'retarget' | 'protected'
  * What importing one entry does:
  * - add: a new connection. `instead` is set when the entry matched an
  *   existing connection that is left untouched because the entry points
- *   elsewhere (other endpoint or kind): 'retarget' for a user connection,
+ *   elsewhere (other endpoint, kind or fallback relay): 'retarget' for a user connection,
  *   'protected' for an embedded/preset one. The new connection gets a fresh
  *   ID and only the credentials the file itself holds.
  * - update: applies `patch` (described by `changes`) to `target`, whose
@@ -186,7 +188,7 @@ function displayValue(field: ImportField, v: unknown): string {
  * Entries are planned in order, each against the result of the previous ones.
  *
  * Imported data must never redirect credentials the user already stored, so:
- * - an entry that would change a match's normalized endpoint or kind is added
+ * - an entry that would change a match's normalized endpoint, kind or fallback relay is added
  *   as a separate connection (fresh ID, only the file's own credentials); the
  *   existing connection keeps its endpoint and secret. Updating it with the
  *   credentials cleared was the alternative; a new entry is clearer because
@@ -232,7 +234,7 @@ export function planConnectionImport(existing: readonly Connection[], items: rea
       continue
     }
     const prot = isProtectedConnection(target)
-    if (!sameEndpoint(target.endpoint, item.endpoint) || (item.kind !== undefined && item.kind !== target.kind)) {
+    if (!sameEndpoint(target.endpoint, item.endpoint) || (item.kind !== undefined && item.kind !== target.kind) || item.proxyConnectionId !== target.proxyConnectionId) {
       add(clean, { of: target, reason: prot ? 'protected' : 'retarget' })
       continue
     }

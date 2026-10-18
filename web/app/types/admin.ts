@@ -50,6 +50,8 @@ export interface Info {
 
 /** Capabilities derived by the server from the caller's admin:* permissions. */
 export interface Capabilities {
+  /** admin:ProxyRequest; absent on older servers. */
+  proxy?: boolean
   /** any admin:* allowed */
   admin: boolean
   /** admin:ServerInfo */
