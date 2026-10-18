@@ -9,7 +9,7 @@
 // with `x-amz-content-sha256: UNSIGNED-PAYLOAD` (aws4fetch default for s3), so
 // bodies are never hashed in the browser. Bodies that S3 requires a checksum
 // for carry Content-MD5.
-import { AwsClient } from 'aws4fetch'
+import { AwsClient } from './signing'
 import type {
   AccessControlPolicy,
   CannedACL,
