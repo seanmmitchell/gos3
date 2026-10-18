@@ -432,8 +432,9 @@ cd web && pnpm dev   # UI with hot reload on http://localhost:3000
 | Target | |
 |---|---|
 | `make build` | Web UI + `bin/gos3` with the UI embedded (`make build-go`: Go only) |
-| `make test` | Go tests with `-race` plus the web unit tests (Vitest) |
-| `make e2e` | `test/e2e`: real servers in-process, driven by aws-sdk-go-v2 and minio-go |
+| `make test` | Go unit and end-to-end tests with `-race`, plus the web unit/component tests (Vitest), each once |
+| `make test-go`, `make test-web` | Only the Go unit tests or web unit/component tests |
+| `make e2e` | Only `test/e2e` with `-race`: real servers in-process, driven by aws-sdk-go-v2 and minio-go |
 | `make e2e-web` | Playwright: mocked UI, UI embedded in a real gos3, standalone UI cross-origin |
 | `make compat` | `test/compat`: boto3 / pytest and AWS CLI against a real binary |
 | `make lint`, `make fmt` | gofmt and go vet |

@@ -22,6 +22,10 @@ type workflowStep struct {
 type workflowJob struct {
 	Steps   []workflowStep    `yaml:"steps"`
 	Outputs map[string]string `yaml:"outputs"`
+	If      string            `yaml:"if"`
+	Needs   yaml.Node         `yaml:"needs"`
+	Uses    string            `yaml:"uses"`
+	With    map[string]any    `yaml:"with"`
 }
 type releaseWorkflow struct {
 	On   map[string]any         `yaml:"on"`

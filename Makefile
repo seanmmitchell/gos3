@@ -68,16 +68,16 @@ notices: ## regenerate THIRD_PARTY_NOTICES (builds both web UI variants first)
 	cd web && $(PNPM) install --frozen-lockfile && $(PNPM) build && $(PNPM) generate:embed
 	$(GO) run ./internal/tools/notices
 
-test: test-go test-web ## run all Go and web unit tests
+test: test-go test-web e2e ## run Go unit, web unit/component and Go end-to-end tests once
 
-test-go: ## run the Go tests with the race detector
-	$(GO) test -race ./...
+test-go: ## run the Go unit tests with the race detector
+	$(GO) test -race ./cmd/... ./internal/...
 
 test-web: ## run the web UI unit tests (Vitest)
 	cd web && $(PNPM) test
 
-e2e: ## run the end-to-end tests against a real server
-	$(GO) test -count=1 ./test/e2e/...
+e2e: ## run the Go end-to-end tests against a real server with the race detector
+	$(GO) test -race -count=1 ./test/e2e/...
 
 lint: ## check formatting and run go vet
 	@unformatted="$$(gofmt -l cmd internal test 2>/dev/null)"; \
@@ -125,7 +125,7 @@ compat: ## run the boto3 / AWS CLI compatibility suite (test/compat/run.sh)
 	test/compat/run.sh
 
 e2e-web: build ## run the Playwright suites (mocked, real server, standalone) against bin/gos3
-	cd web && $(PNPM) test:e2e
+	cd web && E2E_SKIP_UI_BUILD=1 $(PNPM) test:e2e
 	cd web && GOS3_BIN=$(CURDIR)/$(BIN) E2E_SKIP_UI_BUILD=1 $(PNPM) test:e2e:real
 	cd web && GOS3_BIN=$(CURDIR)/$(BIN) $(PNPM) test:e2e:standalone
 

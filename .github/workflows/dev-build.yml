@@ -1,7 +1,8 @@
 name: Dev build
 
-# Every push to dev builds what the next release would ship: archives for all
-# platforms (bin-<os>-<arch> artifacts of this run, kept 30 days) and the
+# Called by CI after every check passes for a push to dev. Builds what the
+# next release would ship: archives for all platforms (bin-<os>-<arch>
+# artifacts of this run, kept 30 days) and the
 # multi-arch image ghcr.io/<owner>/<repo>:dev, also tagged dev-<commit>.
 # Headless archives and image tags append -headless. The
 # version is the next patch release as a prerelease, e.g.
@@ -9,20 +10,15 @@ name: Dev build
 # docs/releasing.md.
 
 on:
-  push:
-    branches: [dev]
+  workflow_call:
 
 permissions:
   contents: read
 
-# Only the newest dev commit matters; a newer push replaces a running build.
-concurrency:
-  group: dev-build
-  cancel-in-progress: true
-
 jobs:
   version:
     name: Version
+    if: github.event_name == 'push' && github.ref == 'refs/heads/dev'
     runs-on: ubuntu-latest
     timeout-minutes: 5
     outputs:
@@ -59,3 +55,5 @@ jobs:
         type=raw,value=dev-${{ needs.version.outputs.commit }}
       cache-scope: dev
       retention-days: 30
+      # The calling CI run has validated github.sha with the full suite.
+      run-tests: false
