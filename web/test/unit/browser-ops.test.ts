@@ -15,6 +15,13 @@ function fakeStore(initial: Record<string, string[]>) {
   const buckets = new Map(Object.entries(initial).map(([b, keys]) => [b, new Set(keys)]))
   const copies: { src: ObjectRef, dst: { bucket: string, key: string } }[] = []
   const client: BrowserOpsClient = {
+    async headObject() {
+      return { contentLength: 1, etag: 'e', metadata: {}, checksums: {}, headers: {} }
+    },
+    async deleteObject(bucket: string, key: string) {
+      buckets.get(bucket)!.delete(key)
+      return {}
+    },
     async listObjectsV2(bucket: string, params: ListObjectsV2Params = {}): Promise<ListResult> {
       const all = [...(buckets.get(bucket) ?? [])].filter(k => k.startsWith(params.prefix ?? '')).sort()
       // Two keys per page to exercise pagination.

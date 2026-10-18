@@ -156,10 +156,9 @@ func (b *Backend) loadBucketKey(bucketID string, create bool) ([]byte, error) {
 // (bucket master keys, restic recovery records) at Open, e.g. after a
 // restore from a backup that did not keep their permissions: on Windows it
 // gives the directory a private ACL that its files inherit, elsewhere it
-// removes group and other permission bits. It is best effort, as file
-// systems without ACLs (FAT, exFAT, some SMB shares) must not keep the
-// server from starting; failures are logged. Only this small directory is
-// visited, not the whole system directory.
+// removes group and other permission bits. This extra pass is best effort;
+// on Windows, Open already requires a protected ACL on the parent .gos3.
+// Only this small directory is visited, not the whole system directory.
 func (b *Backend) protectKeys() {
 	dir := filepath.Join(b.sysDir, keysDirName)
 	entries, err := os.ReadDir(dir)
