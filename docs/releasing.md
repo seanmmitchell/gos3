@@ -223,11 +223,26 @@ What keeps code that did not go through `dev` → `main` out of a release:
 
 ## Dev builds
 
-Every push to `dev` runs [`dev-build.yml`](../.github/workflows/dev-build.yml):
-the same tests and builds as a release (but with caches), published as
+Every push to `dev` runs the full [`CI`](../.github/workflows/ci.yml) suite.
+Only after all six CI jobs pass (including both platform matrix entries)
+does that same run call [`dev-build.yml`](../.github/workflows/dev-build.yml)
+to build and publish the exact `github.sha` that passed. Go and web validation
+are not repeated by the publishing build. A failed or cancelled check blocks
+publishing; a newer push cancels the previous dev run, including its build.
+Pull request and manual CI runs never publish.
+
+The dev build produces the same archives and images as a release (with
+caches), published as
 `ghcr.io/seanmmitchell/gos3:dev` and `:dev-<commit>` with an attestation
 for `--source-ref refs/heads/dev`, and with the archives kept
 as artifacts of the run for 30 days. Nothing appears on the Releases page.
+
+Release builds still run their own Go and web validation and rebuild from
+the tagged SHA without caches. The reusable build's `run-tests` input defaults
+to `true`; uncached builds always validate even if that input is disabled.
+Both publishing paths build their own embedded UI with production dependencies
+only, and download it by the producing job's immutable artifact ID. CI's UI
+artifacts are reused only by its browser tests, never by a publishing build.
 
 Both release and dev builds produce headless archives for every OS and
 architecture, named `gos3_<version>_<os>_<arch>-headless.tar.gz` (`.zip` on

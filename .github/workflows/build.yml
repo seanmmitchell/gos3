@@ -1,7 +1,7 @@
 name: Build
 
 # Reusable build shared by release.yml (tagged releases from main) and
-# dev-build.yml (every push to dev): runs the Go and web tests, builds the
+# dev-build.yml (after CI passes on dev): validates releases, builds the
 # embedded web UI, cross-compiles embedded and headless binaries for every
 # release platform and, when image-tags is set, pushes both multi-arch images to
 # ghcr.io/<owner>/<repo> with a signed build provenance attestation. The
@@ -53,6 +53,11 @@ on:
         required: false
         type: number
         default: 3
+      run-tests:
+        description: Run Go and web checks (CI disables this only after its full suite passes for the same SHA; uncached releases always validate).
+        required: false
+        type: boolean
+        default: true
 
 permissions:
   contents: read
@@ -66,11 +71,11 @@ env:
   VERSION: ${{ inputs.version }}
 
 jobs:
-  # Nothing is built or published unless the commit passes the Go checks (the
-  # full matrix, including the Playwright suites, runs in ci.yml on every pull
-  # request and is required before anything reaches dev or main).
+  # Dev publishing follows the same commit's complete CI run. Releases still
+  # validate independently, even if a caller disables run-tests by mistake.
   test:
     name: Go (vet, test, e2e)
+    if: inputs.run-tests || !inputs.use-cache
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
@@ -99,6 +104,7 @@ jobs:
   # UI embedded into the binaries.
   ui-test:
     name: Web UI (typecheck, test)
+    if: inputs.run-tests || !inputs.use-cache
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
@@ -128,7 +134,6 @@ jobs:
     name: Build embedded UI
     runs-on: ubuntu-latest
     timeout-minutes: 20
-    needs: test
     outputs:
       artifact-id: ${{ steps.upload.outputs.artifact-id }}
     steps:
@@ -165,7 +170,14 @@ jobs:
     name: gos3 ${{ matrix.goos }}/${{ matrix.goarch }} (${{ matrix.variant.name }})
     runs-on: ubuntu-latest
     timeout-minutes: 20
-    needs: [ui, ui-test]
+    needs: [test, ui, ui-test]
+    # Explicit status functions allow the two validation jobs to be skipped
+    # after CI, while a failed/cancelled check or UI build still blocks output.
+    if: >-
+      ${{ !cancelled() && needs.ui.result == 'success' &&
+      ((needs.test.result == 'success' && needs.ui-test.result == 'success') ||
+      (!inputs.run-tests && inputs.use-cache &&
+      needs.test.result == 'skipped' && needs.ui-test.result == 'skipped')) }}
     strategy:
       fail-fast: true
       matrix:

@@ -122,7 +122,9 @@ export default defineConfig({
     }
   ],
   webServer: realOnly ? undefined : {
-    command: `pnpm generate:embed && node test/e2e/serve.mjs`,
+    command: process.env.E2E_SKIP_UI_BUILD === '1'
+      ? 'node test/e2e/serve.mjs'
+      : 'pnpm generate:embed && node test/e2e/serve.mjs',
     url: `http://127.0.0.1:${PORT}/_gos3/ui/`,
     reuseExistingServer: !process.env.CI,
     timeout: 180_000,
