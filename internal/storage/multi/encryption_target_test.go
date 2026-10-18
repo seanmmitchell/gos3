@@ -54,7 +54,7 @@ func TestAESNeedsAESOnEveryCopy(t *testing.T) {
 		if _, err := r.SetReplication(ctx, name, ModeActivePassive, []string{"k"}); !errors.Is(err, ErrInvalidPlacement) {
 			t.Fatalf("replica of %s on a backing without AES256: %v", name, err)
 		}
-		if _, err := r.Move(ctx, name, "", "k"); !errors.Is(err, ErrInvalidPlacement) {
+		if _, err := r.Move(ctx, name, "", "k", nil); !errors.Is(err, ErrInvalidPlacement) {
 			t.Fatalf("move of %s to a backing without AES256: %v", name, err)
 		}
 	}

@@ -93,7 +93,7 @@ func (s *Server) handlePutBucketAcl(w http.ResponseWriter, r *http.Request, rc *
 		}
 	}
 
-	unlock := lockBucketState(rc.bucket)
+	unlock := s.lockBucketState(rc.bucket)
 	defer unlock()
 	own, err := s.bucketConfig(ctx, rc.bucket, storage.ConfigOwnership)
 	if err != nil {
@@ -277,7 +277,7 @@ func (s *Server) handlePutBucketOwnershipControls(w http.ResponseWriter, r *http
 	}
 	oc.Rules[0].ObjectOwnership = v
 
-	unlock := lockBucketState(rc.bucket)
+	unlock := s.lockBucketState(rc.bucket)
 	defer unlock()
 	if v == ownershipBucketOwnerEnforced {
 		raw, err := s.bucketConfig(ctx, rc.bucket, storage.ConfigACL)
@@ -335,7 +335,7 @@ func (s *Server) handlePutPublicAccessBlock(w http.ResponseWriter, r *http.Reque
 		return err
 	}
 	c.XMLNS = s3Namespace
-	unlock := lockBucketState(rc.bucket)
+	unlock := s.lockBucketState(rc.bucket)
 	defer unlock()
 	if err := s.storeBucketConfig(ctx, rc, storage.ConfigPublicAccessBlock, c); err != nil {
 		return err
@@ -346,7 +346,7 @@ func (s *Server) handlePutPublicAccessBlock(w http.ResponseWriter, r *http.Reque
 
 // handleDeletePublicAccessBlock implements DeletePublicAccessBlock (204).
 func (s *Server) handleDeletePublicAccessBlock(w http.ResponseWriter, r *http.Request, rc *reqContext) error {
-	unlock := lockBucketState(rc.bucket)
+	unlock := s.lockBucketState(rc.bucket)
 	defer unlock()
 	return s.deleteBucketConfigResponse(w, r, rc, storage.ConfigPublicAccessBlock)
 }
@@ -457,7 +457,7 @@ func (s *Server) handlePutObjectLockConfiguration(w http.ResponseWriter, r *http
 		return err
 	}
 
-	unlock := lockBucketState(rc.bucket)
+	unlock := s.lockBucketState(rc.bucket)
 	defer unlock()
 	bi, err := s.lookupBucket(ctx, rc.bucket)
 	if err != nil {

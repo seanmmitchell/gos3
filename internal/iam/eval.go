@@ -1,6 +1,7 @@
 package iam
 
 import (
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -18,10 +19,14 @@ const adminARNPrefix = "arn:gos3:admin:::"
 
 // Types of per-target admin resources (arn:gos3:admin:::<type>/<name>).
 const (
-	adminTypeUser   = "user"
-	adminTypePolicy = "policy"
-	adminTypeBucket = "bucket"
+	adminTypeUser    = "user"
+	adminTypePolicy  = "policy"
+	adminTypeBucket  = "bucket"
+	adminTypeBacking = "backing"
 )
+
+// adminTypes are the types of per-target admin resources.
+var adminTypes = []string{adminTypeUser, adminTypePolicy, adminTypeBucket, adminTypeBacking}
 
 // CondAdminPolicyName is the multi-valued condition key holding the policy
 // names an admin:CreateUser or admin:UpdateUser request attaches (absent
@@ -40,9 +45,16 @@ func AdminPolicyARN(name string) string { return adminARNPrefix + adminTypePolic
 // (arn:gos3:admin:::bucket/<name>).
 func AdminBucketARN(name string) string { return adminARNPrefix + adminTypeBucket + "/" + name }
 
+// AdminBackingARN returns the admin resource of a storage backing
+// (arn:gos3:admin:::backing/<name>): the remote buckets and containers of
+// an s3 backing (admin:ListRemoteBuckets, admin:CreateRemoteBucket,
+// admin:AdoptRemoteBucket, admin:ManageContainers).
+func AdminBackingARN(name string) string { return adminARNPrefix + adminTypeBacking + "/" + name }
+
 // ValidAdminRequestResource reports whether r is a resource an admin
 // request can be evaluated against: "" (service level) or
-// arn:gos3:admin:::{user,policy,bucket}/<name> with a non-empty name.
+// arn:gos3:admin:::{user,policy,bucket,backing}/<name> with a non-empty
+// name.
 func ValidAdminRequestResource(r string) bool {
 	if r == "" {
 		return true
@@ -55,11 +67,7 @@ func ValidAdminRequestResource(r string) bool {
 	if !ok || name == "" {
 		return false
 	}
-	switch typ {
-	case adminTypeUser, adminTypePolicy, adminTypeBucket:
-		return true
-	}
-	return false
+	return slices.Contains(adminTypes, typ)
 }
 
 // s3ServiceARN is the resource that service-level s3 actions (Bucket == "",
@@ -87,6 +95,10 @@ type evalCtx struct {
 	// match: id.AccessKey, or "" when that ID is ambiguous (see
 	// usablePrincipalKey).
 	principalKey string
+
+	// budget limits the work of this decision; once it is exceeded the
+	// request is denied.
+	budget *budget
 }
 
 func newEvalCtx(req *AuthzRequest, now time.Time) *evalCtx {
@@ -99,6 +111,7 @@ func newEvalCtx(req *AuthzRequest, now time.Time) *evalCtx {
 		now:     now,
 
 		principalKey: req.Identity.AccessKey,
+		budget:       newBudget(),
 	}
 	switch {
 	case c.isAdmin:
@@ -176,7 +189,7 @@ func (c *evalCtx) lookupVar(name string) (string, bool) {
 // (case-insensitive, with wildcards).
 func (c *evalCtx) actionMatches(patterns []string) bool {
 	for _, p := range patterns {
-		if globMatch(p, c.action, true, false) {
+		if globMatchBudget(p, c.action, true, false, c.budget) {
 			return true
 		}
 	}
@@ -206,7 +219,7 @@ func (c *evalCtx) resourceMatches(patterns []string) bool {
 			}
 			continue
 		}
-		if matchPattern(p, c.resource, false, c.lookupVar) {
+		if matchPattern(p, c.resource, false, c.lookupVar, c.budget) {
 			return true
 		}
 	}
@@ -429,8 +442,16 @@ func IsPublicACL(acl string) bool {
 	return false
 }
 
+// limitDecision is the decision for a request whose evaluation exceeded
+// the work limits (see budget) at the statement where: whether that
+// statement applies is unknown, so the request is denied outright rather
+// than letting an Allow match or a Deny be skipped.
+func limitDecision(where string) Decision {
+	return Decision{ExplicitDeny: true, Reason: "policy evaluation limit exceeded at " + where}
+}
+
 // authorize implements Manager.Authorize.
-func (m *Manager) authorize(req AuthzRequest) Decision {
+func (m *Manager) authorize(req AuthzRequest, shared *budget) Decision {
 	id := req.Identity
 	if id.IsRoot && !id.IsAnonymous {
 		return Decision{Allowed: true, Reason: "root user"}
@@ -459,6 +480,12 @@ func (m *Manager) authorize(req AuthzRequest) Decision {
 	}
 
 	c := newEvalCtx(&req, m.now())
+	if shared != nil {
+		c.budget = shared
+		if shared.exceeded {
+			return limitDecision("request")
+		}
+	}
 	c.principalKey = principalKey
 	allowReason := ""
 	for _, p := range policies {
@@ -467,7 +494,14 @@ func (m *Manager) authorize(req AuthzRequest) Decision {
 			if st.Effect == "Allow" && allowReason != "" {
 				continue // already allowed; only Deny statements matter now
 			}
-			if (st.Effect != "Allow" && st.Effect != "Deny") || !c.statementApplies(st, false) {
+			if st.Effect != "Allow" && st.Effect != "Deny" {
+				continue
+			}
+			applies := c.statementApplies(st, false)
+			if c.budget.exceeded {
+				return limitDecision("policy " + p.Name + " statement " + stmtLabel(st, i))
+			}
+			if !applies {
 				continue
 			}
 			if st.Effect == "Deny" {
@@ -482,7 +516,14 @@ func (m *Manager) authorize(req AuthzRequest) Decision {
 			if st.Effect == "Allow" && allowReason != "" {
 				continue
 			}
-			if (st.Effect != "Allow" && st.Effect != "Deny") || !c.statementApplies(st, true) {
+			if st.Effect != "Allow" && st.Effect != "Deny" {
+				continue
+			}
+			applies := c.statementApplies(st, true)
+			if c.budget.exceeded {
+				return limitDecision("bucket policy statement " + stmtLabel(st, i))
+			}
+			if !applies {
 				continue
 			}
 			if st.Effect == "Deny" {

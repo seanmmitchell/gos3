@@ -1,11 +1,18 @@
 // Package s3client is a small S3 API client used by the remote backings
-// (docs/backings.md): the fs backend's blob mode and the gateway backend.
+// (docs/backings.md): the s3 store and the native (passthrough) buckets of
+// an S3 account.
 //
-// It covers exactly the operations those need (objects, listing, multipart
-// uploads and server-side copies, plus HeadBucket/CreateBucket), signs every
-// request with SigV4 through internal/auth, and retries transient failures.
-// It is built on net/http only; the AWS SDK is a test-only dependency of
-// gos3.
+// It covers exactly the operations those need: objects (also addressed by
+// version ID), listings (ListObjectsV2, ListObjectVersions, uploads and
+// parts), multipart uploads and server-side copies, buckets (listing,
+// creation, regions, versioning, object lock configuration) and the object
+// sub-resources retention, legal hold and tagging. It signs every request
+// with SigV4 through internal/auth and retries transient failures. It is
+// built on net/http only; the AWS SDK is a test-only dependency of gos3.
+//
+// Clients sign for one region; Client.ForRegion returns a client for
+// buckets in another one (on AWS also addressing that region's endpoint),
+// and Client.BucketRegion finds a bucket's region.
 //
 // Helpers on top of the raw operations:
 //   - Spool buffers a stream in memory and spills it to a temporary file,
@@ -36,7 +43,9 @@ package s3client
 import (
 	"bytes"
 	"context"
+	"crypto/md5"
 	"crypto/sha256"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/xml"
 	"errors"
@@ -85,6 +94,12 @@ type Client struct {
 	signPayload bool
 	// now is the clock used for signing (tests).
 	now func() time.Time
+	// root is the client New returned; ForRegion clones share its
+	// regions map and settings.
+	root *Client
+	// regions memoizes the ForRegion clones of root (region -> *Client);
+	// only root's is used.
+	regions *sync.Map
 }
 
 // New returns a client for cfg.
@@ -108,7 +123,9 @@ func New(cfg Config) (*Client, error) {
 		maxAttempts: cfg.MaxAttempts,
 		signPayload: u.Scheme == "http",
 		now:         time.Now,
+		regions:     new(sync.Map),
 	}
+	c.root = c
 	if c.region == "" {
 		c.region = auth.DefaultRegion
 	}
@@ -148,6 +165,14 @@ type Error struct {
 	RequestID  string
 	Op         string // e.g. "PutObject"
 	Err        error  // transport error, if any
+	// Header holds the response headers of the error answer (nil for
+	// transport failures): x-amz-delete-marker, x-amz-version-id,
+	// x-amz-bucket-region, ...
+	Header http.Header
+	// Region is the bucket's region when the answer reported one (the
+	// x-amz-bucket-region header or a <Region> element), e.g. on a 301
+	// PermanentRedirect or a 400 AuthorizationHeaderMalformed.
+	Region string
 }
 
 func (e *Error) Error() string {
@@ -207,6 +232,61 @@ func IsUnavailable(err error) bool {
 	return e.Err != nil || e.StatusCode >= 500
 }
 
+// IsDeleteMarker reports whether err is the answer to a HEAD/GET/DELETE of
+// a delete marker (404 or 405 with x-amz-delete-marker: true) and returns
+// the marker's version ID (x-amz-version-id, "" when not sent).
+func IsDeleteMarker(err error) (versionID string, ok bool) {
+	var e *Error
+	if !errors.As(err, &e) || e.Header == nil {
+		return "", false
+	}
+	if e.StatusCode != http.StatusNotFound && e.StatusCode != http.StatusMethodNotAllowed {
+		return "", false
+	}
+	if !strings.EqualFold(strings.TrimSpace(e.Header.Get("X-Amz-Delete-Marker")), "true") {
+		return "", false
+	}
+	return e.Header.Get("X-Amz-Version-Id"), true
+}
+
+// IsWrongRegion reports whether err says the bucket lives in another
+// region (301 PermanentRedirect or 307 TemporaryRedirect, 400
+// AuthorizationHeaderMalformed or IllegalLocationConstraintException) and
+// returns that region when the answer named it. AuthorizationHeaderMalformed
+// only counts when it is about the region (it names one, or its message
+// mentions the region), since it also reports other malformed signatures.
+func IsWrongRegion(err error) (region string, ok bool) {
+	var e *Error
+	if !errors.As(err, &e) || e.Err != nil {
+		return "", false
+	}
+	switch {
+	case e.StatusCode == http.StatusMovedPermanently, e.Code == "PermanentRedirect":
+	case e.StatusCode == http.StatusTemporaryRedirect, e.Code == "TemporaryRedirect":
+	case e.Code == "IllegalLocationConstraintException":
+	case e.Code == "AuthorizationHeaderMalformed":
+		if e.Region == "" && !strings.Contains(strings.ToLower(e.Message), "region") {
+			return "", false
+		}
+	default:
+		return "", false
+	}
+	return e.Region, true
+}
+
+// IsNotImplemented reports a 501 / NotImplemented answer.
+func IsNotImplemented(err error) bool {
+	st, code := statusOf(err)
+	return st == http.StatusNotImplemented || code == "NotImplemented"
+}
+
+// IsAccessDenied reports a 403 answer (or an AccessDenied failure of a
+// DeleteObjects entry).
+func IsAccessDenied(err error) bool {
+	st, code := statusOf(err)
+	return st == http.StatusForbidden || code == "AccessDenied"
+}
+
 // --- requests ---
 
 // request describes one API call. body, when set, must return a fresh
@@ -226,6 +306,9 @@ type request struct {
 	retryTransport bool
 	// noRetry sends the request exactly once.
 	noRetry bool
+	// md5 sends Content-MD5, computed from body (meant for small bodies
+	// such as XML documents: the body is read once more for it).
+	md5 bool
 }
 
 // url builds the request URL.
@@ -258,6 +341,17 @@ func (c *Client) url(bucket, key string, hasKey bool, q url.Values) *url.URL {
 // do sends req (retrying transient failures) and returns the response of a
 // 2xx answer; the caller must close its body. Error answers become *Error.
 func (c *Client) do(ctx context.Context, req request) (*http.Response, error) {
+	if req.md5 && req.body != nil {
+		sum, err := md5Of(req.body())
+		if err != nil {
+			return nil, &Error{Op: req.op, Err: err}
+		}
+		req.header = req.header.Clone()
+		if req.header == nil {
+			req.header = http.Header{}
+		}
+		req.header.Set("Content-Md5", base64.StdEncoding.EncodeToString(sum))
+	}
 	var lastErr error
 	for attempt := 0; attempt < c.maxAttempts; attempt++ {
 		if attempt > 0 {
@@ -396,29 +490,48 @@ func (b *trackedBody) Close() error {
 	return nil
 }
 
-// parseError turns an error answer into an *Error.
+// parseError turns an error answer into an *Error. Answers without a body
+// (HEAD requests) get a code from their status where S3 clients agree on
+// one: a HEAD of a delete marker addressed by version ID, for example,
+// answers a body-less 405, which becomes MethodNotAllowed.
 func parseError(op string, resp *http.Response) *Error {
-	e := &Error{Op: op, StatusCode: resp.StatusCode, RequestID: resp.Header.Get("X-Amz-Request-Id")}
+	e := &Error{
+		Op:         op,
+		StatusCode: resp.StatusCode,
+		RequestID:  resp.Header.Get("X-Amz-Request-Id"),
+		Header:     resp.Header.Clone(),
+		Region:     resp.Header.Get("X-Amz-Bucket-Region"),
+	}
 	data, _ := io.ReadAll(io.LimitReader(resp.Body, 64<<10))
 	var x struct {
 		Code      string `xml:"Code"`
 		Message   string `xml:"Message"`
 		RequestID string `xml:"RequestId"`
+		Region    string `xml:"Region"`
 	}
 	if len(bytes.TrimSpace(data)) > 0 && xml.Unmarshal(data, &x) == nil {
 		e.Code, e.Message = x.Code, x.Message
 		if x.RequestID != "" {
 			e.RequestID = x.RequestID
 		}
+		if e.Region == "" {
+			e.Region = strings.TrimSpace(x.Region)
+		}
 	}
 	if e.Code == "" {
 		switch resp.StatusCode {
+		case http.StatusMovedPermanently:
+			e.Code = "PermanentRedirect"
 		case http.StatusNotFound:
 			e.Code = "NotFound"
+		case http.StatusMethodNotAllowed:
+			e.Code = "MethodNotAllowed"
 		case http.StatusPreconditionFailed:
 			e.Code = "PreconditionFailed"
 		case http.StatusNotModified:
 			e.Code = "NotModified"
+		case http.StatusNotImplemented:
+			e.Code = "NotImplemented"
 		}
 	}
 	return e
@@ -443,7 +556,10 @@ func decodeXML(op string, resp *http.Response, v any) error {
 		return fmt.Errorf("s3client: %s: decode response: %w", op, err)
 	}
 	if root.XMLName.Local == "Error" {
-		return &Error{Op: op, StatusCode: http.StatusInternalServerError, Code: root.Code, Message: root.Message, RequestID: root.RequestID}
+		return &Error{
+			Op: op, StatusCode: http.StatusInternalServerError, Code: root.Code, Message: root.Message,
+			RequestID: root.RequestID, Header: resp.Header.Clone(),
+		}
 	}
 	if v == nil {
 		return nil
@@ -468,6 +584,64 @@ func readerAtBody(r io.ReaderAt, size int64) func() io.Reader {
 // bytesBody returns a body factory over b.
 func bytesBody(b []byte) func() io.Reader {
 	return func() io.Reader { return bytes.NewReader(b) }
+}
+
+// md5Of returns the raw MD5 of everything r yields.
+func md5Of(r io.Reader) ([]byte, error) {
+	h := md5.New()
+	if _, err := io.Copy(h, r); err != nil {
+		return nil, err
+	}
+	return h.Sum(nil), nil
+}
+
+// xmlRequest returns a request carrying the XML document doc as its body,
+// with Content-Type and Content-MD5 (which S3 requires for most
+// configuration PUTs).
+func xmlRequest(op, method, bucket string, query url.Values, doc any) (request, error) {
+	body, err := xml.Marshal(doc)
+	if err != nil {
+		return request{}, fmt.Errorf("s3client: %s: %w", op, err)
+	}
+	return request{
+		op: op, method: method, bucket: bucket, query: query,
+		header: http.Header{"Content-Type": {"application/xml"}},
+		body:   bytesBody(body), bodySize: int64(len(body)), md5: true,
+	}, nil
+}
+
+// versionIDOf returns the x-amz-version-id of a response: a header, or a
+// trailer when the service sent it after a keep-alive body (gos3 does for
+// long CompleteMultipartUpload and CopyObject requests). Trailers are only
+// known once the body was read to its end.
+func versionIDOf(resp *http.Response) string {
+	if v := resp.Header.Get("X-Amz-Version-Id"); v != "" {
+		return v
+	}
+	return resp.Trailer.Get("X-Amz-Version-Id")
+}
+
+// objectQuery returns the query of an object request: the sub-resource
+// sub ("" = none, e.g. "tagging") and versionId when versionID is not "".
+func objectQuery(sub, versionID string) url.Values {
+	q := url.Values{}
+	if sub != "" {
+		q.Set(sub, "")
+	}
+	if versionID != "" {
+		q.Set("versionId", versionID)
+	}
+	return q
+}
+
+// parseTime parses an ISO 8601 timestamp of a listing or document (zero
+// when it is missing or malformed).
+func parseTime(s string) time.Time {
+	t, err := time.Parse(time.RFC3339Nano, strings.TrimSpace(s))
+	if err != nil {
+		return time.Time{}
+	}
+	return t.UTC()
 }
 
 // quoteETag returns the ETag in its quoted wire form.

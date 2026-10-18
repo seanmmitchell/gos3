@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import type { BreadcrumbItem, NavigationMenuItem } from '@nuxt/ui'
 import { useConnectionsStore } from '~/stores/connections'
-import { usersPageMode } from '~/components/admin/-capabilities'
+import { canViewJobs, usersPageMode } from '~/components/admin/-capabilities'
 
 const store = useConnectionsStore()
 const route = useRoute()
@@ -24,7 +24,9 @@ const serverItems = computed<NavigationMenuItem[]>(() => {
     if (usersPageMode(c.kind, caps) === 'manage') items.push({ label: 'Users', icon: 'i-lucide-users', to: appRoutes.users(c.id) })
     if (caps.managePolicies) items.push({ label: 'Policies', icon: 'i-lucide-shield-check', to: appRoutes.policies(c.id) })
     if (caps.manageConfig) items.push({ label: 'Settings', icon: 'i-lucide-settings', to: appRoutes.settings(c.id) })
-    if (caps.viewStorage) items.push({ label: 'Storage', icon: 'i-lucide-hard-drive', to: appRoutes.storage(c.id) })
+    // Backing pages (/servers/:id/backings/:name) belong to Storage.
+    if (caps.viewStorage) items.push({ label: 'Storage', icon: 'i-lucide-hard-drive', to: appRoutes.storage(c.id), active: route.path.startsWith(`${appRoutes.server(c.id)}/backings/`) || undefined })
+    if (canViewJobs(c.kind, caps)) items.push({ label: 'Jobs', icon: 'i-lucide-list-checks', to: appRoutes.jobs(c.id) })
     if (caps.discovery) items.push({ label: 'Discovery', icon: 'i-lucide-radar', to: appRoutes.discovery(c.id) })
   }
   return items
@@ -41,6 +43,7 @@ const SECTION_LABELS: Record<string, string> = {
   policies: 'Policies',
   settings: 'Settings',
   storage: 'Storage',
+  jobs: 'Jobs',
   discovery: 'Discovery'
 }
 
@@ -58,6 +61,12 @@ const autoCrumbs = computed<BreadcrumbItem[]>(() => {
   const rest = path.slice(appRoutes.server(id).length).split('/').filter(Boolean).map(s => decodeURIComponent(s))
   const section = rest[0]
   if (!section) return items
+  if (section === 'backings') {
+    // Backing pages live under the Storage page.
+    items.push({ label: 'Storage', to: appRoutes.storage(id) })
+    if (rest[1]) items.push({ label: rest[1] })
+    return items
+  }
   items.push({ label: SECTION_LABELS[section] ?? section, to: `${appRoutes.server(id)}/${section}` })
   if (section === 'buckets' && rest[1]) {
     const bucket = rest[1]
@@ -105,13 +114,28 @@ watch(() => connection.value?.id, (id) => {
       v-model:collapsed="collapsed"
       collapsible
       resizable
-      :min-size="14"
+      :min-size="12"
       :default-size="16"
-      :max-size="24"
+      :max-size="32"
       :collapsed-size="4.25"
-      class="bg-elevated/25"
+      class="peer bg-elevated/25"
       :ui="{ footer: 'lg:border-t lg:border-default' }"
     >
+      <!-- Nuxt UI's handle is an invisible 0px line; this one shows itself on
+           hover and while dragging, and has a wider grab area. -->
+      <template #resize-handle="{ onMouseDown, onTouchStart, onDoubleClick, ui }">
+        <UDashboardResizeHandle
+          aria-controls="gos3-dashboard-sidebar-main"
+          aria-label="Resize sidebar"
+          title="Drag to resize · double-click to reset"
+          data-slot="handle"
+          :class="ui.handle({ class: 'z-10 before:-left-2 before:-right-2 after:absolute after:inset-y-0 after:-left-px after:w-0.5 after:transition-colors hover:after:bg-primary/50 peer-data-[dragging=true]:after:bg-primary' })"
+          @mousedown="onMouseDown"
+          @touchstart="onTouchStart"
+          @dblclick="onDoubleClick"
+        />
+      </template>
+
       <template #header="{ collapsed: isCollapsed }">
         <LayoutAppLogo :collapsed="isCollapsed" :class="isCollapsed ? 'mx-auto' : ''" />
       </template>

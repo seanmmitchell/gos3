@@ -3,10 +3,14 @@ package admin
 import (
 	"errors"
 	"net/http"
+	"slices"
 	"strings"
 
 	"github.com/seanmmitchell/gos3/internal/config"
+	"github.com/seanmmitchell/gos3/internal/iam"
+	"github.com/seanmmitchell/gos3/internal/storage"
 	"github.com/seanmmitchell/gos3/internal/storage/multi"
+	"github.com/seanmmitchell/gos3/internal/storage/s3account"
 )
 
 // Storage backings and bucket placement (docs/admin-api.md "Storage
@@ -25,7 +29,16 @@ func (a *api) router() (*multi.Router, error) {
 // backingJSON is the Backing document.
 type backingJSON struct {
 	multi.BackingStatus
-	Disk *diskStats `json:"disk"`
+	// Account summarises an s3 backing (nil for other backings).
+	Account *accountJSON `json:"account,omitempty"`
+	Disk    *diskStats   `json:"disk"`
+}
+
+// accountJSON is the AccountInfo document of an s3 backing: its
+// configuration summary and its containers (the home first).
+type accountJSON struct {
+	s3account.AccountInfo
+	Containers []s3account.ContainerInfo `json:"containers"`
 }
 
 func (a *api) getBackingConfig(rc *reqCtx) (int, any, error) {
@@ -105,6 +118,16 @@ func (a *api) listBackings(rc *reqCtx) (int, any, error) {
 		if b.Kind == config.BackendFS && b.Path != "" {
 			out[i].Disk = diskUsage(b.Path)
 		}
+		if rm, ok := remoteManagerOf(r, b.Name); ok {
+			info := rm.Info()
+			out[i].Account = &accountJSON{AccountInfo: info, Containers: containersOf(rc, rm)}
+			if len(b.Kinds) == 0 {
+				for _, k := range info.Kinds {
+					out[i].Kinds = append(out[i].Kinds, string(k))
+				}
+				out[i].DefaultKind = string(info.DefaultKind)
+			}
+		}
 	}
 	return http.StatusOK, map[string]any{
 		"defaultBacking": r.DefaultBacking(),
@@ -131,6 +154,21 @@ type placementRequest struct {
 	Replicas []string   `json:"replicas"`
 }
 
+// requirePlacementBacking authorizes putting a copy of a bucket on backing:
+// besides the route's admin:UpdateBucketPlacement on the bucket, the caller
+// needs it on arn:gos3:admin:::backing/<backing>. A grant on a bucket alone
+// does not choose where its data may go (and a copy's restic repository on
+// an s3 backing is opened with that backing's own S3 keys).
+func (a *api) requirePlacementBacking(rc *reqCtx, backing string) error {
+	if backing == "" {
+		return nil // refused by the router as invalid
+	}
+	return a.requireAction(rc, rc.action, iam.AdminBackingARN(backing), nil)
+}
+
+// putPlacement implements PUT /buckets/{name}/placement. Every replica
+// that is not already a member of the placement is authorized with
+// requirePlacementBacking.
 func (a *api) putPlacement(rc *reqCtx) (int, any, error) {
 	r, err := a.router()
 	if err != nil {
@@ -140,7 +178,19 @@ func (a *api) putPlacement(rc *reqCtx) (int, any, error) {
 	if err := rc.decodeBody(&req, false); err != nil {
 		return 0, nil, err
 	}
-	st, err := r.SetReplication(rc.ctx, rc.r.PathValue("name"), req.Mode, req.Replicas)
+	bucket := rc.r.PathValue("name")
+	cur, err := r.Placement(bucket)
+	if err != nil {
+		return 0, nil, err
+	}
+	for _, b := range req.Replicas {
+		if !slices.ContainsFunc(cur.Members, func(m multi.MemberStatus) bool { return m.Backing == b }) {
+			if err := a.requirePlacementBacking(rc, b); err != nil {
+				return 0, nil, err
+			}
+		}
+	}
+	st, err := r.SetReplication(rc.ctx, bucket, req.Mode, req.Replicas)
 	if err != nil {
 		return 0, nil, err
 	}
@@ -153,6 +203,9 @@ func (a *api) putPlacement(rc *reqCtx) (int, any, error) {
 type moveRequest struct {
 	To   string `json:"to"`
 	From string `json:"from"`
+	// Container chooses the container of the copy on an s3 "to" backing
+	// ("" = the backing's default; such copies are wrapped buckets).
+	Container string `json:"container"`
 }
 
 func (a *api) startMove(rc *reqCtx) (int, any, error) {
@@ -167,11 +220,23 @@ func (a *api) startMove(rc *reqCtx) (int, any, error) {
 	if req.To == "" {
 		return 0, nil, badRequest("\"to\" (the target backing) is required")
 	}
-	st, err := r.Move(rc.ctx, rc.r.PathValue("name"), req.From, req.To)
+	if err := a.requirePlacementBacking(rc, req.To); err != nil {
+		return 0, nil, err
+	}
+	var target *storage.BucketTarget
+	if req.Container != "" {
+		if !validContainerID(req.Container) {
+			return 0, nil, badRequest("\"container\" must be a container ID (\"home\" or up to %d lowercase letters, digits and '-'), got %q",
+				maxContainerID, req.Container)
+		}
+		target = &storage.BucketTarget{Kind: storage.BucketKindWrapped, Container: req.Container}
+	}
+	st, err := r.Move(rc.ctx, rc.r.PathValue("name"), req.From, req.To, target)
 	if err != nil {
 		return 0, nil, err
 	}
-	a.log.Info("admin: bucket move started", "bucket", st.Bucket, "to", req.To, "by", describeIdentity(rc.id))
+	a.log.Info("admin: bucket move started", "bucket", st.Bucket, "to", req.To, "container", req.Container,
+		"by", describeIdentity(rc.id))
 	return http.StatusAccepted, st, nil
 }
 

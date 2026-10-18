@@ -4,8 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"io"
-	"log/slog"
 	"os"
 	"path/filepath"
 	"strings"
@@ -15,29 +13,36 @@ import (
 	"github.com/seanmmitchell/gos3/internal/config"
 	"github.com/seanmmitchell/gos3/internal/s3client"
 	"github.com/seanmmitchell/gos3/internal/storage"
-	"github.com/seanmmitchell/gos3/internal/storage/gateway"
+	"github.com/seanmmitchell/gos3/internal/storage/localstate"
 	"github.com/seanmmitchell/gos3/internal/storage/multi"
-	"github.com/seanmmitchell/gos3/internal/storage/routed"
+	"github.com/seanmmitchell/gos3/internal/storage/s3account"
 	"github.com/seanmmitchell/gos3/internal/storage/s3store"
 )
 
 // s3 backings (docs/backings.md).
 //
-// An s3 backing is an s3store on <bucket>/<prefix> of the remote service.
-// A gateway backing (s3.gateway) is a routed backend: an s3store opened in
-// gateway mode keeps the bucket records, configuration documents and the
-// gateway's multipart state in <bucket>/<prefix>, and a gateway store
-// keeps the objects natively in remote buckets named like the gos3
-// buckets.
+// An s3 backing is a connection to a remote S3 service (endpoint and
+// credentials), an s3account.Backend: it holds native buckets (one remote
+// bucket each, adopted or created by gos3) and wrapped buckets (gos3's
+// format inside a container: the backing's home, a dedicated remote bucket
+// or an existing remote bucket under a prefix). Its records live in its
+// home (home_bucket/home_prefix) or, without a home, in a local state
+// database in the system directory (S3RecordsDir).
 //
-// s3store.Open does no remote I/O: the backing loads in the background
-// and answers storage.ErrBackingUnavailable until it is loaded. At
+// Every s3 backing of the server, those added live included, shares the
+// server's claims registry (Server.claims), so that no remote location is
+// used twice: a native bucket's remote bucket is used by nothing else, and
+// homes and containers never nest.
+//
+// s3account.Open does no remote I/O that can fail it: a backing with a home
+// loads in the background and answers storage.ErrBackingUnavailable until
+// it is loaded; one keeping its records locally is ready at once. At
 // startup the server waits up to s3StartupWait for the s3 backings to
-// load, so a reachable remote is healthy from the first request; a
-// backing that fails to load does not stop the server (the router starts
-// it unhealthy and its health probe notices when it loads). A backing
-// added live must load within s3LiveOpenTimeout, else the change is
-// refused with the reason.
+// load, so a reachable remote is healthy from the first request; a backing
+// that fails to load does not stop the server (the router starts it
+// unhealthy and its health probe notices when it loads). A backing added
+// live must load within s3LiveOpenTimeout, else the change is refused with
+// the reason.
 
 // Timeouts of loading s3 backings.
 const (
@@ -45,12 +50,11 @@ const (
 	s3LiveOpenTimeout = 30 * time.Second
 )
 
-// backingModeGateway is the multi.Backing Mode of an s3 gateway backing.
-const backingModeGateway = "gateway"
-
-// gatewayAuxNamespace is the s3store aux namespace of the gateway store's
-// multipart state.
-const gatewayAuxNamespace = "gateway"
+// S3RecordsDir returns the directory holding the records of the s3 backing
+// name when it has no home: <systemDir>/s3/<name>.
+func S3RecordsDir(systemDir, name string) string {
+	return filepath.Join(systemDir, "s3", name)
+}
 
 // newS3Client returns a client for the service of c.
 func newS3Client(c config.S3Config) (*s3client.Client, error) {
@@ -63,147 +67,120 @@ func newS3Client(c config.S3Config) (*s3client.Client, error) {
 	})
 }
 
-// openS3 opens the s3 backing name described by c (validated). It does
-// no remote I/O that can fail it (see waitS3Loaded).
-func (s *Server) openS3(name string, c config.S3Config) (_ multi.Backing, err error) {
+// s3Connection returns the connection of the s3 settings c (validated):
+// a client, the service description restic uses, the part size and the
+// key-encryption key.
+func s3Connection(c config.S3Config) (s3store.Connection, error) {
 	kek, err := c.KEK()
 	if err != nil {
-		return multi.Backing{}, err
+		return s3store.Connection{}, err
 	}
 	client, err := newS3Client(c)
 	if err != nil {
+		return s3store.Connection{}, err
+	}
+	return s3store.Connection{
+		Client: client, Endpoint: c.Endpoint, Region: c.Region, AccessKey: c.AccessKey,
+		SecretKey: c.SecretKey, PathStyle: c.PathStyle(), PartSize: c.PartSize, KEK: kek,
+	}, nil
+}
+
+// sameConnection reports whether a and b connect the same way (endpoint,
+// region, addressing, part size, credentials and encryption key).
+func sameConnection(a, b config.S3Config) bool {
+	return a.Endpoint == b.Endpoint && a.Region == b.Region && a.PathStyle() == b.PathStyle() &&
+		a.PartSize == b.PartSize && a.AccessKey == b.AccessKey && a.SecretKey == b.SecretKey &&
+		a.EncryptionKey == b.EncryptionKey
+}
+
+// openS3 opens the s3 backing name described by c (validated). It does no
+// remote I/O that can fail it (see waitS3Startup and openLiveBacking).
+func (s *Server) openS3(name string, c config.S3Config) (_ multi.Backing, err error) {
+	conn, err := s3Connection(c)
+	if err != nil {
 		return multi.Backing{}, err
+	}
+	opts := s3account.Options{
+		Name:        name,
+		Conn:        conn,
+		DefaultKind: storage.BucketKind(c.EffectiveDefaultKind()),
+		Claims:      s.claims,
+		Logger:      s.log.With("component", "storage"), // s3account names the backing
+	}
+	var records string // where the records are, for the log
+	switch {
+	case c.HasHome():
+		opts.Home = &s3account.Location{Bucket: c.HomeBucket, Prefix: c.HomePrefix}
+		records = "home " + c.HomeBucket + "/" + c.HomePrefix
+	case s.systemDir == "":
+		// Refused by config.Validate already.
+		return multi.Backing{}, fmt.Errorf("s3 backing %q has no home_bucket: its records need the system directory; set storage.path or home_bucket", name)
+	default:
+		opts.LocalDir = S3RecordsDir(s.systemDir, name)
+		records = opts.LocalDir
 	}
 	tmp, err := s.newTempDir(name)
 	if err != nil {
 		return multi.Backing{}, err
 	}
-	// The backing reserves its remote bucket (see reservedRemoteBucket)
-	// and its temporary directory until it is closed.
-	release := s.holdS3Resources(tmp, c.Bucket)
+	// The backing uses its temporary directory until it is closed.
+	release := s.holdTempDir(tmp)
 	defer func() {
 		if err != nil {
 			release()
 		}
 	}()
-	storeTmp := filepath.Join(tmp, "store")
-	if err := os.MkdirAll(storeTmp, 0o700); err != nil {
-		return multi.Backing{}, fmt.Errorf("creating temporary directory: %w", err)
-	}
-	log := s.log.With("component", "storage") // s3store and gateway name the backing
-	meta, err := s3store.Open(s3store.Options{
-		Name:      name,
-		Client:    client,
-		Endpoint:  c.Endpoint,
-		Region:    c.Region,
-		AccessKey: c.AccessKey,
-		SecretKey: c.SecretKey,
-		PathStyle: c.PathStyle(),
-		Bucket:    c.Bucket,
-		Prefix:    c.Prefix,
-		PartSize:  c.PartSize,
-		KEK:       kek,
-		Gateway:   c.Gateway,
-		TempDir:   storeTmp,
-		Logger:    log,
-	})
+	opts.TempDir = tmp
+	acct, err := s3account.Open(opts)
 	if err != nil {
 		return multi.Backing{}, err
 	}
-	b := multi.Backing{Name: name, Kind: config.BackendS3, Location: meta.Location(),
-		Backend: &s3Backing{Backend: meta, release: release}}
-	if !c.Gateway {
-		return b, nil
-	}
-	gw := newGatewayStore(gateway.Options{
-		Name:     name,
-		Client:   client,
-		Bucket:   "", // per-bucket mode: gos3 bucket b is remote bucket b
-		Prefix:   "",
-		PartSize: c.PartSize,
-		State:    meta.AuxState(gatewayAuxNamespace),
-		// The bucket of every open s3 backing, this one's included, at
-		// the time of each bucket creation.
-		Reserved: s.reservedRemoteBucket,
-		SpoolDir: filepath.Join(tmp, "spool"),
-		Logger:   log,
-	}, meta)
-	b.Mode = backingModeGateway
-	b.Backend = &gatewayBacking{
-		Backend: routed.New(routed.Options{Primary: meta, Store: gw, Logger: log}),
-		meta:    meta, gw: gw, release: release,
-	}
-	return b, nil
+	// The home's URL, or "local:" for records in the system directory.
+	location := acct.Location()
+	s.log.Info("s3 storage backing", "backing", name, "endpoint", c.Endpoint, "records", records,
+		"default_kind", c.EffectiveDefaultKind())
+	return multi.Backing{Name: name, Kind: config.BackendS3, Location: location,
+		Backend: &s3Backing{Backend: acct, release: release, settings: c}}, nil
 }
 
 // s3Backing is the storage.Backend of an s3 backing handed to the router:
-// the s3store, whose Close also releases the server's resources of the
-// backing (holdS3Resources). Embedding keeps every optional interface of
-// the s3store.
+// the s3account backend, whose Close also releases the server's resources
+// of the backing (its temporary directory). Embedding keeps every optional
+// interface of the backend, s3account.RemoteManager included (the admin API
+// asserts it on multi.Router.BackingBackend).
 type s3Backing struct {
-	*s3store.Backend
+	*s3account.Backend
 	release func()
+
+	mu       sync.Mutex
+	settings config.S3Config // the settings last applied (secrets included)
 }
 
-// Close closes the s3store, then releases the backing's resources.
+// Close closes the backend, then releases the backing's resources.
 func (b *s3Backing) Close() error {
 	err := b.Backend.Close()
 	b.release()
 	return err
 }
 
-// gatewayBacking is the storage.Backend of a gateway backing: the routed
-// backend over the metadata s3store and the gateway store, whose Close
-// also releases the server's resources of the backing. Embedding keeps
-// every optional interface of the routed backend.
-type gatewayBacking struct {
-	*routed.Backend
-	meta    *s3store.Backend
-	gw      *gatewayStore
-	release func()
+// current returns the settings last applied.
+func (b *s3Backing) current() config.S3Config {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.settings
 }
 
-// Close closes the routed backend (gateway and metadata stores), then
-// releases the backing's resources.
-func (b *gatewayBacking) Close() error {
-	err := b.Backend.Close()
-	b.release()
-	return err
+// applied records that c is applied.
+func (b *s3Backing) applied(c config.S3Config) {
+	b.mu.Lock()
+	b.settings = c
+	b.mu.Unlock()
 }
 
-// s3storeOf returns the s3store of an s3 backing (the metadata store of a
-// gateway backing), or nil for other backends.
-func s3storeOf(be storage.Backend) *s3store.Backend {
-	switch v := be.(type) {
-	case *s3Backing:
-		return v.Backend
-	case *gatewayBacking:
-		return v.meta
-	}
-	return nil
-}
-
-// waitS3Loaded waits until st is loaded and serving. It gives up early,
-// returning the reason, when the backing failed to load (the backing keeps
-// retrying in the background), and when ctx ends.
-func waitS3Loaded(ctx context.Context, st *s3store.Backend) error {
-	tick := time.NewTicker(20 * time.Millisecond)
-	defer tick.Stop()
-	for {
-		select {
-		case <-st.Ready():
-			return nil
-		case <-ctx.Done():
-			if err := st.Status().Err; err != nil {
-				return fmt.Errorf("%w: %w", storage.ErrBackingUnavailable, err)
-			}
-			return fmt.Errorf("%w: not loaded in time (%s)", storage.ErrBackingUnavailable, st.Status().State)
-		case <-tick.C:
-			if status := st.Status(); status.State == s3store.StateFailed && status.Err != nil {
-				return fmt.Errorf("%w: %w", storage.ErrBackingUnavailable, status.Err)
-			}
-		}
-	}
+// accountOf returns the s3 backing of be, or nil for other backends.
+func accountOf(be storage.Backend) *s3Backing {
+	b, _ := be.(*s3Backing)
+	return b
 }
 
 // waitS3Startup waits (concurrently, at most s3StartupWait) for the s3
@@ -213,14 +190,21 @@ func (s *Server) waitS3Startup(backings []multi.Backing) {
 	defer cancel()
 	var wg sync.WaitGroup
 	for _, b := range backings {
-		st := s3storeOf(b.Backend)
-		if st == nil {
+		acct := accountOf(b.Backend)
+		if acct == nil {
 			continue
 		}
 		wg.Go(func() {
-			if err := waitS3Loaded(ctx, st); err != nil {
+			if err := acct.WaitReady(ctx); err != nil {
 				s.log.Warn("s3 storage backing is not available yet; starting without it (its buckets answer 503 "+
 					"until it loads, which is retried in the background)", "backing", b.Name, "location", b.Location, "err", err)
+				return
+			}
+			// The records are loaded; let the other containers finish
+			// loading too, so their wrapped buckets serve right away.
+			if loading := acct.WaitContainers(ctx); len(loading) > 0 {
+				s.log.Warn("s3 storage backing: containers still loading; their buckets answer 503 until they do",
+					"backing", b.Name, "containers", loading)
 			}
 		})
 	}
@@ -229,7 +213,9 @@ func (s *Server) waitS3Startup(backings []multi.Backing) {
 
 // openLiveBacking is BackingOpener.Open: it opens a backing added (or
 // replaced) through the admin API. An s3 backing must load within
-// s3LiveOpenTimeout, so that wrong settings are reported to the caller.
+// s3LiveOpenTimeout, so that wrong settings are reported to the caller; a
+// backing keeping its records locally loads at once, so its credentials
+// are checked against the service instead.
 func (s *Server) openLiveBacking(def config.BackingDefinition) (multi.Backing, error) {
 	bc := def.Config()
 	switch bc.Backend {
@@ -241,11 +227,19 @@ func (s *Server) openLiveBacking(def config.BackingDefinition) (multi.Backing, e
 		}
 		b, err := s.openS3(bc.Name, *bc.S3)
 		if err != nil {
+			if class := s3ErrorClass(err); class != nil {
+				return multi.Backing{}, fmt.Errorf("%w: %w", class, err)
+			}
 			return multi.Backing{}, fmt.Errorf("%w: %w", multi.ErrInvalidPlacement, err)
 		}
+		acct := accountOf(b.Backend)
 		ctx, cancel := context.WithTimeout(s.lifeCtx, s3LiveOpenTimeout)
 		defer cancel()
-		if err := waitS3Loaded(ctx, s3storeOf(b.Backend)); err != nil {
+		err = acct.WaitReady(ctx)
+		if err == nil && !bc.S3.HasHome() {
+			err = s.checkS3Credentials(ctx, acct, *bc.S3)
+		}
+		if err != nil {
 			_ = b.Backend.Close()
 			return multi.Backing{}, classifyS3Error(err)
 		}
@@ -254,21 +248,50 @@ func (s *Server) openLiveBacking(def config.BackingDefinition) (multi.Backing, e
 	return s.openFS(bc.Name, bc.Path)
 }
 
-// classifyS3Error marks the errors of an s3 backing that a configuration
-// change must fix: a prefix owned by another server is a conflict, wrong
-// settings are invalid (both answered with 4xx by the admin API).
-func classifyS3Error(err error) error {
+// checkS3Credentials checks that the service accepts the settings c of the
+// open s3 backing acct, which keeps its records locally (so loading it did
+// not reach the service): the connection is prepared as for a change of
+// settings, and the prepared change dropped.
+func (s *Server) checkS3Credentials(ctx context.Context, acct *s3Backing, c config.S3Config) error {
+	conn, err := s3Connection(c)
+	if err != nil {
+		return err
+	}
+	_, err = acct.PrepareConnection(ctx, conn)
+	return err
+}
+
+// s3ErrorClass returns the multi error class of an error of an s3 backing
+// that a configuration change must fix, or nil: multi.ErrConflict for a
+// remote location in use (claimed by another backing, owned by another
+// gos3 server, local records locked by another process), and
+// multi.ErrInvalidPlacement for wrong settings (both answered with 4xx by
+// the admin API).
+func s3ErrorClass(err error) error {
 	switch {
-	case errors.Is(err, s3store.ErrInUse):
-		return fmt.Errorf("%w: %w", multi.ErrConflict, err)
-	case errors.Is(err, s3store.ErrWrongKEK), errors.Is(err, s3store.ErrMarkerMismatch),
-		errors.Is(err, s3store.ErrUnmanagedPrefix), errors.Is(err, s3store.ErrNoConditionalWrites):
-		return fmt.Errorf("%w: %w", multi.ErrInvalidPlacement, err)
+	case errors.Is(err, s3account.ErrClaimed), errors.Is(err, s3store.ErrInUse), errors.Is(err, s3store.ErrFenced),
+		errors.Is(err, localstate.ErrLocked):
+		return multi.ErrConflict
+	case errors.Is(err, storage.ErrInvalidTarget), errors.Is(err, s3store.ErrWrongKEK), errors.Is(err, s3store.ErrMarkerMismatch),
+		errors.Is(err, s3store.ErrPrefixNotEmpty), errors.Is(err, s3store.ErrUnmanagedPrefix),
+		errors.Is(err, s3store.ErrNoConditionalWrites):
+		// ErrMarkerMismatch covers ErrMarkerMissing.
+		return multi.ErrInvalidPlacement
 	}
 	for _, code := range s3SettingsErrorCodes {
 		if s3client.IsCode(err, code) {
-			return fmt.Errorf("%w: %w", multi.ErrInvalidPlacement, err)
+			return multi.ErrInvalidPlacement
 		}
+	}
+	return nil
+}
+
+// classifyS3Error marks the errors of an s3 backing that a configuration
+// change must fix (see s3ErrorClass); others are returned unchanged (an
+// unreachable service: storage.ErrBackingUnavailable, answered with 503).
+func classifyS3Error(err error) error {
+	if class := s3ErrorClass(err); class != nil {
+		return fmt.Errorf("%w: %w", class, err)
 	}
 	return err
 }
@@ -281,90 +304,50 @@ var s3SettingsErrorCodes = []string{
 }
 
 // reconfigureBacking is BackingOpener.Reconfigure: it prepares a change of
-// the connection settings (endpoint, region, credentials, addressing, part
-// size, encryption key) of the open s3 backing b to those of def.
-//
-// A gateway backing is reconfigured in place only while it holds no
-// buckets: the gateway store keeps its own client, and swapping it under
-// running object operations (multipart uploads in particular) is not
-// safe; with buckets, change the settings in the configuration (or
-// backings.json) and restart. Whether it holds buckets is read from its
-// metadata store; while that is not loaded (e.g. because wrong settings
-// keep it from loading), from the router's placements: a backing no
-// bucket is placed on can be reconfigured, else the change is refused.
+// the settings of the open s3 backing b that keep its identity (see
+// config.BackingDefinition.Identity) to those of def: the connection
+// (endpoint, region, credentials, addressing, part size, encryption key)
+// and the default bucket kind. A new connection is verified first
+// (s3account.Backend.PrepareConnection: the home's and every loaded
+// container's marker and encryption key, or, without a home, the
+// credentials and the native buckets' remote buckets); a change of the
+// default kind alone needs no remote I/O.
 func (s *Server) reconfigureBacking(ctx context.Context, b multi.Backing, def config.BackingDefinition) (func(), error) {
 	bc := def.Config()
 	if bc.S3 == nil {
 		return nil, fmt.Errorf("%w: backing %q is not an s3 backing", multi.ErrInvalidPlacement, b.Name)
 	}
+	acct := accountOf(b.Backend)
+	if acct == nil {
+		return nil, fmt.Errorf("%w: backing %q cannot be reconfigured", multi.ErrConflict, b.Name)
+	}
 	c := *bc.S3
-	kek, err := c.KEK()
+	kind := storage.BucketKind(c.EffectiveDefaultKind())
+	if kind == storage.BucketKindWrapped && !c.HasHome() {
+		// Refused by config validation already.
+		return nil, fmt.Errorf("%w: backing %q: wrapped buckets as the default kind need a home", multi.ErrInvalidPlacement, b.Name)
+	}
+	finish := func() {
+		if err := acct.SetDefaultKind(kind); err != nil {
+			s.log.Error("changing the default bucket kind of an s3 backing failed", "backing", b.Name, "kind", kind, "err", err)
+		}
+		acct.applied(c)
+	}
+	if sameConnection(acct.current(), c) {
+		return finish, nil
+	}
+	conn, err := s3Connection(c)
 	if err != nil {
 		return nil, fmt.Errorf("%w: %w", multi.ErrInvalidPlacement, err)
 	}
-	client, err := newS3Client(c)
+	commit, err := acct.PrepareConnection(ctx, conn)
 	if err != nil {
-		return nil, fmt.Errorf("%w: %w", multi.ErrInvalidPlacement, err)
+		return nil, classifyS3Error(err)
 	}
-	conn := s3store.Connection{
-		Client: client, Endpoint: c.Endpoint, Region: c.Region, AccessKey: c.AccessKey,
-		SecretKey: c.SecretKey, PathStyle: c.PathStyle(), PartSize: c.PartSize, KEK: kek,
-	}
-	switch be := b.Backend.(type) {
-	case *s3Backing:
-		commit, err := be.PrepareConnection(ctx, conn)
-		if err != nil {
-			return nil, classifyS3Error(err)
-		}
-		return commit, nil
-	case *gatewayBacking:
-		if err := s.checkGatewayIdle(ctx, b.Name, be.meta); err != nil {
-			return nil, err
-		}
-		commit, err := be.meta.PrepareConnection(ctx, conn)
-		if err != nil {
-			return nil, classifyS3Error(err)
-		}
-		return func() {
-			commit()
-			be.gw.reconnect(client, c.PartSize)
-		}, nil
-	}
-	return nil, fmt.Errorf("%w: backing %q cannot be reconfigured", multi.ErrConflict, b.Name)
-}
-
-// errGatewayInUse refuses connection changes of a gateway backing with
-// buckets (see reconfigureBacking).
-func errGatewayInUse(name string) error {
-	return fmt.Errorf("%w: the connection settings of gateway backing %q cannot change while it holds "+
-		"buckets; change them in the configuration and restart the server", multi.ErrConflict, name)
-}
-
-// checkGatewayIdle returns nil when the gateway backing name (metadata
-// store meta) holds no buckets (see reconfigureBacking).
-func (s *Server) checkGatewayIdle(ctx context.Context, name string, meta *s3store.Backend) error {
-	select {
-	case <-meta.Ready():
-		buckets, err := meta.ListBuckets(ctx)
-		if err == nil {
-			if len(buckets) > 0 {
-				return errGatewayInUse(name)
-			}
-			return nil
-		}
-	default:
-	}
-	// Not loaded: no bucket may be placed on it.
-	r, ok := s.backend.(*multi.Router)
-	if !ok {
-		return errGatewayInUse(name)
-	}
-	for _, st := range r.Backings() {
-		if st.Name == name && st.Buckets == 0 && st.Replicas == 0 {
-			return nil
-		}
-	}
-	return errGatewayInUse(name)
+	return func() {
+		commit()
+		finish()
+	}, nil
 }
 
 // Temporary directories of s3 backings are named
@@ -385,7 +368,7 @@ func (s *Server) tempDirPrefix() string {
 
 // newTempDir creates a temporary directory for backing name under
 // os.TempDir() (spool and restic files; never the data directory). It is
-// removed when the backing is closed (holdS3Resources), at the latest by
+// removed when the backing is closed (holdTempDir), at the latest by
 // Close.
 func (s *Server) newTempDir(name string) (string, error) {
 	dir, err := os.MkdirTemp("", s.tempDirPrefix()+name+"-")
@@ -398,24 +381,14 @@ func (s *Server) newTempDir(name string) (string, error) {
 	return dir, nil
 }
 
-// holdS3Resources records that an s3 backing uses the temporary directory
-// dir and the remote bucket bucket, and returns the (idempotent) function
-// releasing both: it removes the directory and stops reserving the bucket.
-func (s *Server) holdS3Resources(dir, bucket string) (release func()) {
-	key := strings.ToLower(bucket)
-	s.tempMu.Lock()
-	if s.s3Buckets == nil {
-		s.s3Buckets = map[string]int{}
-	}
-	s.s3Buckets[key]++
-	s.tempMu.Unlock()
+// holdTempDir records that an s3 backing uses the temporary directory dir
+// and returns the (idempotent) function releasing it: it removes the
+// directory.
+func (s *Server) holdTempDir(dir string) (release func()) {
 	var once sync.Once
 	return func() {
 		once.Do(func() {
 			s.tempMu.Lock()
-			if s.s3Buckets[key]--; s.s3Buckets[key] <= 0 {
-				delete(s.s3Buckets, key)
-			}
 			for i, d := range s.tempDirs {
 				if d == dir {
 					s.tempDirs = append(s.tempDirs[:i], s.tempDirs[i+1:]...)
@@ -428,18 +401,6 @@ func (s *Server) holdS3Resources(dir, bucket string) (release func()) {
 			}
 		})
 	}
-}
-
-// reservedRemoteBucket reports whether bucket is the remote bucket of an
-// open s3 backing: the default one, configured ones and ones added live,
-// gateway metadata buckets included (case-insensitive). A gateway backing
-// must not map a gos3 bucket onto it, or it would adopt that backing's
-// data and metadata as objects. Endpoints are not compared, as one service
-// is often reachable under several names.
-func (s *Server) reservedRemoteBucket(bucket string) bool {
-	s.tempMu.Lock()
-	defer s.tempMu.Unlock()
-	return s.s3Buckets[strings.ToLower(bucket)] > 0
 }
 
 // removeStaleTempDirs removes the temporary directories a previous run of
@@ -499,257 +460,4 @@ func (s *Server) removeTempDirs() {
 			s.log.Warn("could not remove a temporary directory", "dir", d, "err", err)
 		}
 	}
-}
-
-// gatewayStore is the routed.DataStore of a gateway backing: a
-// gateway.Store opened once the metadata store (whose aux state holds the
-// gateway's multipart state, read by gateway.Open) has loaded. Until then
-// it answers storage.ErrBackingUnavailable; the router rarely gets that
-// far, as the metadata store refuses the bucket lookup first.
-type gatewayStore struct {
-	opts gateway.Options
-	meta *s3store.Backend
-	done chan struct{}
-
-	mu     sync.Mutex
-	st     *gateway.Store
-	closed bool
-}
-
-var _ routed.DataStore = (*gatewayStore)(nil)
-
-// newGatewayStore returns the store, which opens the gateway store as soon
-// as meta has loaded.
-func newGatewayStore(opts gateway.Options, meta *s3store.Backend) *gatewayStore {
-	g := &gatewayStore{opts: opts, meta: meta, done: make(chan struct{})}
-	go func() {
-		select {
-		case <-meta.Ready():
-			if _, err := g.store(); err != nil && !errors.Is(err, errGatewayClosed) {
-				g.logger().Warn("gateway backing: opening the gateway store failed; retrying on use", "err", err)
-			}
-		case <-g.done:
-		}
-	}()
-	return g
-}
-
-var errGatewayClosed = errors.New("gateway backing closed")
-
-func (g *gatewayStore) logger() *slog.Logger {
-	if g.opts.Logger != nil {
-		return g.opts.Logger
-	}
-	return slog.New(slog.DiscardHandler)
-}
-
-// store returns the gateway store, opening it when the metadata store has
-// loaded.
-func (g *gatewayStore) store() (*gateway.Store, error) {
-	g.mu.Lock()
-	defer g.mu.Unlock()
-	if g.closed {
-		return nil, errGatewayClosed
-	}
-	if g.st != nil {
-		return g.st, nil
-	}
-	select {
-	case <-g.meta.Ready():
-	default:
-		return nil, fmt.Errorf("%w: gateway backing %q has not loaded yet", storage.ErrBackingUnavailable, g.opts.Name)
-	}
-	st, err := gateway.Open(g.opts)
-	if err != nil {
-		return nil, err
-	}
-	g.st = st
-	return st, nil
-}
-
-// opened reports whether the gateway store was opened.
-func (g *gatewayStore) opened() bool {
-	g.mu.Lock()
-	defer g.mu.Unlock()
-	return g.st != nil
-}
-
-// reconnect makes the store use client and partSize: the gateway store is
-// closed and reopened with them on next use (see reconfigureBacking for
-// when this is safe).
-func (g *gatewayStore) reconnect(client *s3client.Client, partSize int64) {
-	g.mu.Lock()
-	defer g.mu.Unlock()
-	if g.st != nil {
-		_ = g.st.Close()
-		g.st = nil
-	}
-	g.opts.Client, g.opts.PartSize = client, partSize
-}
-
-// Close closes the gateway store (the metadata store is the router's).
-func (g *gatewayStore) Close() error {
-	g.mu.Lock()
-	defer g.mu.Unlock()
-	if g.closed {
-		return nil
-	}
-	g.closed = true
-	close(g.done)
-	if g.st != nil {
-		return g.st.Close()
-	}
-	return nil
-}
-
-func (g *gatewayStore) AttachBucket(ctx context.Context, info storage.BucketInfo) error {
-	st, err := g.store()
-	if err != nil {
-		return err
-	}
-	return st.AttachBucket(ctx, info)
-}
-
-func (g *gatewayStore) CheckEmpty(ctx context.Context, bucket string) error {
-	st, err := g.store()
-	if err != nil {
-		return err
-	}
-	return st.CheckEmpty(ctx, bucket)
-}
-
-func (g *gatewayStore) DetachBucket(ctx context.Context, bucket string) error {
-	st, err := g.store()
-	if err != nil {
-		return err
-	}
-	return st.DetachBucket(ctx, bucket)
-}
-
-func (g *gatewayStore) NewObjectWriter(ctx context.Context, bucket, key string) (storage.ObjectWriter, error) {
-	st, err := g.store()
-	if err != nil {
-		return nil, err
-	}
-	return st.NewObjectWriter(ctx, bucket, key)
-}
-
-func (g *gatewayStore) GetObjectInfo(ctx context.Context, bucket, key, versionID string) (storage.ObjectInfo, error) {
-	st, err := g.store()
-	if err != nil {
-		return storage.ObjectInfo{}, err
-	}
-	return st.GetObjectInfo(ctx, bucket, key, versionID)
-}
-
-func (g *gatewayStore) OpenObject(ctx context.Context, bucket, key, versionID string) (storage.ObjectInfo, io.ReadSeekCloser, error) {
-	st, err := g.store()
-	if err != nil {
-		return storage.ObjectInfo{}, nil, err
-	}
-	return st.OpenObject(ctx, bucket, key, versionID)
-}
-
-func (g *gatewayStore) UpdateObjectMeta(ctx context.Context, bucket, key, versionID string, fn func(*storage.ObjectMeta) error) (storage.ObjectInfo, error) {
-	st, err := g.store()
-	if err != nil {
-		return storage.ObjectInfo{}, err
-	}
-	return st.UpdateObjectMeta(ctx, bucket, key, versionID, fn)
-}
-
-func (g *gatewayStore) DeleteObject(ctx context.Context, bucket, key, versionID string) (storage.DeleteResult, error) {
-	st, err := g.store()
-	if err != nil {
-		return storage.DeleteResult{}, err
-	}
-	return st.DeleteObject(ctx, bucket, key, versionID)
-}
-
-func (g *gatewayStore) DeleteObjectIf(ctx context.Context, bucket, key, versionID string, check func(storage.ObjectInfo) error) (storage.DeleteResult, error) {
-	st, err := g.store()
-	if err != nil {
-		return storage.DeleteResult{}, err
-	}
-	return st.DeleteObjectIf(ctx, bucket, key, versionID, check)
-}
-
-func (g *gatewayStore) WalkObjects(ctx context.Context, bucket, prefix, after string, fn func(storage.ObjectInfo) error) error {
-	st, err := g.store()
-	if err != nil {
-		return err
-	}
-	return st.WalkObjects(ctx, bucket, prefix, after, fn)
-}
-
-func (g *gatewayStore) WalkVersions(ctx context.Context, bucket, prefix, keyMarker, versionIDMarker string, fn func(storage.ObjectInfo) error) error {
-	st, err := g.store()
-	if err != nil {
-		return err
-	}
-	return st.WalkVersions(ctx, bucket, prefix, keyMarker, versionIDMarker, fn)
-}
-
-func (g *gatewayStore) CreateMultipartUpload(ctx context.Context, bucket, key string, meta storage.ObjectMeta, initiator string) (storage.UploadInfo, error) {
-	st, err := g.store()
-	if err != nil {
-		return storage.UploadInfo{}, err
-	}
-	return st.CreateMultipartUpload(ctx, bucket, key, meta, initiator)
-}
-
-func (g *gatewayStore) GetMultipartUpload(ctx context.Context, bucket, key, uploadID string) (storage.UploadInfo, error) {
-	st, err := g.store()
-	if err != nil {
-		return storage.UploadInfo{}, err
-	}
-	return st.GetMultipartUpload(ctx, bucket, key, uploadID)
-}
-
-func (g *gatewayStore) NewPartWriter(ctx context.Context, bucket, key, uploadID string, partNumber int) (storage.PartWriter, error) {
-	st, err := g.store()
-	if err != nil {
-		return nil, err
-	}
-	return st.NewPartWriter(ctx, bucket, key, uploadID, partNumber)
-}
-
-func (g *gatewayStore) ListParts(ctx context.Context, bucket, key, uploadID string) ([]storage.PartInfo, error) {
-	st, err := g.store()
-	if err != nil {
-		return nil, err
-	}
-	return st.ListParts(ctx, bucket, key, uploadID)
-}
-
-func (g *gatewayStore) ListMultipartUploads(ctx context.Context, bucket string) ([]storage.UploadInfo, error) {
-	st, err := g.store()
-	if err != nil {
-		return nil, err
-	}
-	return st.ListMultipartUploads(ctx, bucket)
-}
-
-func (g *gatewayStore) WalkMultipartUploads(ctx context.Context, bucket, prefix string, after storage.UploadPosition, fn func(storage.UploadInfo) error) error {
-	st, err := g.store()
-	if err != nil {
-		return err
-	}
-	return st.WalkMultipartUploads(ctx, bucket, prefix, after, fn)
-}
-
-func (g *gatewayStore) CompleteMultipartUpload(ctx context.Context, bucket, key, uploadID string, partNumbers []int, meta storage.ObjectMeta, opts storage.CommitOptions) (storage.ObjectInfo, error) {
-	st, err := g.store()
-	if err != nil {
-		return storage.ObjectInfo{}, err
-	}
-	return st.CompleteMultipartUpload(ctx, bucket, key, uploadID, partNumbers, meta, opts)
-}
-
-func (g *gatewayStore) AbortMultipartUpload(ctx context.Context, bucket, key, uploadID string) error {
-	st, err := g.store()
-	if err != nil {
-		return err
-	}
-	return st.AbortMultipartUpload(ctx, bucket, key, uploadID)
 }

@@ -23,15 +23,19 @@ The rulesets in [`.github/rulesets/`](../.github/rulesets) enforce this model:
 | `main` | `main` | the same, but merge commits only (no linear history), plus the `Release PR source` check, which fails unless the pull request comes from `dev` of this repository |
 | `release-tags` | tags `v*` | release tags cannot be deleted, moved or force-pushed |
 | `release-tag-creation` | tags `v*` | only repository admins and deploy keys may create release tags (the Release workflow pushes them with a deploy key, see [below](#release-tags-and-the-release-environment)) |
+| `release-branch-names` | branches `v*` | nobody may create a branch named like a release tag (see [Build integrity](#build-integrity)) |
 
 Required checks on both branches: `Go (fmt, vet, test, e2e)`,
 `Go tests (macos-latest)`, `Go tests (windows-latest)`,
 `Web UI (typecheck, test, build)`, `Playwright (mocked, real server, standalone)`,
 `Compatibility (boto3, AWS CLI)`, `Docker images` (all from `ci.yml`),
+`No DO NOT MERGE label` (from `do-not-merge.yml`),
 `Socket Security: Pull Request Alerts` and `GitGuardian Security Checks`.
-A required check is matched by name: after renaming a CI job, update both
-JSON files and apply them again, or pull requests wait for a check that
-never reports.
+`No DO NOT MERGE label` fails while the pull request has the `DO NOT MERGE`
+label and passes again when the label is removed, so the label blocks a
+merge into either branch. A required check is matched by name: after
+renaming a CI job, update both JSON files and apply them again, or pull
+requests wait for a check that never reports.
 
 Notes:
 
@@ -65,7 +69,7 @@ With the GitHub CLI, signed in as a repository admin:
 The script makes `dev` the default branch; allows squash merges and merge
 commits but not rebase merges; turns on auto-merge, "update branch" and
 deleting merged branches; uses the pull request title and description as the
-merge commit message; creates or updates the four rulesets; and sets up the
+merge commit message; creates or updates the five rulesets; and sets up the
 `release` environment with its deploy key (next section). It is safe to run
 again after changing a JSON file, and **must** be run again by an admin
 after a ruleset file changes: GitHub only enforces what was last applied.
@@ -135,9 +139,11 @@ use `git describe`.
 
 If a run fails after the tag was created, run the workflow again: on a
 commit that already has a release tag whose release is not published yet,
-it rebuilds that release (completing the draft) instead of bumping the
-version. A published release is never rebuilt or changed; the workflow
-refuses.
+it rebuilds that tag instead of bumping the version. If the failed run
+already created a draft, inspect it and delete the draft release before
+retrying; keep the tag. The workflow refuses to reuse any pre-existing
+release, including a draft, so foreign notes and assets cannot be published
+by the release job. A published release is never rebuilt or changed.
 
 ## Verifying a release
 
@@ -177,6 +183,14 @@ only `checksums.txt` and the image's BuildKit provenance are available.
 
 What keeps code that did not go through `dev` → `main` out of a release:
 
+- **Built from the tagged commit.** The tag job outputs the full SHA of
+  the commit it tagged (and checks that it is `main`'s head), and the
+  release builds that SHA, never the tag's name: for a bare name,
+  `actions/checkout` prefers a branch over a tag, so a pushed branch named
+  `vX.Y.Z` would otherwise be built and attested as `main`. `build.yml`
+  accepts only a full commit SHA as `ref`, and every job fails unless
+  `git rev-parse HEAD` equals it. The `release-branch-names` ruleset also
+  refuses `v*` branches outright.
 - **No caches in release builds.** GitHub Actions caches are shared between
   branches (a run on `main` restores entries from the default branch, `dev`),
   and any code that runs in a job (tests, npm and pip packages, tools) can

@@ -25,7 +25,8 @@ import (
 //     of the bucket's master key (restic.PasswordFromKey), and restic's
 //     cache is restic-cache/, shared by all of the backing's repositories;
 //   - the recovery record keys/<bucket-id>.restic.json (resticRepository)
-//     keeps the repository and its password after the bucket is deleted;
+//     keeps the repository, its password and the bucket's name after the
+//     bucket is deleted;
 //   - the data file of a restic version holds only its snapshot ID.
 
 // resticRepository is the JSON form of a bucket's recovery record,
@@ -35,6 +36,13 @@ type resticRepository struct {
 	Initialized bool   `json:"initialized,omitempty"`
 	Repository  string `json:"repository"`
 	Password    string `json:"password"`
+	// Bucket is restic.Record.Bucket ("" when unknown).
+	Bucket string `json:"bucket,omitempty"`
+}
+
+// record returns the restic.Record r holds.
+func (r resticRepository) record() restic.Record {
+	return restic.Record{Initialized: r.Initialized, Repository: r.Repository, Bucket: r.Bucket}
 }
 
 // resticCacheDir (below the system directory) is restic's persistent cache
@@ -57,6 +65,10 @@ func validSnapshot(id string) bool { return restic.ValidSnapshot(id) }
 type resticState struct {
 	once sync.Once
 	rt   *restic.Runtime
+	// auxMu serializes creating the keys of aux repositories (see
+	// restic_host.go); the backend's database lock keeps other processes
+	// out of the system directory.
+	auxMu sync.Mutex
 }
 
 // resticRuntime returns the backend's restic runtime. Restores of
@@ -129,7 +141,7 @@ type resticRecords struct{ b *Backend }
 // Load implements restic.RecoveryStore.
 func (s resticRecords) Load(_ context.Context, id string) (restic.Record, error) {
 	rec, _, err := readRecovery(s.b.recoveryPath(id))
-	return restic.Record{Initialized: rec.Initialized, Repository: rec.Repository}, err
+	return rec.record(), err
 }
 
 // Store implements restic.RecoveryStore. An unchanged record is not
@@ -139,15 +151,21 @@ func (s resticRecords) Store(_ context.Context, id string, rec restic.Record) er
 	if err != nil {
 		return err
 	}
+	return writeRecovery(s.b.recoveryPath(id), rec, key)
+}
+
+// writeRecovery writes the recovery record at path: rec plus the password
+// derived from key. An unchanged record is not rewritten.
+func writeRecovery(path string, rec restic.Record, key []byte) error {
 	raw, err := json.Marshal(resticRepository{
 		Initialized: rec.Initialized,
 		Repository:  rec.Repository,
 		Password:    restic.PasswordFromKey(key),
+		Bucket:      rec.Bucket,
 	})
 	if err != nil {
 		return err
 	}
-	path := s.b.recoveryPath(id)
 	if old, err := os.ReadFile(path); err == nil && bytes.Equal(old, raw) {
 		return nil
 	}
@@ -159,13 +177,21 @@ func (s resticRecords) Store(_ context.Context, id string, rec restic.Record) er
 // prepareRestic makes sure the repository of the bucket with ID id exists,
 // initializing a new one, and that its recovery record is current (see
 // restic.Runtime.Prepare). A repository found ready is not checked again
-// by this process.
+// by this process. The record keeps the bucket name it has; see
+// prepareResticFor.
 func (b *Backend) prepareRestic(ctx context.Context, id string) error {
+	return b.prepareResticFor(ctx, id, "")
+}
+
+// prepareResticFor is prepareRestic recording bucket (when not "") as the
+// bucket's name in the recovery record (restic.Record.Bucket), so offline
+// tools find the bucket's repository by its name.
+func (b *Backend) prepareResticFor(ctx context.Context, id, bucket string) error {
 	loc, err := b.resticLocation(id)
 	if err != nil {
 		return err
 	}
-	return b.resticRuntime().Prepare(ctx, id, loc, resticRecords{b})
+	return b.resticRuntime().PrepareWith(ctx, id, bucket, loc, resticRecords{b})
 }
 
 // ValidateEncryptionSettings checks that the bucket can use cfg's provider.

@@ -979,13 +979,24 @@ func (s *Server) canBypassGovernance(r *http.Request, rc *reqContext, bucket, ke
 // that one (a protected object was written in its place, or created where
 // none was found), the delete fails with AccessDenied instead of removing
 // an object the decision never saw.
+//
+// A GOVERNANCE bypass the caller asked for and may use (canBypassGovernance)
+// applies to deletes of a version. Once approved, it is also passed to the
+// backend in ctx (storage.WithGovernanceBypass), whatever gos3 knows of the
+// bucket's object lock: a native bucket's remote service enforces its own.
 func (s *Server) deleteObjectVersion(ctx context.Context, r *http.Request, rc *reqContext, bi storage.BucketInfo, key, vid, ifMatch string) (storage.DeleteResult, error) {
 	var res storage.DeleteResult
 	var err error
 	authz, pinned := rc.authzObjects[objectRef{bi.Name, key, vid}]
-	if ifMatch != "" || (vid != "" && bi.ObjectLockEnabled) || pinned {
-		// Authorization does I/O, so it is decided before the check runs.
-		bypass := vid != "" && s.canBypassGovernance(r, rc, bi.Name, key, vid)
+	// Authorization does I/O, so it is decided before any check runs.
+	bypass := vid != "" && s.canBypassGovernance(r, rc, bi.Name, key, vid)
+	if bypass {
+		ctx = storage.WithGovernanceBypass(ctx)
+	}
+	// Every permanent version delete checks the current version's lock
+	// metadata. The bucket snapshot may predate enabling object lock while
+	// a bulk request was still being received or processing earlier entries.
+	if ifMatch != "" || vid != "" || pinned {
 		var checkErr error
 		check := func(info storage.ObjectInfo) error {
 			checkErr = nil

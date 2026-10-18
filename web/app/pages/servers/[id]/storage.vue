@@ -130,7 +130,7 @@ watch([id, isGos3], ([, gos3]) => {
             description="The server reported no backings."
           />
           <section v-else aria-label="Storage backings" class="grid gap-4 md:grid-cols-2 xl:grid-cols-3">
-            <AdminBackingCard v-for="b in list" :key="b.name" :backing="b" />
+            <AdminBackingCard v-for="b in list" :key="b.name" :backing="b" :server-id="id" />
           </section>
 
           <p v-if="can('manageStorage')" class="text-sm text-muted">

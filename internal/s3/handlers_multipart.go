@@ -437,6 +437,18 @@ func (s *Server) handleUploadPartCopy(w http.ResponseWriter, r *http.Request, rc
 			_ = pw.Abort()
 			return longResult{err: err}
 		}
+		// Refresh the exact version copied, keeping the request's VersionId
+		// condition unchanged. A newer version must not supply its permissions.
+		currentSource, err := s.backend.GetObjectInfo(ctx, src.Bucket, src.Key, info.VersionID)
+		if err != nil || currentSource.DeleteMarker || currentSource.ETag != info.ETag ||
+			currentSource.Size != info.Size || !currentSource.LastModified.Equal(info.LastModified) {
+			_ = pw.Abort()
+			return longResult{err: s3err.ErrAccessDenied}
+		}
+		if rc.authzObjects == nil {
+			rc.authzObjects = make(map[objectRef]authzObject)
+		}
+		rc.authzObjects[objectRef{src.Bucket, src.Key, src.VersionID}] = authzObject{info: currentSource, found: true}
 		if err := s.authorizeTarget(ctx, r, rc, authzTarget{
 			Action: objectReadAction(src.VersionID), Bucket: src.Bucket, Key: src.Key,
 			VersionID: src.VersionID, ObjectRead: true,
@@ -1041,11 +1053,11 @@ func (s *Server) handleCompleteMultipartUpload(w http.ResponseWriter, r *http.Re
 		trailers = append(trailers, "X-Amz-Expiration")
 	}
 	location := objectLocation(r, rc)
-	bucket, key := rc.bucket, rc.key
+	bucket, key, userAgent := rc.bucket, rc.key, r.UserAgent()
 	// Completion continues when the client goes away, like in S3: the
 	// backend commit is atomic and the upload is gone afterwards.
 	return s.respondWithKeepAlive(w, r, rc, early, trailers, func() longResult {
-		info, err := s.completeMultipartUpload(workCtx, bucket, key, up.UploadID, plan.partNumbers, plan.meta, cond)
+		info, err := s.completeMultipartUpload(workCtx, bucket, key, up.UploadID, plan.partNumbers, plan.meta, cond, userAgent)
 		if err != nil {
 			if errors.Is(err, storage.ErrPreconditionFailed) {
 				return longResult{err: s.commitError(workCtx, err, bucket, key, cond)}

@@ -15,7 +15,7 @@ import (
 // user opens can sign requests with them, and the default CORS "*" rule
 // approves signed cross-origin requests.
 func TestDemoCredentialsRefused(t *testing.T) {
-	for _, sk := range []string{"change-me-now", "gos3admin-secret", "MinioAdmin", "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"} {
+	for _, sk := range []string{"change-me-now", "gos3admin-secret", "MinioAdmin", "CHANGE-ME-secret-key-at-least-8-chars", "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"} {
 		c := Default()
 		c.Auth.RootAccessKey, c.Auth.RootSecretKey = "admin", sk
 		if err := c.Validate(); err == nil || !strings.Contains(err.Error(), "auth.root_secret_key") ||

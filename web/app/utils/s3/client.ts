@@ -25,6 +25,7 @@ import type {
   EncryptionConfiguration,
   GetObjectRangeResult,
   GetObjectTextResult,
+  HeadBucketResult,
   HeadResult,
   InitiateMultipartUploadResult,
   LegalHoldStatus,
@@ -532,8 +533,11 @@ export class S3Client {
         'Content-Type': body ? 'application/xml' : undefined,
         'x-amz-bucket-object-lock-enabled': opts.objectLock ? 'true' : undefined,
         'x-amz-acl': opts.acl,
-        // Signed like every other header passed to aws4fetch.
-        'x-gos3-backing': opts.backing || undefined
+        // gos3 placement headers; signed like every other header passed to aws4fetch.
+        'x-gos3-backing': opts.backing || undefined,
+        'x-gos3-bucket-kind': opts.kind || undefined,
+        'x-gos3-remote-bucket': opts.kind !== 'wrapped' ? opts.remoteBucket || undefined : undefined,
+        'x-gos3-container': opts.kind !== 'native' ? opts.container || undefined : undefined
       }
     })
   }
@@ -545,13 +549,15 @@ export class S3Client {
   /**
    * HeadBucket; resolves with the bucket region when the server reports it,
    * and on gos3 with the bucket's storage backing (x-gos3-backing, "local"
-   * for the server's own storage).
+   * for the server's own storage) and, on s3 backings, its kind
+   * (x-gos3-bucket-kind: native or wrapped).
    */
-  async headBucket(name: string, signal?: AbortSignal): Promise<{ region?: string, backing?: string }> {
+  async headBucket(name: string, signal?: AbortSignal): Promise<HeadBucketResult> {
     const { response } = await this.send({ method: 'HEAD', bucket: name, signal })
     return {
       region: response.headers.get('x-amz-bucket-region') ?? undefined,
-      backing: response.headers.get('x-gos3-backing') || undefined
+      backing: response.headers.get('x-gos3-backing') || undefined,
+      kind: response.headers.get('x-gos3-bucket-kind') || undefined
     }
   }
 

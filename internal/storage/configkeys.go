@@ -10,4 +10,5 @@ var AllConfigKeys = []string{
 	ConfigOwnership, ConfigNotification, ConfigLogging,
 	ConfigPublicAccessBlock, ConfigReplication, ConfigAccelerate,
 	ConfigRequestPayment, ConfigCompression, ConfigEncryptionProvider,
+	ConfigResticSnapshots,
 }

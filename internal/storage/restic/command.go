@@ -127,18 +127,45 @@ func baseEnv() []string {
 // loc: global options (--repo, --retry-lock, --http-user-agent
 // storage.ResticUserAgent, the cache and loc.Options) come first. Its
 // environment is the server's without RESTIC_* and AWS_* variables, plus
-// RESTIC_PASSWORD and loc.Env. When ctx ends, restic is interrupted (so
-// that it removes its lock) and killed if it has not exited 15 seconds
-// later.
+// RESTIC_PASSWORD and loc.Env; loc must pass Location.Check. When ctx
+// ends, restic is interrupted (so that it removes its lock) and killed if
+// it has not exited 15 seconds later.
 //
 // Command fails (wrapping storage.ErrEncryptionUnavailable) when no
 // restic of at least MinVersion is on PATH.
 func (rt *Runtime) Command(ctx context.Context, loc Location, args ...string) (*exec.Cmd, error) {
+	return rt.command(ctx, loc, cmdOptions{}, args...)
+}
+
+// defaultRetryLock is how long restic waits for a conflicting repository
+// lock by default.
+const defaultRetryLock = 30 * time.Second
+
+// cmdOptions adjusts a restic command (see Runtime.command).
+type cmdOptions struct {
+	// retryLock is how long restic waits for a conflicting lock (0:
+	// defaultRetryLock).
+	retryLock time.Duration
+	// env holds environment entries added after the location's.
+	env []string
+}
+
+// command implements Command with the options o. A Location that fails
+// Location.Check is refused, so that no repository, option or variable
+// can make restic run another program.
+func (rt *Runtime) command(ctx context.Context, loc Location, o cmdOptions, args ...string) (*exec.Cmd, error) {
+	if err := loc.Check(); err != nil {
+		return nil, err
+	}
 	bin, err := rt.executable(ctx)
 	if err != nil {
 		return nil, err
 	}
-	global := []string{"--repo", loc.Repository, "--retry-lock", "30s", "--http-user-agent", storage.ResticUserAgent}
+	retryLock := o.retryLock
+	if retryLock <= 0 {
+		retryLock = defaultRetryLock
+	}
+	global := []string{"--repo", loc.Repository, "--retry-lock", retryLock.String(), "--http-user-agent", storage.ResticUserAgent}
 	if loc.CacheDir != "" {
 		if err := os.MkdirAll(loc.CacheDir, cacheDirPerm); err != nil {
 			return nil, fmt.Errorf("restic: create cache directory: %w", err)
@@ -155,7 +182,8 @@ func (rt *Runtime) Command(ctx context.Context, loc Location, args ...string) (*
 	cmd.Cancel = func() error { return interrupt(cmd.Process) }
 	cmd.WaitDelay = stopDelay
 	env := append(baseEnv(), "RESTIC_PASSWORD="+loc.Password)
-	cmd.Env = append(env, loc.Env...)
+	env = append(env, loc.Env...)
+	cmd.Env = append(env, o.env...)
 	return cmd, nil
 }
 
@@ -183,6 +211,15 @@ func (e *cmdError) Unwrap() []error { return []error{storage.ErrEncryptionUnavai
 // interrupted because the client went away), otherwise a logged *cmdError
 // with the redacted tail of diag (which may be nil).
 func (rt *Runtime) failure(ctx context.Context, op string, err error, diag *stderrTail, loc Location) error {
+	e := rt.fault(ctx, op, err, diag, loc)
+	if _, ok := e.(*cmdError); ok {
+		rt.log().Warn("restic failed", "op", op, "repository", loc.Repository, "err", e.Error())
+	}
+	return e
+}
+
+// fault is failure without logging.
+func (rt *Runtime) fault(ctx context.Context, op string, err error, diag *stderrTail, loc Location) error {
 	if ctxErr := ctx.Err(); ctxErr != nil {
 		return fmt.Errorf("restic: %s: %w", op, ctxErr)
 	}
@@ -190,7 +227,6 @@ func (rt *Runtime) failure(ctx context.Context, op string, err error, diag *stde
 	if diag != nil {
 		e.detail = diag.redacted(loc.secrets()...)
 	}
-	rt.log().Warn("restic failed", "op", op, "repository", loc.Repository, "err", e.Error())
 	return e
 }
 

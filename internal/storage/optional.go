@@ -29,6 +29,26 @@ type ConditionalDeleter interface {
 	DeleteObjectIf(ctx context.Context, bucket, key, versionID string, check func(ObjectInfo) error) (DeleteResult, error)
 }
 
+// NewerVersionsDeleter makes the permanent delete of a version conditional
+// on the version and on the versions newer than it, atomically.
+//
+// DeleteVersionIf is DeleteObjectIf for a version ID (versionID must not be
+// ""), except that check also receives the versions of key that are newer
+// than the addressed one, nearest first, at most limit of them (limit < 1
+// is taken as 1): newer[0] is the version whose creation made the
+// addressed one noncurrent, and when len(newer) < limit the last entry is
+// the key's latest version (with IsLatest set). newer is empty when the
+// addressed version is the latest. The lifecycle worker uses it to apply
+// NoncurrentDays and NewerNoncurrentVersions to a key's versions as they
+// are at the delete, not as an earlier walk saw them (a newer version
+// removed meanwhile must stop the delete).
+//
+// check must not do I/O, call into the backend or retain newer, and it may
+// be called more than once (the last call decides).
+type NewerVersionsDeleter interface {
+	DeleteVersionIf(ctx context.Context, bucket, key, versionID string, limit int, check func(v ObjectInfo, newer []ObjectInfo) error) (DeleteResult, error)
+}
+
 // CheckedDeleter is ConditionalDeleter for preconditions that may also be
 // satisfied by the key having no object at all.
 //
@@ -159,7 +179,9 @@ type VersionWriter interface {
 	// info.ObjectMeta. info.Bucket, Key, Size and IsLatest are ignored: the
 	// size is that of the written data. An existing version with the same
 	// version ID (for NullVersionID: the key's null version or null delete
-	// marker) is replaced, wherever it is in the key's history. A delete
+	// marker) is replaced, wherever it is in the key's history, unless a
+	// legal hold or unexpired retention protects it (ErrPreconditionFailed).
+	// The lock check and replacement are atomic. A delete
 	// marker must have no data (otherwise ErrInvalidName). info.VersionID
 	// must be NullVersionID or 1-64 URL-safe characters ([A-Za-z0-9_.-]),
 	// otherwise ErrInvalidName. Returns the stored info (IsLatest true).

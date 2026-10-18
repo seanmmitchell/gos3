@@ -41,6 +41,7 @@ jobs:
       contents: read
     outputs:
       tag: ${{ steps.tag.outputs.tag }}
+      commit: ${{ steps.tag.outputs.commit }}
     steps:
       - name: Releases are cut from main
         if: github.ref != 'refs/heads/main'
@@ -85,7 +86,16 @@ jobs:
             git push origin "refs/tags/$tag"
             echo "Tagged $(git rev-parse --short=12 HEAD) as $tag."
           fi
+          # The build checks out this full commit SHA, never the tag's bare
+          # name: actions/checkout prefers a branch over a tag of the same
+          # name, so a pushed v* branch would otherwise be built instead.
+          commit="$(git rev-parse --verify "refs/tags/$tag^{commit}")"
+          if [ "$commit" != "$(git rev-parse HEAD)" ]; then
+            echo "::error::$tag tags $commit, not main's head $(git rev-parse HEAD)."
+            exit 1
+          fi
           echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "commit=$commit" >> "$GITHUB_OUTPUT"
 
   build:
     name: Build
@@ -99,7 +109,7 @@ jobs:
       attestations: write
     uses: ./.github/workflows/build.yml
     with:
-      ref: ${{ needs.version.outputs.tag }}
+      ref: ${{ needs.version.outputs.commit }}
       version: ${{ needs.version.outputs.tag }}
       # No floating major tag before 1.0.0: 0.x minor releases may break.
       image-tags: |
@@ -142,18 +152,15 @@ jobs:
         uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
         with:
           subject-path: dist/gos3_*
-      # The release is created as a draft, completed, then published, so a
-      # failed run leaves a draft to finish rather than a partial release.
+      # Only a draft created by this run may be published. A pre-existing
+      # draft may contain foreign notes or assets and is never reused.
       # Assets of a published release are never replaced (the version job
       # refuses to rebuild one; with release immutability on, GitHub refuses
       # too).
       - name: Create, upload and publish the release
         run: |
-          draft="$(gh release view "$TAG" --json isDraft --jq .isDraft 2>/dev/null || echo missing)"
-          case $draft in
-            missing) gh release create "$TAG" --verify-tag --draft --title "gos3 $TAG" --generate-notes ;;
-            true) echo "Completing the draft release $TAG." ;;
-            *) echo "::error::$TAG is already published."; exit 1 ;;
-          esac
-          gh release upload "$TAG" dist/* --clobber
+          # Create fails if any release already exists, including a draft.
+          # Never upload to or publish a release this run did not create.
+          gh release create "$TAG" --verify-tag --draft --title "gos3 $TAG" --generate-notes
+          gh release upload "$TAG" dist/*
           gh release edit "$TAG" --draft=false

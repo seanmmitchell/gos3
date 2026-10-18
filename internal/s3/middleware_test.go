@@ -287,6 +287,7 @@ func TestMapStorageError(t *testing.T) {
 		{storage.ErrUploadNotFound, "NoSuchUpload"},
 		{storage.ErrPartNotFound, "InvalidPart"},
 		{storage.ErrPreconditionFailed, "PreconditionFailed"},
+		{fmt.Errorf("x: %w", storage.ErrConflict), "SlowDown"},
 		{storage.ErrInvalidName, "InvalidArgument"},
 		{context.Canceled, "RequestTimeout"},
 		{&http.MaxBytesError{Limit: 1}, "MaxMessageLengthExceeded"},

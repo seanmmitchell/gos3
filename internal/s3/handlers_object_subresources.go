@@ -4,6 +4,7 @@ package s3
 // GetObjectAttributes. Owned by the s3-object work item.
 
 import (
+	"context"
 	"encoding/xml"
 	"errors"
 	"maps"
@@ -93,7 +94,14 @@ func (s *Server) subresourceTarget(w http.ResponseWriter, r *http.Request, rc *r
 // storage.ConditionalMetaUpdater (both built-in backends are).
 func (s *Server) updateObjectMeta(r *http.Request, rc *reqContext, info storage.ObjectInfo, attrs map[string][]string,
 	fn func(*storage.ObjectMeta) error) (storage.ObjectInfo, error) {
-	ctx := r.Context()
+	return s.updateObjectMetaCtx(r.Context(), r, rc, info, attrs, fn)
+}
+
+// updateObjectMetaCtx is updateObjectMeta with the context passed to the
+// backend: the request's, or one derived from it that carries what the S3
+// layer approved (storage.WithGovernanceBypass).
+func (s *Server) updateObjectMetaCtx(ctx context.Context, r *http.Request, rc *reqContext, info storage.ObjectInfo, attrs map[string][]string,
+	fn func(*storage.ObjectMeta) error) (storage.ObjectInfo, error) {
 	if err := s.revalidateWrite(rc, func() error { return s.reauthorizeOp(ctx, r, rc, attrs) }); err != nil {
 		return storage.ObjectInfo{}, err
 	}
@@ -454,7 +462,9 @@ func (s *Server) handleGetObjectRetention(w http.ResponseWriter, r *http.Request
 // COMPLIANCE retention can only be extended; active GOVERNANCE retention
 // can only be extended unless the caller bypasses governance
 // (x-amz-bypass-governance-retention: true + s3:BypassGovernanceRetention).
-// An empty <Retention/> removes the retention (same rules).
+// An empty <Retention/> removes the retention (same rules). An approved
+// bypass is also passed to the backend (storage.WithGovernanceBypass): a
+// native bucket's remote service enforces its own retention.
 //
 // The op is authorized here, after the (small) body is decoded, because
 // its s3:object-lock-mode, s3:object-lock-retain-until-date and
@@ -501,8 +511,12 @@ func (s *Server) handlePutObjectRetention(w http.ResponseWriter, r *http.Request
 		return err
 	}
 	bypass := s.canBypassGovernance(r, rc, rc.bucket, rc.key, info.VersionID)
+	ctx := r.Context()
+	if bypass {
+		ctx = storage.WithGovernanceBypass(ctx)
+	}
 	now := s.now()
-	if _, err := s.updateObjectMeta(r, rc, info, attrs, func(m *storage.ObjectMeta) error {
+	if _, err := s.updateObjectMetaCtx(ctx, r, rc, info, attrs, func(m *storage.ObjectMeta) error {
 		if m.RetentionMode != "" && m.RetainUntil.After(now) {
 			extends := mode == m.RetentionMode && !until.Before(m.RetainUntil)
 			switch {

@@ -66,6 +66,9 @@ func importTime(i int) time.Time {
 // importMeta returns full metadata distinguishable by n.
 func importMeta(data []byte, n int) storage.ObjectMeta {
 	m := fullMeta()
+	// Re-import tests replace these versions; lock preservation is covered
+	// separately so their fixtures do not authorize replacing protected data.
+	m.LegalHold, m.RetentionMode, m.RetainUntil = false, "", time.Time{}
 	m.ETag = etagOf(data)
 	m.UserMeta = map[string]string{"n": fmt.Sprint(n), "unicode": "日本語"}
 	m.PartSizes, m.PartChecksums = nil, nil
@@ -138,6 +141,18 @@ func otherID(id string) string {
 
 func testVersionImporter(e *env) {
 	vi := e.versionImporter()
+	e.run("LockedReplacement", func(e *env) {
+		e.mkVersioned("protected", storage.VersioningEnabled)
+		for _, id := range []string{"locked-id", storage.NullVersionID} {
+			m := importMeta([]byte("original"), 0)
+			m.LegalHold = true
+			e.imp("protected", id, id, []byte("original"), importTime(0), m)
+			info := storage.ObjectInfo{VersionID: id, LastModified: importTime(1)}
+			_, err := importObject(e.ctx, e.versionImporter(), "protected", id, []byte("replacement"), info)
+			e.wantErr("replace locked imported version", err, storage.ErrPreconditionFailed)
+			e.wantImported("protected", id, id, []byte("original"), importTime(0), m, true)
+		}
+	})
 
 	for _, status := range []storage.VersioningStatus{storage.VersioningUnversioned, storage.VersioningEnabled, storage.VersioningSuspended} {
 		name := string(status)

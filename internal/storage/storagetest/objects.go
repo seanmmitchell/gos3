@@ -270,6 +270,7 @@ var testKeys = []string{
 }
 
 func testObjectKeys(e *env) {
+	e.skipIfControlKeys() // testKeys must be stored verbatim, NUL bytes included
 	e.mkBucket("b")
 	for i, k := range testKeys {
 		data := []byte("content of key #" + string(rune('A'+i)))

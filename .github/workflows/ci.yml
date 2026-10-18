@@ -78,8 +78,11 @@ jobs:
       # Run the restic repository tests here too (process handling, paths
       # and file locking differ).
       - uses: ./.github/actions/setup-restic
+      # Durable filesystem suites perform thousands of disk flushes. On
+      # Windows runners these can exceed Go's default 10-minute package
+      # timeout; keep all tests enabled within the 30-minute job budget.
       - name: Unit tests
-        run: go test -count=1 ./cmd/... ./internal/...
+        run: go test -timeout=20m -count=1 ./cmd/... ./internal/...
       - name: End-to-end tests
         run: go test -count=1 ./test/e2e/...
 
@@ -107,7 +110,7 @@ jobs:
           corepack enable
           pnpm --version
           echo "PNPM_STORE=$(pnpm store path --silent)" >> "$GITHUB_ENV"
-      - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ${{ env.PNPM_STORE }}
           key: pnpm-${{ runner.os }}-${{ hashFiles('web/pnpm-lock.yaml') }}
@@ -151,7 +154,7 @@ jobs:
         run: |
           corepack enable
           echo "PNPM_STORE=$(cd web && pnpm store path --silent)" >> "$GITHUB_ENV"
-      - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ${{ env.PNPM_STORE }}
           key: pnpm-${{ runner.os }}-${{ hashFiles('web/pnpm-lock.yaml') }}
@@ -206,7 +209,7 @@ jobs:
       # A venv links to its interpreter's absolute path, so the key includes
       # the exact Python version: a runner image with a new 3.13.x starts a
       # fresh venv instead of restoring one with dangling links.
-      - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ${{ env.GOS3_COMPAT_VENV }}
           key: compat-venv-${{ runner.os }}-py${{ steps.python.outputs.python-version }}-${{ hashFiles('test/compat/requirements.txt') }}

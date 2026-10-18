@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"slices"
 	"time"
+
+	"github.com/seanmmitchell/gos3/internal/storage"
 )
 
 // Member roles.
@@ -25,17 +27,21 @@ const (
 
 // BackingStatus describes a backing (GET /_gos3/admin/v1/backings).
 type BackingStatus struct {
-	Name      string    `json:"name"`
-	Kind      string    `json:"kind"`
-	Mode      string    `json:"mode,omitempty"`     // "gateway" for an s3 gateway backing
-	Location  string    `json:"location,omitempty"` // s3 backings: e.g. "s3://bucket/prefix/"
-	Path      string    `json:"path"`
-	Default   bool      `json:"default"`
-	Healthy   bool      `json:"healthy"`
-	LastError string    `json:"lastError"`
-	CheckedAt time.Time `json:"checkedAt,omitzero"`
-	Buckets   int       `json:"buckets"`  // buckets whose primary copy is here
-	Replicas  int       `json:"replicas"` // replica copies and move targets here
+	Name     string `json:"name"`
+	Kind     string `json:"kind"`
+	Location string `json:"location,omitempty"` // s3 backings: e.g. "s3://bucket/prefix/"
+	// Kinds are the bucket kinds the backing offers and DefaultKind the
+	// one new buckets get, for backings with several (s3 backings, see
+	// storage.KindReporter); empty otherwise.
+	Kinds       []string  `json:"kinds,omitempty"`
+	DefaultKind string    `json:"defaultKind,omitempty"`
+	Path        string    `json:"path"`
+	Default     bool      `json:"default"`
+	Healthy     bool      `json:"healthy"`
+	LastError   string    `json:"lastError"`
+	CheckedAt   time.Time `json:"checkedAt,omitzero"`
+	Buckets     int       `json:"buckets"`  // buckets whose primary copy is here
+	Replicas    int       `json:"replicas"` // replica copies and move targets here
 }
 
 // PlacementStatus describes a bucket's placement and the state of every
@@ -66,6 +72,9 @@ type MoveStatus struct {
 	To        string    `json:"to"`
 	StartedAt time.Time `json:"startedAt"`
 	Phase     string    `json:"phase"`
+	// Target is the kind and location the move creates the bucket with on
+	// To (see Router.Move); nil for the backing's choice.
+	Target *storage.BucketTarget `json:"target,omitempty"`
 }
 
 // PlacementSummary is the short form of a placement (bucket lists).
@@ -99,7 +108,7 @@ func (r *Router) Backings() []BackingStatus {
 	for _, b := range topology.order {
 		b.mu.Lock()
 		st := BackingStatus{
-			Name: b.Name, Kind: b.Kind, Mode: b.Mode, Location: b.Location, Path: b.Path, Default: b == topology.def,
+			Name: b.Name, Kind: b.Kind, Location: b.Location, Path: b.Path, Default: b == topology.def,
 			Healthy: b.healthy.Load(), LastError: b.lastErr, CheckedAt: b.checkedAt,
 			Buckets: primaries[b.Name], Replicas: replicas[b.Name],
 		}
@@ -107,9 +116,29 @@ func (r *Router) Backings() []BackingStatus {
 		if st.Healthy {
 			st.LastError = ""
 		}
+		if kr, ok := b.Backend.(storage.KindReporter); ok {
+			kinds, def := kr.BucketKinds()
+			for _, k := range kinds {
+				st.Kinds = append(st.Kinds, string(k))
+			}
+			st.DefaultKind = string(def)
+		}
 		out = append(out, st)
 	}
 	return out
+}
+
+// BackingBackend returns the backend of the backing name (for the admin
+// API's view of an s3 backing's remote buckets), or false for an unknown
+// name. Live backing configuration may replace or remove the backing
+// later, closing that backend: callers use it for the request at hand
+// only.
+func (r *Router) BackingBackend(name string) (storage.Backend, bool) {
+	b := r.topology.Load().backings[name]
+	if b == nil {
+		return nil, false
+	}
+	return b.Backend, true
 }
 
 // Summary returns the short placement of bucket.
@@ -151,7 +180,7 @@ func (r *Router) status(bs *bucketState) PlacementStatus {
 	}
 	if mv := rec.Move; mv != nil {
 		st.Members = append(st.Members, r.memberStatus(rec, bs.members[mv.To], RoleMoveTarget, false))
-		st.Move = &MoveStatus{From: mv.From, To: mv.To, StartedAt: mv.StartedAt, Phase: bs.movePh}
+		st.Move = &MoveStatus{From: mv.From, To: mv.To, StartedAt: mv.StartedAt, Phase: bs.movePh, Target: cloneTarget(mv.Target)}
 	}
 	return st
 }
@@ -209,8 +238,11 @@ func (r *Router) backingByName(name string) (*backing, error) {
 }
 
 // SetReplication sets the bucket's replication mode and replica backings
-// (the primary stays). New replicas start with a full copy; removed ones
-// have their copy deleted in the background.
+// (the primary stays). New replicas start with a full copy, in a bucket
+// their backing creates to receive copies (storage.CreateBucketOptions
+// Import, with the backing's default location); removed ones have their
+// copy deleted in the background. A bucket whose versions cannot be
+// copied (a native bucket) gets no replicas.
 func (r *Router) SetReplication(ctx context.Context, bucket string, mode Mode, replicas []string) (PlacementStatus, error) {
 	r.adminMu.Lock()
 	defer r.adminMu.Unlock()
@@ -235,7 +267,7 @@ func (r *Router) SetReplication(ctx context.Context, bucket string, mode Mode, r
 	if err != nil {
 		return PlacementStatus{}, err
 	}
-	if err := r.checkNewMembers(ctx, bucket, bs, replicas); err != nil {
+	if err := r.checkNewMembers(ctx, bucket, bs, replicas, nil); err != nil {
 		return PlacementStatus{}, err
 	}
 
@@ -278,7 +310,7 @@ func (r *Router) SetReplication(ctx context.Context, bucket string, mode Mode, r
 	}
 	for _, ms := range removed {
 		delete(bs.members, ms.backing.Name)
-		r.addPurgeLocked(bucket, ms.backing.Name)
+		r.addPurgeLocked(bucket, ms.backing.Name, rec.Members[rec.member(ms.backing.Name)].Diverged)
 	}
 	if mode != ModeActiveActive {
 		for _, ms := range bs.members {
@@ -313,9 +345,14 @@ func (r *Router) SetReplication(ctx context.Context, bucket string, mode Mode, r
 }
 
 // Move starts moving the copy of bucket on from (the primary when "") to
-// the backing to. The target is filled in the background; the cutover
-// happens when it has caught up.
-func (r *Router) Move(ctx context.Context, bucket, from, to string) (PlacementStatus, error) {
+// the backing to. target chooses the kind and location of the bucket
+// created on to (nil: the backing's choice for copies); it must name a
+// bucket that can receive copies (not a native bucket), and needs a
+// backing with bucket kinds (else storage.ErrInvalidTarget). It is
+// persisted with the move. The target is filled in the background; the
+// cutover happens when it has caught up. A bucket whose versions cannot be
+// copied (a native bucket) cannot be moved.
+func (r *Router) Move(ctx context.Context, bucket, from, to string, target *storage.BucketTarget) (PlacementStatus, error) {
 	r.adminMu.Lock()
 	defer r.adminMu.Unlock()
 	if _, err := r.backingByName(to); err != nil {
@@ -325,7 +362,8 @@ func (r *Router) Move(ctx context.Context, bucket, from, to string) (PlacementSt
 	if err != nil {
 		return PlacementStatus{}, err
 	}
-	if err := r.checkNewMembers(ctx, bucket, bs, []string{to}); err != nil {
+	target = cloneTarget(target) // the caller keeps its own
+	if err := r.checkNewMembers(ctx, bucket, bs, []string{to}, target); err != nil {
 		return PlacementStatus{}, err
 	}
 	r.mu.Lock()
@@ -349,7 +387,7 @@ func (r *Router) Move(ctx context.Context, bucket, from, to string) (PlacementSt
 			ErrConflict, bucket, to)
 	}
 	next := rec.clone()
-	next.Move = &moveRecord{From: from, To: to, StartedAt: time.Now().UTC()}
+	next.Move = &moveRecord{From: from, To: to, StartedAt: time.Now().UTC(), Target: target}
 	ms := r.newMemberState(bs, to)
 	ms.needFull = true
 	bs.members[to] = ms
@@ -386,7 +424,7 @@ func (r *Router) CancelMove(ctx context.Context, bucket string) (PlacementStatus
 	bs.movePh = ""
 	ms := bs.members[mv.To]
 	delete(bs.members, mv.To)
-	r.addPurgeLocked(bucket, mv.To)
+	r.addPurgeLocked(bucket, mv.To, false)
 	r.mu.Unlock()
 	if ms != nil {
 		r.cancelMember(ms)
@@ -400,6 +438,69 @@ func (r *Router) CancelMove(ctx context.Context, bucket string) (PlacementStatus
 		return r.status(bs), fmt.Errorf("the move was canceled but that could not be saved: %w", saveErr)
 	}
 	return r.status(bs), nil
+}
+
+// ReleaseBucket makes the router forget bucket without deleting any of its
+// data: the backing holding it lets it go (storage.BucketReleaser; a
+// native bucket of an s3 backing keeps its remote bucket and objects), and
+// the bucket's placement is removed without the background deletion that
+// follows DeleteBucket. The bucket must have a single copy (remove its
+// replicas first) and no move in progress (ErrConflict otherwise); a
+// backing that cannot release the bucket answers storage.ErrNotSupported.
+// The subscribers (see Subscribe) see the bucket deleted: the router no
+// longer has it.
+func (r *Router) ReleaseBucket(ctx context.Context, name string) error {
+	if err := r.releaseBucket(ctx, name); err != nil {
+		return err
+	}
+	r.emit(Change{Kind: ChangeBucketDeleted, Bucket: name})
+	return nil
+}
+
+// releaseBucket is ReleaseBucket without reporting the change.
+func (r *Router) releaseBucket(ctx context.Context, name string) error {
+	if r.closed.Load() {
+		return ErrClosed
+	}
+	r.adminMu.Lock()
+	defer r.adminMu.Unlock()
+	bs, err := r.lookup(name)
+	if err != nil {
+		return err
+	}
+	r.mu.RLock()
+	rec := bs.rec
+	prim := bs.members[rec.primary()].backing
+	r.mu.RUnlock()
+	switch {
+	case rec.Move != nil:
+		return fmt.Errorf("%w: a move of bucket %q is in progress; cancel it before releasing the bucket", ErrConflict, name)
+	case len(rec.Members) > 1:
+		return fmt.Errorf("%w: bucket %q has replicas on %v; remove replicas first", ErrConflict, name, memberNames(rec.Members[1:]))
+	}
+	rel, ok := prim.Backend.(storage.BucketReleaser)
+	if !ok {
+		return fmt.Errorf("backing %q cannot release buckets without deleting their data: %w", prim.Name, storage.ErrNotSupported)
+	}
+	if err := rel.ReleaseBucket(ctx, name); err != nil {
+		return r.observe(prim, err)
+	}
+	var cancel []*memberState
+	r.mu.Lock()
+	bs.removed = true
+	delete(r.buckets, name)
+	for _, ms := range bs.members {
+		cancel = append(cancel, ms)
+	}
+	r.mu.Unlock()
+	for _, ms := range cancel {
+		r.cancelMember(ms)
+	}
+	r.log.Info("bucket released; its data is kept", "bucket", name, "backing", prim.Name)
+	// A failed save is repaired at the next start: a placed bucket that no
+	// backing holds any more is forgotten.
+	r.saveLogged("releasing a bucket")
+	return nil
 }
 
 // Promote makes the replica on backingName the bucket's primary. Without

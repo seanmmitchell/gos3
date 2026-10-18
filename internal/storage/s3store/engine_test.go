@@ -257,7 +257,7 @@ func TestMarkerCreateAndReopen(t *testing.T) {
 	v := newEnv(t)
 	e, m := v.mustOpen(nil)
 	mk := e.Marker()
-	if mk.Format != 1 || mk.Kind != "s3" || len(mk.BackingID) != 32 || mk.Gateway || mk.KEKCheck != "" {
+	if mk.Format != 1 || mk.Kind != "s3" || len(mk.BackingID) != 32 || mk.Gateway || !mk.BlobTags || mk.Role != "" || mk.KEKCheck != "" {
 		t.Fatalf("marker = %+v", mk)
 	}
 	if e.KEKState() != KEKNone {
@@ -281,21 +281,102 @@ func TestMarkerCreateAndReopen(t *testing.T) {
 
 func TestMarkerRefusals(t *testing.T) {
 	t.Run("unmanaged", func(t *testing.T) {
-		v := newEnv(t)
-		v.put(testPrefix+"data/1/xyz", []byte("blob"))
-		if _, _, err := v.open(nil); !errors.Is(err, ErrUnmanagedPrefix) {
-			t.Fatalf("Open = %v, want ErrUnmanagedPrefix", err)
+		for _, key := range []string{"meta/lease.json", "data/1/xyz", "parts/u/00001-x", "keys/b.key", "restic/b/config", "gateway/parts/ns/x"} {
+			v := newEnv(t)
+			v.put(testPrefix+key, []byte("blob"))
+			if _, _, err := v.open(nil); !errors.Is(err, ErrUnmanagedPrefix) {
+				t.Fatalf("Open with %s = %v, want ErrUnmanagedPrefix", key, err)
+			}
+			if len(v.keys(markerKey)) != 0 {
+				t.Fatalf("marker created over unmanaged data (%s)", key)
+			}
 		}
-		if len(v.keys(markerKey)) != 0 {
-			t.Fatal("marker created over unmanaged data")
+		// Other keys are tolerated (CreateIfNoData).
+		v := newEnv(t)
+		v.put(testPrefix+"notes.txt", []byte("x"))
+		v.mustOpen(nil)
+	})
+	t.Run("legacy gateway marker", func(t *testing.T) {
+		v := newEnv(t)
+		legacy := `{"format":1,"kind":"s3","backingId":"0123456789abcdef0123456789abcdef","gateway":true,"created":"2026-01-02T03:04:05Z"}`
+		v.put(testPrefix+markerKey, []byte(legacy))
+		e, _ := v.mustOpen(nil)
+		mk := e.Marker()
+		if !mk.Gateway || !mk.BlobTags || mk.BackingID != "0123456789abcdef0123456789abcdef" {
+			t.Fatalf("marker = %+v, want the legacy gateway marker with BlobTags set", mk)
+		}
+		var stored Marker
+		if err := json.Unmarshal(v.get(testPrefix+markerKey), &stored); err != nil || stored.BackingID != mk.BackingID ||
+			!stored.Gateway || !stored.BlobTags || !stored.Created.Equal(mk.Created) {
+			t.Fatalf("stored marker = %+v (%v), want %+v", stored, err, mk)
 		}
 	})
-	t.Run("gateway mismatch", func(t *testing.T) {
+	t.Run("must exist", func(t *testing.T) {
+		v := newEnv(t)
+		if _, _, err := v.open(func(o *EngineOptions) { o.Create = MustExist }); !errors.Is(err, ErrMarkerMissing) || !errors.Is(err, ErrMarkerMismatch) {
+			t.Fatalf("Open = %v, want ErrMarkerMissing", err)
+		}
+		if len(v.keys("")) != 0 {
+			t.Fatalf("MustExist wrote %v", v.keys(""))
+		}
+		e, _ := v.mustOpen(func(o *EngineOptions) { o.Role = RoleContainer })
+		id := e.Marker().BackingID
+		if e.Marker().Role != RoleContainer {
+			t.Fatalf("role = %q", e.Marker().Role)
+		}
+		_ = e.Close()
+		e, _ = v.mustOpen(func(o *EngineOptions) { o.Create = MustExist })
+		if e.Marker().BackingID != id {
+			t.Fatal("MustExist opened another backing")
+		}
+		_ = e.Close()
+	})
+	t.Run("expected backing", func(t *testing.T) {
 		v := newEnv(t)
 		e, _ := v.mustOpen(nil)
+		id := e.Marker().BackingID
 		_ = e.Close()
-		if _, _, err := v.open(func(o *EngineOptions) { o.Gateway = true }); !errors.Is(err, ErrMarkerMismatch) {
-			t.Fatalf("Open = %v, want ErrMarkerMismatch", err)
+		other := "ffffffffffffffffffffffffffffffff"
+		if _, _, err := v.open(func(o *EngineOptions) { o.ExpectBackingID = other }); !errors.Is(err, ErrMarkerMismatch) || errors.Is(err, ErrMarkerMissing) {
+			t.Fatalf("Open with another expected ID = %v, want ErrMarkerMismatch", err)
+		}
+		e, _ = v.mustOpen(func(o *EngineOptions) { o.ExpectBackingID = id })
+		_ = e.Close()
+		// An expected backing is never created.
+		v2 := newEnv(t)
+		if _, _, err := v2.open(func(o *EngineOptions) { o.ExpectBackingID = id }); !errors.Is(err, ErrMarkerMissing) {
+			t.Fatalf("Open of a missing expected backing = %v, want ErrMarkerMissing", err)
+		}
+		if len(v2.keys(markerKey)) != 0 {
+			t.Fatal("marker created for an expected backing")
+		}
+	})
+	t.Run("reload finds another backing", func(t *testing.T) {
+		v := newEnv(t)
+		e, _ := v.mustOpen(nil)
+		mk := e.Marker()
+		swapped := mk
+		swapped.BackingID = "ffffffffffffffffffffffffffffffff"
+		raw, _ := json.Marshal(swapped)
+		v.put(testPrefix+markerKey, raw)
+		e.failCurrent(errors.New("test"))
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		if err := e.Open(ctx); !errors.Is(err, ErrMarkerMismatch) {
+			t.Fatalf("reload with a swapped marker = %v, want ErrMarkerMismatch", err)
+		}
+		if st := e.State(); st.State != StateFailed || !errors.Is(st.Err, ErrMarkerMismatch) {
+			t.Fatalf("state = %+v", st)
+		}
+		// A deleted marker is not recreated by a reload.
+		if err := v.client.DeleteObject(ctx, testBucket, testPrefix+markerKey); err != nil {
+			t.Fatal(err)
+		}
+		if err := e.Open(ctx); !errors.Is(err, ErrMarkerMissing) {
+			t.Fatalf("reload without a marker = %v, want ErrMarkerMissing", err)
+		}
+		if len(v.keys(markerKey)) != 0 {
+			t.Fatal("reload created a marker")
 		}
 	})
 	t.Run("kek", func(t *testing.T) {

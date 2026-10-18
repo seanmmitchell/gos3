@@ -208,7 +208,11 @@ func createBucketOwnershipXML(ownership string) ([]byte, error) {
 // the bucket's data ("default" or a configured backing, see
 // docs/backings.md; absent = the server's default backing). An unknown
 // backing is InvalidArgument; object lock on a gateway backing is
-// NotImplemented.
+// NotImplemented. On backings offering several bucket kinds (s3 backings),
+// x-gos3-bucket-kind, x-gos3-remote-bucket and x-gos3-container choose the
+// kind and location of the bucket (see parseBucketTarget); a remote bucket
+// that exists already is BucketAlreadyExists (an administrator can adopt
+// it), a target the backing cannot honour InvalidArgument.
 func (s *Server) handleCreateBucket(w http.ResponseWriter, r *http.Request, rc *reqContext) error {
 	ctx := r.Context()
 	bucket := rc.bucket
@@ -243,6 +247,10 @@ func (s *Server) handleCreateBucket(w http.ResponseWriter, r *http.Request, rc *
 		return s3err.ErrInvalidArgument.WithMessage("The x-gos3-backing header must name a backing (lowercase letters, digits, '_' and '-').").
 			With("ArgumentName", headerBacking).With("ArgumentValue", backing)
 	}
+	target, err := parseBucketTarget(h)
+	if err != nil {
+		return err
+	}
 	// The (optional) body may have taken long: the caller must still be
 	// allowed to create the bucket.
 	if err := s.revalidateWrite(rc, func() error { return s.reauthorizeOp(ctx, r, rc, nil) }); err != nil {
@@ -270,11 +278,17 @@ func (s *Server) handleCreateBucket(w http.ResponseWriter, r *http.Request, rc *
 	if !rc.identity.IsRoot && !rc.identity.IsAnonymous {
 		owner = rc.identity.User
 	}
-	err = s.backend.CreateBucket(ctx, bucket, storage.CreateBucketOptions{Region: region, ObjectLockEnabled: lock, Owner: owner, Backing: backing})
-	if errors.Is(err, storage.ErrBucketExists) {
+	err = s.backend.CreateBucket(ctx, bucket, storage.CreateBucketOptions{
+		Region: region, ObjectLockEnabled: lock, Owner: owner, Backing: backing, Target: target,
+	})
+	switch {
+	case errors.Is(err, storage.ErrRemoteBucketExists):
+		// Checked first: it wraps ErrBucketExists, but the gos3 bucket does
+		// not exist; the remote bucket a native bucket would create does.
+		return mapStorageError(err)
+	case errors.Is(err, storage.ErrBucketExists):
 		return s.bucketExistsError(r, rc)
-	}
-	if err != nil {
+	case err != nil:
 		return bucketError(err, bucket)
 	}
 	rc.forgetBucket()
@@ -395,6 +409,96 @@ func validLocationConstraint(v string) bool {
 	return true
 }
 
+// gos3 extension headers of CreateBucket choosing the kind and location of
+// a new bucket on backings that offer several (s3 backings, see
+// docs/backings.md). HeadBucket reports the kind in headerBucketKind.
+const (
+	headerBucketKind   = "X-Gos3-Bucket-Kind"
+	headerRemoteBucket = "X-Gos3-Remote-Bucket"
+	headerContainer    = "X-Gos3-Container"
+)
+
+// maxContainerID is the longest container ID x-gos3-container accepts.
+const maxContainerID = 63
+
+// parseBucketTarget reads the CreateBucket extension headers choosing the
+// new bucket's kind and location, and returns nil when none is present
+// (the backing's defaults):
+//
+//   - x-gos3-bucket-kind: native or wrapped (any case);
+//   - x-gos3-remote-bucket: the remote bucket of a native bucket, which
+//     CreateBucket creates; it must be a valid bucket name and implies
+//     native;
+//   - x-gos3-container: the container of a wrapped bucket, "home" or a
+//     container ID (see validContainerID); it implies wrapped.
+//
+// Invalid values, a remote bucket together with a container, and a header
+// contradicting the kind are InvalidArgument. Adopting an existing remote
+// bucket is reserved to the admin API: Target.Adopt is never set here.
+func parseBucketTarget(h http.Header) (*storage.BucketTarget, error) {
+	rawKind := strings.TrimSpace(h.Get(headerBucketKind))
+	remote := strings.TrimSpace(h.Get(headerRemoteBucket))
+	rawContainer := strings.TrimSpace(h.Get(headerContainer))
+	if rawKind == "" && remote == "" && rawContainer == "" {
+		return nil, nil
+	}
+	kind, container := strings.ToLower(rawKind), strings.ToLower(rawContainer)
+	bad := func(header, value, format string, args ...any) error {
+		if !utf8.ValidString(value) {
+			value = strings.ToValidUTF8(value, "�")
+		}
+		return s3err.ErrInvalidArgument.WithMessage(format, args...).
+			With("ArgumentName", strings.ToLower(header)).With("ArgumentValue", truncateValue(value))
+	}
+	t := &storage.BucketTarget{Kind: storage.BucketKind(kind), RemoteBucket: remote, Container: container}
+	switch t.Kind {
+	case "", storage.BucketKindNative, storage.BucketKindWrapped:
+	default:
+		return nil, bad(headerBucketKind, rawKind, "The %s header must be %q or %q.",
+			strings.ToLower(headerBucketKind), storage.BucketKindNative, storage.BucketKindWrapped)
+	}
+	if remote != "" && !validBucketName(remote) {
+		return nil, bad(headerRemoteBucket, remote, "The %s header must be a valid bucket name.", strings.ToLower(headerRemoteBucket))
+	}
+	if container != "" && !validContainerID(container) {
+		return nil, bad(headerContainer, rawContainer,
+			"The %s header must name a container (\"home\" or up to %d lowercase letters, digits and '-', starting with a letter or digit).",
+			strings.ToLower(headerContainer), maxContainerID)
+	}
+	switch {
+	case remote != "" && container != "":
+		return nil, bad(headerContainer, rawContainer, "The %s header (native buckets) and the %s header (wrapped buckets) cannot be combined.",
+			strings.ToLower(headerRemoteBucket), strings.ToLower(headerContainer))
+	case remote != "" && t.Kind == storage.BucketKindWrapped:
+		return nil, bad(headerRemoteBucket, remote, "The %s header is only valid for native buckets.", strings.ToLower(headerRemoteBucket))
+	case container != "" && t.Kind == storage.BucketKindNative:
+		return nil, bad(headerContainer, rawContainer, "The %s header is only valid for wrapped buckets.", strings.ToLower(headerContainer))
+	case t.Kind == "" && remote != "":
+		t.Kind = storage.BucketKindNative
+	case t.Kind == "" && container != "":
+		t.Kind = storage.BucketKindWrapped
+	}
+	return t, nil
+}
+
+// validContainerID reports whether id has the shape of a container ID of an
+// s3 backing: 1..maxContainerID lowercase letters, digits and '-', starting
+// with a letter or digit ("home" names the backing's home container).
+func validContainerID(id string) bool {
+	if id == "" || len(id) > maxContainerID {
+		return false
+	}
+	for i := 0; i < len(id); i++ {
+		switch c := id[i]; {
+		case c >= 'a' && c <= 'z', c >= '0' && c <= '9':
+		case c == '-' && i > 0:
+		default:
+			return false
+		}
+	}
+	return true
+}
+
 // parseCreateBucketBool parses an optional boolean header ("true"/"false", any
 // case; absent means false).
 func parseCreateBucketBool(h http.Header, name string) (bool, error) {
@@ -445,7 +549,9 @@ func (s *Server) handleDeleteBucket(w http.ResponseWriter, r *http.Request, rc *
 // handleHeadBucket implements HeadBucket: 200 with x-amz-bucket-region and
 // x-amz-access-point-alias: false; a missing bucket is 404 (no body). It
 // also reports the bucket's backing in the gos3 extension header
-// x-gos3-backing (the backing holding its primary copy).
+// x-gos3-backing (the backing holding its primary copy) and, on backings
+// with several bucket kinds, the bucket's kind in x-gos3-bucket-kind
+// (native or wrapped).
 func (s *Server) handleHeadBucket(w http.ResponseWriter, r *http.Request, rc *reqContext) error {
 	bi, err := s.bucketInfo(r.Context(), rc)
 	if err != nil {
@@ -455,6 +561,9 @@ func (s *Server) handleHeadBucket(w http.ResponseWriter, r *http.Request, rc *re
 	h.Set("X-Amz-Bucket-Region", s.regionOfBucket(bi))
 	h.Set("X-Amz-Access-Point-Alias", "false")
 	h.Set(headerBacking, backingName(bi.Backing))
+	if bi.Kind != "" {
+		h.Set(headerBucketKind, string(bi.Kind))
+	}
 	writeEmpty(w, http.StatusOK)
 	return nil
 }

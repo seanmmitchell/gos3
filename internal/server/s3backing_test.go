@@ -3,11 +3,13 @@ package server
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"net/http"
 	"os"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -20,19 +22,36 @@ import (
 )
 
 // End-to-end tests of s3 backings against an in-process S3 service
-// (s3clienttest): the default backing on s3, additional s3 and gateway
-// backings, live configuration, restarts and an unreachable service.
+// (s3clienttest): the default backing on s3, additional s3 backings with
+// and without a home holding native and wrapped buckets, live
+// configuration, restarts and an unreachable service.
 
-// s3Settings returns the settings of an s3 backing on remote's bucket.
-func s3Settings(remote *s3clienttest.Remote, bucket, prefix string) *config.S3Config {
+// s3Settings returns the settings of an s3 backing on remote with its home
+// at homeBucket/homePrefix ("" = no home: records in the system
+// directory).
+func s3Settings(remote *s3clienttest.Remote, homeBucket, homePrefix string) *config.S3Config {
 	return &config.S3Config{
 		Endpoint:   remote.URL,
-		Bucket:     bucket,
-		Prefix:     prefix,
+		HomeBucket: homeBucket,
+		HomePrefix: homePrefix,
 		Addressing: "path",
 		AccessKey:  s3clienttest.AccessKey,
 		SecretKey:  s3clienttest.SecretKey,
 	}
+}
+
+// s3Definition returns the admin API definition of an s3 backing on remote
+// (see s3Settings).
+func s3Definition(remote *s3clienttest.Remote, name, homeBucket, homePrefix string) config.BackingDefinition {
+	return config.BackingDefinition{Name: name, Backend: config.BackendS3, S3: &config.S3Definition{
+		Endpoint: remote.URL, HomeBucket: homeBucket, HomePrefix: homePrefix, Addressing: "path",
+		AccessKey: s3clienttest.AccessKey, SecretKey: s3clienttest.SecretKey,
+	}}
+}
+
+// testKEK returns a random key-encryption key in configuration form.
+func testKEK(t *testing.T) string {
+	return base64.StdEncoding.EncodeToString(incompressible(t, config.KEKSize))
 }
 
 // gos3Client returns an S3 client for the gos3 server at url.
@@ -55,12 +74,57 @@ func mustStatus(t *testing.T, what string, res response, want int) {
 	}
 }
 
+// mustStatusIn fails unless res has one of the statuses want.
+func mustStatusIn(t *testing.T, what string, res response, want ...int) {
+	t.Helper()
+	if !slices.Contains(want, res.status) {
+		t.Fatalf("%s: got %d, want one of %v: %s", what, res.status, want, res.body)
+	}
+}
+
 // getBody reads url and fails unless it answers 200 with want.
 func getBody(t *testing.T, url, want string) {
 	t.Helper()
 	res := do(t, "GET", url, nil, &rootCreds, nil)
 	if res.status != 200 || string(res.body) != want {
 		t.Fatalf("GET %s: %d %q, want %q", url, res.status, res.body, want)
+	}
+}
+
+// adminDo sends an admin API request with a JSON body (nil: none).
+func adminDo(t *testing.T, url, method, path string, in any) response {
+	t.Helper()
+	var body []byte
+	if in != nil {
+		var err error
+		if body, err = json.Marshal(in); err != nil {
+			t.Fatal(err)
+		}
+	}
+	return do(t, method, url+"/_gos3/admin/v1"+path, body, &rootCreds, nil)
+}
+
+// createOn creates bucket on backing with the extra CreateBucket headers
+// hdr (may be nil) and fails unless it answers 200.
+func createOn(t *testing.T, url, bucket, backing string, hdr map[string]string) {
+	t.Helper()
+	h := map[string]string{}
+	for k, v := range hdr {
+		h[k] = v
+	}
+	if backing != "" {
+		h["x-gos3-backing"] = backing
+	}
+	mustStatus(t, "create "+bucket, do(t, "PUT", url+"/"+bucket, nil, &rootCreds, h), 200)
+}
+
+// headBucket checks a bucket's backing and kind headers (kind "" = none).
+func headBucket(t *testing.T, url, bucket, backing, kind string) {
+	t.Helper()
+	res := do(t, "HEAD", url+"/"+bucket, nil, &rootCreds, nil)
+	if res.status != 200 || res.header.Get("x-gos3-backing") != backing || res.header.Get("x-gos3-bucket-kind") != kind {
+		t.Fatalf("HEAD %s: %d backing %q kind %q, want %q %q", bucket, res.status,
+			res.header.Get("x-gos3-backing"), res.header.Get("x-gos3-bucket-kind"), backing, kind)
 	}
 }
 
@@ -82,8 +146,50 @@ func backingStatuses(t *testing.T, url string) map[string]multi.BackingStatus {
 	return m
 }
 
-// (a) storage.backend s3 with storage.path: objects, listings, multipart
-// uploads and versioning; data and placements survive a restart.
+// remoteVersioning returns the versioning status of the remote's bucket.
+func remoteVersioning(t *testing.T, remote *s3clienttest.Remote, bucket string) storage.VersioningStatus {
+	t.Helper()
+	info, err := remote.Backend.GetBucket(context.Background(), bucket)
+	if err != nil {
+		t.Fatalf("remote bucket %s: %v", bucket, err)
+	}
+	return info.Versioning
+}
+
+// remoteHas reports whether the remote has bucket.
+func remoteHas(remote *s3clienttest.Remote, bucket string) bool {
+	_, err := remote.Backend.GetBucket(context.Background(), bucket)
+	return err == nil
+}
+
+// waitPlacement waits until the placement of bucket satisfies ok with no
+// move in progress and every member in sync.
+func waitPlacement(t *testing.T, url, bucket string, ok func(multi.PlacementStatus) bool) multi.PlacementStatus {
+	t.Helper()
+	var ps multi.PlacementStatus
+	waitFor(t, 60*time.Second, "placement of "+bucket, func() bool {
+		ps = multi.PlacementStatus{}
+		res := do(t, "GET", url+"/_gos3/admin/v1/buckets/"+bucket+"/placement", nil, &rootCreds, nil)
+		if res.status != 200 {
+			return false
+		}
+		res.json(t, &ps)
+		if ps.Move != nil || !ok(ps) {
+			return false
+		}
+		for _, m := range ps.Members {
+			if m.State != multi.StateInSync {
+				return false
+			}
+		}
+		return true
+	})
+	return ps
+}
+
+// (a) storage.backend s3 with a home and storage.path: objects, listings,
+// multipart uploads and versioning in wrapped buckets of the home; data and
+// placements survive a restart.
 func TestS3DefaultBacking(t *testing.T) {
 	remote := s3clienttest.Start(t)
 	remote.CreateBucket(t, "main")
@@ -96,11 +202,13 @@ func TestS3DefaultBacking(t *testing.T) {
 		t.Fatalf("backend %q, data path %q", srv.BackendName(), srv.DataPath())
 	}
 	mustStatus(t, "ready", do(t, "GET", srv.url+"/_gos3/ready", nil, nil, nil), 200)
-	if b := backingStatuses(t, srv.url)["default"]; b.Kind != "s3" || b.Location != "s3://main/gos3/" || !b.Healthy || b.Path != "" {
+	if b := backingStatuses(t, srv.url)["default"]; b.Kind != "s3" || b.Location != "s3://main/gos3/" || !b.Healthy || b.Path != "" ||
+		b.DefaultKind != "wrapped" || !slices.Equal(b.Kinds, []string{"wrapped", "native"}) {
 		t.Fatalf("default backing: %+v", b)
 	}
 
 	mustStatus(t, "create bucket", do(t, "PUT", srv.url+"/photos", nil, &rootCreds, nil), 200)
+	headBucket(t, srv.url, "photos", "default", "wrapped")
 	mustStatus(t, "put", do(t, "PUT", srv.url+"/photos/a.txt", []byte("alpha"), &rootCreds, nil), 200)
 	mustStatus(t, "put", do(t, "PUT", srv.url+"/photos/dir/b.txt", []byte("beta"), &rootCreds, nil), 200)
 	getBody(t, srv.url+"/photos/a.txt", "alpha")
@@ -108,6 +216,10 @@ func TestS3DefaultBacking(t *testing.T) {
 	mustStatus(t, "list", res, 200)
 	if !bytes.Contains(res.body, []byte("<Key>a.txt</Key>")) || !bytes.Contains(res.body, []byte("<Key>dir/b.txt</Key>")) {
 		t.Fatalf("listing: %s", res.body)
+	}
+	// Wrapped buckets live in the home, never in remote buckets of their own.
+	if remoteHas(remote, "photos") {
+		t.Fatal("a wrapped bucket created a remote bucket")
 	}
 
 	// Multipart upload: a 5 MiB part and a small one.
@@ -168,95 +280,178 @@ func TestS3DefaultBacking(t *testing.T) {
 	if placement.Primary != "default" {
 		t.Fatalf("placement: %+v", placement)
 	}
+	headBucket(t, srv.url, "photos", "default", "wrapped")
 }
 
-// (b) An fs default backing plus an s3 backing "cold" and a gateway
-// backing "gw".
-func TestS3AndGatewayBackings(t *testing.T) {
+// (b) An fs default backing plus the s3 backings "cloud" (a home, wrapped
+// buckets by default, a key-encryption key) and "edge" (no home: records
+// in the system directory, native buckets by default) on one service.
+func TestS3AccountBackings(t *testing.T) {
 	remote := s3clienttest.Start(t)
-	remote.CreateBucket(t, "coldstore")
-	remote.CreateBucket(t, "gwmeta")
+	remote.CreateBucket(t, "cloudhome")
 	cfg := testConfig()
 	cfg.Storage.Backend = config.BackendFS
 	cfg.Storage.Path = t.TempDir()
-	gw := s3Settings(remote, "gwmeta", "")
-	gw.Gateway = true
+	cloud := s3Settings(remote, "cloudhome", "gos3/")
+	cloud.EncryptionKey = testKEK(t)
 	cfg.Storage.Backings = []config.BackingConfig{
-		{Name: "cold", Backend: config.BackendS3, S3: s3Settings(remote, "coldstore", "cold/")},
-		{Name: "gw", Backend: config.BackendS3, S3: gw},
+		{Name: "cloud", Backend: config.BackendS3, S3: cloud},
+		{Name: "edge", Backend: config.BackendS3, S3: s3Settings(remote, "", "")},
 	}
 	srv := start(t, cfg)
 
 	st := backingStatuses(t, srv.url)
-	if b := st["cold"]; b.Kind != "s3" || b.Mode != "" || b.Location != "s3://coldstore/cold/" || !b.Healthy {
-		t.Fatalf("cold: %+v", b)
+	if b := st["cloud"]; b.Kind != "s3" || b.Location != "s3://cloudhome/gos3/" || !b.Healthy || b.DefaultKind != "wrapped" ||
+		!slices.Equal(b.Kinds, []string{"wrapped", "native"}) {
+		t.Fatalf("cloud: %+v", b)
 	}
-	if b := st["gw"]; b.Kind != "s3" || b.Mode != "gateway" || !b.Healthy {
-		t.Fatalf("gw: %+v", b)
+	if b := st["edge"]; b.Kind != "s3" || b.Location != "local:" || !b.Healthy || b.DefaultKind != "native" ||
+		!slices.Equal(b.Kinds, []string{"native"}) {
+		t.Fatalf("edge: %+v", b)
+	}
+	// edge keeps its records in <system dir>/s3/edge.
+	records := S3RecordsDir(filepath.Join(cfg.Storage.Path, config.SystemDirName), "edge")
+	if _, err := os.Stat(filepath.Join(records, "state.db")); err != nil {
+		t.Fatalf("edge's records: %v", err)
+	}
+	if dir, err := os.Stat(records); err != nil || (runtime.GOOS != "windows" && dir.Mode().Perm() != 0o700) {
+		t.Fatalf("edge's records directory: %v", err)
 	}
 	res := do(t, "GET", srv.url+"/_gos3/admin/v1/whoami", nil, &rootCreds, nil)
 	mustStatus(t, "whoami", res, 200)
-	if !bytes.Contains(res.body, []byte(`{"name":"gw","kind":"s3","mode":"gateway"}`)) {
-		t.Fatalf("whoami backings: %s", res.body)
+	for _, want := range []string{`"name":"cloud","kind":"s3","kinds":["wrapped","native"],"defaultKind":"wrapped"`,
+		`"name":"edge","kind":"s3","kinds":["native"],"defaultKind":"native"`} {
+		if !bytes.Contains(res.body, []byte(want)) {
+			t.Fatalf("whoami backings lack %s: %s", want, res.body)
+		}
 	}
 
-	for _, b := range []struct{ bucket, backing string }{{"local", ""}, {"archive", "cold"}, {"shared", "gw"}} {
-		hdr := map[string]string{}
-		if b.backing != "" {
-			hdr["x-gos3-backing"] = b.backing
-		}
-		mustStatus(t, "create "+b.bucket, do(t, "PUT", srv.url+"/"+b.bucket, nil, &rootCreds, hdr), 200)
+	// One bucket of each default kind, plus a native bucket on cloud.
+	for _, b := range []struct{ bucket, backing, kind string }{
+		{"local", "", ""}, {"archive", "cloud", "wrapped"}, {"photos", "edge", "native"},
+	} {
+		createOn(t, srv.url, b.bucket, b.backing, nil)
 		want := b.backing
 		if want == "" {
 			want = "default"
 		}
-		res := do(t, "HEAD", srv.url+"/"+b.bucket, nil, &rootCreds, nil)
-		if res.status != 200 || res.header.Get("x-gos3-backing") != want {
-			t.Fatalf("HEAD %s: %d backing %q, want %q", b.bucket, res.status, res.header.Get("x-gos3-backing"), want)
-		}
+		headBucket(t, srv.url, b.bucket, want, b.kind)
 		mustStatus(t, "put", do(t, "PUT", srv.url+"/"+b.bucket+"/hello", []byte("hi "+b.bucket), &rootCreds, nil), 200)
 		getBody(t, srv.url+"/"+b.bucket+"/hello", "hi "+b.bucket)
 	}
+	createOn(t, srv.url, "nat2", "cloud", map[string]string{"x-gos3-bucket-kind": "native"})
+	headBucket(t, srv.url, "nat2", "cloud", "native")
+	createOn(t, srv.url, "aliased", "edge", map[string]string{"x-gos3-remote-bucket": "edge-remote"})
+	headBucket(t, srv.url, "aliased", "edge", "native")
+	mustStatus(t, "put aliased", do(t, "PUT", srv.url+"/aliased/k", []byte("via alias"), &rootCreds, nil), 200)
+	// A wrapped bucket on edge needs a container; edge has none.
+	mustStatus(t, "wrapped on edge", do(t, "PUT", srv.url+"/boxed", nil, &rootCreds,
+		map[string]string{"x-gos3-backing": "edge", "x-gos3-bucket-kind": "wrapped"}), 400)
 	mustStatus(t, "unknown backing", do(t, "PUT", srv.url+"/nowhere", nil, &rootCreds, map[string]string{"x-gos3-backing": "nope"}), 400)
 
-	// The gateway stores native objects in a remote bucket of the same name.
-	info, err := remote.Backend.GetObjectInfo(context.Background(), "shared", "hello", "")
-	if err != nil || info.Size != int64(len("hi shared")) {
-		t.Fatalf("remote object: %+v %v", info, err)
+	// Native buckets are remote buckets holding the objects as-is; wrapped
+	// buckets are not.
+	ctx := context.Background()
+	for bucket, key := range map[string]string{"photos": "hello", "nat2": "", "edge-remote": "k"} {
+		if !remoteHas(remote, bucket) {
+			t.Fatalf("no remote bucket %s", bucket)
+		}
+		if key == "" {
+			continue
+		}
+		if _, err := remote.Backend.GetObjectInfo(ctx, bucket, key, ""); err != nil {
+			t.Fatalf("remote object %s/%s: %v", bucket, key, err)
+		}
 	}
-	// No versioning on gateway buckets; on s3 backings it works.
-	mustStatus(t, "versioning on gw", do(t, "PUT", srv.url+"/shared?versioning", []byte(versioningEnabled), &rootCreds, nil), 501)
-	mustStatus(t, "versioning on cold", do(t, "PUT", srv.url+"/archive?versioning", []byte(versioningEnabled), &rootCreds, nil), 200)
+	if remoteHas(remote, "archive") || remoteHas(remote, "aliased") {
+		t.Fatal("a gos3 name became a remote bucket")
+	}
 
-	// A gateway backing can be neither a replica nor a move target.
+	// Versioning of a native bucket is the remote bucket's.
+	mustStatus(t, "versioning on aliased", do(t, "PUT", srv.url+"/aliased?versioning", []byte(versioningEnabled), &rootCreds, nil), 200)
+	if v := remoteVersioning(t, remote, "edge-remote"); v != storage.VersioningEnabled {
+		t.Fatalf("remote versioning of edge-remote: %q", v)
+	}
+	mustStatus(t, "put v2", do(t, "PUT", srv.url+"/aliased/k", []byte("again"), &rootCreds, nil), 200)
+	res = do(t, "GET", srv.url+"/aliased?versions&prefix=k", nil, &rootCreds, nil)
+	if n := bytes.Count(res.body, []byte("<Version>")); res.status != 200 || n != 2 {
+		t.Fatalf("versions of aliased/k: %d %d %s", res.status, n, res.body)
+	}
+	if got := versionList(t, remote.Client(t), "edge-remote", "k"); len(got) != 2 {
+		t.Fatalf("remote versions of edge-remote/k: %v", got)
+	}
+	mustStatus(t, "versioning on archive", do(t, "PUT", srv.url+"/archive?versioning", []byte(versioningEnabled), &rootCreds, nil), 200)
+
+	// AES256 needs the KEK and a wrapped bucket.
+	if doc := getProvider(t, srv.url, "archive"); !slices.Contains(doc.Available, storage.EncryptionAES256) {
+		t.Fatalf("providers of archive: %+v", doc)
+	}
+	if doc := getProvider(t, srv.url, "photos"); len(doc.Available) != 0 {
+		t.Fatalf("providers of a native bucket: %+v", doc)
+	}
+	mustStatus(t, "AES256 provider on archive", putProvider(t, srv.url, "archive", storage.EncryptionAES256), 200)
+	mustStatusIn(t, "AES256 provider on photos", putProvider(t, srv.url, "photos", storage.EncryptionAES256), 400)
+	sse := map[string]string{"x-amz-server-side-encryption": "AES256"}
+	mustStatus(t, "SSE put on archive", do(t, "PUT", srv.url+"/archive/sse", []byte("sealed"), &rootCreds, sse), 200)
+	getBody(t, srv.url+"/archive/sse", "sealed")
+	mustStatusIn(t, "SSE put on photos", do(t, "PUT", srv.url+"/photos/sse", []byte("x"), &rootCreds, sse), 400, 501)
+
+	// A native bucket can be neither replicated nor moved (its versions are
+	// the remote's).
 	place := func(bucket string, body any) response {
-		raw, _ := json.Marshal(body)
-		return do(t, "PUT", srv.url+"/_gos3/admin/v1/buckets/"+bucket+"/placement", raw, &rootCreds, nil)
+		return adminDo(t, srv.url, "PUT", "/buckets/"+bucket+"/placement", body)
 	}
-	mustStatus(t, "replica on gw", place("local", map[string]any{"mode": "active-passive", "replicas": []string{"gw"}}), 400)
-	raw, _ := json.Marshal(map[string]string{"to": "gw"})
-	mustStatus(t, "move to gw", do(t, "POST", srv.url+"/_gos3/admin/v1/buckets/local/placement/move", raw, &rootCreds, nil), 400)
+	move := func(bucket string, body any) response {
+		return adminDo(t, srv.url, "POST", "/buckets/"+bucket+"/placement/move", body)
+	}
+	mustStatusIn(t, "replica of a native bucket", place("photos", map[string]any{"mode": "active-passive", "replicas": []string{"cloud"}}), 400, 409)
+	mustStatusIn(t, "move of a native bucket", move("photos", map[string]string{"to": "cloud"}), 400, 409)
+	// Copies on edge would be wrapped buckets, and edge has no container.
+	mustStatus(t, "move to edge", move("local", map[string]string{"to": "edge"}), 400)
 
-	// An s3 backing can hold replicas.
-	mustStatus(t, "replica on cold", place("local", map[string]any{"mode": "active-passive", "replicas": []string{"cold"}}), 200)
-	waitFor(t, 30*time.Second, "replica in sync", func() bool {
-		var ps multi.PlacementStatus
-		res := do(t, "GET", srv.url+"/_gos3/admin/v1/buckets/local/placement", nil, &rootCreds, nil)
-		if res.status != 200 {
-			return false
-		}
-		res.json(t, &ps)
-		for _, m := range ps.Members {
-			if m.State != multi.StateInSync {
-				return false
-			}
-		}
-		return len(ps.Members) == 2
-	})
+	// A wrapped copy: an fs bucket moves to cloud, into a dedicated
+	// container (a remote bucket gos3 creates).
+	var ci struct {
+		ID       string `json:"id"`
+		Location struct {
+			Bucket string `json:"bucket"`
+		} `json:"location"`
+		State string `json:"state"`
+	}
+	res = adminDo(t, srv.url, "POST", "/backings/cloud/containers", map[string]any{"bucket": "cloudbox", "createBucket": true, "label": "box"})
+	mustStatus(t, "add container", res, 201)
+	res.json(t, &ci)
+	if ci.ID == "" || ci.Location.Bucket != "cloudbox" || ci.State != "ready" {
+		t.Fatalf("container: %s", res.body)
+	}
+	mustStatus(t, "move local to cloud", move("local", map[string]string{"to": "cloud", "container": ci.ID}), 202)
+	waitPlacement(t, srv.url, "local", func(ps multi.PlacementStatus) bool { return ps.Primary == "cloud" })
+	headBucket(t, srv.url, "local", "cloud", "wrapped")
+	getBody(t, srv.url+"/local/hello", "hi local")
+	if _, err := remote.Backend.GetObjectInfo(ctx, "cloudbox", "gos3.json", ""); err != nil {
+		t.Fatalf("the container's marker: %v", err)
+	}
+	// An s3 backing (wrapped buckets) can hold replicas.
+	createOn(t, srv.url, "mirrored", "", nil)
+	mustStatus(t, "put", do(t, "PUT", srv.url+"/mirrored/k", []byte("twice"), &rootCreds, nil), 200)
+	mustStatus(t, "replica on cloud", place("mirrored", map[string]any{"mode": "active-passive", "replicas": []string{"cloud"}}), 200)
+	waitPlacement(t, srv.url, "mirrored", func(ps multi.PlacementStatus) bool { return len(ps.Members) == 2 })
+
+	// Everything survives a restart.
+	if err := srv.stop(); err != nil {
+		t.Fatal(err)
+	}
+	srv = start(t, cfg)
+	for bucket, want := range map[string]string{"archive/hello": "hi archive", "photos/hello": "hi photos", "aliased/k": "again",
+		"local/hello": "hi local", "archive/sse": "sealed", "mirrored/k": "twice"} {
+		getBody(t, srv.url+"/"+bucket, want)
+	}
+	headBucket(t, srv.url, "photos", "edge", "native")
+	headBucket(t, srv.url, "local", "cloud", "wrapped")
 }
 
-// (c) and (d): an s3 backing added and edited through the admin API, and
-// restored from backings.json after a restart.
+// (d) s3 backings added and edited through the admin API, and restored from
+// backings.json after a restart.
 func TestLiveS3Backing(t *testing.T) {
 	remote := s3clienttest.Start(t)
 	remote.CreateBucket(t, "live")
@@ -285,34 +480,30 @@ func TestLiveS3Backing(t *testing.T) {
 			t.Fatalf("%s reveals the secret key: %s", what, res.body)
 		}
 	}
-	def := func(name, prefix string) config.BackingDefinition {
-		return config.BackingDefinition{Name: name, Backend: config.BackendS3, S3: &config.S3Definition{
-			Endpoint: remote.URL, Bucket: "live", Prefix: prefix, Addressing: "path",
-			AccessKey: s3clienttest.AccessKey, SecretKey: s3clienttest.SecretKey,
-		}}
-	}
+	const wrongSecret = "wrong-secret-key-000000000000000000000"
+	backingsFile := filepath.Join(cfg.Storage.Path, config.SystemDirName, "backings.json")
 
 	in, _ := get()
 	// Settings the service refuses are reported, and nothing is saved.
-	bad := def("cold", "cold/")
-	bad.S3.SecretKey = "wrong-secret-key-000000000000000000000"
+	bad := s3Definition(remote, "cold", "live", "cold/")
+	bad.S3.SecretKey = wrongSecret
 	mustStatus(t, "add with a wrong secret", put(multi.BackingConfiguration{
 		BackingSettings: config.BackingSettings{Backings: []config.BackingDefinition{bad}, DefaultBacking: in.DefaultBacking},
 		Revision:        in.Revision,
 	}), 400)
-	if _, err := os.Stat(filepath.Join(cfg.Storage.Path, config.SystemDirName, "backings.json")); err == nil {
+	if _, err := os.Stat(backingsFile); err == nil {
 		t.Fatal("backings.json written for a refused configuration")
 	}
-	in.Backings = append(in.Backings, def("cold", "cold/"))
+	in.Backings = append(in.Backings, s3Definition(remote, "cold", "live", "cold/"))
 	res := put(in)
 	mustStatus(t, "add s3 backing", res, 200)
 	noSecret("PUT response", res)
 	in, res = get()
 	noSecret("GET", res)
-	if len(in.Backings) != 1 || in.Backings[0].S3 == nil || !in.Backings[0].S3.SecretKeyConfigured || in.Backings[0].S3.SecretKey != "" {
+	if len(in.Backings) != 1 || in.Backings[0].S3 == nil || !in.Backings[0].S3.SecretKeyConfigured || in.Backings[0].S3.SecretKey != "" ||
+		in.Backings[0].S3.HomeBucket != "live" || in.Backings[0].S3.DefaultKind != "wrapped" {
 		t.Fatalf("configuration: %s", res.body)
 	}
-	backingsFile := filepath.Join(cfg.Storage.Path, config.SystemDirName, "backings.json")
 	checkFile := func() []byte {
 		t.Helper()
 		fi, err := os.Stat(backingsFile)
@@ -328,12 +519,13 @@ func TestLiveS3Backing(t *testing.T) {
 	if data := checkFile(); !bytes.Contains(data, []byte(s3clienttest.SecretKey)) {
 		t.Fatalf("backings.json lacks the secret key: %s", data)
 	}
-	if b := backingStatuses(t, srv.url)["cold"]; b.Kind != "s3" || !b.Healthy || b.Location != "s3://live/cold/" {
+	if b := backingStatuses(t, srv.url)["cold"]; b.Kind != "s3" || !b.Healthy || b.Location != "s3://live/cold/" || b.DefaultKind != "wrapped" {
 		t.Fatalf("cold: %+v", b)
 	}
 
 	// Put a bucket on it.
-	mustStatus(t, "create", do(t, "PUT", srv.url+"/frozen", nil, &rootCreds, map[string]string{"x-gos3-backing": "cold"}), 200)
+	createOn(t, srv.url, "frozen", "cold", nil)
+	headBucket(t, srv.url, "frozen", "cold", "wrapped")
 	mustStatus(t, "put", do(t, "PUT", srv.url+"/frozen/k", []byte("ice"), &rootCreds, nil), 200)
 
 	// A blank secret keeps the stored one; connection settings change in
@@ -350,26 +542,51 @@ func TestLiveS3Backing(t *testing.T) {
 
 	// Wrong credentials are refused and change nothing.
 	in, _ = get()
-	in.Backings[0].S3.SecretKey = "wrong-secret-key-000000000000000000000"
+	in.Backings[0].S3.SecretKey = wrongSecret
 	mustStatus(t, "wrong secret", put(in), 400)
 	getBody(t, srv.url+"/frozen/k", "ice")
 
-	// Changing what data the backing holds while in use is a conflict.
+	// The default kind changes in place, while in use: new buckets are
+	// native, existing ones keep their kind.
 	in, _ = get()
-	in.Backings[0].S3.Prefix = "elsewhere/"
-	mustStatus(t, "prefix change in use", put(in), 409)
+	in.Backings[0].S3.DefaultKind = "native"
+	mustStatus(t, "default kind native", put(in), 200)
+	if b := backingStatuses(t, srv.url)["cold"]; b.DefaultKind != "native" || !b.Healthy {
+		t.Fatalf("cold after the default kind changed: %+v", b)
+	}
+	createOn(t, srv.url, "thawed", "cold", nil)
+	headBucket(t, srv.url, "thawed", "cold", "native")
+	headBucket(t, srv.url, "frozen", "cold", "wrapped")
+	if !remoteHas(remote, "thawed") {
+		t.Fatal("the native bucket has no remote bucket")
+	}
+
+	// Changing what data the backing holds (its home) while in use is a
+	// conflict.
+	in, _ = get()
+	in.Backings[0].S3.HomePrefix = "elsewhere/"
+	mustStatus(t, "home change in use", put(in), 409)
+	in, _ = get()
+	in.Backings[0].S3.HomeBucket = ""
+	in.Backings[0].S3.HomePrefix = ""
+	mustStatus(t, "home removed in use", put(in), 409)
 
 	// An endpoint pointing at this server is refused.
 	in, _ = get()
-	self := def("loop", "loop/")
+	self := s3Definition(remote, "loop", "loop", "")
 	self.S3.Endpoint = srv.url
 	in.Backings = append(in.Backings, self)
 	mustStatus(t, "endpoint on this server", put(in), 400)
 
+	// Another backing on cold's home is refused (the location is claimed).
+	in, _ = get()
+	in.Backings = append(in.Backings, s3Definition(remote, "twin", "live", "cold/sub/"))
+	mustStatusIn(t, "a home inside cold's", put(in), 400, 409)
+
 	// A secret from the environment is used but not written to the file.
 	t.Setenv(config.BackingEnv("envy", "secret_key"), s3clienttest.SecretKey)
 	in, _ = get()
-	envy := def("envy", "envy/")
+	envy := s3Definition(remote, "envy", "live", "envy/")
 	envy.S3.SecretKey = ""
 	in.Backings = append(in.Backings, envy)
 	mustStatus(t, "add backing with an env secret", put(in), 200)
@@ -384,53 +601,58 @@ func TestLiveS3Backing(t *testing.T) {
 	if len(saved.Backings) != 2 || saved.Backings[1].S3.SecretKey != "" || saved.Backings[0].S3.SecretKey != s3clienttest.SecretKey {
 		t.Fatalf("backings.json: %+v", saved)
 	}
-	mustStatus(t, "create on envy", do(t, "PUT", srv.url+"/breeze", nil, &rootCreds, map[string]string{"x-gos3-backing": "envy"}), 200)
+	createOn(t, srv.url, "breeze", "envy", nil)
 
-	// A gateway backing added live: its connection settings change in
-	// place while it holds no buckets, and not once it does.
-	remote.CreateBucket(t, "gwlmeta")
+	// A backing without a home: its credentials are checked when it is
+	// added (it loads without the service), and it holds native buckets.
 	in, _ = get()
-	gwl := def("gwl", "")
-	gwl.S3.Bucket, gwl.S3.Gateway = "gwlmeta", true
-	in.Backings = append(in.Backings, gwl)
-	mustStatus(t, "add gateway backing", put(in), 200)
+	edge := s3Definition(remote, "edge", "", "")
+	edge.S3.SecretKey = wrongSecret
+	in.Backings = append(in.Backings, edge)
+	mustStatus(t, "add a backing without a home with a wrong secret", put(in), 400)
+	in.Backings[len(in.Backings)-1].S3.SecretKey = s3clienttest.SecretKey
+	mustStatus(t, "add a backing without a home", put(in), 200)
+	if b := backingStatuses(t, srv.url)["edge"]; b.Location != "local:" || b.DefaultKind != "native" || !b.Healthy {
+		t.Fatalf("edge: %+v", b)
+	}
+	createOn(t, srv.url, "native", "edge", nil)
+	mustStatus(t, "put on edge", do(t, "PUT", srv.url+"/native/obj", []byte("plain"), &rootCreds, nil), 200)
+	if _, err := remote.Backend.GetObjectInfo(context.Background(), "native", "obj", ""); err != nil {
+		t.Fatalf("native object on the remote: %v", err)
+	}
+	// Its connection changes in place while it holds buckets.
 	in, _ = get()
 	in.Backings[2].S3.Endpoint = strings.Replace(remote.URL, "127.0.0.1", "localhost", 1)
-	mustStatus(t, "change an empty gateway backing", put(in), 200)
-	mustStatus(t, "create on gwl", do(t, "PUT", srv.url+"/native", nil, &rootCreds, map[string]string{"x-gos3-backing": "gwl"}), 200)
-	mustStatus(t, "put on gwl", do(t, "PUT", srv.url+"/native/obj", []byte("plain"), &rootCreds, nil), 200)
-	getBody(t, srv.url+"/native/obj", "plain")
-	if _, err := remote.Backend.GetObjectInfo(context.Background(), "native", "obj", ""); err != nil {
-		t.Fatalf("gateway object on the remote: %v", err)
-	}
-	in, _ = get()
 	in.Backings[2].S3.PartSize = 8 << 20
-	mustStatus(t, "change a gateway backing in use", put(in), 409)
+	mustStatus(t, "change edge's connection", put(in), 200)
+	getBody(t, srv.url+"/native/obj", "plain")
+	in, _ = get()
+	in.Backings[2].S3.SecretKey = wrongSecret
+	mustStatus(t, "wrong secret on edge", put(in), 400)
 
-	// (d) After a restart backings.json is loaded again.
+	// After a restart backings.json is loaded again.
 	if err := srv.stop(); err != nil {
 		t.Fatal(err)
 	}
 	srv = start(t, cfg)
 	getBody(t, srv.url+"/frozen/k2", "snow")
-	res = do(t, "HEAD", srv.url+"/breeze", nil, &rootCreds, nil)
-	if res.status != 200 || res.header.Get("x-gos3-backing") != "envy" {
-		t.Fatalf("HEAD breeze: %d %q", res.status, res.header.Get("x-gos3-backing"))
-	}
+	headBucket(t, srv.url, "breeze", "envy", "wrapped")
+	headBucket(t, srv.url, "thawed", "cold", "native")
 	st := backingStatuses(t, srv.url)
-	if !st["cold"].Healthy || !st["envy"].Healthy {
+	if !st["cold"].Healthy || !st["envy"].Healthy || !st["edge"].Healthy || st["cold"].DefaultKind != "native" {
 		t.Fatalf("backings after restart: %+v", st)
 	}
 	in, _ = get()
 	getBody(t, srv.url+"/native/obj", "plain")
-	if len(in.Backings) != 3 || in.Backings[1].S3.SecretKeySource != config.SourceEnv {
+	if len(in.Backings) != 3 || in.Backings[1].S3.SecretKeySource != config.SourceEnv || in.Backings[0].S3.DefaultKind != "native" {
 		t.Fatalf("configuration after restart: %+v", in)
 	}
 }
 
-// (e) A server whose s3 backing's service is unreachable at startup
+// (g) A server whose s3 backing's service is unreachable at startup
 // starts; that backing's buckets answer 503 until the service is back,
-// then they are served (and buckets without a placement adopted).
+// then they are served (and buckets without a placement adopted). Other
+// backings are not affected.
 func TestS3BackingUnavailableAtStart(t *testing.T) {
 	remote := s3clienttest.Start(t)
 	remote.CreateBucket(t, "coldstore")
@@ -440,13 +662,16 @@ func TestS3BackingUnavailableAtStart(t *testing.T) {
 	cfg.Storage.Replication.HealthInterval = time.Second
 	cfg.Storage.Backings = []config.BackingConfig{
 		{Name: "cold", Backend: config.BackendS3, S3: s3Settings(remote, "coldstore", "")},
+		{Name: "edge", Backend: config.BackendS3, S3: s3Settings(remote, "", "")},
 	}
 	srv := start(t, cfg)
 	mustStatus(t, "create local", do(t, "PUT", srv.url+"/local", nil, &rootCreds, nil), 200)
 	for _, b := range []string{"placed", "unplaced"} {
-		mustStatus(t, "create "+b, do(t, "PUT", srv.url+"/"+b, nil, &rootCreds, map[string]string{"x-gos3-backing": "cold"}), 200)
+		createOn(t, srv.url, b, "cold", nil)
 		mustStatus(t, "put", do(t, "PUT", srv.url+"/"+b+"/k", []byte("v-"+b), &rootCreds, nil), 200)
 	}
+	createOn(t, srv.url, "nearby", "edge", nil)
+	mustStatus(t, "put", do(t, "PUT", srv.url+"/nearby/k", []byte("v-nearby"), &rootCreds, nil), 200)
 	if err := srv.stop(); err != nil {
 		t.Fatal(err)
 	}
@@ -478,6 +703,7 @@ func TestS3BackingUnavailableAtStart(t *testing.T) {
 		t.Fatalf("cold while down: %+v", b)
 	}
 	mustStatus(t, "get from cold while down", do(t, "GET", srv.url+"/placed/k", nil, &rootCreds, nil), 503)
+	mustStatus(t, "get from edge while down", do(t, "GET", srv.url+"/nearby/k", nil, &rootCreds, nil), 503)
 	mustStatus(t, "ready (the default backing is fine)", do(t, "GET", srv.url+"/_gos3/ready", nil, nil, nil), 200)
 	res := do(t, "GET", srv.url+"/", nil, &rootCreds, nil)
 	mustStatus(t, "list buckets", res, 200)
@@ -492,31 +718,33 @@ func TestS3BackingUnavailableAtStart(t *testing.T) {
 		return do(t, "GET", srv.url+"/unplaced/k", nil, &rootCreds, nil).status == 200
 	})
 	getBody(t, srv.url+"/unplaced/k", "v-unplaced")
+	waitFor(t, 60*time.Second, "edge healthy", func() bool { return backingStatuses(t, srv.url)["edge"].Healthy })
+	getBody(t, srv.url+"/nearby/k", "v-nearby")
 }
 
-// (f) An s3 backing configured through the environment only:
+// An s3 backing configured through the environment only:
 // GOS3_STORAGE_BACKINGS=cold=s3 plus GOS3_BACKING_COLD_*.
 func TestS3BackingFromEnvironment(t *testing.T) {
 	remote := s3clienttest.Start(t)
 	remote.CreateBucket(t, "envstore")
 	dir := t.TempDir()
 	for k, v := range map[string]string{
-		"GOS3_ADDRESS":                 "127.0.0.1:0",
-		"GOS3_DATA":                    dir,
-		"GOS3_STORAGE_BACKEND":         "fs",
-		"GOS3_STORAGE_BACKINGS":        "cold=s3",
-		"GOS3_ROOT_ACCESS_KEY":         testAccessKey,
-		"GOS3_ROOT_SECRET_KEY":         testSecretKey,
-		"GOS3_BACKING_COLD_ENDPOINT":   remote.URL,
-		"GOS3_BACKING_COLD_BUCKET":     "envstore",
-		"GOS3_BACKING_COLD_PREFIX":     "gos3",
-		"GOS3_BACKING_COLD_ADDRESSING": "path",
-		"GOS3_BACKING_COLD_ACCESS_KEY": s3clienttest.AccessKey,
-		"GOS3_BACKING_COLD_SECRET_KEY": s3clienttest.SecretKey,
-		"GOS3_BACKING_COLD_PART_SIZE":  "8MiB",
-		"GOS3_BACKING_COLD_GATEWAY":    "false",
-		"GOS3_BACKING_COLD_REGION":     "us-east-1",
-		"GOS3_DEFAULT_BACKING":         "cold",
+		"GOS3_ADDRESS":                   "127.0.0.1:0",
+		"GOS3_DATA":                      dir,
+		"GOS3_STORAGE_BACKEND":           "fs",
+		"GOS3_STORAGE_BACKINGS":          "cold=s3",
+		"GOS3_ROOT_ACCESS_KEY":           testAccessKey,
+		"GOS3_ROOT_SECRET_KEY":           testSecretKey,
+		"GOS3_BACKING_COLD_ENDPOINT":     remote.URL,
+		"GOS3_BACKING_COLD_HOME_BUCKET":  "envstore",
+		"GOS3_BACKING_COLD_HOME_PREFIX":  "gos3",
+		"GOS3_BACKING_COLD_ADDRESSING":   "path",
+		"GOS3_BACKING_COLD_ACCESS_KEY":   s3clienttest.AccessKey,
+		"GOS3_BACKING_COLD_SECRET_KEY":   s3clienttest.SecretKey,
+		"GOS3_BACKING_COLD_PART_SIZE":    "8MiB",
+		"GOS3_BACKING_COLD_DEFAULT_KIND": "wrapped",
+		"GOS3_BACKING_COLD_REGION":       "us-east-1",
+		"GOS3_DEFAULT_BACKING":           "cold",
 	} {
 		t.Setenv(k, v)
 	}
@@ -528,15 +756,12 @@ func TestS3BackingFromEnvironment(t *testing.T) {
 	cfg.Logging.AccessLog = false
 	srv := start(t, cfg)
 	b := backingStatuses(t, srv.url)["cold"]
-	if b.Kind != "s3" || !b.Healthy || b.Location != "s3://envstore/gos3/" {
+	if b.Kind != "s3" || !b.Healthy || b.Location != "s3://envstore/gos3/" || b.DefaultKind != "wrapped" {
 		t.Fatalf("cold: %+v", b)
 	}
 	// The default for new buckets is cold.
 	mustStatus(t, "create", do(t, "PUT", srv.url+"/fromenv", nil, &rootCreds, nil), 200)
-	res := do(t, "HEAD", srv.url+"/fromenv", nil, &rootCreds, nil)
-	if res.header.Get("x-gos3-backing") != "cold" {
-		t.Fatalf("HEAD: %d %q", res.status, res.header.Get("x-gos3-backing"))
-	}
+	headBucket(t, srv.url, "fromenv", "cold", "wrapped")
 	mustStatus(t, "put", do(t, "PUT", srv.url+"/fromenv/k", []byte("env"), &rootCreds, nil), 200)
 	// The data is in the remote bucket under the prefix.
 	var keys []string
@@ -548,10 +773,10 @@ func TestS3BackingFromEnvironment(t *testing.T) {
 	}
 	// The env-sourced secret is shown as such and never written anywhere.
 	var conf multi.BackingConfiguration
-	res = do(t, "GET", srv.url+"/_gos3/admin/v1/backings/config", nil, &rootCreds, nil)
+	res := do(t, "GET", srv.url+"/_gos3/admin/v1/backings/config", nil, &rootCreds, nil)
 	mustStatus(t, "get configuration", res, 200)
 	res.json(t, &conf)
-	if s := conf.Backings[0].S3; s == nil || s.SecretKeySource != config.SourceEnv || s.Endpoint != remote.URL {
+	if s := conf.Backings[0].S3; s == nil || s.SecretKeySource != config.SourceEnv || s.Endpoint != remote.URL || s.HomeBucket != "envstore" {
 		t.Fatalf("configuration: %s", res.body)
 	}
 }

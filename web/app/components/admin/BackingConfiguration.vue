@@ -3,10 +3,15 @@ import type { Backing, BackingBackend, BackingConfiguration, BackingDefinition, 
 import {
   ADDRESSING_ITEMS,
   BACKEND_ITEMS,
+  DEFAULT_KIND_ITEMS,
+  HOME_HELP,
   copyBackingConfiguration,
+  defaultKindValue,
   generateEncryptionKey,
   secretPlaceholder,
   setBackend,
+  setDefaultKind,
+  setHomeBucket,
   toPutBody,
   validateBackingConfiguration
 } from './-backing-form'
@@ -22,13 +27,18 @@ const loading = ref(false)
 const error = ref<unknown>(null)
 const submitted = ref(false)
 const dirty = computed(() => JSON.stringify(form.value) !== JSON.stringify(original.value))
-const validation = computed(() => form.value ? validateBackingConfiguration(form.value) : undefined)
+const validation = computed(() => form.value ? validateBackingConfiguration(form.value, original.value) : undefined)
 const names = computed(() => ['default', ...(form.value?.backings.map(b => b.name).filter(Boolean) ?? [])])
 const save = useAsyncAction(async () => {
   const result = await requireAdmin().putBackingConfiguration(toPutBody(form.value!))
   setForm(result)
   emit('saved')
 }, { successMessage: 'Backing configuration applied', errorTitle: 'Could not configure backings', toastErrors: false })
+
+/** The saved s3 section of a row that was loaded (not added in the form). */
+function loadedS3(b: BackingDefinition): S3BackingDefinition | undefined {
+  return savedRows.has(b) ? original.value?.backings.find(x => x.name === b.name)?.s3 : undefined
+}
 
 function inUse(name: string) {
   const b = props.backings.find(b => b.name === name)
@@ -115,7 +125,7 @@ async function submit() {
       <CommonErrorAlert :error="error" title="Could not load backing configuration" retryable @retry="load" />
       <USkeleton v-if="loading" class="h-32" />
       <form v-else-if="form" class="space-y-5" @submit.prevent="submit">
-        <p class="text-sm text-muted">The system backing named default is configured at startup. Move buckets and remove replicas before changing or removing other backings. New filesystem backings need an empty server directory; new S3 backings an empty bucket or prefix.</p>
+        <p class="text-sm text-muted">The system backing named default is configured at startup. Move buckets and remove replicas before changing or removing other backings. New filesystem backings need an empty server directory; a new S3 backing's home must be an empty bucket or prefix.</p>
         <UAlert v-if="!form.persistent" color="warning" title="Changes are temporary" description="This server has no data directory for saved settings. Backing configuration will be lost on restart." />
         <CommonErrorAlert :error="save.error.value" title="Could not configure backings" />
         <UAlert v-if="submitted && validation" color="error" :title="validation" />
@@ -140,11 +150,19 @@ async function submit() {
                 <UFormField label="Region">
                   <UInput v-model="b.s3.region" placeholder="us-east-1" class="w-full" aria-label="Region" autocomplete="off" />
                 </UFormField>
-                <UFormField label="Bucket" required>
-                  <UInput v-model="b.s3.bucket" :disabled="inUse(b.name)" placeholder="gos3-archive" class="w-full font-mono" aria-label="Bucket" autocomplete="off" />
+                <UFormField label="Home bucket" :help="HOME_HELP">
+                  <UInput
+                    :model-value="b.s3.homeBucket"
+                    :disabled="inUse(b.name)"
+                    placeholder="gos3-archive"
+                    class="w-full font-mono"
+                    aria-label="Home bucket"
+                    autocomplete="off"
+                    @update:model-value="setHomeBucket(b.s3, String($event ?? ''), loadedS3(b))"
+                  />
                 </UFormField>
-                <UFormField label="Prefix" help="Optional; keys inside the bucket start with it.">
-                  <UInput v-model="b.s3.prefix" :disabled="inUse(b.name)" placeholder="gos3/" class="w-full font-mono" aria-label="Prefix" autocomplete="off" />
+                <UFormField label="Home prefix" help="Optional; gos3's keys inside the home bucket start with it.">
+                  <UInput v-model="b.s3.homePrefix" :disabled="inUse(b.name) || (!b.s3.homeBucket && !b.s3.homePrefix)" placeholder="gos3/" class="w-full font-mono" aria-label="Home prefix" autocomplete="off" />
                 </UFormField>
                 <UFormField label="Access key" required>
                   <UInput v-model="b.s3.accessKey" class="w-full font-mono" aria-label="Access key" autocomplete="off" />
@@ -153,12 +171,9 @@ async function submit() {
                   <UInput v-model="b.s3.secretKey" type="password" :placeholder="secretPlaceholder(b.name, b.s3, 'secret')" class="w-full font-mono" aria-label="Secret key" autocomplete="new-password" />
                 </UFormField>
               </div>
-              <UCheckbox
-                v-model="b.s3.gateway"
-                :disabled="inUse(b.name)"
-                label="Gateway"
-                description="Objects stored natively in remote buckets named like the gos3 buckets, readable by other S3 tools; no versioning, object lock, replicas or moves."
-              />
+              <UFormField label="Default bucket kind" help="Native buckets keep their objects as-is in a remote bucket of their own; wrapped buckets use gos3's format inside a container (needs a home or an added container). Users can choose per bucket.">
+                <USelect :model-value="defaultKindValue(b.s3)" :items="[...DEFAULT_KIND_ITEMS]" class="w-full sm:w-96" aria-label="Default bucket kind" @update:model-value="setDefaultKind(b.s3, String($event))" />
+              </UFormField>
               <details class="rounded-md border border-default" data-testid="s3-advanced">
                 <summary class="cursor-pointer px-3 py-2 text-sm font-medium text-highlighted">Advanced</summary>
                 <div class="space-y-3 px-3 pb-3">
@@ -190,7 +205,7 @@ async function submit() {
             </div>
             <p v-else class="text-sm text-muted">Memory backing contents are lost when the server restarts.</p>
             <div class="flex items-center justify-between gap-3">
-              <span class="text-xs text-muted">{{ !inUse(b.name) ? 'Changes take effect when you save.' : b.backend === 's3' ? 'In use — connection settings can change; move buckets and remove replicas before changing the bucket, prefix or gateway.' : 'In use — move buckets and remove replicas before editing.' }}</span>
+              <span class="text-xs text-muted">{{ !inUse(b.name) ? 'Changes take effect when you save.' : b.backend === 's3' ? 'In use — connection settings and the default bucket kind can change; move buckets and remove replicas before changing the home bucket or prefix.' : 'In use — move buckets and remove replicas before editing.' }}</span>
               <UButton color="error" variant="ghost" label="Remove" icon="i-lucide-trash-2" :disabled="inUse(b.name)" @click="remove(index)" />
             </div>
           </div>

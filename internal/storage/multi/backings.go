@@ -32,7 +32,8 @@ type BackingOpener struct {
 	Open func(def config.BackingDefinition) (Backing, error)
 	// Reconfigure prepares a change of the connection settings of backing
 	// b (an s3 backing: endpoint, region, credentials, encryption key,
-	// addressing, part size) to those of def, which has the same identity
+	// addressing, part size, default bucket kind) to those of def, which
+	// has the same identity
 	// (see config.BackingDefinition.Identity) as b's current definition.
 	// It verifies the new settings without changing b, and returns commit,
 	// which switches b to them; commit is only called once the new
@@ -171,10 +172,10 @@ func errInUse(name string) error {
 //
 // A backing is compared with its current definition by name: the same
 // settings leave it alone; a different identity (see
-// config.BackingDefinition.Identity: another fs path, s3 bucket, prefix or
-// gateway mode) replaces it; the same identity with other connection
-// settings reconfigures it in place (BackingOpener.Reconfigure), also when
-// it holds buckets. Blank secrets keep the stored ones (see
+// config.BackingDefinition.Identity: another fs path, or another place for
+// an s3 backing's records) replaces it; the same identity with other
+// connection settings reconfigures it in place
+// (BackingOpener.Reconfigure), also when it holds buckets. Blank secrets keep the stored ones (see
 // config.BackingSettings.Apply).
 //
 // A backing can be replaced or removed only when the router places
@@ -385,17 +386,16 @@ func (r *Router) applyBackings(ctx context.Context, p *backingPlan) (BackingConf
 	if next.def == nil {
 		return BackingConfiguration{}, fmt.Errorf("%w: default backing %q", ErrUnknownBacking, p.defs.DefaultBacking)
 	}
+	replicas := make([]*backing, 0, len(r.opts.NewBucketReplicas))
 	for _, name := range r.opts.NewBucketReplicas {
-		switch b := next.backings[name]; {
-		case b == nil:
+		b := next.backings[name]
+		if b == nil {
 			return BackingConfiguration{}, fmt.Errorf("%w: backing %q is a new bucket replica", ErrInvalidPlacement, name)
-		case !canImport(b):
-			return BackingConfiguration{}, fmt.Errorf("%w: new bucket replica: %s", ErrInvalidPlacement, errNoImport(name))
 		}
+		replicas = append(replicas, b)
 	}
-	if len(r.opts.NewBucketReplicas) > 0 && !canImport(next.def) {
-		return BackingConfiguration{}, fmt.Errorf("%w: the default backing %q is an S3 gateway backing, which cannot "+
-			"have the replicas new buckets get", ErrInvalidPlacement, next.def.Name)
+	if err := checkNewBucketReplicas(ctx, next.def, replicas); err != nil {
+		return BackingConfiguration{}, err
 	}
 	if err := ctx.Err(); err != nil {
 		return BackingConfiguration{}, err

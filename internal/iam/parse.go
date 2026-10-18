@@ -181,12 +181,42 @@ func validateNewIdentityPolicy(doc *PolicyDocument) string {
 	if reason := validateIdentityPolicy(doc); reason != "" {
 		return reason
 	}
+	if reason := validateVarRefs(doc); reason != "" {
+		return reason
+	}
 	for i := range doc.Statement {
 		for _, r := range resourcesOf(&doc.Statement[i]) {
 			if strings.HasPrefix(r, "arn:gos3:") && !validAdminResource(r) {
 				return "Policy has invalid resource: " + r + " (gos3 admin resources are " +
 					AdminResourceARN + ", " + adminARNPrefix + "user/<name>, " +
-					adminARNPrefix + "policy/<name> and " + adminARNPrefix + "bucket/<name>)"
+					adminARNPrefix + "policy/<name>, " + adminARNPrefix + "bucket/<name> and " +
+					adminARNPrefix + "backing/<name>)"
+			}
+		}
+	}
+	return ""
+}
+
+// validateVarRefs refuses Resource and Condition values with more than
+// maxVarRefs policy variable references, which evaluation would deny on
+// anyway (see budget). Only new identity policies are checked, so a stored
+// one still loads from iam.json; a stored bucket policy failing it is
+// treated as invalid, which denies its requests just the same.
+func validateVarRefs(doc *PolicyDocument) string {
+	for i := range doc.Statement {
+		st := &doc.Statement[i]
+		for _, r := range resourcesOf(st) {
+			if strings.Count(r, "${") > maxVarRefs {
+				return fmt.Sprintf("Policy has more than %d policy variables in a resource", maxVarRefs)
+			}
+		}
+		for opName, kv := range st.Condition {
+			for key, vals := range kv {
+				for _, v := range vals {
+					if strings.Count(v, "${") > maxVarRefs {
+						return fmt.Sprintf("Policy has more than %d policy variables in a Condition value for %s %s", maxVarRefs, opName, key)
+					}
+				}
 			}
 		}
 	}
@@ -195,9 +225,9 @@ func validateNewIdentityPolicy(doc *PolicyDocument) string {
 
 // validAdminResource accepts the admin resource patterns
 // arn:gos3:admin:::* and arn:gos3:admin:::<type>/<name>, where <type> (or a
-// wildcard pattern of it) names user, policy or bucket and <name> is a
-// non-empty pattern. A typo there would otherwise silently match nothing,
-// which for a Deny statement means denying nothing.
+// wildcard pattern of it) names user, policy, bucket or backing and <name>
+// is a non-empty pattern. A typo there would otherwise silently match
+// nothing, which for a Deny statement means denying nothing.
 func validAdminResource(r string) bool {
 	rest, ok := strings.CutPrefix(r, adminARNPrefix)
 	if !ok || rest == "" {
@@ -210,7 +240,7 @@ func validAdminResource(r string) bool {
 	if name == "" {
 		return false
 	}
-	for _, t := range []string{adminTypeUser, adminTypePolicy, adminTypeBucket} {
+	for _, t := range adminTypes {
 		if globMatch(typ, t, false, false) {
 			return true
 		}
@@ -221,6 +251,9 @@ func validAdminResource(r string) bool {
 // validateBucketPolicy validates a bucket policy for bucket.
 func validateBucketPolicy(doc *PolicyDocument, bucket string) string {
 	if reason := validateCommon(doc); reason != "" {
+		return reason
+	}
+	if reason := validateVarRefs(doc); reason != "" {
 		return reason
 	}
 	for i := range doc.Statement {

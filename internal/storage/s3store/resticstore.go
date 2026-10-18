@@ -24,12 +24,14 @@ import (
 //     with the backing's current credentials; its password is the hex of
 //     the bucket's master key (restic.PasswordFromKey);
 //   - the recovery record keys/<bucket-id>.restic.json holds
-//     {initialized, repository} and never the password, which derives from
-//     the wrapped master key next to it;
+//     {initialized, repository, bucket} and never the password, which
+//     derives from the wrapped master key next to it;
 //   - a version's snapshot ID is kept in the index (blobRef.Restic); empty
 //     objects never reach restic;
 //   - restic's cache lives in <TempDir>/restic-cache/<backing-id> (or the
-//     user cache directory).
+//     user cache directory);
+//   - aux repositories (restic.Host, see restic_host.go) live at
+//     <Bucket>/<Prefix>restic-aux/<name>, keyed by keys/aux/<name>.key.
 
 func (b *Backend) recoveryObject(id string) string {
 	return b.keys.prefix + keysDir + id + ".restic.json"
@@ -61,10 +63,11 @@ func (s *recoveryStore) Load(ctx context.Context, id string) (restic.Record, err
 }
 
 // Store implements restic.RecoveryStore; an unchanged record is not
-// rewritten.
+// rewritten. Every field of rec is kept (restic.Record never holds the
+// password).
 func (s *recoveryStore) Store(ctx context.Context, id string, rec restic.Record) error {
 	b := s.b
-	raw, err := json.Marshal(restic.Record{Initialized: rec.Initialized, Repository: rec.Repository})
+	raw, err := json.Marshal(rec)
 	if err != nil {
 		return err
 	}
@@ -105,6 +108,13 @@ func (s *recoveryStore) remember(id string, raw []byte) {
 // connection; ok is false when the connection lacks what restic needs
 // (credentials).
 func (b *Backend) resticRepository(id string) (restic.S3Repository, bool) {
+	return b.s3Repository(resticDir + id)
+}
+
+// s3Repository describes the repository at rel (below the prefix) with the
+// current connection; ok is false when the connection lacks what restic
+// needs (credentials).
+func (b *Backend) s3Repository(rel string) (restic.S3Repository, bool) {
 	c := b.conn.Load()
 	endpoint := c.endpoint
 	if endpoint == "" {
@@ -120,7 +130,7 @@ func (b *Backend) resticRepository(id string) (restic.S3Repository, bool) {
 	return restic.S3Repository{
 		Endpoint:  endpoint,
 		Bucket:    b.opts.Bucket,
-		Path:      path + "restic/" + id,
+		Path:      path + strings.TrimSuffix(rel, "/"),
 		Region:    c.region,
 		AccessKey: c.accessKey,
 		SecretKey: c.secretKey,
@@ -162,13 +172,17 @@ func (b *Backend) resticLocation(ctx context.Context, bk *bucket) (restic.Locati
 }
 
 // prepareRestic makes sure the repository of bk exists (see
-// restic.Runtime.Prepare) and returns its location.
+// restic.Runtime.PrepareWith; the recovery record names the bucket, so
+// offline tools find its repository by its name) and returns its location.
 func (b *Backend) prepareRestic(ctx context.Context, bk *bucket) (restic.Location, error) {
 	loc, err := b.resticLocation(ctx, bk)
 	if err != nil {
 		return restic.Location{}, err
 	}
-	return loc, b.restic.Prepare(ctx, bk.id, loc, &b.recovery)
+	bk.mu.RLock()
+	name := bk.ix.Info.Name
+	bk.mu.RUnlock()
+	return loc, b.restic.PrepareWith(ctx, bk.id, name, loc, &b.recovery)
 }
 
 // resticWriter archives one version into the bucket's repository while it
@@ -188,7 +202,7 @@ func (b *Backend) newResticWriter(ctx context.Context, bk *bucket, bucket, key s
 	if err != nil {
 		return nil, err
 	}
-	return &resticWriter{a: b.restic.NewArchiver(ctx, loc, bucket, key)}, nil
+	return &resticWriter{a: b.restic.NewArchiverWith(ctx, loc, restic.ArchiveOptions{Bucket: bucket, BucketID: bk.id, Key: key})}, nil
 }
 
 func (w *resticWriter) Write(p []byte) (int, error) {

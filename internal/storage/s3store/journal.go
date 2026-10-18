@@ -95,14 +95,24 @@ func decodeBatch(data []byte) (batchHeader, []Record, error) {
 	bad := func(format string, args ...any) (batchHeader, []Record, error) {
 		return h, nil, fmt.Errorf("%w: batch %d/%d: %s", ErrCorruptJournal, h.Epoch, h.Seq, fmt.Sprintf(format, args...))
 	}
+	if len(data) > maxBatchObject {
+		return bad("object exceeds size limit")
+	}
+	if h.N < 0 || h.N > maxBatchRecords {
+		return bad("record count %d exceeds batch limits", h.N)
+	}
 	if h.Gzip {
 		zr, err := gzip.NewReader(bytes.NewReader(payload))
 		if err != nil {
 			return bad("gzip: %v", err)
 		}
+		defer zr.Close()
 		if payload, err = io.ReadAll(io.LimitReader(zr, maxBatchObject+1)); err != nil {
 			return bad("gzip: %v", err)
 		}
+	}
+	if len(payload) > maxBatchObject {
+		return bad("payload exceeds size limit")
 	}
 	sum := sha256.Sum256(payload)
 	if hex.EncodeToString(sum[:]) != h.SHA256 {
@@ -114,10 +124,21 @@ func decodeBatch(data []byte) (batchHeader, []Record, error) {
 		}
 		return h, nil, nil
 	}
-	if h.N < 0 || h.LSN[0] == 0 || h.LSN[0]+uint64(h.N) != h.LSN[1]+1 {
+	if h.LSN[0] == 0 ||
+		(h.N == 0 && h.LSN[1] != h.LSN[0]-1) ||
+		(h.N > 0 && (h.LSN[1] < h.LSN[0] || h.LSN[1]-h.LSN[0] != uint64(h.N-1))) {
 		return bad("inconsistent lsn range %v for %d records", h.LSN, h.N)
 	}
-	recs := make([]Record, 0, h.N)
+	// Count actual record lines before allocating; N is remote input. Even
+	// a tiny, checksummed object can otherwise request an enormous slice.
+	lines := bytes.Count(payload, []byte{'\n'})
+	if len(payload) > 0 && payload[len(payload)-1] != '\n' {
+		lines++
+	}
+	if h.N != lines {
+		return bad("%d record lines, header says %d", lines, h.N)
+	}
+	var recs []Record
 	for len(payload) > 0 {
 		line, rest, _ := bytes.Cut(payload, []byte{'\n'})
 		payload = rest

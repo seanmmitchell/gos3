@@ -101,22 +101,22 @@ func TestExpandVars(t *testing.T) {
 		{`back\slash`, true, `back\\slash`, true},
 	}
 	for _, tt := range tests {
-		got, ok := expandVars(tt.in, lookup, tt.pattern)
+		got, ok := expandVars(tt.in, lookup, tt.pattern, nil)
 		if ok != tt.ok || (ok && got != tt.want) {
 			t.Errorf("expandVars(%q, pattern=%v) = %q, %v; want %q, %v", tt.in, tt.pattern, got, ok, tt.want, tt.ok)
 		}
 	}
 	// Literal '*' from a variable must not act as a wildcard.
-	if matchPattern("${s3:prefix}", "pXq", false, lookup) {
+	if matchPattern("${s3:prefix}", "pXq", false, lookup, nil) {
 		t.Fatal("variable value treated as wildcard")
 	}
-	if !matchPattern("${s3:prefix}", "p*q", false, lookup) {
+	if !matchPattern("${s3:prefix}", "p*q", false, lookup, nil) {
 		t.Fatal("variable value not matched literally")
 	}
-	if !matchPattern(`a\b*`, `a\bcd`, false, lookup) {
+	if !matchPattern(`a\b*`, `a\bcd`, false, lookup, nil) {
 		t.Fatal("plain backslash not literal")
 	}
-	if !matchPattern(`a\b/${aws:username}`, `a\b/alice`, false, lookup) {
+	if !matchPattern(`a\b/${aws:username}`, `a\b/alice`, false, lookup, nil) {
 		t.Fatal("backslash with variables not literal")
 	}
 }

@@ -176,4 +176,10 @@ watch(() => [props.bucket, props.objectKey, props.versionId, force.value], () =>
 .browser-markdown :deep(pre code) { background: transparent; padding: 0; }
 .browser-markdown :deep(blockquote) { border-left: 3px solid var(--ui-border-accented); padding-left: 0.75rem; color: var(--ui-text-muted); margin: 0.5rem 0; }
 .browser-markdown :deep(hr) { border-color: var(--ui-border); margin: 1rem 0; }
+/* Wide tables scroll on their own instead of stretching the preview. */
+.browser-markdown :deep(table) { display: block; width: max-content; max-width: 100%; overflow-x: auto; border-collapse: collapse; margin: 0.5rem 0; }
+.browser-markdown :deep(th),
+.browser-markdown :deep(td) { border: 1px solid var(--ui-border); padding: 0.375rem 0.75rem; text-align: left; vertical-align: top; }
+.browser-markdown :deep(th) { font-weight: 600; background: var(--ui-bg-elevated); }
+.browser-markdown :deep(tbody tr:nth-child(even)) { background: color-mix(in oklab, var(--ui-bg-elevated) 50%, transparent); }
 </style>

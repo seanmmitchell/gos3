@@ -91,13 +91,15 @@ func (r *Router) readers(bs *bucketState, spread bool) []*backing {
 }
 
 // readFrom calls fn with the bucket's readers in order until one answers
-// with something other than a backing failure.
-// cb, when not nil, tells errors of the caller's callback apart.
+// with something other than a backing failure or the unavailability of its
+// copy's remote location (storage.ErrBucketUnavailable, which leaves the
+// backing healthy). cb, when not nil, tells errors of the caller's
+// callback apart.
 func (r *Router) readFrom(bs *bucketState, spread bool, cb *cbTracker, fn func(b *backing) error) error {
 	var first error
 	for _, b := range r.readers(bs, spread) {
 		err := fn(b)
-		if !isBackingError(err) || cb.isCaller(err) {
+		if !fallBack(err) || cb.isCaller(err) {
 			return err
 		}
 		r.observe(b, err)
@@ -106,6 +108,13 @@ func (r *Router) readFrom(bs *bucketState, spread bool, cb *cbTracker, fn func(b
 		}
 	}
 	return first
+}
+
+// fallBack reports whether a read that failed with err should be retried
+// on another copy of the bucket: after a failure of the backing, or of the
+// copy's remote location alone (storage.ErrBucketUnavailable).
+func fallBack(err error) bool {
+	return isBackingError(err) || errors.Is(err, storage.ErrBucketUnavailable)
 }
 
 // route says where a write to a bucket goes.
@@ -175,26 +184,35 @@ func (r *Router) demote(ms *memberState, key string) {
 
 // replicate propagates a change of key, made on rt.lead, to the other
 // members: synchronously to the followers (the caller holds the key's
-// lock), in the background to the others.
+// lock), in the background to the others (see settle).
 func (r *Router) replicate(ctx context.Context, rt *route, key string) {
+	committed := map[*memberState]bool{}
 	for _, f := range rt.followers {
-		if err := r.syncKey(ctx, rt.lead, f.backing, rt.bs.name, key, nil); err != nil {
-			r.demote(f, key)
-			continue
+		err := r.syncKey(ctx, rt.lead, f.backing, rt.bs.name, key, false, nil)
+		if err == nil {
+			committed[f] = true
 		}
-		if !r.inSyncMode(f) {
-			r.markDirty(f, key)
+		if errors.Is(err, errRestoredLocked) {
+			r.restoredLocked(rt.bs, key)
 		}
 	}
-	for _, a := range rt.async {
-		r.markDirty(a, key)
-	}
+	r.settle(rt, key, committed)
 }
 
 // objectWrite runs op, a change of bucket/key, on the bucket's primary and
-// replicates it. caller reports whether an error came from the caller's
-// callback rather than from the backing.
+// replicates it, then reports the change to the subscribers (see
+// Subscribe). cb tells errors of the caller's callbacks apart from those
+// of the backing.
 func (r *Router) objectWrite(ctx context.Context, bucket, key string, cb *cbTracker, op func(b storage.Backend) error) error {
+	if err := r.objectWriteGated(ctx, bucket, key, cb, op); err != nil {
+		return err
+	}
+	r.emitObject(bucket, key)
+	return nil
+}
+
+// objectWriteGated is objectWrite without reporting the change.
+func (r *Router) objectWriteGated(ctx context.Context, bucket, key string, cb *cbTracker, op func(b storage.Backend) error) error {
 	rt, leave, err := r.enterWrite(ctx, bucket)
 	if err != nil {
 		return err
@@ -215,13 +233,26 @@ func (r *Router) objectWrite(ctx context.Context, bucket, key string, cb *cbTrac
 }
 
 // bucketWrite applies op (a bucket-level change) to the primary, then to
-// every other copy. A copy that fails gets a full comparison later.
-func (r *Router) bucketWrite(ctx context.Context, bucket string, op func(b storage.Backend) error) error {
+// every other copy. A copy that fails gets a full comparison later. The
+// change is reported to the subscribers as a ChangeBucketConfig of
+// configKey (see Change.ConfigKey: "" for a bucket setting).
+func (r *Router) bucketWrite(ctx context.Context, bucket, configKey string, op func(b storage.Backend) error) error {
+	if err := r.bucketWriteGated(ctx, bucket, op); err != nil {
+		return err
+	}
+	r.emit(Change{Kind: ChangeBucketConfig, Bucket: bucket, ConfigKey: configKey})
+	return nil
+}
+
+// bucketWriteGated is bucketWrite without reporting the change.
+func (r *Router) bucketWriteGated(ctx context.Context, bucket string, op func(b storage.Backend) error) error {
 	rt, leave, err := r.enterWrite(ctx, bucket)
 	if err != nil {
 		return err
 	}
 	defer leave()
+	rt.bs.configMu.Lock()
+	defer rt.bs.configMu.Unlock()
 	if err := op(rt.lead.Backend); err != nil {
 		return r.observe(rt.lead, err)
 	}
@@ -364,9 +395,24 @@ func (r *Router) ListBuckets(ctx context.Context) ([]storage.BucketInfo, error) 
 
 // CreateBucket creates the bucket on opts.Backing (the x-gos3-backing
 // header), or on the default backing when it is empty. An unknown backing
-// yields storage.ErrInvalidBacking. The default replicas are added except
-// the chosen backing itself.
+// yields storage.ErrInvalidBacking. opts.Target (the bucket's kind and
+// location) needs a backing with bucket kinds
+// (storage.BucketCapabilities), else storage.ErrInvalidTarget; it is
+// checked (storage.NewCapsOf) before anything is created. The default
+// replicas are added except the chosen backing itself, when the new bucket
+// keeps a version history to copy (not a native bucket) and they can
+// receive copies. The new bucket is reported to the subscribers (see
+// Subscribe).
 func (r *Router) CreateBucket(ctx context.Context, name string, opts storage.CreateBucketOptions) error {
+	if err := r.createBucket(ctx, name, opts); err != nil {
+		return err
+	}
+	r.emit(Change{Kind: ChangeBucketCreated, Bucket: name})
+	return nil
+}
+
+// createBucket is CreateBucket without reporting the change.
+func (r *Router) createBucket(ctx context.Context, name string, opts storage.CreateBucketOptions) error {
 	if r.closed.Load() {
 		return ErrClosed
 	}
@@ -415,6 +461,16 @@ func (r *Router) CreateBucket(ctx context.Context, name string, opts storage.Cre
 	defer r.adminMu.Unlock()
 	// The member backends do not know the router's backing names.
 	opts.Backing = ""
+	if opts.Target != nil {
+		if _, ok := target.Backend.(storage.BucketCapabilities); !ok {
+			return fmt.Errorf("%w: backing %q has no bucket kinds or locations to choose from", storage.ErrInvalidTarget, target.Name)
+		}
+	}
+	// Refuse a target the backing cannot honour before creating anything.
+	caps, err := storage.NewCapsOf(ctx, target.Backend, opts)
+	if err != nil {
+		return err
+	}
 	if err := target.Backend.CreateBucket(ctx, name, opts); err != nil {
 		return r.observe(target, err)
 	}
@@ -427,11 +483,20 @@ func (r *Router) CreateBucket(ctx context.Context, name string, opts storage.Cre
 			continue
 		}
 		rb := topology.backings[rep]
-		if rb == nil || !canImport(rb) || !canImport(target) {
-			// Open and live configuration refuse such replicas; a bucket
-			// on an s3 gateway backing keeps no versions to copy.
+		var why error
+		switch {
+		case rb == nil:
+			why = fmt.Errorf("%w %q", ErrUnknownBacking, rep)
+		case !caps.History:
+			why = errNoHistory(target, name, caps.Kind)
+		default:
+			why = importTarget(ctx, rb, nil)
+		}
+		if why != nil {
+			// Open and live configuration refuse replicas that no new
+			// bucket can have; this bucket's kind or backing rules them out.
 			r.log.Warn("new bucket created without one of its default replicas, which cannot be used for it",
-				"bucket", name, "backing", rep, "primary", target.Name)
+				"bucket", name, "backing", rep, "primary", target.Name, "reason", why)
 			continue
 		}
 		r.mu.RLock()
@@ -512,8 +577,18 @@ func (r *Router) primaryOf(bs *bucketState) string {
 }
 
 // DeleteBucket deletes the (empty) bucket from its primary; the other
-// copies are deleted in the background.
+// copies are deleted in the background. The deletion is reported to the
+// subscribers (see Subscribe).
 func (r *Router) DeleteBucket(ctx context.Context, name string) error {
+	if err := r.deleteBucket(ctx, name); err != nil {
+		return err
+	}
+	r.emit(Change{Kind: ChangeBucketDeleted, Bucket: name})
+	return nil
+}
+
+// deleteBucket is DeleteBucket without reporting the change.
+func (r *Router) deleteBucket(ctx context.Context, name string) error {
 	if r.closed.Load() {
 		return ErrClosed
 	}
@@ -536,7 +611,8 @@ func (r *Router) DeleteBucket(ctx context.Context, name string) error {
 	for bname, ms := range bs.members {
 		cancel = append(cancel, ms)
 		if bname != prim.Name {
-			r.addPurgeLocked(name, bname)
+			i := bs.rec.member(bname)
+			r.addPurgeLocked(name, bname, i > 0 && bs.rec.Members[i].Diverged)
 		}
 	}
 	r.mu.Unlock()
@@ -554,12 +630,12 @@ func (r *Router) DeleteBucket(ctx context.Context, name string) error {
 
 // SetBucketVersioning changes the versioning state on every copy.
 func (r *Router) SetBucketVersioning(ctx context.Context, name string, status storage.VersioningStatus) error {
-	return r.bucketWrite(ctx, name, func(b storage.Backend) error { return b.SetBucketVersioning(ctx, name, status) })
+	return r.bucketWrite(ctx, name, "", func(b storage.Backend) error { return b.SetBucketVersioning(ctx, name, status) })
 }
 
 // SetBucketObjectLock enables object lock on every copy.
 func (r *Router) SetBucketObjectLock(ctx context.Context, name string, enabled bool) error {
-	return r.bucketWrite(ctx, name, func(b storage.Backend) error { return b.SetBucketObjectLock(ctx, name, enabled) })
+	return r.bucketWrite(ctx, name, "", func(b storage.Backend) error { return b.SetBucketObjectLock(ctx, name, enabled) })
 }
 
 // GetBucketConfig returns a configuration document.
@@ -600,12 +676,12 @@ func (r *Router) ViewBucketConfig(ctx context.Context, bucket, key string, fn fu
 
 // PutBucketConfig stores a configuration document on every copy.
 func (r *Router) PutBucketConfig(ctx context.Context, bucket, key string, data []byte) error {
-	return r.bucketWrite(ctx, bucket, func(b storage.Backend) error { return b.PutBucketConfig(ctx, bucket, key, data) })
+	return r.bucketWrite(ctx, bucket, key, func(b storage.Backend) error { return b.PutBucketConfig(ctx, bucket, key, data) })
 }
 
 // DeleteBucketConfig removes a configuration document from every copy.
 func (r *Router) DeleteBucketConfig(ctx context.Context, bucket, key string) error {
-	return r.bucketWrite(ctx, bucket, func(b storage.Backend) error { return b.DeleteBucketConfig(ctx, bucket, key) })
+	return r.bucketWrite(ctx, bucket, key, func(b storage.Backend) error { return b.DeleteBucketConfig(ctx, bucket, key) })
 }
 
 // --- objects ---
@@ -700,6 +776,24 @@ func (r *Router) DeleteObjectIf(ctx context.Context, bucket, key, versionID stri
 	return res, err
 }
 
+// DeleteVersionIf implements storage.NewerVersionsDeleter.
+func (r *Router) DeleteVersionIf(ctx context.Context, bucket, key, versionID string, limit int, check func(storage.ObjectInfo, []storage.ObjectInfo) error) (storage.DeleteResult, error) {
+	var res storage.DeleteResult
+	cb := &cbTracker{}
+	err := r.objectWrite(ctx, bucket, key, cb, func(b storage.Backend) error {
+		nd, ok := b.(storage.NewerVersionsDeleter)
+		if !ok {
+			return fmt.Errorf("newer-version conditional deletes: %w", errors.ErrUnsupported)
+		}
+		var err error
+		res, err = nd.DeleteVersionIf(ctx, bucket, key, versionID, limit, func(v storage.ObjectInfo, newer []storage.ObjectInfo) error {
+			return cb.note(check(v, newer))
+		})
+		return err
+	})
+	return res, err
+}
+
 // DeleteObjectChecked implements storage.CheckedDeleter.
 func (r *Router) DeleteObjectChecked(ctx context.Context, bucket, key, versionID string, check func(storage.ObjectInfo, bool) error) (storage.DeleteResult, error) {
 	var res storage.DeleteResult
@@ -718,7 +812,7 @@ func (r *Router) DeleteObjectChecked(ctx context.Context, bucket, key, versionID
 }
 
 // walk runs a walk on the bucket's readers. It falls back to the next
-// reader on a backing failure only when nothing was delivered yet.
+// reader (see fallBack) only when nothing was delivered yet.
 func (r *Router) walk(bs *bucketState, fn func(storage.ObjectInfo) error, run func(b storage.Backend, fn func(storage.ObjectInfo) error) error) error {
 	cands := r.readers(bs, false)
 	cb := &cbTracker{}
@@ -728,7 +822,7 @@ func (r *Router) walk(bs *bucketState, fn func(storage.ObjectInfo) error, run fu
 			delivered = true
 			return cb.note(fn(oi))
 		})
-		if !isBackingError(err) || cb.isCaller(err) {
+		if !fallBack(err) || cb.isCaller(err) {
 			return err
 		}
 		r.observe(b, err)

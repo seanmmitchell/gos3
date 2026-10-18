@@ -94,10 +94,13 @@ func (s *Server) newObjectWriter(ctx context.Context, bucket, key string, c stor
 // completeMultipartUpload is Backend.CompleteMultipartUpload storing the
 // object as the compression policy says, encrypted when the upload
 // requested SSE (prepareEncryption decides the provider; uploads created
-// by older builds are encrypted too).
+// by older builds are encrypted too). userAgent is the completing
+// request's User-Agent: the encryption is decided again at completion (an
+// upload without SSE is archived when the bucket's settings say so by
+// then), so restic's own uploads must be refused here too.
 func (s *Server) completeMultipartUpload(ctx context.Context, bucket, key, uploadID string, partNumbers []int,
-	meta storage.ObjectMeta, cond storage.CommitOptions) (storage.ObjectInfo, error) {
-	if err := s.prepareEncryption(ctx, bucket, &meta, ""); err != nil {
+	meta storage.ObjectMeta, cond storage.CommitOptions, userAgent string) (storage.ObjectInfo, error) {
+	if err := s.prepareEncryption(ctx, bucket, &meta, userAgent); err != nil {
 		return storage.ObjectInfo{}, err
 	}
 	var size int64

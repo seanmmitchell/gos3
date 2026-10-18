@@ -2,15 +2,18 @@
 import type { BucketSummary } from '~/types/admin'
 import type { ObjectLockConfiguration, VersioningStatus } from '~/types/s3'
 import { S3Error } from '~/utils/s3/errors'
-import { bucketSettingsTabs, canShowBucketUsage, resolveBucketTab, type BucketSettingsTab } from '~/components/admin/-capabilities'
+import { bucketSettingsTabs, canManageJobs, canShowBucketUsage, resolveBucketTab, type BucketSettingsTab } from '~/components/admin/-capabilities'
 import { modeOption } from '~/components/admin/-storage'
+import CopyBucketModal from '~/components/jobs/CopyBucketModal.vue'
 
 /**
  * Bucket settings with one section per S3 bucket sub-resource, plus gos3-only
  * ones such as compression, picked with the chips under the header (synced
  * with `?tab=`). Shared state — versioning, object lock, the admin
- * BucketSummary and (gos3) the primary storage backing — is loaded here and
- * refreshed when a tab changes it.
+ * BucketSummary and (gos3) the primary storage backing with, on s3
+ * backings, the bucket's kind (native or wrapped) and location — is loaded
+ * here and refreshed when a tab changes it. With manageJobs the header
+ * offers "Copy / Mirror…" (CopyBucketModal).
  */
 const route = useRoute()
 const router = useRouter()
@@ -33,6 +36,8 @@ const tabLabel = computed(() => tabs.value.find(t => t.value === tab.value)?.lab
 
 // --- shared state ----------------------------------------------------------
 const versioning = ref<VersioningStatus | null>(null)
+/** The bucket's storage cannot keep versions (GetBucketVersioning answered NotImplemented). */
+const versioningUnsupported = ref(false)
 const objectLock = ref<ObjectLockConfiguration | null>(null)
 const stateError = ref<unknown>(null)
 const stateLoading = ref(false)
@@ -46,10 +51,15 @@ async function loadState() {
   stateError.value = null
   try {
     const s3 = requireS3()
+    let unsupported = false
     const [v, ol] = await Promise.all([
       s3.getBucketVersioning(bucket.value).catch((e: unknown) => {
-        // Buckets that cannot be versioned (gos3 gateway backings) may answer NotImplemented.
-        if (isNotImplemented(e)) return { status: '' as const }
+        // Buckets that cannot be versioned (e.g. a native bucket whose
+        // remote S3 service has no versioning) may answer NotImplemented.
+        if (isNotImplemented(e)) {
+          unsupported = true
+          return { status: '' as const }
+        }
         throw e
       }),
       s3.getObjectLockConfiguration(bucket.value).catch((e: unknown) => {
@@ -59,6 +69,7 @@ async function loadState() {
       })
     ])
     versioning.value = v.status
+    versioningUnsupported.value = unsupported
     objectLock.value = ol
   } catch (e) {
     stateError.value = e
@@ -87,23 +98,31 @@ async function loadSummary() {
 }
 
 // Primary storage backing (gos3): from the admin summary's placement, else
-// HeadBucket's x-gos3-backing header; its kind / mode from WhoAmI.backings.
-const headBacking = ref<string | undefined>()
+// HeadBucket's x-gos3-backing header; its kind from WhoAmI.backings. On s3
+// backings the bucket kind comes from the summary or x-gos3-bucket-kind.
+const head = ref<{ backing?: string, kind?: string }>({})
 async function loadBacking() {
   const name = bucket.value
-  headBacking.value = undefined
+  head.value = {}
   if (connection.value?.kind !== 'gos3') return
   try {
-    const { backing } = await requireS3().headBucket(name)
-    if (name === bucket.value) headBacking.value = backing
+    const { backing, kind } = await requireS3().headBucket(name)
+    if (name === bucket.value) head.value = { backing, kind }
   } catch {
     // Optional; the tabs then simply do not know the backing.
   }
 }
-const backing = computed(() => summary.value?.placement?.primary || headBacking.value)
+const backing = computed(() => summary.value?.placement?.primary || head.value.backing)
 const backingDetails = computed(() => findBacking(backing.value, whoami.value?.backings))
-/** Gateway-backed buckets support neither versioning nor object lock. */
-const noVersioning = computed(() => isGatewayBacking(backingDetails.value))
+/** native | wrapped (s3 backings), '' when unknown or on other backings. */
+const bucketKind = computed(() => summary.value?.kind || head.value.kind || '')
+const bucketLocation = computed(() => summary.value?.location || '')
+const kindInfo = computed(() => (bucketKind.value ? bucketKindInfo(bucketKind.value) : null))
+const backingBadgeTitle = computed(() => {
+  const parts = [backingDetails.value ? `Storage backing: ${backingKindInfo(backingDetails.value).label}` : `Storage backing ${backing.value}`]
+  if (kindInfo.value) parts.push(`${kindInfo.value.label} bucket${bucketLocation.value ? ` in ${bucketLocation.value}` : ''}`)
+  return parts.join(' · ')
+})
 
 function refreshShared() {
   void loadState()
@@ -124,6 +143,22 @@ const replication = computed(() => {
 
 const notFound = computed(() => stateError.value instanceof S3Error && stateError.value.code === 'NoSuchBucket')
 const lockEnabled = computed(() => !!objectLock.value?.enabled)
+
+// Copy / mirror jobs (gos3, admin:CreateCopyJob).
+const canCopy = computed(() => canManageJobs(connection.value?.kind, capabilities.value))
+const overlay = useOverlay()
+/** Bumped when a job was created here, so the overview's Jobs card reloads. */
+const jobsKey = ref(0)
+async function openCopy() {
+  const job = await overlay.create(CopyBucketModal, { destroyOnClose: true }).open({
+    bucket: bucket.value,
+    versioning: versioningUnsupported.value ? '' : versioning.value,
+    // Known once the bucket's state has loaded; else the dialog asks the server.
+    objectLock: versioning.value === null ? null : lockEnabled.value,
+    serverId: id.value
+  })
+  if (job) jobsKey.value++
+}
 </script>
 
 <template>
@@ -137,16 +172,18 @@ const lockEnabled = computed(() => !!objectLock.value?.enabled)
         <UBadge v-if="replication" :label="replication" color="primary" variant="subtle" size="sm" icon="i-lucide-copy" />
         <UBadge v-if="summary?.placement?.moving" label="Moving" color="warning" variant="subtle" size="sm" icon="i-lucide-arrow-right-left" />
         <UBadge
-          v-if="backing && backingDetails?.kind === 's3'"
-          :label="backing"
-          :icon="backingKindInfo(backingDetails).icon"
-          :title="`Storage backing: ${backingKindInfo(backingDetails).label}`"
+          v-if="backing && (backingDetails?.kind === 's3' || kindInfo)"
+          :label="kindInfo ? `${backing} · ${kindInfo.label.toLowerCase()}` : backing"
+          :icon="kindInfo?.icon ?? backingKindInfo(backingDetails).icon"
+          :title="backingBadgeTitle"
           color="neutral"
           variant="subtle"
           size="sm"
+          data-testid="backing-badge"
         />
       </template>
       <template #actions>
+        <UButton v-if="canCopy && !notFound" color="neutral" variant="outline" icon="i-lucide-copy-plus" label="Copy / Mirror…" data-testid="copy-bucket" @click="openCopy" />
         <UButton color="neutral" variant="outline" icon="i-lucide-folder-open" label="Browse" :to="appRoutes.bucket(id, bucket)" />
       </template>
     </CommonPageHeader>
@@ -173,6 +210,9 @@ const lockEnabled = computed(() => !!objectLock.value?.enabled)
           :object-lock="lockEnabled"
           :backing="backing"
           :backing-details="backingDetails"
+          :kind="bucketKind"
+          :location="bucketLocation"
+          :jobs-key="jobsKey"
           @navigate="tab = $event"
         />
         <BucketSettingsVersioningTab
@@ -180,25 +220,26 @@ const lockEnabled = computed(() => !!objectLock.value?.enabled)
           :bucket="bucket"
           :status="versioning"
           :object-lock="lockEnabled"
-          :unsupported="noVersioning"
+          :unsupported="versioningUnsupported"
           @changed="refreshShared"
         />
         <BucketSettingsPolicyTab v-else-if="tab === 'policy'" :bucket="bucket" @changed="loadSummary" />
         <BucketSettingsCorsTab v-else-if="tab === 'cors'" :bucket="bucket" @changed="loadSummary" />
         <BucketSettingsLifecycleTab v-else-if="tab === 'lifecycle'" :bucket="bucket" :versioning="versioning" @changed="loadSummary" />
         <BucketSettingsTagsTab v-else-if="tab === 'tags'" :bucket="bucket" @changed="loadSummary" />
-        <BucketSettingsEncryptionTab v-else-if="tab === 'encryption'" :bucket="bucket" @changed="loadSummary" />
+        <BucketSettingsEncryptionTab v-else-if="tab === 'encryption'" :bucket="bucket" :kind="bucketKind" @changed="loadSummary" />
+        <BucketSettingsResticTab v-else-if="tab === 'restic'" :bucket="bucket" :kind="bucketKind" @changed="loadSummary" />
         <BucketSettingsCompressionTab v-else-if="tab === 'compression'" :bucket="bucket" @changed="loadSummary" />
         <BucketSettingsObjectLockTab
           v-else-if="tab === 'object-lock'"
           :bucket="bucket"
           :versioning="versioning"
-          :unsupported="noVersioning"
+          :unsupported="versioningUnsupported"
           @changed="refreshShared"
         />
         <BucketSettingsAccessTab v-else-if="tab === 'access'" :bucket="bucket" @changed="loadSummary" />
-        <BucketSettingsPlacementTab v-else-if="tab === 'placement'" :bucket="bucket" @changed="loadSummary" />
-        <BucketSettingsDangerZoneTab v-else-if="tab === 'danger'" :bucket="bucket" />
+        <BucketSettingsPlacementTab v-else-if="tab === 'placement'" :bucket="bucket" :kind="bucketKind" @changed="loadSummary" />
+        <BucketSettingsDangerZoneTab v-else-if="tab === 'danger'" :bucket="bucket" :kind="bucketKind" :location="bucketLocation" />
       </div>
     </template>
   </div>

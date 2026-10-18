@@ -8,6 +8,8 @@ import (
 	"path/filepath"
 	"slices"
 	"time"
+
+	"github.com/seanmmitchell/gos3/internal/storage"
 )
 
 // Mode is a bucket's replication mode.
@@ -45,6 +47,9 @@ type stateFile struct {
 	// member (removed replicas, the source of a finished move, the copies
 	// of a deleted bucket) and are still to be deleted.
 	Purges []purgeRecord `json:"purges,omitempty"`
+	// DivergedPurges are the Purges of copies that were Diverged members
+	// when they were removed (see purgeLocked).
+	DivergedPurges []purgeRecord `json:"divergedPurges,omitempty"`
 }
 
 // placementRecord is the persisted placement of one bucket. Records are
@@ -64,6 +69,12 @@ type memberRecord struct {
 	// true for the primary). A replica that is not Synced never serves
 	// reads and cannot be promoted without force.
 	Synced bool `json:"synced"`
+	// Diverged is set on every remaining copy after a forced promotion or
+	// failover: any may hold acknowledged writes or lock metadata the new
+	// primary never received. Stronger protection on identical versions is
+	// merged; missing locked content is retained as an explicit conflict,
+	// including during purge. A conflict cannot clear Diverged or set Synced.
+	Diverged bool `json:"diverged,omitempty"`
 }
 
 // moveRecord is a move of a member's copy to another backing. The target
@@ -72,6 +83,10 @@ type moveRecord struct {
 	From      string    `json:"from"`
 	To        string    `json:"to"`
 	StartedAt time.Time `json:"startedAt"`
+	// Target is the kind and location of the bucket created on To (nil:
+	// the backing's choice for copies). It is optional, so state files
+	// written before it existed load unchanged (same stateVersion).
+	Target *storage.BucketTarget `json:"target,omitempty"`
 }
 
 // purgeRecord is a bucket copy to delete from a backing.
@@ -85,8 +100,18 @@ func (p *placementRecord) clone() *placementRecord {
 	c.Members = slices.Clone(p.Members)
 	if p.Move != nil {
 		m := *p.Move
+		m.Target = cloneTarget(p.Move.Target)
 		c.Move = &m
 	}
+	return &c
+}
+
+// cloneTarget returns a copy of t (nil for nil).
+func cloneTarget(t *storage.BucketTarget) *storage.BucketTarget {
+	if t == nil {
+		return nil
+	}
+	c := *t
 	return &c
 }
 

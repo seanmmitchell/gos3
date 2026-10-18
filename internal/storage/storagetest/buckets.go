@@ -14,6 +14,7 @@ func bucketTests() []testCase {
 	return []testCase{
 		{"CreateAndGet", testBucketCreateAndGet},
 		{"CreateWithObjectLock", testBucketCreateWithObjectLock},
+		{"ObjectLockRequiresVersioning", testObjectLockRequiresVersioning},
 		{"CreateDuplicate", testBucketCreateDuplicate},
 		{"GetMissing", testBucketGetMissing},
 		{"ListOrder", testBucketListOrder},
@@ -26,6 +27,20 @@ func bucketTests() []testCase {
 		{"Versioning", testBucketVersioning},
 		{"ObjectLock", testBucketObjectLock},
 		{"MissingBucketOperations", testBucketMissingOps},
+	}
+}
+
+func testObjectLockRequiresVersioning(e *env) {
+	e.mkBucketOpts("locked", storage.CreateBucketOptions{ObjectLockEnabled: true})
+	for _, status := range []storage.VersioningStatus{storage.VersioningSuspended, storage.VersioningUnversioned} {
+		if err := e.b.SetBucketVersioning(e.ctx, "locked", status); err == nil {
+			e.t.Errorf("locked bucket accepted versioning %q", status)
+		}
+	}
+	got, err := e.b.GetBucket(e.ctx, "locked")
+	e.noErr("GetBucket", err)
+	if got.Versioning != storage.VersioningEnabled {
+		e.t.Fatalf("locked bucket versioning changed: %+v", got)
 	}
 }
 
@@ -49,8 +64,8 @@ func testBucketCreateAndGet(e *env) {
 		// (internal/storage/multi, routed) fill in for buckets created
 		// without one; ListBuckets must agree with GetBucket on it (below).
 		got.CreatedAt, got.Backing = time.Time{}, ""
-		if got != tc.want {
-			e.t.Errorf("GetBucket(%q) = %+v, want %+v (CreatedAt and Backing ignored)", tc.name, got, tc.want)
+		if got := withoutOutputOnly(got); got != tc.want {
+			e.t.Errorf("GetBucket(%q) = %+v, want %+v (CreatedAt, Backing, Kind and Location ignored)", tc.name, got, tc.want)
 		}
 	}
 
@@ -67,10 +82,19 @@ func testBucketCreateAndGet(e *env) {
 			e.t.Errorf("ListBuckets CreatedAt %s != GetBucket CreatedAt %s for %q", fmtTime(li.CreatedAt), fmtTime(gi.CreatedAt), li.Name)
 		}
 		li.CreatedAt, gi.CreatedAt = time.Time{}, time.Time{}
-		if li != gi {
-			e.t.Errorf("ListBuckets entry %+v != GetBucket %+v", li, gi)
+		if li, gi := withoutOutputOnly(li), withoutOutputOnly(gi); li != gi {
+			e.t.Errorf("ListBuckets entry %+v != GetBucket %+v (Kind and Location ignored)", li, gi)
 		}
 	}
+}
+
+// withoutOutputOnly returns bi without the output-only fields that
+// backings with bucket kinds (s3 backings) set and others leave empty:
+// Kind and Location. They are not part of what CreateBucket stores, so
+// whole-value comparisons ignore them.
+func withoutOutputOnly(bi storage.BucketInfo) storage.BucketInfo {
+	bi.Kind, bi.Location = "", ""
+	return bi
 }
 
 func testBucketCreateWithObjectLock(e *env) {

@@ -7,6 +7,7 @@ import (
 	"errors"
 	"io/fs"
 	"os"
+	"path/filepath"
 	"regexp"
 	"strings"
 	"testing"
@@ -71,8 +72,11 @@ func TestServeGeneratedSecretNotInOutput(t *testing.T) {
 }
 
 func TestStorageSummary(t *testing.T) {
-	s3 := &config.S3Config{Endpoint: "http://minio:9000", Bucket: "bk", Prefix: "gos3/"}
-	gw := &config.S3Config{Endpoint: "https://s3.example.com", Bucket: "meta", Gateway: true}
+	s3 := &config.S3Config{Endpoint: "http://minio:9000", HomeBucket: "bk", HomePrefix: "gos3/"}
+	nat := &config.S3Config{Endpoint: "https://s3.example.com", HomeBucket: "meta", DefaultKind: config.BucketKindNative}
+	local := &config.S3Config{Endpoint: "https://s3.example.com"}
+	state := filepath.FromSlash("/state")
+	records := filepath.Join(state, config.SystemDirName, "s3", "default")
 	for _, tc := range []struct {
 		backend, path string
 		s3            *config.S3Config
@@ -81,8 +85,9 @@ func TestStorageSummary(t *testing.T) {
 		{config.BackendFS, "/data", nil, "fs at /data"},
 		{config.BackendMemory, "/state", nil, "memory (ephemeral objects; system state in /state)"},
 		{config.BackendMemory, "", nil, "memory (ephemeral: everything is lost on exit)"},
-		{config.BackendS3, "/state", s3, "s3 at http://minio:9000/bk/gos3/; system state in /state"},
-		{config.BackendS3, "", gw, "s3 at https://s3.example.com/meta/ [gateway]; system state ephemeral (IAM users, settings, placements and live backings are lost on exit)"},
+		{config.BackendS3, "/state", s3, "s3 at http://minio:9000 home bk/gos3/ (default kind wrapped); system state in /state"},
+		{config.BackendS3, "", nat, "s3 at https://s3.example.com home meta/ (default kind native); system state ephemeral (IAM users, settings, placements and live backings are lost on exit)"},
+		{config.BackendS3, state, local, "s3 at https://s3.example.com (records in " + records + "; default kind native); system state in " + state},
 	} {
 		if got := storageSummary(tc.backend, tc.path, tc.s3); got != tc.want {
 			t.Errorf("storageSummary(%s, %q) = %q, want %q", tc.backend, tc.path, got, tc.want)

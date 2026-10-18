@@ -13,9 +13,6 @@ import (
 
 // CreateMultipartUpload starts a multipart upload of bucket/key.
 func (b *Backend) CreateMultipartUpload(ctx context.Context, bucket, key string, meta storage.ObjectMeta, initiator string) (storage.UploadInfo, error) {
-	if b.opts.Gateway {
-		return storage.UploadInfo{}, errGateway
-	}
 	if err := index.ValidKey(key); err != nil {
 		return storage.UploadInfo{}, err
 	}
@@ -42,9 +39,6 @@ func (b *Backend) CreateMultipartUpload(ctx context.Context, bucket, key string,
 
 // GetMultipartUpload returns an in-progress upload of bucket/key.
 func (b *Backend) GetMultipartUpload(ctx context.Context, bucket, key, uploadID string) (storage.UploadInfo, error) {
-	if b.opts.Gateway {
-		return storage.UploadInfo{}, errGateway
-	}
 	bk, err := b.rlockBucket(ctx, bucket)
 	if err != nil {
 		return storage.UploadInfo{}, err
@@ -74,9 +68,6 @@ type partWriter struct {
 // NewPartWriter starts writing part partNumber (1..MaxPartNumber) of an
 // upload. The upload's existence is checked again at Commit.
 func (b *Backend) NewPartWriter(ctx context.Context, bucket, key, uploadID string, partNumber int) (storage.PartWriter, error) {
-	if b.opts.Gateway {
-		return nil, errGateway
-	}
 	if partNumber < 1 || partNumber > MaxPartNumber {
 		return nil, fmt.Errorf("s3store: invalid part number %d", partNumber)
 	}
@@ -175,9 +166,6 @@ func (w *partWriter) Abort() error {
 
 // ListParts returns all committed parts sorted by part number.
 func (b *Backend) ListParts(ctx context.Context, bucket, key, uploadID string) ([]storage.PartInfo, error) {
-	if b.opts.Gateway {
-		return nil, errGateway
-	}
 	bk, err := b.rlockBucket(ctx, bucket)
 	if err != nil {
 		return nil, err
@@ -203,9 +191,6 @@ func (b *Backend) ListParts(ctx context.Context, bucket, key, uploadID string) (
 
 // ListMultipartUploads returns all in-progress uploads in listing order.
 func (b *Backend) ListMultipartUploads(ctx context.Context, bucket string) ([]storage.UploadInfo, error) {
-	if b.opts.Gateway {
-		return nil, errGateway
-	}
 	bk, err := b.rlockBucket(ctx, bucket)
 	if err != nil {
 		return nil, err
@@ -222,9 +207,6 @@ func (b *Backend) ListMultipartUploads(ctx context.Context, bucket string) ([]st
 // WalkMultipartUploads calls fn for the uploads with the given key prefix
 // after position after, in listing order (see storage.UploadWalker).
 func (b *Backend) WalkMultipartUploads(ctx context.Context, bucket, prefix string, after storage.UploadPosition, fn func(storage.UploadInfo) error) error {
-	if b.opts.Gateway {
-		return errGateway
-	}
 	if fn == nil {
 		return errors.New("s3store: nil walk function")
 	}
@@ -255,9 +237,6 @@ type partSrc struct {
 // into a restic snapshot. If the preconditions fail the upload is kept.
 func (b *Backend) CompleteMultipartUploadWith(ctx context.Context, bucket, key, uploadID string, partNumbers []int,
 	meta storage.ObjectMeta, opts storage.CommitOptions, wopts storage.WriteOptions) (storage.ObjectInfo, error) {
-	if b.opts.Gateway {
-		return storage.ObjectInfo{}, errGateway
-	}
 	if err := b.checkWriteOptions(wopts); err != nil {
 		return storage.ObjectInfo{}, err
 	}
@@ -498,9 +477,6 @@ func (b *Backend) archiveParts(ctx context.Context, bk *bucket, bucket, key, upl
 
 // AbortMultipartUpload removes the upload and its parts.
 func (b *Backend) AbortMultipartUpload(ctx context.Context, bucket, key, uploadID string) error {
-	if b.opts.Gateway {
-		return errGateway
-	}
 	bk, err := b.lockBucket(ctx, bucket)
 	if err != nil {
 		return err

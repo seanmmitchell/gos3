@@ -650,6 +650,30 @@ func findVersion(bb *bbolt.Bucket, bucket, key, versionID string) (*versionRecor
 	return &rec, vk, bytes.Equal(latestKey, vk), nil
 }
 
+// newerVersions returns at most limit versions of key that are newer than
+// the one stored at vk, nearest first; the key's latest version has
+// IsLatest set (see storage.NewerVersionsDeleter).
+func newerVersions(bb *bbolt.Bucket, bucket, key string, vk []byte, limit int) ([]storage.ObjectInfo, error) {
+	p := keyVersionsPrefix(key)
+	c := bb.Bucket(subVersions).Cursor()
+	var newer []storage.ObjectInfo
+	c.Seek(vk)
+	k, v := c.Prev()
+	for ; k != nil && bytes.HasPrefix(k, p) && len(newer) < limit; k, v = c.Prev() {
+		var rec versionRecord
+		if err := decodeRecord(v, &rec); err != nil {
+			return nil, err
+		}
+		newer = append(newer, cloneInfo(rec.info(bucket, key, false)))
+	}
+	// Versions sort newest first: the last one collected is the latest
+	// when nothing of key precedes it.
+	if n := len(newer); n > 0 && (k == nil || !bytes.HasPrefix(k, p)) {
+		newer[n-1].IsLatest = true
+	}
+	return newer, nil
+}
+
 // refreshCurrent recomputes the "cur" entry of key from its newest version.
 func refreshCurrent(bb *bbolt.Bucket, key string) error {
 	cur := bb.Bucket(subCurrent)

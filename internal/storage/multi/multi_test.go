@@ -369,10 +369,10 @@ func TestMoveKeepsVersionsAndAcceptsWrites(t *testing.T) {
 	}
 	exercise(t, r, "m")
 	before := dump(t, bk[0].Backend, "m")
-	if _, err := r.Move(ctx, "m", "", "disk2"); err != nil {
+	if _, err := r.Move(ctx, "m", "", "disk2", nil); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := r.Move(ctx, "m", "", "mem"); !errors.Is(err, ErrConflict) {
+	if _, err := r.Move(ctx, "m", "", "mem", nil); !errors.Is(err, ErrConflict) {
 		t.Fatalf("second move: %v", err)
 	}
 	// Writes keep working during the move.
@@ -400,7 +400,7 @@ func TestMoveKeepsVersionsAndAcceptsWrites(t *testing.T) {
 		return errors.Is(err, storage.ErrBucketNotFound)
 	})
 	// And on to memory (fs IDs into the memory backend).
-	if _, err := r.Move(ctx, "m", "", "mem"); err != nil {
+	if _, err := r.Move(ctx, "m", "", "mem", nil); err != nil {
 		t.Fatal(err)
 	}
 	waitState(t, r, "m", StateInSync)
@@ -422,7 +422,7 @@ func TestCancelMove(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := r.Move(ctx, "c", "", "b"); err != nil {
+	if _, err := r.Move(ctx, "c", "", "b", nil); err != nil {
 		t.Fatal(err)
 	}
 	time.Sleep(100 * time.Millisecond)
@@ -546,7 +546,7 @@ func TestPlacementValidation(t *testing.T) {
 	if _, err := r.SetReplication(ctx, "nope", ModeSingle, nil); !errors.Is(err, storage.ErrBucketNotFound) {
 		t.Errorf("unknown bucket: %v", err)
 	}
-	if _, err := r.Move(ctx, "v", "", "a"); !errors.Is(err, ErrConflict) {
+	if _, err := r.Move(ctx, "v", "", "a", nil); !errors.Is(err, ErrConflict) {
 		t.Errorf("move onto itself: %v", err)
 	}
 	if _, err := r.Promote(ctx, "v", "b", false); !errors.Is(err, ErrInvalidPlacement) {

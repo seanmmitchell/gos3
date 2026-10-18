@@ -55,7 +55,14 @@ export const appRoutes = {
   policy: (id: string, name: string) => `/servers/${seg(id)}/policies/${seg(name)}`,
   settings: (id: string) => `/servers/${seg(id)}/settings`,
   storage: (id: string) => `/servers/${seg(id)}/storage`,
-  discovery: (id: string) => `/servers/${seg(id)}/discovery`
+  /** Page of one storage backing (s3 backings: remote buckets and containers). */
+  backing: (id: string, backing: string, tab?: string, query: Record<string, string> = {}) => {
+    const q = new URLSearchParams(tab ? { tab, ...query } : query).toString()
+    return `/servers/${seg(id)}/backings/${seg(backing)}${q ? `?${q}` : ''}`
+  },
+  discovery: (id: string) => `/servers/${seg(id)}/discovery`,
+  /** Background jobs (copy, mirror, restic), optionally filtered by bucket. */
+  jobs: (id: string, bucket?: string) => `/servers/${seg(id)}/jobs${bucket ? `?bucket=${encodeURIComponent(bucket)}` : ''}`
 }
 
 /** Single string route param (first element for arrays). */

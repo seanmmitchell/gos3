@@ -125,7 +125,7 @@ export function formatPolicy(doc: PolicyDocument | unknown): string {
 // Identity policy templates
 // ---------------------------------------------------------------------------
 
-export type TemplateParam = 'bucket' | 'cidr' | 'users' | 'policies'
+export type TemplateParam = 'bucket' | 'cidr' | 'users' | 'policies' | 'backings'
 
 export interface PolicyTemplateParams {
   bucket?: string
@@ -134,10 +134,12 @@ export interface PolicyTemplateParams {
   users?: string
   /** Comma separated policy names a user manager may attach. */
   policies?: string
+  /** Storage backing name or pattern (wildcards allowed), e.g. cloud-*. */
+  backings?: string
 }
 
 export interface IamPolicyTemplate {
-  id: 'readonly-bucket' | 'readwrite-bucket' | 'prefix-per-user' | 'deny-delete' | 'ip-restricted' | 'own-access-keys' | 'user-manager'
+  id: 'readonly-bucket' | 'readwrite-bucket' | 'prefix-per-user' | 'deny-delete' | 'ip-restricted' | 'own-access-keys' | 'user-manager' | 'backing-manager'
   label: string
   description: string
   /** Parameters the template needs (shown as inputs). */
@@ -157,7 +159,10 @@ const s3Arn = (bucket: string, path?: string) => `arn:aws:s3:::${bucket}${path !
 export const ADMIN_SERVICE_ARN = 'arn:gos3:admin:::*'
 
 /** Per-target admin resource types: arn:gos3:admin:::<type>/<name>. */
-export type AdminResourceType = 'user' | 'policy' | 'bucket'
+export type AdminResourceType = 'user' | 'policy' | 'bucket' | 'backing'
+
+/** The per-target admin resource types, in the order the UI lists them. */
+export const ADMIN_RESOURCE_TYPE_NAMES: readonly AdminResourceType[] = ['user', 'policy', 'bucket', 'backing']
 
 /** ARN of one admin target (wildcards allowed in policies). */
 export function adminArn(type: AdminResourceType, name: string): string {
@@ -172,7 +177,8 @@ export const ADMIN_RESOURCE_FORMS: readonly { type: AdminResourceType | 'service
   { type: 'service', arn: ADMIN_SERVICE_ARN, description: 'Every admin action and target' },
   { type: 'user', arn: adminArn('user', '<name>'), description: 'CreateUser, GetUser, UpdateUser, DeleteUser; CreateAccessKey (target user); UpdateAccessKey / DeleteAccessKey (the key\'s owner)' },
   { type: 'policy', arn: adminArn('policy', '<name>'), description: 'GetPolicy, PutPolicy, DeletePolicy' },
-  { type: 'bucket', arn: adminArn('bucket', '<name>'), description: 'GetBucket, ForceDeleteBucket, GetBucketCompression, PutBucketCompression, GetBucketEncryption, PutBucketEncryption' }
+  { type: 'bucket', arn: adminArn('bucket', '<name>'), description: 'GetBucket, CreateBucket, ForceDeleteBucket, ReleaseBucket, GetBucketCompression, PutBucketCompression, GetBucketEncryption, PutBucketEncryption, GetBucketPlacement, UpdateBucketPlacement' },
+  { type: 'backing', arn: adminArn('backing', '<name>'), description: 'ListRemoteBuckets, CreateRemoteBucket, AdoptRemoteBucket, ManageContainers (s3 backings: remote buckets and containers); also UpdateBucketPlacement, PutBucketSnapshots and GetResticCredentials for the backing a bucket\'s data is put on or whose keys are revealed' }
 ]
 
 /** Every admin action (IAM action "admin:<Action>"), see docs/admin-api.md. */
@@ -198,11 +204,20 @@ export const ADMIN_ACTIONS: readonly string[] = [
   'admin:SimulatePolicy',
   'admin:ListBuckets',
   'admin:GetBucket',
+  'admin:CreateBucket',
   'admin:ForceDeleteBucket',
+  'admin:ReleaseBucket',
   'admin:GetBucketCompression',
   'admin:PutBucketCompression',
   'admin:GetBucketEncryption',
   'admin:PutBucketEncryption',
+  'admin:ListBackings',
+  'admin:GetBucketPlacement',
+  'admin:UpdateBucketPlacement',
+  'admin:ListRemoteBuckets',
+  'admin:CreateRemoteBucket',
+  'admin:AdoptRemoteBucket',
+  'admin:ManageContainers',
   'admin:GetDiscovery',
   'admin:ProbeNetwork',
   'admin:ScanNetwork'
@@ -220,11 +235,19 @@ const ADMIN_RESOURCE_TYPES: Readonly<Record<string, AdminResourceType>> = {
   'admin:putpolicy': 'policy',
   'admin:deletepolicy': 'policy',
   'admin:getbucket': 'bucket',
+  'admin:createbucket': 'bucket',
   'admin:forcedeletebucket': 'bucket',
+  'admin:releasebucket': 'bucket',
   'admin:getbucketcompression': 'bucket',
   'admin:putbucketcompression': 'bucket',
   'admin:getbucketencryption': 'bucket',
-  'admin:putbucketencryption': 'bucket'
+  'admin:putbucketencryption': 'bucket',
+  'admin:getbucketplacement': 'bucket',
+  'admin:updatebucketplacement': 'bucket',
+  'admin:listremotebuckets': 'backing',
+  'admin:createremotebucket': 'backing',
+  'admin:adoptremotebucket': 'backing',
+  'admin:managecontainers': 'backing'
 }
 
 /** True for admin:* actions (case-insensitive prefix). */
@@ -259,14 +282,16 @@ export function adminRequestResource(resource: string): string | undefined {
   return !r || r === '*' || r === ADMIN_SERVICE_ARN ? undefined : r
 }
 
+const ADMIN_TARGET_RE = new RegExp(`^arn:gos3:admin:::(${ADMIN_RESOURCE_TYPE_NAMES.join('|')})/.+$`)
+
 /**
  * Checks a simulator resource for an admin action: empty (service level) or
- * arn:gos3:admin:::{user,policy,bucket}/<name>. Returns an error message.
+ * arn:gos3:admin:::{user,policy,bucket,backing}/<name>. Returns an error message.
  */
 export function validateAdminResource(resource: string): string | undefined {
   if (adminRequestResource(resource) === undefined) return undefined
   const r = resource.trim()
-  if (!/^arn:gos3:admin:::(user|policy|bucket)\/.+$/.test(r)) return 'Use arn:gos3:admin:::user/<name>, …:::policy/<name> or …:::bucket/<name> (empty = service level)'
+  if (!ADMIN_TARGET_RE.test(r)) return 'Use arn:gos3:admin:::user/<name>, …:::policy/<name>, …:::bucket/<name> or …:::backing/<name> (empty = service level)'
   return undefined
 }
 
@@ -319,19 +344,30 @@ export const IAM_POLICY_TEMPLATES: readonly IamPolicyTemplate[] = [
   {
     id: 'prefix-per-user',
     label: 'Home folder per user',
-    description: 'Each user may only use objects under <bucket>/<their user name>/ (${aws:username}).',
+    description: 'Each user may only use objects under <bucket>/<their user name>/ (${aws:username}). Listing shows the top level (folder names only, with delimiter "/") and everything under the user\'s own folder.',
     params: ['bucket'],
     required: ['bucket'],
     build: ({ bucket }) => {
       const b = bucketOrAll(bucket)
       return doc(
         { Sid: 'BucketLocation', Effect: 'Allow', Action: ['s3:GetBucketLocation'], Resource: [s3Arn(b)] },
+        // The top level only one level deep (delimiter "/"): folder names,
+        // not every user's keys.
+        {
+          Sid: 'ListRoot',
+          Effect: 'Allow',
+          Action: ['s3:ListBucket'],
+          Resource: [s3Arn(b)],
+          Condition: { StringEquals: { 's3:prefix': [''], 's3:delimiter': ['/'] } }
+        },
+        // The user's own folder, with its trailing "/": a bare
+        // ${aws:username} prefix would also list alice2/ for alice.
         {
           Sid: 'ListOwnPrefix',
           Effect: 'Allow',
           Action: ['s3:ListBucket'],
           Resource: [s3Arn(b)],
-          Condition: { StringLike: { 's3:prefix': ['', '${aws:username}', '${aws:username}/*'] } }
+          Condition: { StringLike: { 's3:prefix': ['${aws:username}/', '${aws:username}/*'] } }
         },
         {
           Sid: 'OwnObjects',
@@ -410,6 +446,28 @@ export const IAM_POLICY_TEMPLATES: readonly IamPolicyTemplate[] = [
         }
       )
     }
+  },
+  {
+    id: 'backing-manager',
+    label: 'Manage S3 backings',
+    description: 'Browse the remote buckets of the s3 backings matching a name pattern, create remote buckets, adopt them as native buckets and manage the containers of wrapped buckets. Creating and releasing gos3 buckets is evaluated per bucket (admin:CreateBucket, admin:ReleaseBucket on every bucket here). Use * for every backing: the console only detects grants on all backings, so with a narrower pattern it offers the actions of a backing once it could list that backing\'s remote buckets.',
+    params: ['backings'],
+    required: ['backings'],
+    build: ({ backings }) => {
+      const pattern = backings?.trim() || '*'
+      return doc(
+        { Sid: 'ListBackings', Effect: 'Allow', Action: ['admin:ListBackings'], Resource: [ADMIN_SERVICE_ARN] },
+        {
+          Sid: 'ManageRemoteBuckets',
+          Effect: 'Allow',
+          Action: ['admin:ListRemoteBuckets', 'admin:CreateRemoteBucket', 'admin:AdoptRemoteBucket', 'admin:ManageContainers'],
+          // Every backing: arn:gos3:admin:::* also matches the service level,
+          // where whoami evaluates these actions for its capabilities.
+          Resource: [pattern === '*' ? ADMIN_SERVICE_ARN : adminArn('backing', pattern)]
+        },
+        { Sid: 'CreateAndReleaseBuckets', Effect: 'Allow', Action: ['admin:CreateBucket', 'admin:ReleaseBucket'], Resource: [adminArn('bucket', '*')] }
+      )
+    }
   }
 ]
 
@@ -445,6 +503,9 @@ export function templateParamErrors(t: IamPolicyTemplate, p: PolicyTemplateParam
   }
   if (t.params.includes('users') && p.users?.trim() && !/^[\w+=,.@*?-]+$/.test(p.users.trim())) {
     out.users = 'Invalid user name or pattern'
+  }
+  if (t.params.includes('backings') && p.backings?.trim() && !/^[a-z0-9_*?-]+$/.test(p.backings.trim())) {
+    out.backings = 'Invalid backing name or pattern'
   }
   if (t.params.includes('policies') && p.policies?.trim() && p.policies.split(/[\s,]+/).filter(Boolean).some(n => !IAM_NAME_RE.test(n))) {
     out.policies = 'Invalid policy name'

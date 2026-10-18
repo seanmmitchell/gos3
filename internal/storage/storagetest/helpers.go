@@ -147,6 +147,44 @@ func (e *env) setVersioning(name string, status storage.VersioningStatus) {
 	e.noErr(fmt.Sprintf("SetBucketVersioning(%q, %q)", name, status), err)
 }
 
+// --- keys ---
+
+// key returns fixture key k as the suite uses it. With
+// Options.NoControlKeys every control character (below 0x20, and DEL)
+// becomes '!' (0x21), the lowest printable character after the space, so
+// a fixture key keeps its byte-wise order relative to the printable keys
+// around it (fixtures use control characters only to sort early).
+func (e *env) key(k string) string {
+	if !e.suite.noControlKeys {
+		return k
+	}
+	b := []byte(k) // byte-wise: control characters are never part of a multi-byte rune
+	for i, c := range b {
+		if c < 0x20 || c == 0x7f {
+			b[i] = '!'
+		}
+	}
+	return string(b)
+}
+
+// keys maps key over ks (into a new slice).
+func (e *env) keys(ks ...string) []string {
+	out := make([]string, len(ks))
+	for i, k := range ks {
+		out[i] = e.key(k)
+	}
+	return out
+}
+
+// skipIfControlKeys skips a subtest whose purpose is control-character
+// keys when Options.NoControlKeys is set.
+func (e *env) skipIfControlKeys() {
+	e.t.Helper()
+	if e.suite.noControlKeys {
+		e.t.Skip("NoControlKeys: the backend cannot store keys with control characters")
+	}
+}
+
 // --- objects ---
 
 // etagOf returns the unquoted MD5 hex of data, as the S3 layer computes it.
@@ -463,8 +501,14 @@ func (e *env) checkTime(what string, got, start time.Time) {
 
 // --- version IDs ---
 
+// maxOpaqueVersionID is the longest version ID the S3 layer accepts from
+// clients (and so the longest a backend may pass through).
+const maxOpaqueVersionID = 1024
+
 // checkVersionID verifies a generated version ID is valid: non-empty, never
-// "null", at most 64 characters and URL-safe (docs/ARCHITECTURE.md).
+// "null", at most 64 characters and URL-safe (docs/ARCHITECTURE.md). With
+// Options.OpaqueVersionIDs it applies the S3 layer's rule instead: at most
+// 1024 printable, non-space ASCII characters.
 func (e *env) checkVersionID(what, id string) {
 	e.t.Helper()
 	switch {
@@ -472,6 +516,12 @@ func (e *env) checkVersionID(what, id string) {
 		e.t.Errorf("%s: empty version ID", what)
 	case id == storage.NullVersionID:
 		e.t.Errorf("%s: version ID is %q, want a generated ID", what, id)
+	case e.suite.opaqueVersionIDs:
+		if len(id) > maxOpaqueVersionID {
+			e.t.Errorf("%s: version ID %.64q... is %d characters, want <= %d", what, id, len(id), maxOpaqueVersionID)
+		} else if i := strings.IndexFunc(id, func(r rune) bool { return r <= ' ' || r > '~' }); i >= 0 {
+			e.t.Errorf("%s: version ID %q has a character at offset %d that is not printable, non-space ASCII", what, id, i)
+		}
 	case len(id) > 64:
 		e.t.Errorf("%s: version ID %q is %d characters, want <= 64", what, id, len(id))
 	case url.QueryEscape(id) != id:

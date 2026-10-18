@@ -36,12 +36,18 @@ func (c Config) validateBackings() error {
 		}
 	}
 	names := map[string]bool{DefaultBackingName: true}
-	var places []s3Place
-	gateways := map[string]bool{}
+	var places []s3Place               // homes of s3 backings
+	homeless := map[string]bool{}      // s3 backings without a home
+	nativeDefault := map[string]bool{} // s3 backings creating native buckets by default
+	addS3 := func(key, name string, s *S3Config) {
+		if s.HasHome() {
+			places = append(places, s3Place{key, s3Server(s.Endpoint), s.HomeBucket, s.HomePrefix})
+		}
+		homeless[name] = !s.HasHome()
+		nativeDefault[name] = s.EffectiveDefaultKind() == BucketKindNative
+	}
 	if c.Storage.Backend == BackendS3 && c.Storage.S3 != nil {
-		s := c.Storage.S3
-		places = append(places, s3Place{"storage.s3", s3Server(s.Endpoint), s.Bucket, s.Prefix})
-		gateways[DefaultBackingName] = s.Gateway
+		addS3("storage.s3", DefaultBackingName, c.Storage.S3)
 	}
 	envNames := map[string]string{} // GOS3_BACKING_<NAME> part -> s3 backing name
 	for i, b := range c.Storage.Backings {
@@ -61,12 +67,12 @@ func (c Config) validateBackings() error {
 		switch b.Backend {
 		case BackendS3:
 			if b.Path != "" {
-				return fmt.Errorf("%s.path: an s3 backing has no path (its data and metadata live in the remote bucket)", key)
+				return fmt.Errorf("%s.path: an s3 backing has no path (its records live in its home or in the system directory)", key)
 			}
 			if b.S3 == nil {
 				return fmt.Errorf("%s.s3: required for an s3 backing", key)
 			}
-			if err := validateS3(key+".s3", b.Name, *b.S3); err != nil {
+			if err := validateS3(key+".s3", b.Name, *b.S3, c.SystemDir()); err != nil {
 				return err
 			}
 			if other, dup := envNames[backingEnvName(b.Name)]; dup {
@@ -74,8 +80,7 @@ func (c Config) validateBackings() error {
 					key, b.Name, other, strings.TrimSuffix(BackingEnv(b.Name, ""), "_"))
 			}
 			envNames[backingEnvName(b.Name)] = b.Name
-			places = append(places, s3Place{key + ".s3", s3Server(b.S3.Endpoint), b.S3.Bucket, b.S3.Prefix})
-			gateways[b.Name] = b.S3.Gateway
+			addS3(key+".s3", b.Name, b.S3)
 		case BackendFS:
 			if b.Path == "" {
 				return fmt.Errorf("%s.path: required for an %s backing", key, b.Backend)
@@ -97,7 +102,7 @@ func (c Config) validateBackings() error {
 		}
 	}
 	if c.Storage.Backend == BackendS3 && c.Storage.S3 != nil {
-		if err := validateS3("storage.s3", DefaultBackingName, *c.Storage.S3); err != nil {
+		if err := validateS3("storage.s3", DefaultBackingName, *c.Storage.S3, c.SystemDir()); err != nil {
 			return err
 		}
 	}
@@ -135,13 +140,14 @@ func (c Config) validateBackings() error {
 			return fmt.Errorf("storage.replication.default_replicas[%d]: %q is the default backing, where new buckets have their primary copy", i, r)
 		case slices.Contains(rp.DefaultReplicas[:i], r):
 			return fmt.Errorf("storage.replication.default_replicas[%d]: %q is listed twice", i, r)
-		case gateways[r]:
-			return fmt.Errorf("storage.replication.default_replicas[%d]: %q is an s3 gateway backing, which cannot hold replicas", i, r)
+		case homeless[r]:
+			return fmt.Errorf("storage.replication.default_replicas[%d]: %q is an s3 backing without home_bucket; "+
+				"replicas are wrapped buckets, which need a container to import into: set its home_bucket", i, r)
 		}
 	}
-	if gateways[def] && len(rp.DefaultReplicas) > 0 {
-		return fmt.Errorf("storage.replication.default_replicas: the default backing %q is an s3 gateway backing, whose buckets cannot be replicated; "+
-			"choose another storage.default_backing or remove the default replicas", def)
+	if nativeDefault[def] && len(rp.DefaultReplicas) > 0 {
+		return fmt.Errorf("storage.replication.default_replicas: new buckets on the default backing %q are native (its default_kind), "+
+			"which cannot be replicated; set its default_kind to wrapped, choose another storage.default_backing or remove the default replicas", def)
 	}
 	if rp.DefaultMode == ReplicationSingle && len(rp.DefaultReplicas) > 0 {
 		return errors.New("storage.replication.default_mode: single takes no default_replicas")

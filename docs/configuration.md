@@ -145,20 +145,21 @@ changed while running.
 
 | YAML key | Env | Flag | Default | Description |
 |---|---|---|---|---|
-| `storage.backend` | `GOS3_STORAGE_BACKEND` | `--backend` | `fs` | `fs` (files under `path`), `memory` (everything is lost on exit) or `s3` (a bucket of a remote S3 service, configured by `storage.s3`; see [backings.md](backings.md)). |
-| `storage.path` | `GOS3_DATA` | `--data` | `./data` for `fs`, empty for `memory` and `s3` | Data directory. With `fs` it holds the objects and the metadata database. With every backend it holds the system state in `<path>/.gos3/` (see [operations.md](operations.md#the-data-directory)). With `memory` or `s3` and no path the system state is ephemeral, including generated root credentials and IAM users (a warning is logged); with `memory` the whole server is. |
+| `storage.backend` | `GOS3_STORAGE_BACKEND` | `--backend` | `fs` | `fs` (files under `path`), `memory` (everything is lost on exit) or `s3` (an account of a remote S3 service, configured by `storage.s3`; see [backings.md](backings.md)). |
+| `storage.path` | `GOS3_DATA` | `--data` | `./data` for `fs`, empty for `memory` and `s3` | Data directory. With `fs` it holds the objects and the metadata database. With every backend it holds the system state in `<path>/.gos3/` (see [operations.md](operations.md#the-data-directory)), including the records of s3 backings without a home, which therefore require it. With `memory` or `s3` and no path the system state is ephemeral, including generated root credentials and IAM users (a warning is logged); with `memory` the whole server is. |
 | `storage.s3.endpoint` | `GOS3_S3_ENDPOINT` | | | `s3` backend: service URL, `http(s)://host[:port]` without a path. Required. |
 | `storage.s3.region` | `GOS3_S3_REGION` | | `us-east-1` | `s3` backend: signing region. |
-| `storage.s3.bucket` | `GOS3_S3_BUCKET` | | | `s3` backend: the remote bucket holding all data and metadata. Required; must exist. |
-| `storage.s3.prefix` | `GOS3_S3_PREFIX` | | | `s3` backend: key prefix inside the bucket. |
+| `storage.s3.home_bucket` | `GOS3_S3_HOME_BUCKET` | | | `s3` backend: the remote bucket of the backing's [home](backings.md#home-and-records), which holds gos3's records for the backing and its shared container of wrapped buckets. Optional; must exist when set. Empty: the records are kept in the system directory (requires `storage.path`). |
+| `storage.s3.home_prefix` | `GOS3_S3_HOME_PREFIX` | | | `s3` backend: key prefix of the home inside `home_bucket`; requires `home_bucket`. |
+| `storage.s3.default_kind` | `GOS3_S3_DEFAULT_KIND` | | `wrapped` with a home, else `native` | `s3` backend: [kind](backings.md#bucket-kinds) of buckets created without one, `wrapped` (requires a home) or `native`. |
 | `storage.s3.addressing` | `GOS3_S3_ADDRESSING` | | `auto` | `s3` backend: `auto`, `path` or `virtual`. |
 | `storage.s3.part_size` | `GOS3_S3_PART_SIZE` | | `16MiB` | `s3` backend: upload part size and largest single PUT to the service, 5 MiB-5 GiB. |
 | `storage.s3.access_key`, `storage.s3.secret_key` | `GOS3_S3_ACCESS_KEY`, `GOS3_S3_SECRET_KEY` | | | `s3` backend: credentials. Required. The secret is redacted by `gos3 config print`. |
-| `storage.s3.encryption_key` | `GOS3_S3_ENCRYPTION_KEY` | | | `s3` backend: key-encryption key, base64 of exactly 32 bytes (`openssl rand -base64 32`). Enables native AES256 and restic; losing it loses the encrypted objects. Redacted by `gos3 config print`. |
-| `storage.s3.gateway` | `GOS3_S3_GATEWAY` | | `false` | `s3` backend: store objects natively in remote buckets named like the gos3 buckets (no versioning or object lock). |
+| `storage.s3.encryption_key` | `GOS3_S3_ENCRYPTION_KEY` | | | `s3` backend: key-encryption key, base64 of exactly 32 bytes (`openssl rand -base64 32`). Enables native AES256 and restic on wrapped buckets, and restic repositories for [whole-bucket snapshots](encryption.md#whole-bucket-snapshots) in the home; losing it loses the encrypted objects and those snapshots. Redacted by `gos3 config print`. |
+| `storage.s3.bucket`, `storage.s3.prefix`, `storage.s3.gateway` | `GOS3_S3_BUCKET`, `GOS3_S3_PREFIX`, `GOS3_S3_GATEWAY` | | | **Deprecated** aliases: `bucket` and `prefix` mean `home_bucket` and `home_prefix`, `gateway: true` means `default_kind: native`. Accepted with a warning at startup; an alias and its replacement with different values are an error. `gos3 config print` shows the new keys. |
 | `storage.fsync_data` | `GOS3_FSYNC` | `--fsync` | `true` | fsync object data before acknowledging a write (every fs backing). `--fsync=false` is faster but can lose recent writes on power loss. |
 | `storage.backings` | `GOS3_STORAGE_BACKINGS` | | none | Additional storage backings, see [below](#storage-backings). Env syntax: comma-separated `name=/path` (fs), `name=fs:/path`, `name=memory` or `name=s3` (configured by `GOS3_BACKING_<NAME>_*`). |
-| `storage.backings[].s3.*` | `GOS3_BACKING_<NAME>_<FIELD>` | | | Settings of an s3 backing, the same keys as `storage.s3`. The variables (`<NAME>` upper-cased with `-` as `_`; `<FIELD>` `ENDPOINT`, `REGION`, `BUCKET`, `PREFIX`, `ADDRESSING`, `PART_SIZE`, `ACCESS_KEY`, `SECRET_KEY`, `ENCRYPTION_KEY` or `GATEWAY`) only fill fields left empty by the file or `backings.json`. |
+| `storage.backings[].s3.*` | `GOS3_BACKING_<NAME>_<FIELD>` | | | Settings of an s3 backing, the same keys as `storage.s3`. The variables (`<NAME>` upper-cased with `-` as `_`; `<FIELD>` `ENDPOINT`, `REGION`, `HOME_BUCKET`, `HOME_PREFIX`, `DEFAULT_KIND`, `ADDRESSING`, `PART_SIZE`, `ACCESS_KEY`, `SECRET_KEY` or `ENCRYPTION_KEY`; `BUCKET`, `PREFIX` and `GATEWAY=true` are deprecated aliases of `HOME_BUCKET`, `HOME_PREFIX` and `DEFAULT_KIND=native`) only fill fields left empty by the file or `backings.json`. |
 | `storage.default_backing` | `GOS3_DEFAULT_BACKING` | | `default` | Backing new buckets are created on. |
 | `storage.replication.default_mode` | `GOS3_REPLICATION_MODE` | | `single` | Replication of new buckets: `single`, `active-passive` or `active-active` (`active-passive` when only `default_replicas` is set). |
 | `storage.replication.default_replicas` | `GOS3_REPLICATION_REPLICAS` | | none | Backings new buckets are replicated to (comma-separated in env). Must not include the default backing. |
@@ -185,39 +186,63 @@ storage:
     - name: scratch
       backend: memory              # lost on restart
     - name: cold
-      backend: s3                  # a remote S3 bucket; no path
+      backend: s3                  # an account of a remote S3 service; no path
       s3:
         endpoint: https://s3.eu-central-1.amazonaws.com
         region: eu-central-1
-        bucket: acme-gos3-cold
-        prefix: gos3/
+        home_bucket: acme-gos3-cold  # records + shared container: wrapped buckets by default
+        home_prefix: gos3/
         # access_key, secret_key, encryption_key: or GOS3_BACKING_COLD_*
+    - name: shared
+      backend: s3                  # no home: records in /var/lib/gos3/.gos3/s3/shared/
+      s3:
+        endpoint: http://minio.lan:9000
+        # default_kind: native     # the default without a home
   default_backing: nvme            # new buckets go here
   replication:
     default_mode: active-passive   # new buckets get a replica...
     default_replicas: [archive]    # ...on archive
 ```
 
-An s3 backing keeps all of its data and metadata in the remote bucket under
-its prefix, and needs no local directory; `path` is not allowed on it. Its
-`s3` block takes the keys of `storage.s3` above, and every field can come
-from `GOS3_BACKING_<NAME>_<FIELD>` instead (filling only fields left empty).
+An s3 backing is a connection to an account of an S3 service and needs no
+local data directory; `path` is not allowed on it. Its buckets are
+**wrapped** (gos3's format inside a container, every feature) or **native**
+(objects as they are in a remote bucket of their own, which other tools
+can use); see [backings.md](backings.md#bucket-kinds). Its `s3` block takes
+the keys of `storage.s3` above, and every field can come from
+`GOS3_BACKING_<NAME>_<FIELD>` instead (filling only fields left empty).
 With the environment alone:
 
 ```sh
 GOS3_STORAGE_BACKINGS=nvme=/mnt/nvme/gos3,cold=s3
 GOS3_BACKING_COLD_ENDPOINT=https://s3.eu-central-1.amazonaws.com
-GOS3_BACKING_COLD_BUCKET=acme-gos3-cold
+GOS3_BACKING_COLD_HOME_BUCKET=acme-gos3-cold
 GOS3_BACKING_COLD_ACCESS_KEY=...
 GOS3_BACKING_COLD_SECRET_KEY=...
 ```
 
-Two s3 backings of one server cannot use the same bucket with equal or
-nested prefixes, and a gateway backing cannot be a default replica. See
-[backings.md](backings.md) for the s3 backend, its requirements (one server
-per bucket and prefix, conditional writes) and the gateway option. New
-buckets can be put on any backing with CreateBucket's `x-gos3-backing`
-header or the web UI.
+Validation of s3 backings:
+
+- `home_prefix` requires `home_bucket`; a backing without `home_bucket`
+  requires `storage.path` (its records live in the system directory).
+- `default_kind` is `wrapped` or `native`; empty means `wrapped` with a
+  home and `native` without. `wrapped` requires a home.
+- Two s3 backings of one server cannot have their homes on the same
+  service and bucket with equal or nested prefixes. Backings without a home
+  are not compared; overlapping containers and native buckets are refused
+  when they are added (see [backings.md](backings.md#containers)).
+- `storage.replication.default_replicas` cannot name an s3 backing without
+  a home (replicas are wrapped buckets, which need a container), and cannot
+  be set while new buckets on `storage.default_backing` are native (its
+  `default_kind`), because native buckets cannot be replicated.
+- A deprecated key (`bucket`, `prefix`, `gateway`) and its replacement with
+  different values are an error.
+
+See [backings.md](backings.md) for the s3 backend, its requirements (one
+server per home and per container, conditional writes) and the migration of
+earlier development builds. New buckets can be put on any backing with
+CreateBucket's `x-gos3-backing` header (and, on s3 backings,
+`x-gos3-bucket-kind`) or the web UI.
 
 Backings can also be configured live in **Storage → Configure backings** in
 the web UI. Administrators can add filesystem, memory or S3 backings, edit or
@@ -234,9 +259,9 @@ New backings added live must contain no existing buckets. Backings holding
 buckets, replicas, move targets, or pending cleanup cannot be replaced or
 removed; move their buckets and remove replicas first. The connection
 settings of an s3 backing (endpoint, region, credentials, encryption key,
-addressing, part size) can be changed while it is in use (a gateway
-backing's only while it holds no buckets); its bucket, prefix and gateway
-switch cannot. Changing the default does not move
+addressing, part size) and its `default_kind` can be changed while it is in
+use; its home (`home_bucket`, `home_prefix`, including adding or removing
+one) cannot. Changing the default does not move
 existing buckets. The selected default must not be one of the configured
 default replicas. See [backings.md](backings.md#configuring-backings-live).
 
@@ -305,7 +330,8 @@ The default `expose_headers` is `*`, `ETag`, `Content-Length`, `Content-Type`,
 `x-amz-server-side-encryption`, `x-amz-object-lock-mode`,
 `x-amz-object-lock-retain-until-date`, `x-amz-object-lock-legal-hold`,
 `x-amz-expiration`, `x-amz-restore`, `x-amz-website-redirect-location`,
-`x-amz-abort-date` and `x-amz-abort-rule-id`. The `*` makes `x-amz-meta-*`
+`x-amz-abort-date`, `x-amz-abort-rule-id`, `x-amz-bucket-region` and the
+gos3 extension headers `x-gos3-backing` and `x-gos3-bucket-kind`. The `*` makes `x-amz-meta-*`
 readable, which the web UI's metadata editor needs. The explicit names cover
 browsers that do not honour `*`. A standalone web UI only needs its origin in
 `allowed_origins`; see [web-ui.md](web-ui.md#cors).
@@ -371,6 +397,24 @@ see [operations.md](operations.md#compression).
 | `compression.min_size` | `GOS3_COMPRESSION_MIN_SIZE` | `4096` | `compression.minSize` | Objects smaller than this (when the size is known before the upload, i.e. not for chunked uploads without a length) are stored uncompressed. Bytes or `4KiB`-style. |
 | `compression.skip_content_types` | `GOS3_COMPRESSION_SKIP_CONTENT_TYPES` | compressed images, `video/*`, `audio/*`, `font/woff*`, archives, zip-based document formats (see `gos3 config print`) | `compression.skipContentTypes` | Media types stored uncompressed because they are compressed already: `type/subtype`, `type/*` or a prefix ending in `*` (case-insensitive, parameters ignored), at most 256. `[]` compresses every type. Objects with a compressing `Content-Encoding` (`gzip`, `br`, `zstd`, …) are never compressed again. |
 
+### Jobs and restic snapshots
+
+Background [jobs](jobs.md) (copy, mirror, and the snapshots, restores and
+prunes of [whole-bucket restic snapshots](encryption.md#whole-bucket-snapshots))
+and the snapshot runs themselves. The jobs and the snapshot schedules are
+managed through the admin API and the web UI; these keys only size the
+machinery. They are static: a change takes effect at the next start. The
+jobs are kept in `<data>/.gos3/jobs/` (in memory, with a warning, without a
+system directory). See [operations.md](operations.md#jobs-and-restic-snapshots).
+
+| YAML key | Env | Default | Description |
+|---|---|---|---|
+| `jobs.workers` | `GOS3_JOBS_WORKERS` | `2` | Jobs running at once, of every kind, 1–64; further jobs wait in the `queued` state. A mirror between passes does not count. The keys a single copy job copies in parallel are its own `concurrency` option (default 4). |
+| `restic.snapshots.workers` | `GOS3_RESTIC_SNAPSHOTS_WORKERS` | `1` | Whole-bucket snapshot, restore and prune jobs running restic at once, 1–64. Each also takes one of the `jobs.workers`, so a value above `jobs.workers` has no effect. |
+| `restic.snapshots.stage_dir` | `GOS3_RESTIC_SNAPSHOTS_STAGE_DIR` | `restic-stage/` in the system directory | Where snapshot runs build their trees, one subdirectory per repository and bucket, kept between runs. Needs about `spool_bytes` free, an inode per key of the largest bucket, and a file system that keeps sparse files and file times (see [operations.md](operations.md#restic-snapshot-stage)). Without a system directory (and without this setting) each run of the server uses a private temporary directory, created on first use (mode 0700) and removed at shutdown. |
+| `restic.snapshots.spool_bytes` | `GOS3_RESTIC_SNAPSHOTS_SPOOL_BYTES` | `8GiB` | Data a run writes to the stage before it saves a partial snapshot and continues from it, at least 64 MiB (a single larger object is staged whole). Bytes or `8GiB`-style. |
+| `restic.snapshots.incremental` | `GOS3_RESTIC_SNAPSHOTS_INCREMENTAL` | `true` | Stage unchanged objects as sparse placeholders, so a run reads only new and changed objects. `false` reads and stages every object at every run (restic still stores only new data). |
+
 ### Other
 
 | Env | Flag | Description |
@@ -396,7 +440,7 @@ storage:
       s3:
         endpoint: https://s3.eu-central-1.amazonaws.com
         region: eu-central-1
-        bucket: nas-gos3
+        home_bucket: nas-gos3      # wrapped buckets by default
         # credentials and encryption key from GOS3_BACKING_OFFSITE_ACCESS_KEY,
         # GOS3_BACKING_OFFSITE_SECRET_KEY and GOS3_BACKING_OFFSITE_ENCRYPTION_KEY
 cors:
@@ -463,7 +507,12 @@ gos3 config env               list the GOS3_* environment variables
 gos3 discover [flags]         find gos3 servers on the local network
 gos3 keygen [--json]          generate a random access/secret key pair (alias: gos3 keys gen)
 gos3 healthcheck [flags]      check a server's health (exit 0 = healthy)
+gos3 restic env|exec|objects|recover [flags]   a bucket's restic repositories: credentials, restic, archived objects
 ```
+
+`gos3 restic` is described in
+[encryption.md](encryption.md#the-gos3-restic-command) (`gos3 restic help`
+lists its flags).
 
 Flags can be written with one or two dashes (`-address` or `--address`). Exit
 codes are 0 (success), 1 (error) and 2 (usage error).
