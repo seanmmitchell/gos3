@@ -11,7 +11,7 @@ permissions:
 
 concurrency:
   group: ci-${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' || github.ref == 'refs/heads/dev' }}
 
 env:
   NODE_VERSION: "22"
@@ -90,6 +90,9 @@ jobs:
     name: Web UI (typecheck, test, build)
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    outputs:
+      embedded-artifact-id: ${{ steps.embedded.outputs.artifact-id }}
+      standalone-artifact-id: ${{ steps.standalone.outputs.artifact-id }}
     defaults:
       run:
         working-directory: web
@@ -110,7 +113,7 @@ jobs:
           corepack enable
           pnpm --version
           echo "PNPM_STORE=$(pnpm store path --silent)" >> "$GITHUB_ENV"
-      - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ${{ env.PNPM_STORE }}
           key: pnpm-${{ runner.os }}-${{ hashFiles('web/pnpm-lock.yaml') }}
@@ -119,7 +122,16 @@ jobs:
       - run: pnpm typecheck
       - run: pnpm test
       - name: Standalone build
-        run: pnpm build
+        run: |
+          pnpm build
+          # Keep Nitro's symlinks and file modes across artifact transfer.
+          tar -C .output -cf ui-standalone.tar .
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        id: standalone
+        with:
+          name: ci-ui-standalone
+          path: web/ui-standalone.tar
+          retention-days: 7
       - name: Embedded build
         run: pnpm generate:embed
       # Both builds above record the npm packages they ship in web/.notices.
@@ -127,8 +139,9 @@ jobs:
         working-directory: .
         run: go run ./internal/tools/notices -check
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        id: embedded
         with:
-          name: ui-embed
+          name: ci-ui-embed
           path: web/.output/public/
           retention-days: 7
 
@@ -136,9 +149,10 @@ jobs:
     name: Playwright (mocked, real server, standalone)
     runs-on: ubuntu-latest
     timeout-minutes: 45
-    needs: [go, web]
+    needs: [web]
     env:
       PLAYWRIGHT_BROWSERS_PATH: ${{ github.workspace }}/.pw-browsers
+      E2E_SKIP_UI_BUILD: "1"
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
         with:
@@ -154,13 +168,33 @@ jobs:
         run: |
           corepack enable
           echo "PNPM_STORE=$(cd web && pnpm store path --silent)" >> "$GITHUB_ENV"
-      - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ${{ env.PNPM_STORE }}
           key: pnpm-${{ runner.os }}-${{ hashFiles('web/pnpm-lock.yaml') }}
           restore-keys: pnpm-${{ runner.os }}-
-      - name: Build gos3 with the embedded UI
-        run: make build
+      # These artifacts belong to this run's web producer. Publishing builds
+      # still build their own UI in an isolated production-only job.
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          artifact-ids: ${{ needs.web.outputs.embedded-artifact-id }}
+          path: web/.output/public
+          merge-multiple: true
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          artifact-ids: ${{ needs.web.outputs.standalone-artifact-id }}
+          path: web/.e2e-cache
+          merge-multiple: true
+      - name: Prepare UI builds and gos3
+        run: |
+          cd web && pnpm install --frozen-lockfile && cd ..
+          mkdir -p web/.e2e-cache/standalone-output
+          tar -xf web/.e2e-cache/ui-standalone.tar -C web/.e2e-cache/standalone-output
+          dist=internal/webui/dist
+          find "$dist" -mindepth 1 -maxdepth 1 ! -name .keep -exec rm -rf {} +
+          cp -R web/.output/public/. "$dist/"
+          test -f "$dist/index.html" || cp "$dist/200.html" "$dist/index.html"
+          make build-go
       - name: Install Chromium
         working-directory: web
         run: pnpm exec playwright install --with-deps chromium
@@ -171,7 +205,6 @@ jobs:
         working-directory: web
         env:
           GOS3_BIN: ${{ github.workspace }}/bin/gos3
-          E2E_SKIP_UI_BUILD: "1"
         run: pnpm test:e2e:real
       - name: Standalone UI tests (cross-origin)
         working-directory: web
@@ -191,7 +224,6 @@ jobs:
     name: Compatibility (boto3, AWS CLI)
     runs-on: ubuntu-latest
     timeout-minutes: 30
-    needs: [go]
     env:
       GOS3_COMPAT_VENV: ${{ github.workspace }}/.compat-venv
     steps:
@@ -209,7 +241,7 @@ jobs:
       # A venv links to its interpreter's absolute path, so the key includes
       # the exact Python version: a runner image with a new 3.13.x starts a
       # fresh venv instead of restoring one with dangling links.
-      - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ${{ env.GOS3_COMPAT_VENV }}
           key: compat-venv-${{ runner.os }}-py${{ steps.python.outputs.python-version }}-${{ hashFiles('test/compat/requirements.txt') }}
@@ -293,3 +325,16 @@ jobs:
           fi
           GOS3_ROOT_ACCESS_KEY=ciroot GOS3_ROOT_SECRET_KEY=ciroot-secret \
             docker compose --profile ui config --quiet
+
+  dev-build:
+    name: Dev build
+    # Validate this exact push once, including every platform and deployment
+    # mode, before publishing. PR and manual CI runs never publish.
+    if: github.event_name == 'push' && github.ref == 'refs/heads/dev'
+    needs: [go, go-platforms, web, playwright, compat, docker]
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+      attestations: write
+    uses: ./.github/workflows/dev-build.yml

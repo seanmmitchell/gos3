@@ -7,6 +7,8 @@ import { attachmentDisposition, rebaseKey } from './useBrowserPaths'
 /** The S3Client methods used here. */
 export interface BrowserOpsClient {
   listObjectsV2(bucket: string, params?: ListObjectsV2Params, signal?: AbortSignal): Promise<ListResult>
+  headObject(bucket: string, key: string, opts?: { versionId?: string, checksumMode?: boolean, signal?: AbortSignal }): Promise<HeadResult>
+  deleteObject(bucket: string, key: string, versionId?: string, opts?: { ifMatch?: string, signal?: AbortSignal }): Promise<unknown>
   deleteObjects(bucket: string, objects: ObjectIdentifier[], opts?: { quiet?: boolean, signal?: AbortSignal }): Promise<DeleteObjectsResult>
   deletePrefix(bucket: string, prefix: string, opts?: { allVersions?: boolean, signal?: AbortSignal, onProgress?: (deleted: number) => void }): Promise<DeleteObjectsResult>
   copyObject(src: ObjectRef, dst: { bucket: string, key: string }, opts?: CopyObjectOptions): Promise<CopyObjectResult>
@@ -276,9 +278,9 @@ export async function aclToKeep(client: Pick<BrowserOpsClient, 'getObjectAcl'>, 
 
 /**
  * Executes a transfer plan with CopyObject (sequentially, so progress is
- * exact and the server is not flooded). With `move`, successfully copied
- * sources are deleted afterwards in batches, and objects keep their ACL
- * (see aclToKeep). Copies onto themselves are skipped. Throws, before
+ * exact and the server is not flooded). With `move`, each source is deleted
+ * only if it still has the ETag observed before copying, and objects keep
+ * their ACL (see aclToKeep). Copies onto themselves are skipped. Throws, before
  * copying anything, when an item would overwrite another item's source
  * (findTransferOverlap).
  */
@@ -293,7 +295,6 @@ export async function runTransfer(
     throw new Error(`“${overlap.dstKey}” is both copied and overwritten by this transfer (the destination is inside the source). Choose a destination outside the selected folders.`)
   }
   const result: OpResult = { done: 0, failures: [], warnings: [] }
-  const copied: ObjectIdentifier[] = []
   const total = plan.length
   for (const item of plan) {
     if (opts.signal?.aborted) break
@@ -302,23 +303,24 @@ export async function runTransfer(
       result.failures.push({ key: item.src.key, message: 'Source and destination are the same' })
       continue
     }
+    let copied = false
     try {
+      const etag = opts.move && !item.src.versionId
+        ? (await client.headObject(item.src.bucket, item.src.key, { checksumMode: false, signal: opts.signal })).etag
+        : undefined
+      if (opts.move && !item.src.versionId && !etag) throw new Error('Cannot safely move an object without a readable source ETag')
       const acl = opts.move ? await aclToKeep(client, item.src) : undefined
       await client.copyObject(item.src, { bucket: dstBucket, key: item.dstKey }, { signal: opts.signal, acl: acl === 'custom' ? undefined : acl })
+      copied = true
+      if (opts.move) await client.deleteObject(item.src.bucket, item.src.key, item.src.versionId, { ifMatch: etag })
       if (acl === 'custom') result.warnings!.push({ key: item.src.key, versionId: item.src.versionId, message: 'moved, but its custom ACL grants were not carried over (the object is private now)' })
       result.done++
-      copied.push({ key: item.src.key, versionId: item.src.versionId })
     } catch (e) {
-      if (opts.signal?.aborted) break
-      result.failures.push({ key: item.src.key, versionId: item.src.versionId, message: msg(e) })
+      if (opts.signal?.aborted && !copied) break
+      result.failures.push({ key: item.src.key, versionId: item.src.versionId, message: copied ? `copied, but the source could not be deleted: ${msg(e)}` : msg(e) })
     }
   }
   opts.onProgress?.({ done: result.done, total })
-  if (opts.move && copied.length) {
-    const srcBucket = plan[0]!.src.bucket
-    const r = await client.deleteObjects(srcBucket, copied, { quiet: false })
-    for (const e of r.errors) result.failures.push({ key: e.key, versionId: e.versionId, message: `copied, but the source could not be deleted: ${e.code}: ${e.message}` })
-  }
   return result
 }
 

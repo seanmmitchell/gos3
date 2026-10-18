@@ -64,6 +64,13 @@ Builds normally write `.nuxt/` and `.output/`. `NUXT_BUILD_DIR` and
 one without overwriting it (the standalone e2e setup builds into
 `.e2e-cache/standalone-*` this way).
 
+`pnpm test:e2e` normally builds the embedded UI first. With
+`E2E_SKIP_UI_BUILD=1`, it serves an existing embedded build; `make e2e-web`
+uses this after `make build`. CI transfers its web job's embedded and
+standalone builds by immutable artifact ID, so browser tests exercise those
+outputs without rebuilding them. The standalone preset variant still builds
+separately because it includes a different build-time `servers.json`.
+
 `pnpm test:e2e` never downloads browsers: `playwright.config.ts` uses
 `PW_CHROMIUM_PATH` or the newest `chromium-*` under `PLAYWRIGHT_BROWSERS_PATH`
 (default `/opt/pw-browsers`). `test/e2e/serve.mjs` serves `.output/public`

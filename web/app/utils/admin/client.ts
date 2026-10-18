@@ -10,7 +10,7 @@
 // there is no body), never UNSIGNED-PAYLOAD, so a captured request cannot be
 // replayed with another body. gos3 rejects admin requests with a body whose
 // payload is unsigned. Errors are thrown as AdminError.
-import { AwsClient } from 'aws4fetch'
+import { AwsClient } from '../s3/signing'
 import type {
   AccessKey,
   AccessKeyStatus,

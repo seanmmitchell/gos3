@@ -914,6 +914,10 @@ func TestWalkHugeRecords(t *testing.T) {
 // leave the persisted version pointing at nothing).
 func TestIndeterminateCommitKeepsData(t *testing.T) {
 	b, bkt := newBucket(t, storage.VersioningUnversioned)
+	// The failed commit below intentionally leaves an unreferenced old file.
+	// Finish startup recovery first so it cannot quarantine that file between
+	// the before/after counts used to check a rejected write's cleanup.
+	waitRecovery(t, b)
 	put(t, b, bkt, "k", "old")
 	boom := errors.New("fdatasync: input/output error")
 	b.commitFault = func() error { return boom }

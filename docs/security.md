@@ -303,10 +303,12 @@ itself, `root-credentials.json`, `iam.json` and `settings.json`. On Windows
 the modes above do not apply; instead gos3 gives `.gos3` a protected ACL
 (no inherited entries) that grants access only to the account running gos3,
 SYSTEM and Administrators, inherited by everything inside, and writes the
-secret files with the same ACL. If that fails (for example on a file system
-without ACLs), gos3 logs a warning and starts anyway. The fs backend's
-`.gos3/keys/` directory (encryption keys and restic recovery records) is
-handled the same way at startup, and is also made private before a new key
+secret files with the same ACL. Each fs backing protects its own `.gos3`
+before opening data or metadata, including backings outside the server's
+system directory. An fs backing fails to open if its ACL cannot be protected;
+for system state used with other backends, gos3 logs a warning and starts.
+The fs backend's `.gos3/keys/` directory (encryption keys and restic recovery
+records) is handled the same way at startup, and is also made private before a new key
 is written there; if that fails, creating the key (and so enabling
 encryption for the bucket) fails. Object data outside
 `.gos3` keeps the data directory's ACL. SSE-S3 (`AES256`) encrypts new object

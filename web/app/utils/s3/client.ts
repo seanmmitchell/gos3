@@ -9,7 +9,7 @@
 // with `x-amz-content-sha256: UNSIGNED-PAYLOAD` (aws4fetch default for s3), so
 // bodies are never hashed in the browser. Bodies that S3 requires a checksum
 // for carry Content-MD5.
-import { AwsClient } from 'aws4fetch'
+import { AwsClient } from './signing'
 import type {
   AccessControlPolicy,
   CannedACL,
@@ -784,8 +784,9 @@ export class S3Client {
    * DeleteObject. Keys with '.' / '..' segments cannot be put into a URL;
    * they are deleted with DeleteObjects (key in the request body) instead.
    */
-  async deleteObject(bucket: string, key: string, versionId?: string, opts: { bypassGovernanceRetention?: boolean, signal?: AbortSignal } = {}): Promise<DeleteObjectResult> {
+  async deleteObject(bucket: string, key: string, versionId?: string, opts: { bypassGovernanceRetention?: boolean, ifMatch?: string, signal?: AbortSignal } = {}): Promise<DeleteObjectResult> {
     if (hasDotSegment(key)) {
+      if (opts.ifMatch) throw new Error('Conditional delete is unavailable for keys with dot segments')
       const r = await this.deleteObjects(bucket, [{ key, versionId }], { quiet: false, ...opts })
       const err = r.errors[0]
       if (err) throw new S3Error({ code: err.code, message: err.message, status: 0, details: { Key: err.key } })
@@ -796,14 +797,17 @@ export class S3Client {
   }
 
   /** DeleteObject with the key in the request URL (no dot-segment fallback). */
-  private async deleteObjectByUrl(bucket: string, key: string, versionId: string | undefined, opts: { bypassGovernanceRetention?: boolean, signal?: AbortSignal }): Promise<DeleteObjectResult> {
+  private async deleteObjectByUrl(bucket: string, key: string, versionId: string | undefined, opts: { bypassGovernanceRetention?: boolean, ifMatch?: string, signal?: AbortSignal }): Promise<DeleteObjectResult> {
     const { response } = await this.send({
       method: 'DELETE',
       bucket,
       key,
       signal: opts.signal,
       query: { versionId },
-      headers: { 'x-amz-bypass-governance-retention': opts.bypassGovernanceRetention ? 'true' : undefined }
+      headers: {
+        'If-Match': opts.ifMatch ? `"${opts.ifMatch}"` : undefined,
+        'x-amz-bypass-governance-retention': opts.bypassGovernanceRetention ? 'true' : undefined
+      }
     })
     return {
       versionId: response.headers.get('x-amz-version-id') ?? undefined,
@@ -877,8 +881,26 @@ export class S3Client {
       opts.onProgress?.(total.deleted.length)
     }
     if (opts.allVersions) {
-      for await (const page of this.listObjectVersionsPages(bucket, { prefix }, opts.signal)) {
+      // Deleting a page can invalidate its VersionIdMarker (notably for
+      // imported versions on the fs backing). Resume after the last key
+      // whose versions were all on this page, then re-list any remaining
+      // versions of the boundary key.
+      let keyMarker: string | undefined
+      for (;;) {
+        const page = await this.listObjectVersions(bucket, { prefix, keyMarker }, opts.signal)
+        if (!page.versions.length) {
+          if (page.isTruncated) throw new Error('Version listing was truncated without any versions')
+          break
+        }
+        const boundaryKey = page.versions.at(-1)!.key
+        for (let i = page.versions.length - 2; i >= 0; i--) {
+          if (page.versions[i]!.key !== boundaryKey) {
+            keyMarker = page.versions[i]!.key
+            break
+          }
+        }
         await flush(page.versions.map(v => ({ key: v.key, versionId: v.versionId })))
+        if (total.errors.length || !page.isTruncated) break
       }
     } else {
       for await (const page of this.listObjectsV2Pages(bucket, { prefix }, opts.signal)) {
@@ -909,10 +931,13 @@ export class S3Client {
     return parseCopyObjectResult(body, response.headers)
   }
 
-  /** Copy then delete the source (rename). */
+  /** Copy then conditionally delete the source (rename). */
   async moveObject(src: ObjectRef, dst: { bucket: string, key: string }, opts: CopyObjectOptions = {}): Promise<CopyObjectResult> {
+    if (src.bucket === dst.bucket && src.key === dst.key && !src.versionId) throw new Error('Source and destination are the same')
+    const etag = src.versionId ? undefined : (await this.headObject(src.bucket, src.key, { checksumMode: false, signal: opts.signal })).etag
+    if (!src.versionId && !etag) throw new Error('Cannot safely move an object without a readable source ETag')
     const r = await this.copyObject(src, dst, opts)
-    await this.deleteObject(src.bucket, src.key, src.versionId)
+    await this.deleteObject(src.bucket, src.key, src.versionId, { ifMatch: etag })
     return r
   }
 

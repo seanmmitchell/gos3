@@ -461,4 +461,8 @@ ListObjectsV2, ListParts and GetObjectAttributes.
   is stored. SigV4 canonical header values are likewise trimmed of spaces
   and tabs only.
 - The admin API's force delete (`DELETE /_gos3/admin/v1/buckets/{name}?force=true`)
-  removes locked object versions too. It requires `admin:ForceDeleteBucket`.
+  requires `admin:ForceDeleteBucket` and honours Object Lock, including for
+  root. Legal holds and unexpired COMPLIANCE retention block deletion;
+  unexpired GOVERNANCE retention requires `bypassGovernanceRetention=true`
+  and `s3:BypassGovernanceRetention`. See
+  [security.md](security.md#admin-api-notes).

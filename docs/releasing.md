@@ -19,8 +19,8 @@ The rulesets in [`.github/rulesets/`](../.github/rulesets) enforce this model:
 
 | Ruleset | Applies to | Enforces |
 |---|---|---|
-| `dev` | `dev` | no deletion or force push; changes only through pull requests, squash-merged, with resolved review threads; linear history; signed commits; required checks |
-| `main` | `main` | the same, but merge commits only (no linear history), plus the `Release PR source` check, which fails unless the pull request comes from `dev` of this repository |
+| `dev` | `dev` | no deletion or force push; changes only through pull requests, squash-merged, with resolved review threads; linear history; required checks |
+| `main` | `main` | the same, but merge commits only (no linear history), signed commits required, plus the `Release PR source` check, which fails unless the pull request comes from `dev` of this repository |
 | `release-tags` | tags `v*` | release tags cannot be deleted, moved or force-pushed |
 | `release-tag-creation` | tags `v*` | only repository admins and deploy keys may create release tags (the Release workflow pushes them with a deploy key, see [below](#release-tags-and-the-release-environment)) |
 | `release-branch-names` | branches `v*` | nobody may create a branch named like a release tag (see [Build integrity](#build-integrity)) |
@@ -43,9 +43,9 @@ Notes:
   not let authors approve their own pull requests. When a second maintainer
   joins, raise `required_approving_review_count` (and consider
   `require_last_push_approval`) in both branch rulesets.
-- **Signed commits.** The commits GitHub creates when it merges a pull
-  request are signed, so squash merges into `dev` and merge commits into
-  `main` pass; commits on pull request branches do not need signatures.
+- **Signed commits on main only.** `main` requires signed commits; `dev`
+  and feature branches do not. GitHub signs the commits it creates when
+  merging pull requests.
 - **No bypass.** No one, admins included, can push to `dev` or `main`
   directly or merge without the checks, or delete or move a release tag. An
   admin can still edit or disable a ruleset, which the audit log records.
@@ -116,8 +116,19 @@ use `git describe`.
 
 ## Cutting a release
 
+The [0.2.0 overview](releases/0.2.0.md) is the baseline for the first full
+release. For future releases, update the README quick start, deployment image
+versions (including both Kubernetes manifests) and version-specific upgrade
+notes before opening the release PR.
+
 1. Open a pull request from `dev` into `main` titled `Release vX.Y.Z`, with
-   the `skip-changelog` label. Once the checks pass, merge it (merge commit).
+   the `skip-changelog` label. Describe the release for someone installing
+   gos3 for the first time: its purpose, main capabilities, changes since
+   the previous tag, installation choices, upgrade and rollback requirements,
+   known limitations and validation results. Link the release overview and
+   full comparison; a list of merged PR titles alone is not enough. State
+   which checks passed and which are still pending. Once the checks pass,
+   merge it (merge commit).
 2. Run Actions → **Release** → Run workflow on branch `main`, choosing the
    part of the version to increment: `patch`, `minor` or `major`. The first
    release, from no tags, is `minor` → `v0.1.0`.
@@ -130,10 +141,12 @@ use `git describe`.
      [build integrity](#build-integrity));
    - pushes `ghcr.io/seanmmitchell/gos3` tagged `X.Y.Z`, `X.Y`, `X` (from
      1.0.0 on) and `latest`, with BuildKit provenance, an SBOM and a signed
-     build provenance attestation; publishes the headless image under the
-     same tags with `-headless` appended, including `latest-headless`;
-   - attests the archives' build provenance, then creates the GitHub release
-     as a draft with the archives, `checksums.txt` and notes generated from
+     build provenance attestation for public-repository builds; publishes the
+     headless image under the same tags with `-headless` appended, including
+     `latest-headless`;
+   - attests the archives' build provenance for public-repository builds,
+     then creates the GitHub release as a draft with the archives,
+     `checksums.txt` and notes generated from
      the merged pull requests, grouped by label
      ([`.github/release.yml`](../.github/release.yml)), and publishes it.
 
@@ -147,7 +160,7 @@ by the release job. A published release is never rebuilt or changed.
 
 ## Verifying a release
 
-Every release archive and image from the first release after v0.1.0 on has
+Public-repository release archives and images from v0.2.0 onward have
 a [build provenance attestation](https://docs.github.com/actions/security-for-github-actions/using-artifact-attestations):
 a Sigstore-signed statement, made by the workflow run that built it, of the
 repository, workflow, branch and commit it came from. `checksums.txt` only
@@ -223,11 +236,27 @@ What keeps code that did not go through `dev` → `main` out of a release:
 
 ## Dev builds
 
-Every push to `dev` runs [`dev-build.yml`](../.github/workflows/dev-build.yml):
-the same tests and builds as a release (but with caches), published as
+Every push to `dev` runs the full [`CI`](../.github/workflows/ci.yml) suite.
+Only after all six CI jobs pass (including both platform matrix entries)
+does that same run call [`dev-build.yml`](../.github/workflows/dev-build.yml)
+to build and publish the exact `github.sha` that passed. Go and web validation
+are not repeated by the publishing build. A failed or cancelled check blocks
+publishing; a newer push cancels the previous dev run, including its build.
+Pull request and manual CI runs never publish.
+
+The dev build produces the same archives and images as a release (with
+caches), published as
 `ghcr.io/seanmmitchell/gos3:dev` and `:dev-<commit>` with an attestation
-for `--source-ref refs/heads/dev`, and with the archives kept
-as artifacts of the run for 30 days. Nothing appears on the Releases page.
+for `--source-ref refs/heads/dev` when the repository is public, and with the
+archives kept as artifacts of the run for 30 days. Nothing appears on the
+Releases page.
+
+Release builds still run their own Go and web validation and rebuild from
+the tagged SHA without caches. The reusable build's `run-tests` input defaults
+to `true`; uncached builds always validate even if that input is disabled.
+Both publishing paths build their own embedded UI with production dependencies
+only, and download it by the producing job's immutable artifact ID. CI's UI
+artifacts are reused only by its browser tests, never by a publishing build.
 
 Both release and dev builds produce headless archives for every OS and
 architecture, named `gos3_<version>_<os>_<arch>-headless.tar.gz` (`.zip` on

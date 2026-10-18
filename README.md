@@ -2,10 +2,15 @@
 
 **gos3** is an S3-compatible object storage server in a single Go binary. It
 comes with a built-in web console, IAM, versioning, object lock, lifecycle
-rules, and automatic discovery of other gos3 servers on your network.
+rules, and opt-in discovery of other gos3 servers on your network.
 
 Run `gos3 serve`, point the AWS CLI, an SDK, `mc` or rclone at it, and open
 `http://localhost:9000/_gos3/ui/`.
+
+**v0.2.0 is the first full gos3 release.** It brings together local and remote
+S3 storage, bucket replication, compression, encryption, copy/mirror jobs and
+restic backups. Start with the [0.2.0 release overview](docs/releases/0.2.0.md)
+for downloads, what's new since 0.1.0, upgrade steps and limitations.
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="docs/screenshots/dashboard-dark.png">
@@ -68,8 +73,9 @@ Run `gos3 serve`, point the AWS CLI, an SDK, `mc` or rclone at it, and open
 
 ### Binary
 
-Download an archive from the [releases](https://github.com/seanmmitchell/gos3/releases)
-(Linux, macOS, Windows; amd64 and arm64); from releases after 0.1.0 on,
+Download an archive from [v0.2.0](https://github.com/seanmmitchell/gos3/releases/tag/v0.2.0)
+(Linux, macOS, Windows; amd64 and arm64). For public-repository builds from
+v0.2.0 onward,
 `gh attestation verify <archive> --repo seanmmitchell/gos3 --source-ref refs/heads/main`
 checks that it was built by the Release workflow on `main` (see
 [verifying a release](docs/releasing.md#verifying-a-release)). Or build
@@ -94,16 +100,18 @@ bin/gos3 serve --data ./data
 ### Docker
 
 ```sh
-docker run --rm ghcr.io/seanmmitchell/gos3:0.1.0 keygen > gos3.env   # your root keys
+(umask 077; docker run --rm ghcr.io/seanmmitchell/gos3:0.2.0 keygen > gos3.env)  # private root keys
 docker run -d --name gos3 -p 127.0.0.1:9000:9000 -v gos3-data:/data --env-file gos3.env \
-  ghcr.io/seanmmitchell/gos3:0.1.0
+  ghcr.io/seanmmitchell/gos3:0.2.0
 ```
 
 This publishes the port on this machine only; use `-p 9000:9000` to serve
 the network. `X.Y.Z` and `X.Y` are releases, `latest` is the newest release,
-and `dev` follows the development branch. Releases after 0.1.0 carry signed
-build provenance:
-`gh attestation verify oci://ghcr.io/seanmmitchell/gos3:X.Y.Z --repo seanmmitchell/gos3 --source-ref refs/heads/main`.
+and `dev` follows the development branch. Public-repository builds from v0.2.0
+onward carry signed build provenance:
+`gh attestation verify oci://ghcr.io/seanmmitchell/gos3:0.2.0 --repo seanmmitchell/gos3 --source-ref refs/heads/main`.
+Builds published while the repository is private have no GitHub attestations;
+see [verification and its limits](docs/releasing.md#verifying-a-release).
 
 To build the image yourself, run `docker build -t gos3 .` or `make docker`.
 The image runs as a non-root user (uid 65532), keeps its data in `/data`, has
@@ -340,19 +348,20 @@ Details on the embedded and standalone modes, presets (`servers.json`,
 
 ## Discovery
 
-Each gos3 server publishes an identity document at `/_gos3/info` and finds
-other servers through:
+Each gos3 server publishes an identity document at `/_gos3/info`. Discovery
+defaults to off; enable `discovery.enabled` and the mechanisms you want:
 
 | Mechanism | Default | Notes |
 |---|---|---|
-| mDNS / DNS-SD `_gos3._tcp.local.` | on | LAN, zero configuration |
-| UDP multicast beacon `239.255.73.83:7373` | on | Works where mDNS is blocked; also used by the standalone UI and `gos3 discover` |
+| mDNS / DNS-SD `_gos3._tcp.local.` | off | Enable `discovery.mdns`; `discovery.advertise` enables announcements |
+| UDP multicast beacon `239.255.73.83:7373` | off | Enable `discovery.beacon`; `discovery.advertise` enables announcements |
 | Static seeds | none | `--seed http://nas:9000` |
 | DNS SRV `_gos3._tcp.<domain>` | none | For example a Kubernetes headless Service |
-| Network scan | on demand | From the UI or admin API; needs `admin:ScanNetwork` |
+| Network scan | off | Enable `discovery.allow_scan`; needs `admin:ScanNetwork` |
 
 Every candidate is verified through `/_gos3/info` before it is listed as a
-peer. `gos3 discover` lists servers from the command line. The protocol is
+peer. `gos3 discover` explicitly runs a one-shot search from the command line,
+including mDNS and beacons unless disabled for that command. The protocol is
 specified in [docs/discovery.md](docs/discovery.md).
 
 ## Security notes
@@ -391,6 +400,7 @@ More in [docs/security.md](docs/security.md).
 
 | | |
 |---|---|
+| [docs/releases/0.2.0.md](docs/releases/0.2.0.md) | first full release: capabilities, downloads, upgrade notes and limitations |
 | [docs/configuration.md](docs/configuration.md) | every YAML key, environment variable and flag |
 | [docs/deployment.md](docs/deployment.md) | Docker, Compose, systemd, Kubernetes, reverse proxies, TLS |
 | [docs/backings.md](docs/backings.md) | storage backings: S3 accounts as a backend (whole server or per bucket), native and wrapped buckets, containers, the remote bucket browser, live configuration |
@@ -422,8 +432,9 @@ cd web && pnpm dev   # UI with hot reload on http://localhost:3000
 | Target | |
 |---|---|
 | `make build` | Web UI + `bin/gos3` with the UI embedded (`make build-go`: Go only) |
-| `make test` | Go tests with `-race` plus the web unit tests (Vitest) |
-| `make e2e` | `test/e2e`: real servers in-process, driven by aws-sdk-go-v2 and minio-go |
+| `make test` | Go unit and end-to-end tests with `-race`, plus the web unit/component tests (Vitest), each once |
+| `make test-go`, `make test-web` | Only the Go unit tests or web unit/component tests |
+| `make e2e` | Only `test/e2e` with `-race`: real servers in-process, driven by aws-sdk-go-v2 and minio-go |
 | `make e2e-web` | Playwright: mocked UI, UI embedded in a real gos3, standalone UI cross-origin |
 | `make compat` | `test/compat`: boto3 / pytest and AWS CLI against a real binary |
 | `make lint`, `make fmt` | gofmt and go vet |
@@ -439,7 +450,10 @@ Repository layout:
 cmd/gos3/            CLI (serve, config, discover, keygen, healthcheck, version)
 internal/server/     wiring, top-level routing, TLS, graceful shutdown
 internal/s3/         S3 HTTP layer          internal/auth/       SigV4, chunked uploads, POST policy
-internal/storage/    backends (fs, memory)  internal/iam/        users, keys, policies
+internal/storage/    backends, replication, encryption, copying
+internal/iam/        users, keys, policies
+internal/jobs/       persistent job engine  internal/copyjob/   copy and mirror jobs
+internal/resticsnap/ whole-bucket snapshots and restores
 internal/admin/      admin JSON API         internal/discovery/  mDNS, beacon, seeds, SRV, scan
 internal/lifecycle/  lifecycle rules        internal/config/     configuration and runtime settings
 internal/metrics/    Prometheus metrics     internal/webui/      embedded UI
@@ -463,9 +477,10 @@ archives and image. Branch rules, versioning and the release steps are in
 
 ## Limitations
 
-- **Single node.** Buckets can be replicated between the backings (disks)
-  of one server, but not between servers; there is no erasure coding or
-  clustering. Discovery finds servers but does not combine them. Use backups
+- **Independent servers.** Bucket replicas belong to the backings of one
+  gos3 server; there is no erasure coding or distributed cluster. Copy/mirror
+  jobs can reach another server through an S3 backing, but discovery does
+  not combine servers or their bucket namespaces. Use backups
   (see [docs/operations.md](docs/operations.md#backups)) for durability.
 - One account: IAM users share the bucket namespace, and there is no STS and
   no session tokens.

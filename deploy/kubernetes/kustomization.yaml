@@ -33,4 +33,4 @@ images:
     # also pin the digest that `gh attestation verify` checked
     # (docs/releasing.md#verifying-a-release):
     #   digest: sha256:...
-    newTag: "0.1.0"
+    newTag: "0.2.0"

@@ -1,6 +1,8 @@
-// Small, dependency-free hashing helpers used for request body checksums.
+// Small hashing helpers used for request body checksums.
 // S3 requires Content-MD5 (or an x-amz-checksum-*) on DeleteObjects and most
 // Put*Configuration calls; WebCrypto has no MD5, so it is implemented here.
+
+import { sha256 } from '@noble/hashes/sha2.js'
 
 const encoder = new TextEncoder()
 
@@ -116,13 +118,15 @@ export function md5Base64(input: BytesInput): string {
 }
 
 // ---------------------------------------------------------------------------
-// SHA-256 (WebCrypto)
+// SHA-256 (WebCrypto when available, JavaScript on HTTP LAN origins)
 // ---------------------------------------------------------------------------
 
 /** Lower-case hex SHA-256 of input (strings are UTF-8 encoded). */
 export async function sha256Hex(input: BytesInput): Promise<string> {
   const bytes = toBytes(input)
-  return bytesToHex(new Uint8Array(await globalThis.crypto.subtle.digest('SHA-256', bytes as Uint8Array<ArrayBuffer>)))
+  const subtle = globalThis.crypto?.subtle
+  if (!subtle) return bytesToHex(sha256(bytes))
+  return bytesToHex(new Uint8Array(await subtle.digest('SHA-256', bytes as Uint8Array<ArrayBuffer>)))
 }
 
 // ---------------------------------------------------------------------------

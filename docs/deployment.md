@@ -4,10 +4,14 @@ gos3 is one static binary, available with or without the embedded web UI.
 It needs a data directory and one TCP port (9000 by default). Discovery uses UDP multicast
 (`239.255.73.83:7373`, mDNS `224.0.0.251:5353`) when it is enabled.
 
-Every gos3 server is **independent**: there is no replication or clustering.
-Running several servers gives you several sets of buckets, which discovery and
-the web UI help you find and manage. Do not put several gos3 servers behind one
-load balancer.
+Every gos3 server is **independent**. A server can replicate buckets between
+its own storage backings and copy/mirror to other S3 endpoints, but servers
+do not form a distributed cluster or share a bucket namespace. Discovery and
+the web UI help you find and manage them. Do not put several independent
+gos3 servers behind one load balancer.
+
+For the current release, start with the [0.2.0 release overview](releases/0.2.0.md)
+and its [upgrade checklist](releases/0.2.0.md#upgrading-from-010).
 
 - [Binary](#binary)
 - [Docker](#docker) and [Docker Compose](#docker-compose)
@@ -21,10 +25,10 @@ Release archives for Linux, macOS and Windows (amd64 and arm64) come in two
 variants: `gos3_X.Y.Z_<os>_<arch>.tar.gz` with the UI embedded, and
 `gos3_X.Y.Z_<os>_<arch>-headless.tar.gz` with no UI assets compiled in
 (`.zip` on Windows). Both contain a `gos3` executable (`gos3.exe` on Windows).
-The release also includes `checksums.txt` covering both variants. From the first release
-after 0.1.0, every archive and image has a signed build provenance
-attestation; check it before installing (see
-[releasing.md](releasing.md#verifying-a-release)):
+The release also includes `checksums.txt` covering both variants. From v0.2.0
+onward, public-repository builds have signed build provenance attestations;
+check them before installing. Private-repository builds skip GitHub attestations;
+see [verification and its limits](releasing.md#verifying-a-release):
 
 ```sh
 gh attestation verify gos3_X.Y.Z_linux_amd64.tar.gz \

@@ -491,6 +491,68 @@ describe('listing encoding (review fix)', () => {
   })
 })
 
+describe('safe browser deletion', () => {
+  it('conditions direct moves on the source ETag observed before copying', async () => {
+    const { client, calls } = makeClient(req => {
+      if (req.method === 'HEAD') return new Response(null, { status: 200, headers: { ETag: '"old-etag"', 'Content-Length': '3' } })
+      if (req.method === 'PUT') return xml(`<CopyObjectResult ${NS}><ETag>"old-etag"</ETag></CopyObjectResult>`)
+      if (req.method === 'DELETE') return new Response(null, { status: 204 })
+      throw new Error(`unexpected ${req.method}`)
+    })
+    await client.moveObject({ bucket: 'b', key: 'source' }, { bucket: 'b', key: 'dest' })
+    expect(calls.map(c => c.method)).toEqual(['HEAD', 'PUT', 'DELETE'])
+    expect(calls[2]?.headers['if-match']).toBe('"old-etag"')
+    await expect(client.moveObject({ bucket: 'b', key: 'source' }, { bucket: 'b', key: 'source' })).rejects.toThrow(/same/)
+    expect(calls).toHaveLength(3)
+  })
+
+  it('sends If-Match on a source delete', async () => {
+    const { client, calls } = makeClient(() => new Response(null, { status: 204 }))
+    await client.deleteObject('b', 'source', undefined, { ifMatch: 'old-etag' })
+    expect(calls[0]?.method).toBe('DELETE')
+    expect(calls[0]?.headers['if-match']).toBe('"old-etag"')
+  })
+
+  it('purges versions across a page boundary after the imported marker is deleted', async () => {
+    const remaining = [
+      { key: 'folder/a', id: 'imported-three' },
+      { key: 'folder/a', id: 'imported-two' },
+      { key: 'folder/a', id: 'imported-one' },
+      { key: 'folder/b', id: 'imported-four' }
+    ]
+    const { client, calls } = makeClient(req => {
+      const url = new URL(req.url)
+      if (req.method === 'GET' && url.searchParams.has('versions')) {
+        const keyMarker = url.searchParams.get('key-marker') ?? ''
+        const versionMarker = url.searchParams.get('version-id-marker') ?? ''
+        let start = remaining.findIndex(v => v.key > keyMarker)
+        if (versionMarker) {
+          const found = remaining.findIndex(v => v.key === keyMarker && v.id === versionMarker)
+          start = found >= 0 ? found + 1 : remaining.findIndex(v => v.key > keyMarker)
+        }
+        const page = (start < 0 ? [] : remaining.slice(start, start + 2))
+        const truncated = start >= 0 && start + page.length < remaining.length
+        const last = page.at(-1)
+        return xml(`<ListVersionsResult ${NS}><Name>b</Name><IsTruncated>${truncated}</IsTruncated><NextKeyMarker>${last?.key ?? ''}</NextKeyMarker><NextVersionIdMarker>${last?.id ?? ''}</NextVersionIdMarker>${page.map(v => `<Version><Key>${v.key}</Key><VersionId>${v.id}</VersionId><IsLatest>false</IsLatest><Size>1</Size></Version>`).join('')}</ListVersionsResult>`)
+      }
+      if (req.method === 'POST' && url.searchParams.has('delete')) {
+        const deleted = [...req.body.matchAll(/<Object><Key>([^<]+)<\/Key><VersionId>([^<]+)<\/VersionId><\/Object>/g)]
+        for (const match of deleted) {
+          const index = remaining.findIndex(v => v.key === match[1] && v.id === match[2])
+          if (index >= 0) remaining.splice(index, 1)
+        }
+        return xml(`<DeleteResult ${NS}>${deleted.map(m => `<Deleted><Key>${m[1]}</Key><VersionId>${m[2]}</VersionId></Deleted>`).join('')}</DeleteResult>`)
+      }
+      throw new Error(`unexpected ${req.method} ${req.url}`)
+    })
+    const result = await client.deletePrefix('b', 'folder/', { allVersions: true })
+    expect(result.errors).toEqual([])
+    expect(result.deleted).toHaveLength(4)
+    expect(remaining).toEqual([])
+    expect(calls.filter(c => c.method === 'GET').every(c => !new URL(c.url).searchParams.has('version-id-marker'))).toBe(true)
+  })
+})
+
 describe('upload cancellation races (review fix)', () => {
   it('does not start the XHR when canceled while the request is being signed', async () => {
     const sent: unknown[] = []

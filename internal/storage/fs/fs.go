@@ -110,6 +110,7 @@ import (
 	"go.etcd.io/bbolt"
 	berrors "go.etcd.io/bbolt/errors"
 
+	"github.com/seanmmitchell/gos3/internal/config"
 	"github.com/seanmmitchell/gos3/internal/storage"
 	"github.com/seanmmitchell/gos3/internal/storage/crypt"
 )
@@ -217,6 +218,13 @@ func Open(root string, opts Options) (*Backend, error) {
 	for _, d := range []string{b.sysDir, b.dataDir, b.tmpDir, b.uploadDir} {
 		if err := os.MkdirAll(d, dirPerm); err != nil {
 			return nil, fmt.Errorf("fs: create %s: %w", d, err)
+		}
+		if d == b.sysDir && runtime.GOOS == "windows" {
+			// Each fs backing has its own .gos3, which may be outside the
+			// server's system directory and inherit a shared parent ACL.
+			if err := config.RestrictDir(d); err != nil {
+				return nil, fmt.Errorf("fs: protect backing directory %s: %w", d, err)
+			}
 		}
 		b.tightenPerm(d)
 	}
