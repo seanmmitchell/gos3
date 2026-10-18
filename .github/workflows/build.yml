@@ -256,7 +256,9 @@ jobs:
 
   image:
     name: Container image (ghcr.io, ${{ matrix.variant.target }})
-    if: inputs.image-tags != ''
+    # Dev builds skip validation already performed by CI. Override the
+    # implicit success() check so those skipped ancestors do not skip images.
+    if: ${{ !cancelled() && needs.binaries.result == 'success' && inputs.image-tags != '' }}
     runs-on: ubuntu-latest
     timeout-minutes: 45
     # Only publish an image for a commit whose binaries built.
