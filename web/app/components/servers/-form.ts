@@ -18,6 +18,7 @@ export interface ServerFormModel {
   kind: KindChoice
   forcePathStyle: boolean
   remember: boolean
+  proxyConnectionId?: string
   color: string
   /** gos3 server ID when known (discovery prefill / detection). */
   serverId?: string
@@ -49,6 +50,7 @@ export function formFromConnection(c: Connection): ServerFormModel {
     kind: c.kind,
     forcePathStyle: c.forcePathStyle,
     remember: c.remember,
+    proxyConnectionId: c.proxyConnectionId,
     color: c.color ?? '',
     serverId: c.serverId
   }
@@ -66,6 +68,7 @@ export function formFromInput(p: Partial<ConnectionInput>): ServerFormModel {
     kind: p.kind ?? 'auto',
     forcePathStyle: p.forcePathStyle ?? true,
     remember: p.remember ?? false,
+    proxyConnectionId: p.proxyConnectionId,
     color: p.color ?? '',
     serverId: p.serverId
   }
@@ -132,6 +135,7 @@ export function formToInput(m: ServerFormModel, detected?: ConnectionKind): Conn
     kind: resolveKind(m.kind, detected),
     forcePathStyle: m.forcePathStyle,
     remember: m.remember,
+    proxyConnectionId: m.proxyConnectionId,
     color: m.color || undefined,
     serverId: m.serverId
   }
@@ -163,6 +167,7 @@ export function duplicateInput(c: Connection, existingNames: readonly string[]):
     remember: c.remember,
     source: 'user',
     serverId: c.serverId,
+    proxyConnectionId: c.proxyConnectionId,
     color: c.color
   }
 }

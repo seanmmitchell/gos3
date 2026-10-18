@@ -140,6 +140,7 @@ type api struct {
 	usage  *ttlCache[storage.BucketUsage] // per bucket
 	totals *ttlCache[storageTotals]       // key ""
 	scans  chan struct{}                  // running network scans (semaphore)
+	relays chan struct{}                  // concurrent management relay requests
 	probes chan struct{}                  // running probes (semaphore)
 }
 
@@ -156,6 +157,7 @@ func newAPI(d Deps) *api {
 	a := &api{d: d, log: d.Logger, now: time.Now,
 		scans:  make(chan struct{}, maxConcurrentScans),
 		probes: make(chan struct{}, maxConcurrentProbes),
+		relays: make(chan struct{}, 8),
 	}
 	if a.log == nil {
 		a.log = slog.Default()
@@ -368,6 +370,10 @@ func (a *api) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// (non-JSON) redirect.
 	if cleaned := path.Clean(p); cleaned != p && cleaned+"/" != p {
 		writeError(w, notFound("unknown admin API path %s", p))
+		return
+	}
+	if p == Prefix+"/proxy" {
+		a.serveProxy(w, r)
 		return
 	}
 	a.mux.ServeHTTP(w, r)

@@ -41,6 +41,7 @@ import {
   planConnectionImport,
   sameEndpoint
 } from '~/utils/connections'
+import { configureTransports, getTransport } from '~/utils/transport'
 import { S3Error } from '~/utils/s3/errors'
 
 export const LOCAL_STORAGE_KEY = 'gos3.connections.v1'
@@ -51,6 +52,7 @@ export const LEGACY_DEFAULT_SERVER_KEY = 'gos3.defaultServer.v1'
 /** Capabilities of identities without admin access (and of generic S3 servers). */
 export const NO_CAPABILITIES: Capabilities = Object.freeze({
   admin: false,
+  proxy: false,
   viewInfo: false,
   viewStats: false,
   manageConfig: false,
@@ -178,6 +180,17 @@ export const useConnectionsStore = defineStore('connections', () => {
     inflight.delete(id)
     delete statuses.value[id]
     clearClientCache(id)
+    invalidateDependents(id)
+  }
+  function invalidateDependents(id: string): void {
+    for (const c of connections.value) {
+      if (c.proxyConnectionId === id) {
+        generations.set(c.id, generation(c.id) + 1)
+        inflight.delete(c.id)
+        delete statuses.value[c.id]
+        clearClientCache(c.id)
+      }
+    }
   }
   /** True when the endpoint, credentials, region or kind differ. */
   function signingChanged(a: Connection, b: Connection): boolean {
@@ -187,6 +200,19 @@ export const useConnectionsStore = defineStore('connections', () => {
       || a.region !== b.region
       || a.kind !== b.kind
       || a.forcePathStyle !== b.forcePathStyle
+      || a.proxyConnectionId !== b.proxyConnectionId
+  }
+
+  configureTransports(id => byId(id), (id, relayId) => {
+    if (byId(id)) setStatus(id, { proxyConnectionId: relayId })
+  })
+
+  function validateRelay(c: Connection): void {
+    if (!c.proxyConnectionId) return
+    const relay = byId(c.proxyConnectionId)
+    if (c.proxyConnectionId === c.id || (relay && (relay.endpoint === c.endpoint || relay.kind !== 'gos3' || relay.proxyConnectionId))) {
+      throw new Error('Choose a different gos3 server that connects directly as the fallback relay')
+    }
   }
 
   // -- getters -------------------------------------------------------------
@@ -344,6 +370,7 @@ export const useConnectionsStore = defineStore('connections', () => {
   /** Adds a connection (endpoint is normalised; id generated if missing). */
   function add(input: ConnectionInput): Connection {
     const c = completeConnection(input)
+    validateRelay(c)
     if (byId(c.id)) throw new Error(`A connection with id "${c.id}" already exists`)
     connections.value.push(c)
     persist()
@@ -356,6 +383,8 @@ export const useConnectionsStore = defineStore('connections', () => {
     if (idx < 0) throw new Error(`Unknown connection "${id}"`)
     const prev = connections.value[idx]!
     const next = completeConnection({ ...prev, ...patch, id })
+    validateRelay(next)
+    if (next.proxyConnectionId && connections.value.some(c => c.proxyConnectionId === id)) throw new Error('A relay must connect directly')
     connections.value[idx] = next
     if (signingChanged(prev, next)) invalidate(id)
     persist()
@@ -473,10 +502,11 @@ export const useConnectionsStore = defineStore('connections', () => {
         if (existing.source === 'preset') {
           // Definition comes from the preset; credentials the user entered win
           // while the endpoint stays the same.
-          const moved = !sameEndpoint(existing.endpoint, p.endpoint)
+          const moved = !sameEndpoint(existing.endpoint, p.endpoint) || p.proxyConnectionId !== existing.proxyConnectionId
           update(id, {
             name: p.name ?? existing.name,
             endpoint: p.endpoint,
+            proxyConnectionId: p.proxyConnectionId,
             region: p.region ?? existing.region,
             kind: p.kind ?? existing.kind,
             forcePathStyle: p.forcePathStyle ?? existing.forcePathStyle,
@@ -581,21 +611,24 @@ export const useConnectionsStore = defineStore('connections', () => {
   function setStatus(id: string, s: Partial<ConnectionStatus>): ConnectionStatus {
     const next = { ...statusOf(id), ...s }
     statuses.value[id] = next
+    if (s.state && ['offline', 'unauthorized', 'error'].includes(s.state)) invalidateDependents(id)
     return next
   }
 
   async function check(c: Connection): Promise<ConnectionStatus> {
+    const transport = getTransport(c)
+    const doFetch: FetchLike = req => transport.send(req)
     const t0 = Date.now()
     const gen = generation(c.id)
     const stale = () => gen !== generation(c.id) || !byId(c.id)
     const done = (s: Partial<ConnectionStatus>) => {
       // The connection changed (e.g. new credentials) while this check ran: drop the result.
       if (stale()) return statusOf(c.id)
-      return setStatus(c.id, { error: undefined, errorCode: undefined, ...s, checkedAt: Date.now(), latencyMs: Date.now() - t0 })
+      return setStatus(c.id, { error: undefined, errorCode: undefined, ...s, proxyConnectionId: transport.proxyConnectionId, checkedAt: Date.now(), latencyMs: Date.now() - t0 })
     }
 
     if (c.kind === 'gos3') {
-      const probe = await probeServer(c.endpoint, { timeoutMs: 5000 })
+      const probe = await probeServer(c.endpoint, { timeoutMs: c.proxyConnectionId ? 15000 : 5000, fetch: doFetch })
       const info = probe.info ?? null
       if (!probe.ok && probe.error?.isNetworkError) {
         return done({ state: 'offline', info: statusOf(c.id).info, whoami: null, error: probe.error.message, errorCode: probe.error.code })
@@ -623,7 +656,7 @@ export const useConnectionsStore = defineStore('connections', () => {
     }
 
     // Generic S3: verify credentials with ListBuckets; opportunistically detect gos3.
-    const infoP = probeServer(c.endpoint, { timeoutMs: 3000 }).then(p => p.info ?? null)
+    const infoP = probeServer(c.endpoint, { timeoutMs: c.proxyConnectionId ? 15000 : 3000, fetch: doFetch }).then(p => p.info ?? null)
     if (!hasCredentials(c)) return done({ state: 'unknown', info: await infoP, whoami: null })
     try {
       await getS3Client(c).listBuckets()
@@ -665,12 +698,18 @@ export const useConnectionsStore = defineStore('connections', () => {
     return refreshStatus(id)
   }
 
+  function retestDirect(id: string): Promise<ConnectionStatus> {
+    invalidate(id)
+    return refreshStatus(id)
+  }
+
   function refreshAll(): Promise<ConnectionStatus[]> {
     return Promise.all(connections.value.map(c => refreshStatus(c.id)))
   }
 
   /** Test helper: resets all state (does not touch storage). */
   function resetState(): void {
+    clearClientCache()
     connections.value = []
     activeId.value = null
     defaultId.value = null
@@ -724,6 +763,7 @@ export const useConnectionsStore = defineStore('connections', () => {
     applyPresets,
     applyEmbedded,
     refreshStatus,
+    retestDirect,
     ensureStatus,
     refreshAll,
     resetState

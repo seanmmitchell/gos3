@@ -70,7 +70,7 @@ function row(step: ImportStep, i: number): PreviewRow {
       const of = step.instead.of
       const why = step.instead.reason === 'protected'
         ? `"${of.name}" is a built-in ${of.source === 'embedded' ? 'embedded' : 'preset'} server and is never changed by an import`
-        : `"${of.name}" points to ${of.endpoint}${step.input.kind && step.input.kind !== of.kind ? ` (${of.kind})` : ''}; it keeps its endpoint and stored credentials`
+        : `"${of.name}" points to ${of.endpoint}${step.input.kind && step.input.kind !== of.kind ? ` (${of.kind})` : ''}; it keeps its endpoint and stored credentials${step.input.proxyConnectionId !== of.proxyConnectionId ? "; its fallback relay also stays unchanged" : ""}`
       return { key, icon: 'i-lucide-copy-plus', color: 'text-warning', title: `${title} as a separate server`, detail: `Matches ${why}.` }
     }
     case 'update':

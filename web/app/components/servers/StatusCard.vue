@@ -133,6 +133,10 @@ const menu = computed<DropdownMenuItem[][]>(() => [
           <p class="mt-0.5 truncate font-mono text-xs text-muted" :title="connection.endpoint">
             {{ connection.endpoint }}
           </p>
+          <p v-if="status.proxyConnectionId" class="text-xs text-muted">
+            Connected through {{ store.byId(status.proxyConnectionId)?.name ?? 'relay' }}
+            <UButton label="Retest direct access" variant="link" size="xs" @click="store.retestDirect(connection.id)" />
+          </p>
         </div>
         <UDropdownMenu :items="menu" :content="{ align: 'end' }">
           <UButton color="neutral" variant="ghost" size="sm" icon="i-lucide-ellipsis-vertical" :aria-label="`More actions for ${connection.name}`" />

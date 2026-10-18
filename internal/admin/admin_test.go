@@ -123,7 +123,7 @@ func TestAuthorization(t *testing.T) {
 		}
 	})
 	t.Run("admin policy and root", func(t *testing.T) {
-		all := capabilities{true, true, true, true, true, true, true, true, true, true, true, true, true, true, true,
+		all := capabilities{true, true, true, true, true, true, true, true, true, true, true, true, true, true, true, true,
 			true, true, true, true, true, true, true, true, true, true, true}
 		for _, c := range []auth.Credentials{adm, rootCreds} {
 			r := e.do(&c, "GET", Prefix+"/whoami", nil)
