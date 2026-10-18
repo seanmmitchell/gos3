@@ -68,10 +68,12 @@ package multi
 
 import (
 	"context"
+	"crypto/rand"
 	"errors"
 	"fmt"
 	"log/slog"
 	"slices"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -679,6 +681,12 @@ func memberNames(ms []memberRecord) []string {
 // newBucketState builds the runtime state of a bucket. Every member but
 // the primary, and the move target, starts with a full comparison.
 func (r *Router) newBucketState(name string, rec *placementRecord) *bucketState {
+	if rec.ID == "" {
+		// Upgrade placements written before IDs existed, then persist them
+		// with the normal save at the end of Open.
+		rec = rec.clone()
+		rec.ID = strings.ToLower(rand.Text())
+	}
 	bs := &bucketState{name: name, rec: rec, members: map[string]*memberState{}}
 	for _, m := range rec.Members {
 		ms := r.newMemberState(bs, m.Backing)
@@ -796,6 +804,7 @@ func isBackingError(err error) bool {
 		storage.ErrPartNotFound, storage.ErrConfigNotFound, storage.ErrPreconditionFailed,
 		storage.ErrInvalidName, storage.ErrStopWalk, context.Canceled, context.DeadlineExceeded,
 		errors.ErrUnsupported, storage.ErrEncryptionUnavailable, storage.ErrNotSupported,
+		storage.ErrResourceLimit,
 		storage.ErrInvalidBacking, storage.ErrBucketUnavailable, storage.ErrRemoteDenied,
 		storage.ErrRemoteRejected, storage.ErrInvalidTarget, storage.ErrConflict,
 	} {

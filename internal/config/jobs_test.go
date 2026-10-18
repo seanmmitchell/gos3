@@ -10,6 +10,9 @@ func TestJobsDefaults(t *testing.T) {
 	if c.Jobs.Workers != DefaultJobsWorkers || DefaultJobsWorkers != 2 {
 		t.Errorf("jobs.workers = %d", c.Jobs.Workers)
 	}
+	if c.Restic.RestoreSpoolBytes != DefaultRestoreSpoolBytes {
+		t.Errorf("restic.restore_spool_bytes = %d", c.Restic.RestoreSpoolBytes)
+	}
 	s := c.Restic.Snapshots
 	if s.Workers != 1 || s.StageDir != "" || s.SpoolBytes != 8<<30 || !s.Incremental {
 		t.Errorf("restic.snapshots = %+v", s)
@@ -18,7 +21,7 @@ func TestJobsDefaults(t *testing.T) {
 	var z Config
 	z.Normalize()
 	if z.Jobs.Workers != DefaultJobsWorkers || z.Restic.Snapshots.Workers != DefaultSnapshotWorkers ||
-		z.Restic.Snapshots.SpoolBytes != DefaultSnapshotSpoolBytes {
+		z.Restic.Snapshots.SpoolBytes != DefaultSnapshotSpoolBytes || z.Restic.RestoreSpoolBytes != DefaultRestoreSpoolBytes {
 		t.Errorf("normalized zero config: %+v %+v", z.Jobs, z.Restic)
 	}
 }
@@ -28,6 +31,7 @@ func TestJobsKeysFromLayers(t *testing.T) {
 jobs:
   workers: 4
 restic:
+  restore_spool_bytes: 536870912
   snapshots:
     workers: 2
     stage_dir: " /var/tmp/stage "
@@ -42,12 +46,13 @@ restic:
 		t.Fatal(err)
 	}
 	s := c.Restic.Snapshots
-	if c.Jobs.Workers != 4 || s.Workers != 2 || s.StageDir != "/var/tmp/stage" || s.SpoolBytes != 1<<30 || s.Incremental {
+	if c.Jobs.Workers != 4 || c.Restic.RestoreSpoolBytes != 512<<20 || s.Workers != 2 || s.StageDir != "/var/tmp/stage" || s.SpoolBytes != 1<<30 || s.Incremental {
 		t.Fatalf("from file: %+v %+v", c.Jobs, s)
 	}
 
 	c, err = load(file, env(map[string]string{
 		"GOS3_JOBS_WORKERS":                 "8",
+		"GOS3_RESTIC_RESTORE_SPOOL_BYTES":   "256MiB",
 		"GOS3_RESTIC_SNAPSHOTS_WORKERS":     "3",
 		"GOS3_RESTIC_SNAPSHOTS_STAGE_DIR":   "/mnt/stage",
 		"GOS3_RESTIC_SNAPSHOTS_SPOOL_BYTES": "512MiB",
@@ -57,7 +62,7 @@ restic:
 		t.Fatal(err)
 	}
 	s = c.Restic.Snapshots
-	if c.Jobs.Workers != 16 || s.Workers != 3 || s.StageDir != "/mnt/stage" || s.SpoolBytes != 512<<20 || !s.Incremental {
+	if c.Jobs.Workers != 16 || c.Restic.RestoreSpoolBytes != 256<<20 || s.Workers != 3 || s.StageDir != "/mnt/stage" || s.SpoolBytes != 512<<20 || !s.Incremental {
 		t.Fatalf("env and override: %+v %+v", c.Jobs, s)
 	}
 
@@ -98,6 +103,8 @@ func TestJobsValidation(t *testing.T) {
 		{"spool min", func(c *Config) { c.Restic.Snapshots.SpoolBytes = 64 << 20 }, ""},
 		{"spool low", func(c *Config) { c.Restic.Snapshots.SpoolBytes = 64<<20 - 1 }, "restic.snapshots.spool_bytes"},
 		{"spool negative", func(c *Config) { c.Restic.Snapshots.SpoolBytes = -1 }, "restic.snapshots.spool_bytes"},
+		{"restore spool min", func(c *Config) { c.Restic.RestoreSpoolBytes = 64 << 20 }, ""},
+		{"restore spool low", func(c *Config) { c.Restic.RestoreSpoolBytes = 64<<20 - 1 }, "restic.restore_spool_bytes"},
 		{"stage dir", func(c *Config) { c.Restic.Snapshots.StageDir = "/srv/stage" }, ""},
 		{"stage dir nul", func(c *Config) { c.Restic.Snapshots.StageDir = "a\x00b" }, "restic.snapshots.stage_dir"},
 	}

@@ -68,6 +68,12 @@ func (s *Service) check(ctx context.Context, kind string, raw []byte, warn bool)
 	if err := s.checkRules(ctx, &sp, in); err != nil {
 		return Spec{}, nil, err
 	}
+	// Never trust bindings supplied in the request. Validation records the
+	// bucket incarnations that the runner must use, including across retries.
+	sp.BucketBindings = bucketBindings{Source: identityOf(in.srcInfo)}
+	if in.dstExists {
+		sp.BucketBindings.Target = identityOf(in.dstInfo)
+	}
 	if err := checkJobs(&sp, s.activeJobs(nil)); err != nil {
 		return Spec{}, nil, err
 	}

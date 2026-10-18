@@ -65,6 +65,8 @@ type Options struct {
 	Role string
 	// TempDir holds spool and restic temporary files ("" = os.TempDir()).
 	TempDir string
+	// MaxRestoreSpoolBytes caps encrypted per-object restic restores.
+	MaxRestoreSpoolBytes int64
 	// LeaseInterval and LeaseTTL tune ownership fencing (0 = defaults).
 	LeaseInterval time.Duration
 	LeaseTTL      time.Duration

@@ -176,6 +176,33 @@ func (c *evalCtx) buildLower() {
 	setDefault("aws:epochtime", strconv.FormatInt(c.now.Unix(), 10))
 }
 
+// ambiguousTagKey reports a tag condition key supplied with more than one
+// spelling. Stored tags may predate the case-insensitive duplicate check, or
+// come from a native backing. Such a tag set cannot be evaluated safely:
+// positive conditions could grant access using one value while a negated
+// Deny is defeated by the other.
+func ambiguousTagKey(raw map[string][]string) bool {
+	seen := make(map[string]struct{})
+	for key := range raw {
+		lk := strings.ToLower(key)
+		tag := false
+		for _, prefix := range []string{"s3:existingobjecttag/", "s3:requestobjecttag/", "aws:requesttag/", "aws:resourcetag/"} {
+			if strings.HasPrefix(lk, prefix) {
+				tag = true
+				break
+			}
+		}
+		if !tag {
+			continue
+		}
+		if _, ok := seen[lk]; ok {
+			return true
+		}
+		seen[lk] = struct{}{}
+	}
+	return false
+}
+
 // lookupVar resolves a policy variable (single-valued keys only).
 func (c *evalCtx) lookupVar(name string) (string, bool) {
 	v, ok := c.lookup(name)
@@ -202,7 +229,7 @@ func (c *evalCtx) actionMatches(patterns []string) bool {
 // so no s3 ARN (not even "arn:aws:s3:::*" or "arn:*") grants an admin
 // action and no admin ARN grants an s3 action. Service-level requests (no
 // resource) only match "arn:aws:s3:::*" for s3 actions and
-// "arn:gos3:admin:::*" for admin actions; per-target admin resources
+// an all-wildcard admin ARN for admin actions; per-target admin resources
 // (arn:gos3:admin:::user/<name>, ...) are glob-matched like s3 ARNs, policy
 // variables included.
 func (c *evalCtx) resourceMatches(patterns []string) bool {
@@ -214,7 +241,8 @@ func (c *evalCtx) resourceMatches(patterns []string) bool {
 			continue
 		}
 		if c.resource == "" {
-			if (c.isAdmin && p == AdminResourceARN) || (!c.isAdmin && p == s3ServiceARN) {
+			adminAll := c.isAdmin && len(p) > len(adminARNPrefix) && strings.Trim(p[len(adminARNPrefix):], "*") == ""
+			if adminAll || (!c.isAdmin && p == s3ServiceARN) {
 				return true
 			}
 			continue
@@ -458,6 +486,9 @@ func (m *Manager) authorize(req AuthzRequest, shared *budget) Decision {
 	}
 	if req.Action == "" {
 		return Decision{Reason: "missing action"}
+	}
+	if ambiguousTagKey(req.Conditions) {
+		return Decision{ExplicitDeny: true, Reason: "ambiguous tag condition keys"}
 	}
 
 	var policies []*NamedPolicy

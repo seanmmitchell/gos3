@@ -279,6 +279,20 @@ func TestTagConditionKeysCaseInsensitive(t *testing.T) {
 	})
 }
 
+func TestAmbiguousTagConditionsFailClosed(t *testing.T) {
+	m := newEvalManager(t)
+	bp := mustBucketPolicy(t, "b", `{"Statement":[
+		{"Effect":"Allow","Principal":"*","Action":"s3:GetObject","Resource":"arn:aws:s3:::b/*"},
+		{"Effect":"Deny","Principal":"*","Action":"s3:GetObject","Resource":"arn:aws:s3:::b/*",
+		 "Condition":{"StringNotEquals":{"s3:ExistingObjectTag/Env":"prod"}}}]}`)
+	runAuthzCases(t, m, []authzCase{
+		{name: "one tag value is allowed", id: anon, action: "s3:GetObject", bucket: "b", key: "k", bp: bp,
+			cond: kv("s3:ExistingObjectTag/Env", "prod"), want: true},
+		{name: "case-variant tag values are ambiguous", id: anon, action: "s3:GetObject", bucket: "b", key: "k", bp: bp,
+			cond: map[string][]string{"s3:ExistingObjectTag/Env": {"prod"}, "s3:ExistingObjectTag/env": {"dev"}}, wantDeny: true},
+	})
+}
+
 func TestMixedCaseTagDeny(t *testing.T) {
 	m := newEvalManager(t)
 	bp := mustBucketPolicy(t, "b", `{"Statement":[

@@ -301,6 +301,8 @@ func mapStorageError(err error) error {
 		return &mappedStorageError{s3: errInvalidTarget, cause: err}
 	case errors.Is(err, storage.ErrNotSupported):
 		return s3err.ErrNotImplemented.WithMessage("This operation is not supported by the bucket's backing.")
+	case errors.Is(err, storage.ErrResourceLimit):
+		return &mappedStorageError{s3: s3err.ErrServiceUnavailable, cause: err}
 	case errors.Is(err, storage.ErrBackingUnavailable):
 		// Also storage.ErrBucketUnavailable (one bucket's remote location),
 		// which wraps it.

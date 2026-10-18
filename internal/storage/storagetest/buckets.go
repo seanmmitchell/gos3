@@ -65,7 +65,7 @@ func testBucketCreateAndGet(e *env) {
 		// without one; ListBuckets must agree with GetBucket on it (below).
 		got.CreatedAt, got.Backing = time.Time{}, ""
 		if got := withoutOutputOnly(got); got != tc.want {
-			e.t.Errorf("GetBucket(%q) = %+v, want %+v (CreatedAt, Backing, Kind and Location ignored)", tc.name, got, tc.want)
+			e.t.Errorf("GetBucket(%q) = %+v, want %+v (CreatedAt, Backing, InstanceID, Kind and Location ignored)", tc.name, got, tc.want)
 		}
 	}
 
@@ -81,6 +81,9 @@ func testBucketCreateAndGet(e *env) {
 		if !li.CreatedAt.Equal(gi.CreatedAt) {
 			e.t.Errorf("ListBuckets CreatedAt %s != GetBucket CreatedAt %s for %q", fmtTime(li.CreatedAt), fmtTime(gi.CreatedAt), li.Name)
 		}
+		if li.InstanceID != gi.InstanceID {
+			e.t.Errorf("ListBuckets InstanceID %q != GetBucket InstanceID %q for %q", li.InstanceID, gi.InstanceID, li.Name)
+		}
 		li.CreatedAt, gi.CreatedAt = time.Time{}, time.Time{}
 		if li, gi := withoutOutputOnly(li), withoutOutputOnly(gi); li != gi {
 			e.t.Errorf("ListBuckets entry %+v != GetBucket %+v (Kind and Location ignored)", li, gi)
@@ -90,10 +93,10 @@ func testBucketCreateAndGet(e *env) {
 
 // withoutOutputOnly returns bi without the output-only fields that
 // backings with bucket kinds (s3 backings) set and others leave empty:
-// Kind and Location. They are not part of what CreateBucket stores, so
+// InstanceID, Kind and Location. They are not part of what CreateBucket stores, so
 // whole-value comparisons ignore them.
 func withoutOutputOnly(bi storage.BucketInfo) storage.BucketInfo {
-	bi.Kind, bi.Location = "", ""
+	bi.InstanceID, bi.Kind, bi.Location = "", "", ""
 	return bi
 }
 

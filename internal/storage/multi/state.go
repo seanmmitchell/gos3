@@ -56,7 +56,10 @@ type stateFile struct {
 // treated as immutable once published in bucketState.rec: changes build a
 // new record (clone) and swap it in.
 type placementRecord struct {
-	Mode Mode `json:"mode"`
+	// ID is generated once per bucket incarnation and survives moves and
+	// restarts. It changes when a bucket name is deleted and recreated.
+	ID   string `json:"id,omitempty"`
+	Mode Mode   `json:"mode"`
 	// Members hold a copy of the bucket; Members[0] is the primary.
 	Members []memberRecord `json:"members"`
 	Move    *moveRecord    `json:"move,omitempty"`

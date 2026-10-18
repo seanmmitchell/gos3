@@ -121,7 +121,10 @@ const (
 
 // BucketInfo describes a bucket.
 type BucketInfo struct {
-	Name              string
+	Name string
+	// InstanceID is the router's persistent identity for this incarnation
+	// of a bucket name. Member backends leave it empty.
+	InstanceID        string `json:"-"`
 	CreatedAt         time.Time
 	Region            string
 	Versioning        VersioningStatus

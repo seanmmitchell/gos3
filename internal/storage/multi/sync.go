@@ -107,10 +107,16 @@ func (r *Router) restoredLocked(bs *bucketState, key string) {
 func (r *Router) syncKey(ctx context.Context, src, dst *backing, bucket, key string, restore bool, prog *Progress) error {
 	sv, err := copier.KeyVersions(ctx, src.Backend, bucket, key)
 	if err != nil {
+		if errors.Is(err, copier.ErrTooManyVersions) {
+			return err // a key's history is not a backing failure
+		}
 		return r.observe(src, fmt.Errorf("listing %s/%s on backing %q: %w", bucket, key, src.Name, err))
 	}
 	dv, err := copier.KeyVersions(ctx, dst.Backend, bucket, key)
 	if err != nil {
+		if errors.Is(err, copier.ErrTooManyVersions) {
+			return err
+		}
 		return r.observe(dst, fmt.Errorf("listing %s/%s on backing %q: %w", bucket, key, dst.Name, err))
 	}
 	if prog != nil {

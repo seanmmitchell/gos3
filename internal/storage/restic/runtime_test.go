@@ -15,6 +15,7 @@ import (
 	"github.com/seanmmitchell/gos3/internal/s3client"
 	"github.com/seanmmitchell/gos3/internal/s3client/s3clienttest"
 	"github.com/seanmmitchell/gos3/internal/storage"
+	"github.com/seanmmitchell/gos3/internal/storage/crypt"
 	"github.com/seanmmitchell/gos3/internal/storage/restic/restictest"
 )
 
@@ -190,6 +191,101 @@ func TestRoundTrip(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+func TestRestoreSpoolQuota(t *testing.T) {
+	tooLarge := &Runtime{}
+	large, err := tooLarge.Open(t.Context(), Location{Repository: "unused"}, strings.Repeat("0", 64), DefaultRestoreSpoolBytes+1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := large.Prepare(); !errors.Is(err, ErrRestoreSpoolLimit) {
+		t.Fatalf("oversized restore: %v", err)
+	}
+	large.Close()
+
+	restictest.Install(t, "current")
+	loc, _ := localRepo(t)
+	rt := &Runtime{TempDir: t.TempDir(), MaxRestoreSpoolBytes: crypt.EncryptedSize(4) + 1}
+	other := &Runtime{TempDir: t.TempDir(), MaxRestoreSpoolBytes: crypt.EncryptedSize(4) + 1}
+	if err := rt.Prepare(t.Context(), "b1", loc, &memRecords{}); err != nil {
+		t.Fatal(err)
+	}
+	first, err := archive(t, rt, loc, "abcd")
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := archive(t, rt, loc, "efgh")
+	if err != nil {
+		t.Fatal(err)
+	}
+	a, err := rt.Open(t.Context(), loc, first, 4)
+	if err != nil || a.Prepare() != nil {
+		t.Fatalf("first restore: %v", err)
+	}
+	defer a.Close()
+	b, err := other.Open(t.Context(), loc, second, 4)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := b.Prepare(); !errors.Is(err, ErrRestoreSpoolLimit) || !errors.Is(err, storage.ErrResourceLimit) {
+		t.Fatalf("second concurrent restore: %v", err)
+	}
+	b.Close()
+	if rt.spoolBytes != crypt.EncryptedSize(4) {
+		t.Fatalf("reserved bytes = %d, want %d", rt.spoolBytes, crypt.EncryptedSize(4))
+	}
+	a.Close()
+	if rt.spoolBytes != 0 {
+		t.Fatalf("reserved bytes after close = %d", rt.spoolBytes)
+	}
+	c, err := other.Open(t.Context(), loc, second, 4)
+	if err != nil || c.Prepare() != nil {
+		t.Fatalf("restore after release: %v", err)
+	}
+	c.Close()
+	if rt.spoolBytes != 0 || other.spoolBytes != 0 {
+		t.Fatalf("reserved bytes after final close = %d and %d", rt.spoolBytes, other.spoolBytes)
+	}
+}
+
+func TestRangeRestoreSpoolsOnlyRequestedBytes(t *testing.T) {
+	restictest.Install(t, "current")
+	loc, _ := localRepo(t)
+	rt := &Runtime{TempDir: t.TempDir(), MaxRestoreSpoolBytes: crypt.EncryptedSize(3)}
+	if err := rt.Prepare(t.Context(), "b1", loc, &memRecords{}); err != nil {
+		t.Fatal(err)
+	}
+	data := strings.Repeat("0123456789", 10000)
+	snap, err := archive(t, rt, loc, data)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, start := range []int64{0, int64(len(data)) - 3} {
+		r, err := rt.Open(t.Context(), loc, snap, int64(len(data)))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := r.Seek(start, io.SeekStart); err != nil {
+			t.Fatal(err)
+		}
+		if err := r.PrepareRange(start, 3); err != nil {
+			t.Fatalf("range at %d: %v", start, err)
+		}
+		got, err := io.ReadAll(r)
+		if err != nil || string(got) != data[start:start+3] {
+			t.Fatalf("range at %d: %q, %v", start, got, err)
+		}
+		if rt.spoolBytes != crypt.EncryptedSize(3) {
+			t.Fatalf("reserved bytes = %d, want %d", rt.spoolBytes, crypt.EncryptedSize(3))
+		}
+		if err := r.Close(); err != nil {
+			t.Fatal(err)
+		}
+		if rt.spoolBytes != 0 || len(tempFiles(t, rt.TempDir)) != 0 {
+			t.Fatalf("spool not released: %d bytes, %v files", rt.spoolBytes, tempFiles(t, rt.TempDir))
+		}
 	}
 }
 

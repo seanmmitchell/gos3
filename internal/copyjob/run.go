@@ -44,6 +44,9 @@ type checkpoint struct {
 	Full bool `json:"full,omitempty"`
 	// Created: the job created the target bucket.
 	Created bool `json:"created,omitempty"`
+	// TargetIdentity pins a target created by this job. Existing targets are
+	// pinned in the normalized spec at submission.
+	TargetIdentity bucketIdentity `json:"targetIdentity,omitempty"`
 	// Configs are the configuration documents the job copied to the
 	// target (a mirror deletes them when the source drops them).
 	Configs []string `json:"configs,omitempty"`
@@ -168,6 +171,15 @@ func (r *run) execute(ctx context.Context) error {
 	if err := r.refresh(ctx); err != nil {
 		return err
 	}
+	// A resumed job must be checked against jobs submitted while it was
+	// failed or paused, including when it last stopped during preparation.
+	// A first run has no checkpoint; prepare uses olderJobs to arbitrate
+	// jobs submitted concurrently before either starts.
+	if r.phase() != "" {
+		if err := checkJobs(&r.sp, r.s.activeJobs(func(j jobs.Job) bool { return j.ID != r.job.ID })); err != nil {
+			return jobs.Permanent(err)
+		}
+	}
 	if err := r.prepare(ctx); err != nil {
 		return err
 	}
@@ -214,6 +226,25 @@ func (r *run) refresh(ctx context.Context) error {
 		return jobs.Permanent(fmt.Errorf("the target bucket %q no longer exists", r.sp.Target.Bucket))
 	}
 	r.in = in
+	if r.sp.BucketBindings.Source.empty() || !r.sp.BucketBindings.Source.matches(in.srcInfo) {
+		return jobs.Permanent(fmt.Errorf("the source bucket %q was replaced; submit a new job", r.sp.Source.Bucket))
+	}
+	if in.dstExists {
+		want := r.sp.BucketBindings.Target
+		if want.empty() {
+			want = r.cp.TargetIdentity
+		}
+		switch {
+		case !want.empty() && !want.matches(in.dstInfo):
+			return jobs.Permanent(fmt.Errorf("the target bucket %q was replaced; submit a new job", r.sp.Target.Bucket))
+		case want.empty() && !r.created():
+			return jobs.Permanent(fmt.Errorf("the target bucket %q appeared after submission; submit a new job", r.sp.Target.Bucket))
+		case want.empty() && r.phase() != phasePreparing:
+			return jobs.Permanent(fmt.Errorf("the target bucket %q has no saved identity; submit a new job", r.sp.Target.Bucket))
+		}
+	} else if !r.sp.BucketBindings.Target.empty() || !r.cp.TargetIdentity.empty() {
+		return jobs.Permanent(fmt.Errorf("the target bucket %q no longer exists", r.sp.Target.Bucket))
+	}
 	r.identity = in.identity()
 	mode := modeFingerprint
 	if r.identity {
@@ -257,6 +288,21 @@ func (r *run) prepare(ctx context.Context) error {
 		if !r.in.dstExists {
 			return fmt.Errorf("the target bucket %q was not created", r.sp.Target.Bucket)
 		}
+	}
+	if created && r.cp.TargetIdentity.empty() {
+		r.setCP(func(cp *checkpoint) { cp.TargetIdentity = identityOf(r.in.dstInfo) })
+		// Do not write any copied data until the created bucket's identity
+		// is durable. An ordinary progress checkpoint may be skipped on a
+		// storage error, but this binding is required for a safe retry.
+		r.cpMu.Lock()
+		cp := r.cp
+		r.cpMu.Unlock()
+		if err := r.h.SaveCheckpoint(cp); err != nil {
+			return fmt.Errorf("saving the created target's identity: %w", err)
+		}
+		r.cpMu.Lock()
+		r.cpDirty, r.cpSavedAt = false, time.Now()
+		r.cpMu.Unlock()
 	}
 	if !created && r.sp.Options.OnExisting == OnExistingFail {
 		empty, err := rangeEmpty(ctx, r.s.router, r.sp.Target.Bucket, r.sp.Target.Prefix)
@@ -751,6 +797,7 @@ func (r *run) flush() {
 // backings, buckets or encryption, a router shutting down.
 func transient(err error) bool {
 	return errors.Is(err, storage.ErrBackingUnavailable) || errors.Is(err, storage.ErrEncryptionUnavailable) ||
+		errors.Is(err, storage.ErrResourceLimit) ||
 		errors.Is(err, multi.ErrClosed)
 }
 
@@ -759,7 +806,7 @@ func transient(err error) bool {
 func impossible(err error) bool {
 	for _, e := range []error{
 		copier.ErrPlaintext, copier.ErrEncryptionUnsupported, copier.ErrRetention, copier.ErrNoImport,
-		copier.ErrNotVersioned, storage.ErrBucketNotFound, jobs.ErrInvalidSpec, jobs.ErrConflict,
+		copier.ErrNotVersioned, copier.ErrTooManyVersions, storage.ErrBucketNotFound, jobs.ErrInvalidSpec, jobs.ErrConflict,
 	} {
 		if errors.Is(err, e) {
 			return true

@@ -120,6 +120,8 @@ var ErrClosed = errors.New("fs: backend closed")
 
 // Options configures Open.
 type Options struct {
+	// MaxRestoreSpoolBytes caps encrypted per-object restic restores.
+	MaxRestoreSpoolBytes int64
 	// FsyncData fsyncs every data file (and its directory) before the
 	// metadata referencing it is committed. Slower, but committed objects
 	// survive power loss.
@@ -148,18 +150,19 @@ const (
 type Backend struct {
 	// keyMu guards keys, the cache of bucket master keys by bucket ID
 	// (see bucketKey).
-	keyMu     sync.RWMutex
-	keys      map[string]*bucketKeyEntry
-	root      string
-	sysDir    string
-	dataDir   string
-	tmpDir    string
-	uploadDir string
-	orphanDir string
-	retention time.Duration
-	fsync     bool
-	log       *slog.Logger
-	db        *bbolt.DB
+	keyMu                sync.RWMutex
+	keys                 map[string]*bucketKeyEntry
+	root                 string
+	sysDir               string
+	dataDir              string
+	tmpDir               string
+	uploadDir            string
+	orphanDir            string
+	retention            time.Duration
+	maxRestoreSpoolBytes int64
+	fsync                bool
+	log                  *slog.Logger
+	db                   *bbolt.DB
 
 	closed atomic.Bool
 	cancel context.CancelFunc
@@ -197,12 +200,13 @@ func Open(root string, opts Options) (*Backend, error) {
 		return nil, fmt.Errorf("fs: resolve root: %w", err)
 	}
 	b := &Backend{
-		root:         abs,
-		sysDir:       filepath.Join(abs, ".gos3"),
-		fsync:        opts.FsyncData,
-		log:          opts.Logger,
-		recoveryDone: make(chan struct{}),
-		pending:      pendingSet{m: make(map[string]int)},
+		maxRestoreSpoolBytes: opts.MaxRestoreSpoolBytes,
+		root:                 abs,
+		sysDir:               filepath.Join(abs, ".gos3"),
+		fsync:                opts.FsyncData,
+		log:                  opts.Logger,
+		recoveryDone:         make(chan struct{}),
+		pending:              pendingSet{m: make(map[string]int)},
 	}
 	if b.log == nil {
 		b.log = slog.New(slog.DiscardHandler)

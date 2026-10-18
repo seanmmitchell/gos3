@@ -10,7 +10,43 @@ import (
 
 	"github.com/seanmmitchell/gos3/internal/storage"
 	storagefs "github.com/seanmmitchell/gos3/internal/storage/fs"
+	"github.com/seanmmitchell/gos3/internal/storage/restic/restictest"
 )
+
+func TestMain(m *testing.M) { restictest.Main(m) }
+
+func TestResticRangeDoesNotSpoolWholeObject(t *testing.T) {
+	restictest.Install(t, "current")
+	b, err := storagefs.Open(t.TempDir(), storagefs.Options{MaxRestoreSpoolBytes: 64})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer b.Close()
+	ctx := t.Context()
+	if err := b.CreateBucket(ctx, "archive", storage.CreateBucketOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	data := bytes.Repeat([]byte("abcdefghij"), 100)
+	w, err := b.NewObjectWriterWith(ctx, "archive", "key", storage.WriteOptions{Encryption: storage.EncryptionRestic})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := w.Write(data); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := w.Commit(ctx, storage.ObjectMeta{}, storage.CommitOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	e := newTestEnv(t, withOptions(func(o *Options) { o.Backend = b }))
+	r := e.signed("GET", "/archive/key", nil, objHdr("Range", "bytes=999-999"))
+	if r.StatusCode != http.StatusPartialContent || string(r.Data) != "j" {
+		t.Fatalf("ranged GET: %d %q", r.StatusCode, r.Data)
+	}
+	r = e.signed("GET", "/archive/key", nil, nil)
+	if r.StatusCode != http.StatusServiceUnavailable || r.code() != "ServiceUnavailable" {
+		t.Fatalf("full GET exceeding spool quota: %d %s", r.StatusCode, r.code())
+	}
+}
 
 func TestResticRejectsRecursiveRepositoryWrites(t *testing.T) {
 	e := newTestEnv(t)

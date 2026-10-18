@@ -86,6 +86,22 @@ func TestZipWalkPairsKeys(t *testing.T) {
 	}
 }
 
+func TestVersionHistoryLimit(t *testing.T) {
+	src := memEndpoint(t, "source", "", storage.VersioningEnabled)
+	dst := memEndpoint(t, "target", "", storage.VersioningEnabled)
+	for range MaxKeyVersions + 1 {
+		putText(t, src, "hot", "x")
+	}
+	if _, err := KeyVersions(t.Context(), src.Backend, src.Bucket, "hot"); !errors.Is(err, ErrTooManyVersions) {
+		t.Fatalf("KeyVersions: %v", err)
+	}
+	called := false
+	err := ZipWalk(t.Context(), src, dst, "", true, func([]KeyPair) error { called = true; return nil })
+	if !errors.Is(err, ErrTooManyVersions) || called {
+		t.Fatalf("ZipWalk: error %v, callback called %t", err, called)
+	}
+}
+
 func TestZipWalkResumes(t *testing.T) {
 	src, dst := zipFixture(t)
 	for _, tc := range []struct {
