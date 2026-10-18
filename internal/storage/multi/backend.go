@@ -364,6 +364,7 @@ func (r *Router) ListBuckets(ctx context.Context) ([]storage.BucketInfo, error) 
 			if in, ok := m[bs.name]; ok {
 				bs.cacheInfo(in)
 				in.Backing = r.primaryOf(bs)
+				in.InstanceID = r.instanceID(bs)
 				out = append(out, in)
 				found = true
 				break
@@ -378,6 +379,7 @@ func (r *Router) ListBuckets(ctx context.Context) ([]storage.BucketInfo, error) 
 		if cached := bs.info.Load(); cached != nil {
 			in := *cached
 			in.Backing = r.primaryOf(bs)
+			in.InstanceID = r.instanceID(bs)
 			out = append(out, in)
 			continue
 		}
@@ -565,8 +567,15 @@ func (r *Router) GetBucket(ctx context.Context, name string) (storage.BucketInfo
 	if err == nil {
 		bs.cacheInfo(info)
 		info.Backing = r.primaryOf(bs)
+		info.InstanceID = r.instanceID(bs)
 	}
 	return info, err
+}
+
+func (r *Router) instanceID(bs *bucketState) string {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return bs.rec.ID
 }
 
 // primaryOf returns the name of the backing holding bs's primary copy.

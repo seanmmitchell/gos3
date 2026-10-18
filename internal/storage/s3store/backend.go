@@ -189,7 +189,7 @@ func Open(opts Options) (*Backend, error) {
 		client: opts.Client, kek: opts.KEK, partSize: opts.PartSize,
 		endpoint: opts.Endpoint, region: opts.Region, accessKey: opts.AccessKey, secretKey: opts.SecretKey, pathStyle: opts.PathStyle,
 	})
-	b.restic = &restic.Runtime{Log: opts.Logger, TempDir: opts.TempDir}
+	b.restic = &restic.Runtime{Log: opts.Logger, TempDir: opts.TempDir, MaxRestoreSpoolBytes: opts.MaxRestoreSpoolBytes}
 	b.recovery.b = b
 	b.recoveryHeads = maxRecoveryHeads
 	eng, err := NewEngine(EngineOptions{

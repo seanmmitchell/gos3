@@ -2,6 +2,8 @@ package copier
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"maps"
 	"reflect"
 	"slices"
@@ -9,6 +11,13 @@ import (
 
 	"github.com/seanmmitchell/gos3/internal/storage"
 )
+
+// MaxKeyVersions bounds the history held in memory while copying or
+// replicating one key. A larger history fails explicitly before any writes
+// to that key, instead of growing with untrusted listing size.
+const MaxKeyVersions = 4096
+
+var ErrTooManyVersions = errors.New("copier: too many versions of one key")
 
 // Comparison helpers shared with the multi router's replication.
 
@@ -84,6 +93,9 @@ func KeyVersions(ctx context.Context, b storage.Backend, bucket, key string) ([]
 	err := b.WalkVersions(ctx, bucket, key, "", "", func(oi storage.ObjectInfo) error {
 		if oi.Key != key {
 			return storage.ErrStopWalk
+		}
+		if len(out) >= MaxKeyVersions {
+			return fmt.Errorf("%w: %s/%s exceeds %d", ErrTooManyVersions, bucket, key, MaxKeyVersions)
 		}
 		out = append(out, oi)
 		return nil

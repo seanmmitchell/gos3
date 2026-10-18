@@ -224,7 +224,8 @@ func TestRegressionPrepareConnectionMissesContainerLoadedInWindow(t *testing.T) 
 
 type prepReader struct{ io.ReadSeekCloser }
 
-func (prepReader) Prepare() error { return nil }
+func (prepReader) Prepare() error                  { return nil }
+func (prepReader) PrepareRange(int64, int64) error { return nil }
 
 // R4: the error-classifying reader of non-home containers hides
 // storage.PreparingReader (restic readers).
@@ -237,6 +238,9 @@ func TestRegressionWrapReaderHidesPrepare(t *testing.T) {
 	out := c.wrapReader(in)
 	if _, ok := out.(storage.PreparingReader); !ok {
 		t.Errorf("BUG: container.wrapReader drops storage.PreparingReader (%T)", out)
+	}
+	if _, ok := out.(storage.RangePreparingReader); !ok {
+		t.Errorf("container.wrapReader drops storage.RangePreparingReader (%T)", out)
 	}
 }
 

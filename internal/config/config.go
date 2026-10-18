@@ -255,6 +255,9 @@ type JobsConfig struct {
 // ResticConfig configures gos3's use of restic beyond the per-version
 // archive (which needs no settings).
 type ResticConfig struct {
+	// RestoreSpoolBytes caps encrypted temporary data reserved by
+	// concurrent per-object restores across the server. Static.
+	RestoreSpoolBytes int64 `yaml:"restore_spool_bytes"`
 	// Snapshots configures the runs of whole-bucket snapshots.
 	Snapshots ResticSnapshotsConfig `yaml:"snapshots"`
 }

@@ -665,7 +665,7 @@ func TestBackingKindsAndBackend(t *testing.T) {
 // Failures of one bucket's remote location, refusals by a remote service
 // and invalid targets are not failures of the backing.
 func TestBucketErrorsAreNotBackingFailures(t *testing.T) {
-	for _, s := range []error{storage.ErrBucketUnavailable, storage.ErrRemoteDenied, storage.ErrRemoteRejected, storage.ErrInvalidTarget} {
+	for _, s := range []error{storage.ErrBucketUnavailable, storage.ErrRemoteDenied, storage.ErrRemoteRejected, storage.ErrInvalidTarget, storage.ErrResourceLimit} {
 		if isBackingError(fmt.Errorf("x: %w", s)) {
 			t.Errorf("%v counted as a backing failure", s)
 		}

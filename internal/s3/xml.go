@@ -217,13 +217,16 @@ func validateTags(tags []Tag, max int, tooMany string) (map[string]string, error
 		return nil, s3err.ErrInvalidTag.WithMessage("%s", tooMany)
 	}
 	m := make(map[string]string, len(tags))
+	folded := make(map[string]struct{}, len(tags))
 	for _, t := range tags {
 		if err := validateTag(t.Key, t.Value); err != nil {
 			return nil, err
 		}
-		if _, dup := m[t.Key]; dup {
+		key := strings.ToLower(t.Key)
+		if _, dup := folded[key]; dup {
 			return nil, s3err.ErrInvalidTag.WithMessage("Cannot provide multiple Tags with the same key")
 		}
+		folded[key] = struct{}{}
 		m[t.Key] = t.Value
 	}
 	return m, nil

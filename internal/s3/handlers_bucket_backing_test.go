@@ -70,6 +70,7 @@ func TestBackingErrorMapping(t *testing.T) {
 		{storage.ErrInvalidBacking, "InvalidArgument", 400},
 		{storage.ErrNotSupported, "NotImplemented", 501},
 		{fmt.Errorf("wrapped: %w", storage.ErrBackingUnavailable), "ServiceUnavailable", 503},
+		{storage.ErrResourceLimit, "ServiceUnavailable", 503},
 	} {
 		var se *s3err.Error
 		if !errors.As(mapStorageError(tc.err), &se) || se.Code != tc.code || se.HTTPStatus != tc.status {

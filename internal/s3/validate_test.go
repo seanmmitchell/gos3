@@ -178,14 +178,15 @@ func TestTags(t *testing.T) {
 		t.Fatal(m, err)
 	}
 	for name, tags := range map[string][]Tag{
-		"dup":        {{"a", "1"}, {"a", "2"}},
-		"empty key":  {{"", "1"}},
-		"long key":   {{strings.Repeat("k", 129), ""}},
-		"long value": {{"k", strings.Repeat("v", 257)}},
-		"aws prefix": {{"AWS:x", "1"}},
-		"bad char":   {{"a<b", "1"}},
-		"bad value":  {{"a", "1;2"}},
-		"too many":   make([]Tag, 11),
+		"dup":              {{"a", "1"}, {"a", "2"}},
+		"case-variant dup": {{"Env", "prod"}, {"env", "dev"}},
+		"empty key":        {{"", "1"}},
+		"long key":         {{strings.Repeat("k", 129), ""}},
+		"long value":       {{"k", strings.Repeat("v", 257)}},
+		"aws prefix":       {{"AWS:x", "1"}},
+		"bad char":         {{"a<b", "1"}},
+		"bad value":        {{"a", "1;2"}},
+		"too many":         make([]Tag, 11),
 	} {
 		if name == "too many" {
 			for i := range tags {
