@@ -1032,9 +1032,12 @@ Supply-chain rules:
   to check the web dependencies; CI does not currently run that command.
 - **Release builds.** Releases are built without GitHub Actions caches (which
   any job on `dev` can write), the shipped UI is built without the test-only
-  npm packages, and archives and images carry signed build provenance
-  attestations (`gh attestation verify`). See
-  [releasing.md](releasing.md#build-integrity).
+  npm packages, and new archives and images built from the public gos3
+  repository carry signed build provenance attestations (`gh attestation verify`).
+  Older artifacts, including v0.2.0, were built while the repository was private
+  and have no GitHub attestations. See
+  [release verification](releasing.md#verifying-a-release) and
+  [build integrity](releasing.md#build-integrity).
 - **License notices.** `THIRD_PARTY_NOTICES` reproduces the licenses of
   everything gos3 ships: the Go standard library, the Go modules linked into
   the binary on every release platform, and the npm packages that the web UI
@@ -1052,6 +1055,9 @@ Neither is part of the embedded UI, which is static files, nor of the
 standalone UI server bundle (`web/.output/server`).
 
 ## Reporting vulnerabilities
+
+gos3's source and [issue tracker](https://github.com/seanmmitchell/gos3/issues)
+are public. Use public issues for ordinary bugs and feature requests.
 
 Please report security issues privately to the maintainers, for example via
 GitHub's private vulnerability reporting on the repository, and not in public

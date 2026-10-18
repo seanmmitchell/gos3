@@ -1,6 +1,8 @@
 # Deployment
 
-gos3 is one static binary, available with or without the embedded web UI.
+gos3 is public on [GitHub](https://github.com/seanmmitchell/gos3) under the
+[MIT license](../LICENSE). It is one static binary, available with or without
+the embedded web UI.
 It needs a data directory and one TCP port (9000 by default). Discovery uses UDP multicast
 (`239.255.73.83:7373`, mDNS `224.0.0.251:5353`) when it is enabled.
 
@@ -25,15 +27,18 @@ Release archives for Linux, macOS and Windows (amd64 and arm64) come in two
 variants: `gos3_X.Y.Z_<os>_<arch>.tar.gz` with the UI embedded, and
 `gos3_X.Y.Z_<os>_<arch>-headless.tar.gz` with no UI assets compiled in
 (`.zip` on Windows). Both contain a `gos3` executable (`gos3.exe` on Windows).
-The release also includes `checksums.txt` covering both variants. From v0.2.0
-onward, public-repository builds have signed build provenance attestations;
-check them before installing. Private-repository builds skip GitHub attestations;
-see [verification and its limits](releasing.md#verifying-a-release):
+The release also includes `checksums.txt` covering both variants. New releases
+built from the public repository have signed build provenance attestations.
+Check an attested release before installing:
 
 ```sh
 gh attestation verify gos3_X.Y.Z_linux_amd64.tar.gz \
   --repo seanmmitchell/gos3 --source-ref refs/heads/main
 ```
+
+v0.2.0 was built while the repository was private and has no GitHub
+attestations. Making the repository public does not add attestations to older
+artifacts; see [verification and its limits](releasing.md#verifying-a-release).
 
 To build from source you need Go 1.26.9 or newer (`go.mod` requires it, for
 the standard library's security fixes), Node.js 22 and pnpm (via corepack):
@@ -102,12 +107,15 @@ docker logs gos3                    # banner: endpoints, UI URL, credentials sou
 `-p 127.0.0.1:9000:9000` publishes the port on the host's loopback only;
 drop the address (`-p 9000:9000`) to serve the network. The published images
 are `ghcr.io/seanmmitchell/gos3:X.Y.Z` (also `X.Y` and `latest`); deploy a
-version, not `latest`, and pin its digest after verifying it:
+version, not `latest`, and pin its digest after verifying it. For releases built
+after gos3 became public, verify the signed provenance:
 
 ```sh
 gh attestation verify oci://ghcr.io/seanmmitchell/gos3:X.Y.Z \
   --repo seanmmitchell/gos3 --source-ref refs/heads/main
 ```
+
+The v0.2.0 images predate the visibility change and have no GitHub attestations.
 
 Image defaults:
 

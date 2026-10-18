@@ -4,6 +4,11 @@ Nuxt 4 SPA (TypeScript strict, Nuxt UI v4, Pinia) that manages one or more S3
 servers — gos3 or any S3-compatible service — with gos3-only extras (IAM,
 settings, metrics, discovery) through the admin API.
 
+The web UI is part of the public, MIT-licensed
+[gos3 repository](https://github.com/seanmmitchell/gos3). Report bugs in the
+[public issue tracker](https://github.com/seanmmitchell/gos3/issues) and target
+pull requests at `dev`; see the [development guide](../README.md#development).
+
 It ships in two modes from one codebase:
 
 | Mode | Build | Served by | Notes |

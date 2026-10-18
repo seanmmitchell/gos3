@@ -545,8 +545,9 @@ migrations are covered separately below.
 1. Read the release notes.
 2. Back up the data directory (see above).
 3. Check archive checksums and verify the archive or image with
-   `gh attestation verify` when an attestation is available. Builds made
-   while the repository is private skip GitHub attestations; see
+   `gh attestation verify` for releases built after gos3 became public.
+   Older artifacts, including v0.2.0, were built while the repository was
+   private and have no GitHub attestations; see
    [verification and its limits](releasing.md#verifying-a-release).
 4. Replace the binary or image (on Kubernetes, raise `newTag`, and `digest`
    if you pin one, in `kustomization.yaml`), and restart.

@@ -4,6 +4,10 @@
 comes with a built-in web console, IAM, versioning, object lock, lifecycle
 rules, and opt-in discovery of other gos3 servers on your network.
 
+gos3 is public on [GitHub](https://github.com/seanmmitchell/gos3) under the
+[MIT license](LICENSE). Source, documentation, releases and the
+[issue tracker](https://github.com/seanmmitchell/gos3/issues) are publicly accessible.
+
 Run `gos3 serve`, point the AWS CLI, an SDK, `mc` or rclone at it, and open
 `http://localhost:9000/_gos3/ui/`.
 
@@ -74,12 +78,14 @@ for downloads, what's new since 0.1.0, upgrade steps and limitations.
 ### Binary
 
 Download an archive from [v0.2.0](https://github.com/seanmmitchell/gos3/releases/tag/v0.2.0)
-(Linux, macOS, Windows; amd64 and arm64). For public-repository builds from
-v0.2.0 onward,
+(Linux, macOS, Windows; amd64 and arm64). Check the archive against the release's
+`checksums.txt`. Releases built after gos3 became public also carry signed
+build provenance:
 `gh attestation verify <archive> --repo seanmmitchell/gos3 --source-ref refs/heads/main`
-checks that it was built by the Release workflow on `main` (see
-[verifying a release](docs/releasing.md#verifying-a-release)). Or build
-it with Go 1.26.9 or newer, Node.js 22 and pnpm:
+checks that an attested archive was built by the Release workflow on `main`.
+v0.2.0 was built before the repository became public and has no GitHub
+attestations; see [verifying a release](docs/releasing.md#verifying-a-release).
+Or build it with Go 1.26.9 or newer, Node.js 22 and pnpm:
 
 ```sh
 make build                      # web UI + bin/gos3 with the UI embedded
@@ -107,10 +113,10 @@ docker run -d --name gos3 -p 127.0.0.1:9000:9000 -v gos3-data:/data --env-file g
 
 This publishes the port on this machine only; use `-p 9000:9000` to serve
 the network. `X.Y.Z` and `X.Y` are releases, `latest` is the newest release,
-and `dev` follows the development branch. Public-repository builds from v0.2.0
-onward carry signed build provenance:
-`gh attestation verify oci://ghcr.io/seanmmitchell/gos3:0.2.0 --repo seanmmitchell/gos3 --source-ref refs/heads/main`.
-Builds published while the repository is private have no GitHub attestations;
+and `dev` follows the development branch. Images built after gos3 became public
+carry signed build provenance. For an attested release, verify its version with
+`gh attestation verify oci://ghcr.io/seanmmitchell/gos3:X.Y.Z --repo seanmmitchell/gos3 --source-ref refs/heads/main`.
+The v0.2.0 images predate the visibility change and have no GitHub attestations;
 see [verification and its limits](docs/releasing.md#verifying-a-release).
 
 To build the image yourself, run `docker build -t gos3 .` or `make docker`.
@@ -416,6 +422,11 @@ More in [docs/security.md](docs/security.md).
 | [docs/releasing.md](docs/releasing.md) | branches, branch rules, versioning, releases and dev builds |
 
 ## Development
+
+Clone the public repository with `git clone https://github.com/seanmmitchell/gos3.git`.
+Report bugs and feature requests in the [issue tracker](https://github.com/seanmmitchell/gos3/issues),
+and submit pull requests against `dev`. Report vulnerabilities privately as
+described in [docs/security.md](docs/security.md#reporting-vulnerabilities).
 
 Requirements: Go 1.26.9 or newer, Node.js 22 with corepack (pnpm), and
 optionally Docker and Python 3 (for the compatibility suite). `go.mod`
