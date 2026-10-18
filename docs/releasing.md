@@ -1,5 +1,11 @@
 # Branches, releases and versioning
 
+gos3 is a public, [MIT-licensed](../LICENSE)
+[GitHub repository](https://github.com/seanmmitchell/gos3). Source, pull requests,
+workflow runs and releases are publicly accessible. New release and dev builds
+publish signed GitHub attestations; older artifacts retain the verification
+limits described [below](#verifying-a-release).
+
 ## Branches
 
 | Branch | Holds | Receives | Merge method |
@@ -141,10 +147,10 @@ notes before opening the release PR.
      [build integrity](#build-integrity));
    - pushes `ghcr.io/seanmmitchell/gos3` tagged `X.Y.Z`, `X.Y`, `X` (from
      1.0.0 on) and `latest`, with BuildKit provenance, an SBOM and a signed
-     build provenance attestation for public-repository builds; publishes the
+     build provenance attestation; publishes the
      headless image under the same tags with `-headless` appended, including
      `latest-headless`;
-   - attests the archives' build provenance for public-repository builds,
+   - attests the archives' build provenance,
      then creates the GitHub release as a draft with the archives,
      `checksums.txt` and notes generated from
      the merged pull requests, grouped by label
@@ -160,7 +166,7 @@ by the release job. A published release is never rebuilt or changed.
 
 ## Verifying a release
 
-Public-repository release archives and images from v0.2.0 onward have
+Release archives and images built after gos3 became public have
 a [build provenance attestation](https://docs.github.com/actions/security-for-github-actions/using-artifact-attestations):
 a Sigstore-signed statement, made by the workflow run that built it, of the
 repository, workflow, branch and commit it came from. `checksums.txt` only
@@ -187,10 +193,16 @@ verified digest (`sha256:…`); deploy that digest (for example `digest:` in
 `deploy/kubernetes/kustomization.yaml`) rather than a tag, which can be
 pushed again.
 
-GitHub stores attestations only for public repositories (private ones need
-GitHub Enterprise Cloud), so the workflows skip the attestation steps while
-the repository is private; builds from that time have none to verify, and
-only `checksums.txt` and the image's BuildKit provenance are available.
+**Older artifacts:** v0.2.0 was built while gos3 was private, and its archive
+and image attestation steps were
+[skipped](https://github.com/seanmmitchell/gos3/actions/runs/39091054901).
+Use its `checksums.txt` and the images' BuildKit provenance; GitHub attestation
+verification is unavailable for those artifacts. Making the repository public
+does not add attestations to past builds, and a published release must not be
+rebuilt to add them.
+
+The workflows retain their repository-visibility guards for private forks.
+In the public gos3 repository, both archive and image attestation steps run.
 
 ## Build integrity
 
@@ -247,7 +259,7 @@ Pull request and manual CI runs never publish.
 The dev build produces the same archives and images as a release (with
 caches), published as
 `ghcr.io/seanmmitchell/gos3:dev` and `:dev-<commit>` with an attestation
-for `--source-ref refs/heads/dev` when the repository is public, and with the
+for `--source-ref refs/heads/dev`, and with the
 archives kept as artifacts of the run for 30 days. Nothing appears on the
 Releases page.
 

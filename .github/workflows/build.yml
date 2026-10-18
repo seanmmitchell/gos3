@@ -330,9 +330,8 @@ jobs:
           sbom: true
       # Verify with: gh attestation verify oci://ghcr.io/<owner>/<repo>:<tag>
       #   --repo <owner>/<repo> --source-ref refs/heads/main (docs/releasing.md)
-      # GitHub stores attestations only for public repositories (and private
-      # ones on GitHub Enterprise Cloud); for a user-owned private repository
-      # it refuses them, so the step is skipped while gos3 is private.
+      # gos3 is public, so this step runs. Keep the visibility guard for
+      # private forks, where GitHub may not support artifact attestations.
       - name: Attest build provenance
         if: github.event.repository.visibility == 'public'
         uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
