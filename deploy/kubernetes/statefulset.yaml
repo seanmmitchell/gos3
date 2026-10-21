@@ -37,7 +37,7 @@ spec:
           # A release tag (set in kustomization.yaml), pulled only when the
           # node does not have it. Pin the digest too (kustomization.yaml)
           # so a re-pushed tag cannot change what runs.
-          image: ghcr.io/seanmmitchell/gos3:0.2.0
+          image: ghcr.io/seanmmitchell/gos3:0.2.2
           args: ["serve"]
           ports:
             - name: gos3

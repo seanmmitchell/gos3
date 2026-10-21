@@ -903,7 +903,7 @@ seeds, DNS SRV and active scans; every candidate is verified by fetching
 
 ## Build, test & conventions
 
-- Go ≥ 1.26.9 (`go.mod`'s `go` line; toolchain auto). `gofmt`, `go vet` clean. Std `log/slog`.
+- Go ≥ 1.26.10 (`go.mod`'s `go` line; toolchain auto). `gofmt`, `go vet` clean. Std `log/slog`.
   Stdlib `net/http` (Go 1.22+ mux patterns OK for the admin API).
 - Allowed third-party Go deps (already in go.mod): `go.etcd.io/bbolt`,
   `github.com/miekg/dns`, `gopkg.in/yaml.v3`, and for tests only
