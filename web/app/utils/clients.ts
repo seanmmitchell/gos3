@@ -27,7 +27,7 @@ export function getS3Client(conn: ClientConn): S3Client {
     secretAccessKey: conn.secretAccessKey,
     forcePathStyle: conn.forcePathStyle,
     transport: {
-      send: req => getTransport(conn).send(req),
+      send: (req, send) => getTransport(conn).send(req, send, true),
       presign: (url, expires) => getTransport(conn).presign(url, expires)
     }
   })

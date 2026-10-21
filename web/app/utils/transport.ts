@@ -10,6 +10,12 @@ export interface RequestTransport {
   presign(destination: string, expiresSeconds: number): Promise<string>
 }
 type Sender = (request: Request) => Promise<Response>
+// The destination signs before the browser uploads to the relay, which then
+// spools and verifies the entire body. Header signatures expire after 15 min.
+// Budget for a slow 16 KiB/s upload plus one hour, up to SigV4's 7-day limit.
+function relayWriteExpiresSeconds(size: number): number {
+  return Math.min(604800, Math.ceil(size / (16 * 1024)) + 3600)
+}
 let resolveConnection: (id: string) => Connection | undefined = () => undefined
 let routeChanged: (id: string, relayId?: string) => void = () => {}
 const transports = new Map<string, { signature: string, transport: ConnectionTransport }>()
@@ -86,21 +92,37 @@ export class ConnectionTransport {
       routeChanged(this.connection.id, this.connection.proxyConnectionId)
     }
   }
-  private async prepare(request: Request): Promise<Request> {
+  private async prepare(request: Request, s3Write: boolean): Promise<Request> {
     const relay = await this.relay()
-    const url = new URL(relay.endpoint + '/_gos3/admin/v1/proxy')
-    url.searchParams.set('request', metadata(request))
     const body = await request.blob()
     const digest = await bodyHash(body)
+    let destination = request
+    if (s3Write && body.size && request.method !== 'GET' && request.method !== 'HEAD') {
+      // A presigned destination request remains valid while the relay receives
+      // a slow upload. Pin its exact bytes in both the signed query and header.
+      const url = new URL(request.url)
+      url.searchParams.set('X-Amz-Content-Sha256', digest)
+      url.searchParams.set('X-Amz-Expires', String(relayWriteExpiresSeconds(body.size)))
+      const headers = new Headers(request.headers)
+      headers.delete('Authorization')
+      headers.delete('X-Amz-Date')
+      headers.set('X-Amz-Content-Sha256', digest)
+      destination = await signer(this.connection).sign(url.toString(), {
+        method: request.method, headers,
+        aws: { signQuery: true }
+      } as RequestInit)
+    }
+    const url = new URL(relay.endpoint + '/_gos3/admin/v1/proxy')
+    url.searchParams.set('request', metadata(destination))
     if (request.signal.aborted) throw new DOMException('Aborted', 'AbortError')
     return signer(relay).sign(url.toString(), {
       method: request.method === 'HEAD' ? 'HEAD' : 'POST', body: body.size ? body : undefined,
       headers: { 'X-Amz-Content-Sha256': digest }, signal: request.signal
     })
   }
-  private async through(request: Request, send: Sender): Promise<Response> {
+  private async through(request: Request, send: Sender, s3Write = false): Promise<Response> {
     let response: Response
-    try { response = await send(await this.prepare(request)) }
+    try { response = await send(await this.prepare(request, s3Write)) }
     catch (error) {
       if (request.signal.aborted) throw error
       if (error instanceof TransportError) throw error
@@ -108,6 +130,11 @@ export class ConnectionTransport {
       throw new TransportError('ProxyFailed', 'The relay request failed. Check the relay connection.')
     }
     if (response.headers.get('X-Gos3-Proxy') !== 'upstream') {
+      // A relay 502 can follow client.Do sending a write whose response was
+      // lost. The same code also covers pre-forward failures; be conservative.
+      if (request.method !== 'GET' && request.method !== 'HEAD' && response.status === 502) {
+        throw new TransportError('WriteOutcomeUnknown', 'The relayed write may already have succeeded. Check the destination before explicitly retrying it.', response.status)
+      }
       throw new TransportError('ProxyFailed', 'The relay refused the request or could not reach the destination.', response.status)
     }
     this.activate()
@@ -119,8 +146,8 @@ export class ConnectionTransport {
     else headers.delete('Cache-Control')
     return new Response(response.body, { status: response.status, statusText: response.statusText, headers })
   }
-  async send(request: Request, send: Sender = this.network): Promise<Response> {
-    if (this.relayActive) return this.through(request, send)
+  async send(request: Request, send: Sender = this.network, s3Write = false): Promise<Response> {
+    if (this.relayActive) return this.through(request, send, s3Write)
     if (!this.connection.proxyConnectionId) return send(request)
     const read = request.method === 'GET' || request.method === 'HEAD'
     // Retain only reads for replay. A failed write is never sent a second time.

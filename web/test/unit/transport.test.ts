@@ -5,6 +5,7 @@ import { ConnectionTransport, configureTransports, getTransport } from '~/utils/
 import { useConnectionsStore } from '~/stores/connections'
 import { getAdminClient, getS3Client } from '~/utils/clients'
 import { AwsClient } from '~/utils/s3/signing'
+import { sha256Hex } from '~/utils/s3/hash'
 
 const relay = completeConnection({ id: 'relay', endpoint: 'https://relay.test', accessKeyId: 'relay-key', secretAccessKey: 'relay-secret' })
 const target = completeConnection({ id: 'target', endpoint: 'https://target.test', accessKeyId: 'target-key', secretAccessKey: 'target-secret', proxyConnectionId: relay.id })
@@ -64,6 +65,40 @@ describe('one-hop automatic relay transport', () => {
       throw new TypeError('offline')
     })
     await expect(new ConnectionTransport(target, failed).send(new Request(target.endpoint))).rejects.toMatchObject({ code: 'ProxyFailed', status: 502 })
+  })
+  it('reports a relay 502 after a write as an unknown outcome', async () => {
+    const fetch = network()
+    const transport = new ConnectionTransport(target, fetch)
+    await transport.send(new Request(target.endpoint)) // activate the relay with a safe read
+    fetch.mockImplementation(async r => r.url.endsWith('/whoami')
+      ? Response.json({ capabilities: { proxy: true } })
+      : Response.json({ error: {} }, { status: 502, headers: { 'X-Gos3-Proxy': 'error' } }))
+    await expect(transport.send(new Request(target.endpoint + '/bucket/key', { method: 'PUT', body: 'data' })))
+      .rejects.toMatchObject({ code: 'WriteOutcomeUnknown', status: 502 })
+    expect(fetch.mock.calls.filter(([r]) => new URL(r.url).pathname.endsWith('/proxy')).map(([r]) => meta(r).method))
+      .toEqual(['GET', 'PUT'])
+  })
+  it('pins a delayed S3 upload to a long-lived, signed payload hash', async () => {
+    const fetch = network()
+    const transport = new ConnectionTransport(target, fetch)
+    await transport.send(new Request(target.endpoint))
+    const hash = await sha256Hex('upload bytes')
+    const oldDate = '20200101T000000Z'
+    const signed = await new AwsClient({ accessKeyId: target.accessKeyId, secretAccessKey: target.secretAccessKey, region: target.region, service: 's3' })
+      .sign(target.endpoint + '/bucket/key', { method: 'PUT', body: 'upload bytes', headers: { 'X-Amz-Content-Sha256': hash }, aws: { datetime: oldDate } } as RequestInit)
+    await transport.send(signed, fetch, true)
+    const outer = fetch.mock.calls.at(-1)![0]
+    const destination = meta(outer)
+    const url = new URL(destination.url)
+    expect(destination.method).toBe('PUT')
+    expect(Number(url.searchParams.get('X-Amz-Expires'))).toBeGreaterThan(3600)
+    expect(Number(url.searchParams.get('X-Amz-Expires'))).toBeLessThan(604800)
+    expect(url.searchParams.get('X-Amz-Date')).not.toBe(oldDate)
+    expect(url.searchParams.get('X-Amz-Content-Sha256')).toBe(hash)
+    expect(url.searchParams.get('X-Amz-SignedHeaders')).toContain('x-amz-content-sha256')
+    expect(destination.headers['x-amz-content-sha256']).toBe(hash)
+    expect(destination.headers.authorization).toBeUndefined()
+    expect(await outer.text()).toBe('upload bytes')
   })
   it('does not fallback after user cancellation', async () => {
     const controller = new AbortController(); controller.abort()
