@@ -33,8 +33,7 @@ WORKDIR /src/web
 # production dependencies are installed: `nuxt generate` needs none of the
 # devDependencies (test tools), so their code never runs in the image build.
 COPY web/package.json web/pnpm-lock.yaml web/pnpm-workspace.yaml ./
-# Node 25 no longer bundles Corepack; install the package manager pinned by
-# the project instead of relying on the base image to provide it.
+# Install the project's pinned package manager directly for repeatable builds.
 RUN npm install --global --ignore-scripts "$(node -p "require('./package.json').packageManager")"
 RUN --mount=type=cache,id=gos3-pnpm,target=/pnpm/store \
     pnpm config set store-dir /pnpm/store && \
@@ -49,7 +48,7 @@ RUN --mount=type=cache,id=gos3-pnpm,target=/pnpm/store \
 # ---------------------------------------------------------------------------
 # Go binary with the UI embedded (internal/webui/dist)
 # ---------------------------------------------------------------------------
-FROM --platform=$BUILDPLATFORM golang:1.27-bookworm@sha256:5cf287a799e6b94384bad13d16b14904c531f51ba65792237e122ce42b392f61 AS go-base
+FROM --platform=$BUILDPLATFORM golang:1.27-bookworm@sha256:5c3e9b43cfd3bb95c7937462e29d87ada57b481a96fa23ad0eb61778d7a00110 AS go-base
 ARG TARGETOS
 ARG TARGETARCH
 ARG VERSION=dev
@@ -63,7 +62,7 @@ COPY go.mod go.sum ./
 RUN want="$(tr -d '\r' <go.mod | sed -n 's/^go //p')"; \
     have="$(cd / && go env GOVERSION)"; have="${have#go}"; \
     if [ "$(printf '%s\n%s\n' "$want" "$have" | sort -V | head -n 1)" != "$want" ]; then \
-      echo "build toolchain has go$have but go.mod requires go >= $want: update GO_VERSION and its checksums" >&2; \
+      echo "build toolchain has go$have but go.mod requires go >= $want: update the pinned golang FROM line" >&2; \
       exit 1; \
     fi
 RUN --mount=type=cache,target=/go/pkg/mod go mod download
@@ -110,7 +109,7 @@ RUN --mount=type=cache,target=/go/pkg/mod \
 # (whose tests check that it names this version). The golang image is reused
 # for curl and to decompress the .bz2 with Go's compress/bzip2.
 # ---------------------------------------------------------------------------
-FROM --platform=$BUILDPLATFORM golang:1.27-bookworm@sha256:5cf287a799e6b94384bad13d16b14904c531f51ba65792237e122ce42b392f61 AS restic
+FROM --platform=$BUILDPLATFORM golang:1.27-bookworm@sha256:5c3e9b43cfd3bb95c7937462e29d87ada57b481a96fa23ad0eb61778d7a00110 AS restic
 ARG TARGETOS
 ARG TARGETARCH
 ARG RESTIC_VERSION=0.19.1
