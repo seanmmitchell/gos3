@@ -3,6 +3,7 @@ package admin
 import (
 	"encoding/base64"
 	"io"
+	"mime"
 	"net/http"
 	"net/url"
 	"os"
@@ -199,6 +200,12 @@ func (a *api) serveProxy(w http.ResponseWriter, r *http.Request) {
 		}
 		w.Header()[name] = values
 	}
+	// A PDF opened under the console origin must be downloaded. Browser PDF
+	// viewers do not reliably enforce the sandbox CSP used for other content.
+	if isRelayPDF(w.Header().Values("Content-Type")) {
+		w.Header().Set("Content-Type", "application/pdf")
+		w.Header().Set("Content-Disposition", relayAttachmentDisposition(w.Header().Get("Content-Disposition")))
+	}
 	// Expose all forwarded metadata, including provider-specific x-amz-meta-*
 	// and gos3 backing headers, for consoles on another allowed origin.
 	w.Header().Set("X-Gos3-Proxy-Cache-Control", resp.Header.Get("Cache-Control"))
@@ -218,6 +225,23 @@ func (a *api) serveProxy(w http.ResponseWriter, r *http.Request) {
 			panic(http.ErrAbortHandler)
 		}
 	}
+}
+
+func isRelayPDF(values []string) bool {
+	if len(values) != 1 || strings.Contains(values[0], ",") {
+		return false
+	}
+	mediaType, _, err := mime.ParseMediaType(values[0])
+	return err == nil && mediaType == "application/pdf"
+}
+
+func relayAttachmentDisposition(disposition string) string {
+	if _, params, err := mime.ParseMediaType(disposition); err == nil && params["filename"] != "" {
+		if value := mime.FormatMediaType("attachment", map[string]string{"filename": params["filename"]}); value != "" {
+			return value
+		}
+	}
+	return "attachment"
 }
 
 func blockedRelayHeader(name string) bool {

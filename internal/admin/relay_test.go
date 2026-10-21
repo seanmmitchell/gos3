@@ -170,6 +170,24 @@ func TestRelayPresignedRangesAndErrors(t *testing.T) {
 	}
 }
 
+func TestRelayPDFIsDownloaded(t *testing.T) {
+	e := newEnv(t)
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/pdf; charset=binary")
+		w.Header().Set("Content-Disposition", `inline; filename="report.pdf"`)
+		_, _ = w.Write([]byte("pdf bytes"))
+	}))
+	defer upstream.Close()
+	r := e.do(&rootCreds, "GET", relayPath(t, relayRequest{URL: upstream.URL, Method: "GET"}), nil)
+	r.expectStatus(t, 200)
+	if r.header.Get("Content-Type") != "application/pdf" || r.header.Get("Content-Disposition") != `attachment; filename=report.pdf` {
+		t.Fatalf("PDF must download under the console origin: %v", r.header)
+	}
+	if !strings.Contains(r.header.Get("Content-Security-Policy"), "sandbox") {
+		t.Fatal("relay sandbox missing")
+	}
+}
+
 func TestRelayGuardsAndCancellation(t *testing.T) {
 	e := newEnv(t)
 	for _, target := range []string{"file:///etc/passwd", "http://user:pass@localhost/", "http://localhost" + Prefix + "/proxy", "http://localhost" + Prefix + "/a/../proxy"} {
