@@ -17,7 +17,7 @@
 # cannot change a release build; Dependabot (.github/dependabot.yml) proposes
 # tag and digest updates. To build on another Go or Node version, edit the tag
 # and the digest of the FROM line together (the build stage checks that the
-# image's Go is at least go.mod's go line).
+# installed Go is at least go.mod's go line).
 
 # ---------------------------------------------------------------------------
 # Web UI: static SPA with base /_gos3/ui/ (web/.output/public)
@@ -49,6 +49,24 @@ RUN --mount=type=cache,id=gos3-pnpm,target=/pnpm/store \
 # Go binary with the UI embedded (internal/webui/dist)
 # ---------------------------------------------------------------------------
 FROM --platform=$BUILDPLATFORM golang:1.26-bookworm@sha256:d9c68c2c51161e12fd77e4c6320687c9cd86e1af1e3ad6e6cd63ff970641453c AS go-base
+ARG BUILDARCH
+ARG GO_VERSION=1.26.10
+# The pinned golang image still contains Go 1.26.9. Install the fixed
+# toolchain from go.dev with the published checksum on each build platform.
+# Replace this step with a newly pinned base image once one ships 1.26.10.
+RUN set -eu; \
+    case "$BUILDARCH" in \
+      amd64) sum=ccfe7ae822d2c2f41f4fe7c956199967a4dac22d0ee0d2b2bfdb440aab3b20c5 ;; \
+      arm64) sum=3f4227ce7b206a513e794f1393adb473a07b46e94d18bd15d1c684bbb7319797 ;; \
+      *) echo "no pinned Go $GO_VERSION checksum for $BUILDARCH" >&2; exit 1 ;; \
+    esac; \
+    archive="go${GO_VERSION}.linux-${BUILDARCH}.tar.gz"; \
+    curl -fsSL --retry 3 -o /tmp/go.tar.gz "https://go.dev/dl/$archive"; \
+    echo "$sum  /tmp/go.tar.gz" | sha256sum -c -; \
+    rm -rf /usr/local/go; \
+    tar -C /usr/local -xzf /tmp/go.tar.gz; \
+    rm /tmp/go.tar.gz; \
+    test "$(go env GOVERSION)" = "go$GO_VERSION"
 ARG TARGETOS
 ARG TARGETARCH
 ARG VERSION=dev
@@ -56,15 +74,13 @@ ARG COMMIT=
 ARG DATE=
 WORKDIR /src
 COPY go.mod go.sum ./
-# The golang image sets GOTOOLCHAIN=local, so the image's own Go (and its
-# standard library) is what gets linked, not the version go.mod names. Fail
-# when it is older than go.mod's go line (the minimum Go with the standard
-# library's security fixes), with a clearer message than `go mod download`
-# would give. A newer image (a Dependabot update) passes.
+# The golang image sets GOTOOLCHAIN=local. Fail if the installed toolchain is
+# older than go.mod's minimum, so a future Go bump cannot silently ship an
+# older standard library. A newer image (a Dependabot update) passes.
 RUN want="$(tr -d '\r' <go.mod | sed -n 's/^go //p')"; \
     have="$(cd / && go env GOVERSION)"; have="${have#go}"; \
     if [ "$(printf '%s\n%s\n' "$want" "$have" | sort -V | head -n 1)" != "$want" ]; then \
-      echo "golang image has go$have but go.mod requires go >= $want: update the FROM line" >&2; \
+      echo "build toolchain has go$have but go.mod requires go >= $want: update GO_VERSION and its checksums" >&2; \
       exit 1; \
     fi
 RUN --mount=type=cache,target=/go/pkg/mod go mod download
