@@ -11,10 +11,10 @@ gos3 is public on [GitHub](https://github.com/seanmmitchell/gos3) under the
 Run `gos3 serve`, point the AWS CLI, an SDK, `mc` or rclone at it, and open
 `http://localhost:9000/_gos3/ui/`.
 
-**v0.2.0 is the first full gos3 release.** It brings together local and remote
-S3 storage, bucket replication, compression, encryption, copy/mirror jobs and
-restic backups. Start with the [0.2.0 release overview](docs/releases/0.2.0.md)
-for downloads, what's new since 0.1.0, upgrade steps and limitations.
+**v0.2.2** improves copy and mirror safety, restic reads and console access
+to servers that a browser cannot reach directly. Start with the
+[0.2.2 release overview](docs/releases/0.2.2.md) for downloads, upgrade steps
+and limitations. [v0.2.0](docs/releases/0.2.0.md) introduced the full feature set.
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="docs/screenshots/dashboard-dark.png">
@@ -77,15 +77,15 @@ for downloads, what's new since 0.1.0, upgrade steps and limitations.
 
 ### Binary
 
-Download an archive from [v0.2.0](https://github.com/seanmmitchell/gos3/releases/tag/v0.2.0)
+Download an archive from [v0.2.2](https://github.com/seanmmitchell/gos3/releases/tag/v0.2.2)
 (Linux, macOS, Windows; amd64 and arm64). Check the archive against the release's
 `checksums.txt`. Releases built after gos3 became public also carry signed
 build provenance:
 `gh attestation verify <archive> --repo seanmmitchell/gos3 --source-ref refs/heads/main`
 checks that an attested archive was built by the Release workflow on `main`.
-v0.2.0 was built before the repository became public and has no GitHub
-attestations; see [verifying a release](docs/releasing.md#verifying-a-release).
-Or build it with Go 1.26.9 or newer, Node.js 22 and pnpm:
+The earlier v0.2.0 build has no GitHub attestations; see
+[verifying a release](docs/releasing.md#verifying-a-release).
+Or build it with Go 1.26.10 or newer, Node.js 22 and pnpm:
 
 ```sh
 make build                      # web UI + bin/gos3 with the UI embedded
@@ -106,9 +106,9 @@ bin/gos3 serve --data ./data
 ### Docker
 
 ```sh
-(umask 077; docker run --rm ghcr.io/seanmmitchell/gos3:0.2.0 keygen > gos3.env)  # private root keys
+(umask 077; docker run --rm ghcr.io/seanmmitchell/gos3:0.2.2 keygen > gos3.env)  # private root keys
 docker run -d --name gos3 -p 127.0.0.1:9000:9000 -v gos3-data:/data --env-file gos3.env \
-  ghcr.io/seanmmitchell/gos3:0.2.0
+  ghcr.io/seanmmitchell/gos3:0.2.2
 ```
 
 This publishes the port on this machine only; use `-p 9000:9000` to serve
@@ -406,7 +406,8 @@ More in [docs/security.md](docs/security.md).
 
 | | |
 |---|---|
-| [docs/releases/0.2.0.md](docs/releases/0.2.0.md) | first full release: capabilities, downloads, upgrade notes and limitations |
+| [docs/releases/0.2.2.md](docs/releases/0.2.2.md) | current release: fixes, downloads, upgrade notes and limitations |
+| [docs/releases/0.2.0.md](docs/releases/0.2.0.md) | first full release and upgrade notes from 0.1.0 |
 | [docs/configuration.md](docs/configuration.md) | every YAML key, environment variable and flag |
 | [docs/deployment.md](docs/deployment.md) | Docker, Compose, systemd, Kubernetes, reverse proxies, TLS |
 | [docs/backings.md](docs/backings.md) | storage backings: S3 accounts as a backend (whole server or per bucket), native and wrapped buckets, containers, the remote bucket browser, live configuration |
@@ -428,9 +429,9 @@ Report bugs and feature requests in the [issue tracker](https://github.com/seanm
 and submit pull requests against `dev`. Report vulnerabilities privately as
 described in [docs/security.md](docs/security.md#reporting-vulnerabilities).
 
-Requirements: Go 1.26.9 or newer, Node.js 22 with corepack (pnpm), and
+Requirements: Go 1.26.10 or newer, Node.js 22 with corepack (pnpm), and
 optionally Docker and Python 3 (for the compatibility suite). `go.mod`
-requires Go 1.26.9 (`go 1.26.9`, a supported release with current security
+requires Go 1.26.10 (`go 1.26.10`, a supported release with current security
 fixes for the standard library gos3 links); with the default
 `GOTOOLCHAIN=auto` an older go command downloads it, and with
 `GOTOOLCHAIN=local` it refuses to build.
