@@ -62,7 +62,8 @@ func (id bucketIdentity) matches(info storage.BucketInfo) bool {
 	// logical bucket. Native S3 buckets can also be replaced behind the
 	// router, so pin their remote creation time and location as well.
 	if id.Kind == storage.BucketKindNative || got.Kind == storage.BucketKindNative {
-		return id.Kind == got.Kind && id.CreatedAt.Equal(got.CreatedAt) && id.Location == got.Location
+		return !id.CreatedAt.IsZero() && !got.CreatedAt.IsZero() &&
+			id.Kind == got.Kind && id.CreatedAt.Equal(got.CreatedAt) && id.Location == got.Location
 	}
 	return true
 }

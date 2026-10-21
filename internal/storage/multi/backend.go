@@ -572,6 +572,35 @@ func (r *Router) GetBucket(ctx context.Context, name string) (storage.BucketInfo
 	return info, err
 }
 
+// GetBucketIdentity reads the primary copy's identity for a copy job. An
+// optional backend implementation may verify an external bucket incarnation;
+// unlike ordinary reads, an unverifiable primary is never replaced by a
+// replica's identity while the primary remains the write destination.
+func (r *Router) GetBucketIdentity(ctx context.Context, name string) (storage.BucketInfo, error) {
+	bs, err := r.lookup(name)
+	if err != nil {
+		return storage.BucketInfo{}, err
+	}
+	r.mu.RLock()
+	rec := bs.rec
+	primary := bs.members[rec.primary()].backing
+	r.mu.RUnlock()
+	var info storage.BucketInfo
+	if identity, ok := primary.Backend.(interface {
+		GetBucketIdentity(context.Context, string) (storage.BucketInfo, error)
+	}); ok {
+		info, err = identity.GetBucketIdentity(ctx, name)
+	} else {
+		info, err = primary.Backend.GetBucket(ctx, name)
+	}
+	if err != nil {
+		return storage.BucketInfo{}, r.observe(primary, err)
+	}
+	info.Backing = primary.Name
+	info.InstanceID = rec.ID
+	return info, nil
+}
+
 func (r *Router) instanceID(bs *bucketState) string {
 	r.mu.RLock()
 	defer r.mu.RUnlock()

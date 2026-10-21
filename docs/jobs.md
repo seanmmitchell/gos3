@@ -184,6 +184,9 @@ that the target cannot store fails the job.
   pass. A resumed job also checks every currently active job.
 - **Buckets are pinned to their incarnations**: a retry or resume refuses
   a source or target that was deleted and recreated under the same name.
+  For native buckets, the job checks the remote bucket's creation date on
+  submission and before each pass. The job cannot proceed if the remote
+  service does not provide a verifiable creation date or bucket listing.
   Jobs submitted before bucket pinning was introduced must be submitted
   again to continue safely.
 - **Per-key history is bounded**: a key with more than 4,096 versions or

@@ -870,7 +870,9 @@ Responses preserve upstream status, bytes and non-sensitive headers, with
 envelope and `X-Gos3-Proxy: error`; network/dial/redirect failures return 502
 `ProxyFailed`, saturation returns 429. Cookies, hop-by-hop headers and upstream
 CORS/policy headers are stripped; sandbox CSP prevents active content executing
-under the relay origin. Responses are not cached. Redirects and nested relays are
-refused; discovery's DNS and dial-time address guards block metadata and invalid
-addresses while allowing LAN and loopback destinations. Environment HTTP proxies
+under the relay origin. PDF responses are served as attachments because browser
+PDF viewers do not reliably enforce the sandbox. Responses are not cached.
+Redirects and nested relays are refused; discovery's DNS and dial-time address
+guards block metadata and invalid addresses while allowing LAN and loopback
+destinations. Environment HTTP proxies
 are not used. The client's CORS origin must be allowed by the relay.
