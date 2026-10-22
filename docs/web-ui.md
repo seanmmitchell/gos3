@@ -702,3 +702,49 @@ and the standalone UI cross-origin).
 | ![Bucket settings](screenshots/bucket-settings.png) | ![Users](screenshots/users.png) |
 | ![Server overview](screenshots/overview.png) | ![Discovery](screenshots/discovery.png) |
 | ![Dashboard, dark](screenshots/dashboard-dark.png) | ![Object browser, dark](screenshots/browser-dark.png) |
+
+## Fallback relay connections
+
+Set **Fallback relay** when adding or editing a server to use a directly reachable,
+signed-in gos3 connection when the browser cannot reach the destination. New
+connections default to the current eligible server; existing connections stay
+direct until configured. This works in both embedded and standalone consoles,
+with gos3 destinations (S3 and admin) and generic S3 destinations.
+
+The relay identity needs `admin:ProxyRequest` on `*`; root and the built-in
+`admin` policy already have it. The relay and destination use separate
+credentials. Secret keys remain in the browser; the relay sees the destination
+URL, access key ID, signed headers and traffic. Choose a relay you trust.
+A relay must connect directly: chains and self references are refused. Older
+gos3 versions without the `proxy` capability cannot act as relays.
+
+The console tries direct access first and falls back for network, timeout, CORS
+and mixed-content failures. HTTP errors from the destination, including rejected
+credentials, do not trigger fallback. Failed reads are retried once. An attempted
+write is **never replayed automatically**: its result may be uncertain even if
+fallback succeeds. Check destination state before explicitly retrying it. Once
+selected, the relay carries subsequent traffic until connection settings change
+or **Retest direct access** is selected on the server card. The sidebar and server
+card show **Connected through <server>** while relaying.
+
+Uploads (including multipart and progress), downloads, previews and read-only
+share links use the relay. Relayed links are bearer URLs bound to one destination
+request; they expire no later than the destination signature. A browser may vary
+Range and If-Range on these read links. Anyone using a shared link must be able
+to reach the relay. Destination permissions and relay key revocation still apply.
+
+A standalone or cross-origin console must be permitted by the **relay's** CORS
+settings (`allowedOrigins`, signed request headers, and POST). The relay sets
+response exposure for object metadata and relay errors. The destination does
+not need to allow the browser origin. TLS certificate validation still applies
+between relay and destination; use HTTPS for both hops where available.
+
+Granting `admin:ProxyRequest` permits outbound HTTP(S) access to public and
+private addresses from the relay. It is not included in read/write or diagnostics
+policies. Discovery's DNS and dial-time metadata/invalid-address protections also
+apply to relays; redirects, cookies and nested relay requests are refused.
+Uploads are authenticated and spooled to temporary disk before forwarding (up to
+5 GiB per request, eight concurrent relay requests). Temporary files are removed
+on success, failure or cancellation. Allow sufficient temporary disk space;
+large uploads incur the additional verification/spooling latency. The UI's
+multipart transfers limit the size of each spooled request.

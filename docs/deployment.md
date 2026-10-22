@@ -12,8 +12,8 @@ do not form a distributed cluster or share a bucket namespace. Discovery and
 the web UI help you find and manage them. Do not put several independent
 gos3 servers behind one load balancer.
 
-For the current release, start with the [0.2.0 release overview](releases/0.2.0.md)
-and its [upgrade checklist](releases/0.2.0.md#upgrading-from-010).
+For the current release, start with the [0.2.2 release overview](releases/0.2.2.md)
+and its [upgrade checklist](releases/0.2.2.md#upgrading-from-021).
 
 - [Binary](#binary)
 - [Docker](#docker) and [Docker Compose](#docker-compose)
@@ -40,7 +40,7 @@ v0.2.0 was built while the repository was private and has no GitHub
 attestations. Making the repository public does not add attestations to older
 artifacts; see [verification and its limits](releasing.md#verifying-a-release).
 
-To build from source you need Go 1.26.9 or newer (`go.mod` requires it, for
+To build from source you need Go 1.26.10 or newer (`go.mod` requires it, for
 the standard library's security fixes), Node.js 22 and pnpm (via corepack):
 
 ```sh
@@ -158,17 +158,18 @@ Notes:
   SHA-256 sums in the `Dockerfile` (from the release's signed `SHA256SUMS`),
   the same pins in `.github/actions/setup-restic/action.yml` (CI) and the
   license URL in `internal/tools/notices`, then run `make notices`.
-- The base images (`node:22-bookworm-slim`, `golang:1.26-bookworm`,
+- The base images (`node:23-bookworm-slim`, `golang:1.26-bookworm`,
   `gcr.io/distroless/static-debian12:nonroot`) and the Dockerfile frontend
   are pinned by digest, and the GitHub Actions in `.github/workflows` by
   commit SHA, so a retagged upstream image or action cannot change a release.
   Dependabot proposes updates weekly (Go images without the 14-day
   cooldown, since Go point releases carry standard library security fixes).
-  To build on another Go or Node version, edit the tag and the digest of the
-  `FROM` line together. The golang image builds with its own Go
-  (`GOTOOLCHAIN=local`), so the build fails when that Go is older than
-  `go.mod`'s `go` line (the minimum with current standard library fixes);
-  raise both together when the minimum goes up.
+  To build on another Node version, edit the tag and digest of its `FROM`
+  line together. Until a pinned base image ships Go 1.26.10, the Go build
+  stage installs the official Go 1.26.10 archives after verifying their
+  published per-architecture SHA-256 sums. `GOTOOLCHAIN=local` and a build
+  check ensure the installed Go is at least `go.mod`'s minimum. When raising
+  that minimum, update the Go archive version and checksums too.
 
 The standalone web UI has its own image, `deploy/docker/web.Dockerfile`
 (`make docker-ui`); see [web-ui.md](web-ui.md#standalone-mode). Its local

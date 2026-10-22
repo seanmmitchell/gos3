@@ -106,6 +106,9 @@ func (s *Server) openS3(name string, c config.S3Config) (_ multi.Backing, err er
 		DefaultKind: storage.BucketKind(c.EffectiveDefaultKind()),
 		Claims:      s.claims,
 		Logger:      s.log.With("component", "storage"), // s3account names the backing
+		Tune: func(o *s3store.Options) {
+			o.MaxRestoreSpoolBytes = s.cfg.Restic.RestoreSpoolBytes
+		},
 	}
 	var records string // where the records are, for the log
 	switch {

@@ -242,9 +242,11 @@ What keeps code that did not go through `dev` → `main` out of a release:
   out of ghcr.io when it is done (the registry credential has to exist while
   the image is pushed).
 - **Pinned inputs.** Actions are pinned by commit SHA and base images by
-  digest. The image build fails if the golang image's Go is older than
-  `go.mod`'s `go` line, so the image never links an older standard library
-  than the minimum the archives are built with.
+  digest. Until a pinned image ships Go 1.26.10, the Docker build installs
+  official Go archives checked against their published SHA-256 sums. The
+  image build fails if the installed Go is older than `go.mod`'s `go` line,
+  so the image never links an older standard library than the minimum the
+  archives are built with.
 
 ## Dev builds
 

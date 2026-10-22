@@ -73,6 +73,8 @@ const (
 	DefaultSnapshotWorkers    = 1
 	DefaultSnapshotSpoolBytes = int64(8) << 30  // 8 GiB
 	MinSnapshotSpoolBytes     = int64(64) << 20 // 64 MiB
+	DefaultRestoreSpoolBytes  = int64(1) << 30  // 1 GiB
+	MinRestoreSpoolBytes      = int64(64) << 20 // 64 MiB
 
 	// Replication modes (storage.replication.default_mode).
 	ReplicationSingle        = "single"
@@ -166,7 +168,7 @@ func Default() Config {
 			SkipContentTypes: slices.Clone(DefaultSkipContentTypes),
 		},
 		Jobs: JobsConfig{Workers: DefaultJobsWorkers},
-		Restic: ResticConfig{Snapshots: ResticSnapshotsConfig{
+		Restic: ResticConfig{RestoreSpoolBytes: DefaultRestoreSpoolBytes, Snapshots: ResticSnapshotsConfig{
 			Workers:     DefaultSnapshotWorkers,
 			SpoolBytes:  DefaultSnapshotSpoolBytes,
 			Incremental: true,
@@ -363,6 +365,9 @@ func (c *Config) Normalize() {
 	if c.Jobs.Workers == 0 {
 		c.Jobs.Workers = DefaultJobsWorkers
 	}
+	if c.Restic.RestoreSpoolBytes == 0 {
+		c.Restic.RestoreSpoolBytes = DefaultRestoreSpoolBytes
+	}
 	snap := &c.Restic.Snapshots
 	if snap.Workers == 0 {
 		snap.Workers = DefaultSnapshotWorkers
@@ -476,6 +481,9 @@ func (c Config) Validate() error {
 func (c Config) validateJobs() error {
 	if n := c.Jobs.Workers; n != 0 && (n < 1 || n > MaxJobsWorkers) {
 		return fmt.Errorf("jobs.workers: must be between 1 and %d, got %d", MaxJobsWorkers, n)
+	}
+	if n := c.Restic.RestoreSpoolBytes; n != 0 && n < MinRestoreSpoolBytes {
+		return fmt.Errorf("restic.restore_spool_bytes: must be at least %d bytes (64 MiB), got %d", MinRestoreSpoolBytes, n)
 	}
 	snap := c.Restic.Snapshots
 	if n := snap.Workers; n != 0 && (n < 1 || n > MaxJobsWorkers) {

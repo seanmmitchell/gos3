@@ -219,6 +219,7 @@ export const ADMIN_ACTIONS: readonly string[] = [
   'admin:AdoptRemoteBucket',
   'admin:ManageContainers',
   'admin:GetDiscovery',
+  'admin:ProxyRequest',
   'admin:ProbeNetwork',
   'admin:ScanNetwork'
 ]

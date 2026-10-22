@@ -641,11 +641,13 @@ func TestPresignedErrors(t *testing.T) {
 }
 
 func TestPresignedWithContentSHA256(t *testing.T) {
-	now := time.Now().UTC()
+	// A relayed upload may reach the destination after the 15-minute header
+	// signature window, while its payload-bound presigned URL remains valid.
+	now := time.Now().UTC().Add(-20 * time.Minute)
 	body := []byte("hashed presigned body")
 	sum := sha256.Sum256(body)
 	h := hex.EncodeToString(sum[:])
-	req, _ := http.NewRequest("PUT", "http://bucket.example.com/obj?X-Amz-Expires=60", bytes.NewReader(body))
+	req, _ := http.NewRequest("PUT", "http://bucket.example.com/obj?X-Amz-Expires=3600", bytes.NewReader(body))
 	s := v4.NewSigner(func(o *v4.SignerOptions) { o.DisableURIPathEscaping = true })
 	// Put the hash in the query so it is part of the canonical request.
 	q := req.URL.Query()

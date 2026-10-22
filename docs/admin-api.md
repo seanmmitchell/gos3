@@ -841,3 +841,38 @@ ListJobs, GetJob and GetBucketSnapshots.
 
 Any other `/_gos3/*` path is a JSON 404 `{"error":{"code":"NotFound",…}}`. See
 [operations.md](operations.md#metrics) for the metric names.
+
+## Browser relay — `GET|HEAD|POST /proxy`
+
+Requires `admin:ProxyRequest` at service level (`Resource: "*"`). `whoami`
+reports `capabilities.proxy`; absent on older servers. This endpoint is available
+when the admin API is enabled, independently of network discovery switches.
+
+The `request` query parameter is unpadded base64url UTF-8 JSON:
+`{"url":"http://destination:9000/bucket/key","method":"GET","headers":{}}`.
+The outer relay request is SigV4-authenticated with the relay credentials; its
+signature binds the query and therefore the destination URL, method and headers.
+Destination authentication stays inside this metadata (Authorization header or
+presigned destination URL); the relay never needs the destination secret key.
+
+HEAD is used for destination HEAD and preserves Content-Length metadata.
+POST carries raw destination body bytes, with header SigV4 and a signed SHA-256
+payload digest (signed streaming is also accepted). It supports destination GET,
+PUT, POST, PATCH and DELETE. Bodies are verified on temporary disk before
+any destination request and access is revalidated after reading. The 1 MiB admin
+JSON limit does not apply: relay bodies are capped at 5 GiB, with eight concurrent
+relay requests. GET accepts only destination GET, no body, and can itself be
+presigned for downloads and media. Range/If-Range may be supplied separately on
+GET; other destination headers must be in the signed metadata.
+
+Responses preserve upstream status, bytes and non-sensitive headers, with
+`X-Gos3-Proxy: upstream`. Relay-generated failures use the ordinary JSON error
+envelope and `X-Gos3-Proxy: error`; network/dial/redirect failures return 502
+`ProxyFailed`, saturation returns 429. Cookies, hop-by-hop headers and upstream
+CORS/policy headers are stripped; sandbox CSP prevents active content executing
+under the relay origin. PDF responses are served as attachments because browser
+PDF viewers do not reliably enforce the sandbox. Responses are not cached.
+Redirects and nested relays are refused; discovery's DNS and dial-time address
+guards block metadata and invalid addresses while allowing LAN and loopback
+destinations. Environment HTTP proxies
+are not used. The client's CORS origin must be allowed by the relay.

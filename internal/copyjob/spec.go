@@ -26,6 +26,46 @@ type Spec struct {
 	Target  TargetSpec  `json:"target"`
 	Options SpecOptions `json:"options"`
 	DryRun  bool        `json:"dryRun,omitempty"`
+	// BucketBindings are set by validation and pin the bucket incarnations
+	// selected when the job was submitted. They are not client options.
+	BucketBindings bucketBindings `json:"bucketBindings,omitempty"`
+}
+
+type bucketBindings struct {
+	Source bucketIdentity `json:"source"`
+	Target bucketIdentity `json:"target,omitempty"`
+}
+
+type bucketIdentity struct {
+	InstanceID string             `json:"instanceID"`
+	CreatedAt  time.Time          `json:"createdAt"`
+	Owner      string             `json:"owner,omitempty"`
+	Backing    string             `json:"backing,omitempty"`
+	Kind       storage.BucketKind `json:"kind,omitempty"`
+	Location   string             `json:"location,omitempty"`
+}
+
+func identityOf(info storage.BucketInfo) bucketIdentity {
+	return bucketIdentity{InstanceID: info.InstanceID, CreatedAt: info.CreatedAt, Owner: info.Owner, Backing: info.Backing, Kind: info.Kind, Location: info.Location}
+}
+
+func (id bucketIdentity) empty() bool {
+	return id.InstanceID == "" && id.CreatedAt.IsZero() && id.Owner == "" && id.Backing == "" && id.Kind == "" && id.Location == ""
+}
+
+func (id bucketIdentity) matches(info storage.BucketInfo) bool {
+	got := identityOf(info)
+	if id.InstanceID == "" || id.InstanceID != got.InstanceID {
+		return false
+	}
+	// A router placement can move or fail over without replacing the
+	// logical bucket. Native S3 buckets can also be replaced behind the
+	// router, so pin their remote creation time and location as well.
+	if id.Kind == storage.BucketKindNative || got.Kind == storage.BucketKindNative {
+		return !id.CreatedAt.IsZero() && !got.CreatedAt.IsZero() &&
+			id.Kind == got.Kind && id.CreatedAt.Equal(got.CreatedAt) && id.Location == got.Location
+	}
+	return true
 }
 
 // SourceSpec is the range of keys copied.

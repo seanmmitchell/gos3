@@ -10,6 +10,7 @@
 // there is no body), never UNSIGNED-PAYLOAD, so a captured request cannot be
 // replayed with another body. gos3 rejects admin requests with a body whose
 // payload is unsigned. Errors are thrown as AdminError.
+import { TransportError } from '../transport'
 import { AwsClient } from '../s3/signing'
 import type {
   AccessKey,
@@ -149,6 +150,7 @@ export function parseAdminError(status: number, body: string): AdminError {
 }
 
 function networkAdminError(e: unknown, url: string, timedOut: boolean): AdminError {
+  if (e instanceof TransportError) return new AdminError(e.code, e.message, e.status, e)
   if (timedOut) return new AdminError('Timeout', `Timed out connecting to ${originOf(url)}.`, 0, e)
   if (typeof e === 'object' && e !== null && (e as { name?: unknown }).name === 'AbortError') {
     return new AdminError('Aborted', 'The request was aborted.', 0, e)

@@ -17,24 +17,24 @@
 # cannot change a release build; Dependabot (.github/dependabot.yml) proposes
 # tag and digest updates. To build on another Go or Node version, edit the tag
 # and the digest of the FROM line together (the build stage checks that the
-# image's Go is at least go.mod's go line).
+# installed Go is at least go.mod's go line).
 
 # ---------------------------------------------------------------------------
 # Web UI: static SPA with base /_gos3/ui/ (web/.output/public)
 # ---------------------------------------------------------------------------
-FROM --platform=$BUILDPLATFORM node:23-bookworm-slim@sha256:86191b94d2a163be41f3dc7fe5e5fcaca8ba2f1be7275d98a06343483c17414a AS ui
+FROM --platform=$BUILDPLATFORM node:24-bookworm-slim@sha256:a5f4366e834695d5f363b920c104953a535d3a9864d1bdf74566a0ebe01daee5 AS ui
 ENV PNPM_HOME=/pnpm \
-    COREPACK_ENABLE_DOWNLOAD_PROMPT=0 \
     NUXT_TELEMETRY_DISABLED=1 \
     CI=true
 ENV PATH=$PNPM_HOME:$PATH
-RUN corepack enable
 WORKDIR /src/web
 # Dependencies first (cached until the lockfile changes). `pnpm fetch` only
 # needs the lockfile; the offline install below links from the store. Only
 # production dependencies are installed: `nuxt generate` needs none of the
 # devDependencies (test tools), so their code never runs in the image build.
 COPY web/package.json web/pnpm-lock.yaml web/pnpm-workspace.yaml ./
+# Install the project's pinned package manager directly for repeatable builds.
+RUN npm install --global --ignore-scripts "$(node -p "require('./package.json').packageManager")"
 RUN --mount=type=cache,id=gos3-pnpm,target=/pnpm/store \
     pnpm config set store-dir /pnpm/store && \
     pnpm fetch --frozen-lockfile
@@ -48,7 +48,7 @@ RUN --mount=type=cache,id=gos3-pnpm,target=/pnpm/store \
 # ---------------------------------------------------------------------------
 # Go binary with the UI embedded (internal/webui/dist)
 # ---------------------------------------------------------------------------
-FROM --platform=$BUILDPLATFORM golang:1.26-bookworm@sha256:d9c68c2c51161e12fd77e4c6320687c9cd86e1af1e3ad6e6cd63ff970641453c AS go-base
+FROM --platform=$BUILDPLATFORM golang:1.27-bookworm@sha256:5c3e9b43cfd3bb95c7937462e29d87ada57b481a96fa23ad0eb61778d7a00110 AS go-base
 ARG TARGETOS
 ARG TARGETARCH
 ARG VERSION=dev
@@ -56,15 +56,13 @@ ARG COMMIT=
 ARG DATE=
 WORKDIR /src
 COPY go.mod go.sum ./
-# The golang image sets GOTOOLCHAIN=local, so the image's own Go (and its
-# standard library) is what gets linked, not the version go.mod names. Fail
-# when it is older than go.mod's go line (the minimum Go with the standard
-# library's security fixes), with a clearer message than `go mod download`
-# would give. A newer image (a Dependabot update) passes.
+# The golang image sets GOTOOLCHAIN=local. Fail if the installed toolchain is
+# older than go.mod's minimum, so a future Go bump cannot silently ship an
+# older standard library. A newer image (a Dependabot update) passes.
 RUN want="$(tr -d '\r' <go.mod | sed -n 's/^go //p')"; \
     have="$(cd / && go env GOVERSION)"; have="${have#go}"; \
     if [ "$(printf '%s\n%s\n' "$want" "$have" | sort -V | head -n 1)" != "$want" ]; then \
-      echo "golang image has go$have but go.mod requires go >= $want: update the FROM line" >&2; \
+      echo "build toolchain has go$have but go.mod requires go >= $want: update the pinned golang FROM line" >&2; \
       exit 1; \
     fi
 RUN --mount=type=cache,target=/go/pkg/mod go mod download
@@ -111,7 +109,7 @@ RUN --mount=type=cache,target=/go/pkg/mod \
 # (whose tests check that it names this version). The golang image is reused
 # for curl and to decompress the .bz2 with Go's compress/bzip2.
 # ---------------------------------------------------------------------------
-FROM --platform=$BUILDPLATFORM golang:1.26-bookworm@sha256:d9c68c2c51161e12fd77e4c6320687c9cd86e1af1e3ad6e6cd63ff970641453c AS restic
+FROM --platform=$BUILDPLATFORM golang:1.27-bookworm@sha256:5c3e9b43cfd3bb95c7937462e29d87ada57b481a96fa23ad0eb61778d7a00110 AS restic
 ARG TARGETOS
 ARG TARGETARCH
 ARG RESTIC_VERSION=0.19.1

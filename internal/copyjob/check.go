@@ -68,6 +68,12 @@ func (s *Service) check(ctx context.Context, kind string, raw []byte, warn bool)
 	if err := s.checkRules(ctx, &sp, in); err != nil {
 		return Spec{}, nil, err
 	}
+	// Never trust bindings supplied in the request. Validation records the
+	// bucket incarnations that the runner must use, including across retries.
+	sp.BucketBindings = bucketBindings{Source: identityOf(in.srcInfo)}
+	if in.dstExists {
+		sp.BucketBindings.Target = identityOf(in.dstInfo)
+	}
 	if err := checkJobs(&sp, s.activeJobs(nil)); err != nil {
 		return Spec{}, nil, err
 	}
@@ -104,7 +110,7 @@ func errNotEmpty(sp *Spec) error {
 func (s *Service) inspect(ctx context.Context, sp *Spec, owner string) (*inspection, error) {
 	in := &inspection{}
 	var err error
-	if in.srcInfo, err = s.router.GetBucket(ctx, sp.Source.Bucket); err != nil {
+	if in.srcInfo, err = s.router.GetBucketIdentity(ctx, sp.Source.Bucket); err != nil {
 		if errors.Is(err, storage.ErrBucketNotFound) {
 			return nil, invalidf("the source bucket %q does not exist", sp.Source.Bucket)
 		}
@@ -113,7 +119,7 @@ func (s *Service) inspect(ctx context.Context, sp *Spec, owner string) (*inspect
 	if in.srcCaps, err = s.router.BucketCaps(ctx, sp.Source.Bucket); err != nil {
 		return nil, fmt.Errorf("reading the source bucket %q: %w", sp.Source.Bucket, err)
 	}
-	in.dstInfo, err = s.router.GetBucket(ctx, sp.Target.Bucket)
+	in.dstInfo, err = s.router.GetBucketIdentity(ctx, sp.Target.Bucket)
 	switch {
 	case err == nil:
 		in.dstExists = true

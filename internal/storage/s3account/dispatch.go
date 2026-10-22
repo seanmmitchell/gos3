@@ -11,6 +11,7 @@ import (
 	"time"
 	"unicode/utf8"
 
+	"github.com/seanmmitchell/gos3/internal/s3client"
 	"github.com/seanmmitchell/gos3/internal/storage"
 	"github.com/seanmmitchell/gos3/internal/storage/compress"
 	"github.com/seanmmitchell/gos3/internal/storage/native"
@@ -335,6 +336,18 @@ func (b *Backend) clearPending(name string) {
 
 // GetBucket returns a bucket's info.
 func (b *Backend) GetBucket(ctx context.Context, name string) (storage.BucketInfo, error) {
+	return b.bucketInfo(ctx, name, false)
+}
+
+// GetBucketIdentity returns the bucket state used to bind a copy job. For a
+// native bucket, CreatedAt comes from a fresh remote ListBuckets response,
+// rather than the local time at which gos3 attached the remote bucket.
+// Without a verifiable remote creation date, a job must not write to it.
+func (b *Backend) GetBucketIdentity(ctx context.Context, name string) (storage.BucketInfo, error) {
+	return b.bucketInfo(ctx, name, true)
+}
+
+func (b *Backend) bucketInfo(ctx context.Context, name string, verifyRemote bool) (storage.BucketInfo, error) {
 	t, err := b.lookup(ctx, name)
 	if err != nil {
 		return storage.BucketInfo{}, err
@@ -342,6 +355,13 @@ func (b *Backend) GetBucket(ctx context.Context, name string) (storage.BucketInf
 	if t.native() {
 		info := t.rec.Info
 		info.Name = name
+		if verifyRemote {
+			created, err := b.remoteCreationDate(ctx, t.rec.Remote)
+			if err != nil {
+				return storage.BucketInfo{}, err
+			}
+			info.CreatedAt = created
+		}
 		return t.withKind(info), nil
 	}
 	info, err := t.c.store.GetBucket(ctx, name)
@@ -349,6 +369,30 @@ func (b *Backend) GetBucket(ctx context.Context, name string) (storage.BucketInf
 		return storage.BucketInfo{}, t.c.classify(err)
 	}
 	return t.withKind(info), nil
+}
+
+func (b *Backend) remoteCreationDate(ctx context.Context, remote string) (time.Time, error) {
+	found := errors.New("remote bucket found")
+	var created time.Time
+	matched := false
+	err := b.client().WalkBuckets(ctx, remote, func(entry s3client.BucketEntry) error {
+		if entry.Name != remote {
+			return nil
+		}
+		matched = true
+		created = entry.CreationDate
+		return found
+	})
+	if err != nil && !errors.Is(err, found) {
+		return time.Time{}, b.remoteError("verify the native bucket's creation date", err)
+	}
+	if !matched {
+		return time.Time{}, fmt.Errorf("s3account %q: remote bucket %q is missing: %w", b.name, remote, storage.ErrBucketNotFound)
+	}
+	if created.IsZero() {
+		return time.Time{}, fmt.Errorf("s3account %q: remote bucket %q has no verifiable creation date: %w", b.name, remote, storage.ErrNotSupported)
+	}
+	return created, nil
 }
 
 // DeleteBucket deletes an empty bucket. A native bucket's remote bucket is

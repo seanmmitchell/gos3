@@ -19,6 +19,8 @@
  * must confirm it before the form is submitted. Nothing is submitted
  * automatically.
  */
+import { completeConnection } from '~/utils/connections'
+import { ConnectionTransport } from '~/utils/transport'
 import type { Connection } from '~/types/connection'
 import { useConnectionsStore } from '~/stores/connections'
 import {
@@ -40,6 +42,12 @@ const route = useRoute()
 const router = useRouter()
 const store = useConnectionsStore()
 const toast = useToast()
+
+const relayItems = computed(() => [
+  { label: 'Disabled (direct only)', value: 'direct' },
+  ...store.connections.filter(c => c.id !== target.value?.id && c.kind === 'gos3' && !c.proxyConnectionId && hasCredentials(c) && store.capabilitiesOf(c.id).proxy)
+    .map(c => ({ label: c.name, value: c.id }))
+])
 
 const queryString = (v: unknown): string => (typeof v === 'string' ? v : Array.isArray(v) && typeof v[0] === 'string' ? v[0] : '')
 const queryServer = computed(() => queryString(route.query.server))
@@ -76,7 +84,10 @@ function reset() {
   if (t) {
     model.value.accessKeyId = t.accessKeyId
     model.value.remember = t.remember
+    model.value.proxyConnectionId = t.proxyConnectionId
   } else {
+    const current = store.active
+    if (current && relayItems.value.some(item => item.value === current.id)) model.value.proxyConnectionId = current.id
     linkPrefill.value = { endpoint: queryString(route.query.endpoint).trim(), name: queryString(route.query.name) }
     model.value.endpoint = linkPrefill.value.endpoint
     model.value.name = linkPrefill.value.name
@@ -151,7 +162,8 @@ async function signIn(c: Connection) {
     secretAccessKey: model.value.secretAccessKey,
     forcePathStyle: c.forcePathStyle
   }
-  const r = await verifyAndDiagnose(creds, c.kind)
+  const transport = new ConnectionTransport({ ...c, ...creds })
+  const r = await verifyAndDiagnose(creds, c.kind, { fetch: req => transport.send(req), timeoutMs: 20000 })
   if (!r.ok) {
     diagnosis.value = r.diagnosis
     return
@@ -164,8 +176,10 @@ async function signIn(c: Connection) {
 }
 
 async function connectNew() {
+  const transport = new ConnectionTransport(completeConnection({ ...formToInput(model.value), id: 'connect-form' }))
+  const deps = { fetch: (req: Request) => transport.send(req), timeoutMs: 20000 }
   let detected = undefined as Awaited<ReturnType<typeof detectKind>> | undefined
-  if (model.value.kind === 'auto') detected = await detectKind(model.value.endpoint)
+  if (model.value.kind === 'auto') detected = await detectKind(model.value.endpoint, deps)
   const input = formToInput(model.value, detected?.kind)
   if (detected?.info) {
     input.name ??= detected.info.name
@@ -178,7 +192,7 @@ async function connectNew() {
     accessKeyId: input.accessKeyId ?? '',
     secretAccessKey: input.secretAccessKey ?? '',
     forcePathStyle: input.forcePathStyle ?? true
-  }, input.kind ?? 's3')
+  }, input.kind ?? 's3', deps)
   if (!r.ok) {
     diagnosis.value = r.diagnosis
     return
@@ -186,7 +200,8 @@ async function connectNew() {
   // Only a connection for the endpoint just verified may take the keys: a
   // stored connection that merely claims the same server ID (IDs are not
   // authenticated) would sign them for its own, possibly hostile, host.
-  const existing = reusableConnection(store.connections, input)
+  const match = reusableConnection(store.connections, input)
+  const existing = match?.proxyConnectionId === input.proxyConnectionId ? match : undefined
   const c: Connection = existing
     ? store.setCredentials(existing.id, { accessKeyId: input.accessKeyId ?? '', secretAccessKey: input.secretAccessKey ?? '', remember: input.remember })
     : store.add({ ...input, source: 'user' })
@@ -268,6 +283,10 @@ const others = computed(() => store.sorted.filter(c => c.id !== target.value?.id
           <UInput v-model.trim="model.endpoint" class="w-full font-mono" placeholder="http://10.0.0.5:9000" inputmode="url" autocomplete="url" spellcheck="false" :autofocus="!linkPrefill.endpoint" />
         </UFormField>
       </template>
+
+      <UFormField v-if="mode === 'new'" label="Fallback relay" help="Try direct access first, then use this gos3 server when the browser cannot reach the destination.">
+        <USelect :model-value="model.proxyConnectionId ?? 'direct'" :items="relayItems" class="w-full" @update:model-value="model.proxyConnectionId = $event === 'direct' ? undefined : $event" />
+      </UFormField>
 
       <UFormField label="Access key ID" :error="shown.accessKeyId" required>
         <UInput v-model.trim="model.accessKeyId" class="w-full font-mono" autocomplete="username" spellcheck="false" :autofocus="mode === 'signin'" />

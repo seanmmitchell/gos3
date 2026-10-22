@@ -860,7 +860,17 @@ func (s *Server) serveObject(w http.ResponseWriter, r *http.Request, rc *reqCont
 	// Data fetched on first use (restic) is fetched now, while a failure
 	// can still be reported with a proper status.
 	if p, ok := body.(storage.PreparingReader); ok {
-		if err := p.Prepare(); err != nil {
+		var err error
+		if rng != nil {
+			if rp, ok := body.(storage.RangePreparingReader); ok {
+				err = rp.PrepareRange(rng.Start, length)
+			} else {
+				err = p.Prepare()
+			}
+		} else {
+			err = p.Prepare()
+		}
+		if err != nil {
 			return mapStorageError(err)
 		}
 	}

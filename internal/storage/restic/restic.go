@@ -192,13 +192,18 @@ type Runtime struct {
 	// TempDir holds the encrypted restores of snapshots being read ("":
 	// os.TempDir()).
 	TempDir string
+	// MaxRestoreSpoolBytes caps encrypted object restores both on this
+	// runtime and across all restic runtimes in the process. Zero uses
+	// DefaultRestoreSpoolBytes.
+	MaxRestoreSpoolBytes int64
 	// LookPath finds the restic executable (default exec.LookPath; tests
 	// replace it).
 	LookPath func(file string) (string, error)
 
-	mu     sync.Mutex
-	repos  map[string]*repoState // by Location.Repository
-	spools map[string]*spool     // by spoolKey
+	mu         sync.Mutex
+	repos      map[string]*repoState // by Location.Repository
+	spools     map[string]*spool     // by spoolKey
+	spoolBytes int64                 // reserved disk bytes, guarded by mu
 
 	// restores counts the background restores (runSpool) in flight.
 	restores sync.WaitGroup

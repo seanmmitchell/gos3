@@ -113,7 +113,8 @@ func (c *container) classify(err error) error {
 // classifyContainerErr implements container.classify for container id.
 func classifyContainerErr(id string, err error) error {
 	switch {
-	case errors.Is(err, storage.ErrBucketUnavailable), errors.Is(err, context.Canceled), errors.Is(err, context.DeadlineExceeded):
+	case errors.Is(err, storage.ErrBucketUnavailable), errors.Is(err, storage.ErrResourceLimit),
+		errors.Is(err, context.Canceled), errors.Is(err, context.DeadlineExceeded):
 		return err
 	}
 	var ce *s3client.Error
@@ -350,6 +351,15 @@ type preparingReader struct {
 
 func (r *preparingReader) Prepare() error { return r.c.classify(r.p.Prepare()) }
 
+type rangePreparingReader struct {
+	preparingReader
+	rp storage.RangePreparingReader
+}
+
+func (r *rangePreparingReader) PrepareRange(start, length int64) error {
+	return r.c.classify(r.rp.PrepareRange(start, length))
+}
+
 // wrapObjectWriter, wrapVersionWriter, wrapPartWriter and wrapReader
 // return w (r) unchanged for the home. The wrappers keep the optional
 // interfaces callers look for: storage.PreparingReader on readers (the
@@ -380,6 +390,9 @@ func (c *container) wrapReader(r io.ReadSeekCloser) io.ReadSeekCloser {
 		return r
 	}
 	if p, ok := r.(storage.PreparingReader); ok {
+		if rp, ok := r.(storage.RangePreparingReader); ok {
+			return &rangePreparingReader{preparingReader: preparingReader{objectReader: objectReader{ReadSeekCloser: r, c: c}, p: p}, rp: rp}
+		}
 		return &preparingReader{objectReader: objectReader{ReadSeekCloser: r, c: c}, p: p}
 	}
 	return &objectReader{ReadSeekCloser: r, c: c}

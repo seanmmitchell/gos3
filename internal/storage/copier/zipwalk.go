@@ -12,8 +12,8 @@ import (
 // batchVersions is the number of listing entries a walk collects before it
 // is suspended and its keys are paired, and roughly the number of entries
 // ZipWalk passes to its callback at once. Batches end at key boundaries,
-// so a key with more versions than this is still delivered whole. A
-// variable for tests.
+// so a key with more versions than this is still delivered whole, up to
+// MaxKeyVersions. A variable for tests.
 var batchVersions = 1000
 
 // ZipWalk pairs the keys under src with those under dst, in ascending key
@@ -31,8 +31,8 @@ var batchVersions = 1000
 //
 // The two ranges must not overlap (the same bucket of the same backend with
 // one prefix starting with the other): copying into the walked source
-// would never end. Memory is bounded by two walk batches (and the versions
-// of the largest key). fn runs outside of both walks, so it may write to either backend;
+// would never end. Memory is bounded by two walk batches and
+// MaxKeyVersions entries per key. fn runs outside of both walks, so it may write to either backend;
 // it may keep the pairs. An error from fn stops the walk and is returned
 // as is; ZipWalk wraps walk errors with the side that failed.
 func ZipWalk(ctx context.Context, src, dst Endpoint, after string, versions bool, fn func([]KeyPair) error) error {
@@ -149,6 +149,9 @@ func (c *cursor) fill(ctx context.Context) error {
 				return storage.ErrStopWalk
 			}
 			groups = append(groups, nil)
+		}
+		if len(groups[len(groups)-1]) >= MaxKeyVersions {
+			return fmt.Errorf("%w: %s/%s exceeds %d", ErrTooManyVersions, c.ep.Bucket, oi.Key, MaxKeyVersions)
 		}
 		groups[len(groups)-1] = append(groups[len(groups)-1], oi)
 		total++

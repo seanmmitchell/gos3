@@ -1,4 +1,5 @@
 // S3 error type and parsing of S3 XML error bodies.
+import { TransportError } from '../transport'
 import { child, text, tryParseXml } from './xml'
 
 /** Error codes used for failures that never reached / were not answered by S3. */
@@ -123,6 +124,7 @@ export function parseS3Error(status: number, body: string, headers?: Headers): S
 
 /** Error thrown when fetch itself fails (unreachable host, CORS, TLS …). */
 export function networkError(cause: unknown, url?: string): S3Error {
+  if (cause instanceof TransportError) return new S3Error({ code: cause.code, message: cause.message, status: cause.status, cause })
   if (isAbortError(cause)) {
     return new S3Error({ code: 'Aborted', message: 'The request was aborted.', status: 0, cause })
   }

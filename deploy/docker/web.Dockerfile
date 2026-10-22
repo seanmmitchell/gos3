@@ -24,15 +24,15 @@
 # Base images are pinned by digest; Dependabot proposes updates. Change the
 # tag and the digest together (both stages use the same image).
 
-FROM node:22-bookworm-slim@sha256:c3de60bf2f9dd0ac6370e6117950ff62d6e339527e7472301c9c78a017978392 AS build
+FROM node:24-bookworm-slim@sha256:a5f4366e834695d5f363b920c104953a535d3a9864d1bdf74566a0ebe01daee5 AS build
 ENV PNPM_HOME=/pnpm \
-    COREPACK_ENABLE_DOWNLOAD_PROMPT=0 \
     NUXT_TELEMETRY_DISABLED=1 \
     CI=true
 ENV PATH=$PNPM_HOME:$PATH
-RUN corepack enable
 WORKDIR /src/web
 COPY web/package.json web/pnpm-lock.yaml web/pnpm-workspace.yaml ./
+# Install the project's pinned package manager directly for repeatable builds.
+RUN npm install --global --ignore-scripts "$(node -p "require('./package.json').packageManager")"
 RUN --mount=type=cache,id=gos3-pnpm,target=/pnpm/store \
     pnpm config set store-dir /pnpm/store && \
     pnpm fetch --frozen-lockfile
@@ -42,7 +42,7 @@ RUN --mount=type=cache,id=gos3-pnpm,target=/pnpm/store \
     pnpm install --frozen-lockfile --offline && \
     pnpm build
 
-FROM node:22-bookworm-slim@sha256:c3de60bf2f9dd0ac6370e6117950ff62d6e339527e7472301c9c78a017978392
+FROM node:24-bookworm-slim@sha256:a5f4366e834695d5f363b920c104953a535d3a9864d1bdf74566a0ebe01daee5
 ENV NODE_ENV=production \
     HOST=0.0.0.0 \
     PORT=3000 \

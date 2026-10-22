@@ -5,7 +5,20 @@ import (
 	"errors"
 	"strings"
 	"testing"
+	"time"
 )
+
+func TestAdminServiceWildcardResource(t *testing.T) {
+	c := newEvalCtx(&AuthzRequest{Action: "admin:ListUsers"}, time.Now())
+	for _, pattern := range []string{AdminResourceARN, adminARNPrefix + "**", adminARNPrefix + "***"} {
+		if !validAdminResource(pattern) || !c.resourceMatches([]string{pattern}) {
+			t.Fatalf("valid wildcard %q does not match a service action", pattern)
+		}
+	}
+	if c.resourceMatches([]string{adminARNPrefix + "user/*"}) {
+		t.Fatal("scoped admin resource matched a service action")
+	}
+}
 
 // TestAuthorizeAdminResources checks per-target admin resources (iam-1):
 // admin actions on users, policies and buckets are evaluated against

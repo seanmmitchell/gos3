@@ -267,27 +267,31 @@ func (r *Router) SetReplication(ctx context.Context, bucket string, mode Mode, r
 	if err != nil {
 		return PlacementStatus{}, err
 	}
-	if err := r.checkNewMembers(ctx, bucket, bs, replicas, nil); err != nil {
-		return PlacementStatus{}, err
-	}
-
-	r.mu.Lock()
+	r.mu.RLock()
 	rec := bs.rec
 	if rec.Move != nil {
-		r.mu.Unlock()
+		r.mu.RUnlock()
 		return PlacementStatus{}, fmt.Errorf("%w: a move of bucket %q is in progress", ErrConflict, bucket)
 	}
 	if slices.Contains(replicas, rec.primary()) {
-		r.mu.Unlock()
+		r.mu.RUnlock()
 		return PlacementStatus{}, fmt.Errorf("%w: %q is the primary of bucket %q", ErrInvalidPlacement, rec.primary(), bucket)
 	}
 	for _, name := range replicas {
 		if rec.member(name) < 0 && r.purges[purgeRecord{Bucket: bucket, Backing: name}] != nil {
-			r.mu.Unlock()
+			r.mu.RUnlock()
 			return PlacementStatus{}, fmt.Errorf("%w: a previous copy of bucket %q on backing %q is still being deleted; retry later",
 				ErrConflict, bucket, name)
 		}
 	}
+	r.mu.RUnlock()
+	// Check placement conflicts before probing the backings: a copy being
+	// deleted is ours, not unrelated data. adminMu keeps rec current while
+	// the checks perform I/O without holding mu.
+	if err := r.checkNewMembers(ctx, bucket, bs, replicas, nil); err != nil {
+		return PlacementStatus{}, err
+	}
+	r.mu.Lock()
 	next := rec.clone()
 	next.Mode = mode
 	next.Members = next.Members[:1]
@@ -363,29 +367,33 @@ func (r *Router) Move(ctx context.Context, bucket, from, to string, target *stor
 		return PlacementStatus{}, err
 	}
 	target = cloneTarget(target) // the caller keeps its own
-	if err := r.checkNewMembers(ctx, bucket, bs, []string{to}, target); err != nil {
-		return PlacementStatus{}, err
-	}
-	r.mu.Lock()
+	r.mu.RLock()
 	rec := bs.rec
 	if from == "" {
 		from = rec.primary()
 	}
 	switch {
 	case rec.Move != nil:
-		r.mu.Unlock()
+		r.mu.RUnlock()
 		return PlacementStatus{}, fmt.Errorf("%w: a move of bucket %q is already in progress", ErrConflict, bucket)
 	case rec.member(from) < 0:
-		r.mu.Unlock()
+		r.mu.RUnlock()
 		return PlacementStatus{}, fmt.Errorf("%w: backing %q holds no copy of bucket %q", ErrInvalidPlacement, from, bucket)
 	case rec.member(to) >= 0:
-		r.mu.Unlock()
+		r.mu.RUnlock()
 		return PlacementStatus{}, fmt.Errorf("%w: backing %q already holds a copy of bucket %q", ErrConflict, to, bucket)
 	case r.purges[purgeRecord{Bucket: bucket, Backing: to}] != nil:
-		r.mu.Unlock()
+		r.mu.RUnlock()
 		return PlacementStatus{}, fmt.Errorf("%w: a previous copy of bucket %q on backing %q is still being deleted; retry later",
 			ErrConflict, bucket, to)
 	}
+	r.mu.RUnlock()
+	// An in-progress move may already have created its target bucket;
+	// report that conflict before checking for unrelated same-name data.
+	if err := r.checkNewMembers(ctx, bucket, bs, []string{to}, target); err != nil {
+		return PlacementStatus{}, err
+	}
+	r.mu.Lock()
 	next := rec.clone()
 	next.Move = &moveRecord{From: from, To: to, StartedAt: time.Now().UTC(), Target: target}
 	ms := r.newMemberState(bs, to)

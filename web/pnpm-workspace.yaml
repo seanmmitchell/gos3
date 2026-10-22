@@ -29,8 +29,10 @@ trustPolicyExclude:
 # Only direct dependencies may come from git repositories or tarball URLs.
 blockExoticSubdeps: true
 
-# Patched versions of vulnerable transitive dependencies.
+# Pinned and patched transitive dependencies.
 overrides:
+  # Retain the previously accepted release while Socket blocks 0.2.119.
+  lib0: 0.2.118
   # Nuxt devtools (disabled in nuxt.config.ts) pulls simple-git:
   # GHSA-x6jw-m9v5-85vh, GHSA-858h-whjf-mvg5, GHSA-v5rq-49vh-5v5c.
   simple-git: ^4.0.2
@@ -42,6 +44,10 @@ overrides:
   shell-quote: 1.11.0
   # GHSA-68fv-2mgg-jv7q: event-loop DoS, via postcss. Oldest fixed release.
   source-map-js: 1.2.2
+  # GHSA-587h-7wmj-h5pm, GHSA-r825-w8mm-5pxw, GHSA-698v-4r3x-3vcv:
+  # editor-launch fixes, published 2026-10-06 (past the 14-day cooldown).
+  launch-editor: 2.14.2
+  vite: 8.3.3
   # WebAssembly fallbacks, loaded only when the native binary is missing (a
   # platform without a prebuilt one). Removed to keep unused code out of the
   # dependency tree; every supported platform has the native package.

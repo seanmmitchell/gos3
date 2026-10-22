@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/seanmmitchell/gos3/internal/storage"
+	"github.com/seanmmitchell/gos3/internal/storage/copier"
 	"github.com/seanmmitchell/gos3/internal/storage/memory"
 	"github.com/seanmmitchell/gos3/internal/storage/storagetest"
 )
@@ -555,6 +556,62 @@ func TestPlacementValidation(t *testing.T) {
 	bs := r.Backings()
 	if len(bs) != 2 || !bs[0].Default || bs[0].Buckets != 1 || !bs[1].Healthy {
 		t.Errorf("Backings() = %+v", bs)
+	}
+}
+
+func TestBucketInstanceIDSurvivesRestartAndChangesOnRecreate(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	state, data := filepath.Join(dir, "placements.json"), filepath.Join(dir, "data")
+	r := openRouter(t, Options{Backings: []Backing{fsBacking(t, "disk", data)}, StatePath: state})
+	if err := r.CreateBucket(ctx, "bucket", storage.CreateBucketOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	first, err := r.GetBucket(ctx, "bucket")
+	if err != nil || first.InstanceID == "" {
+		t.Fatalf("first bucket identity: %+v, %v", first, err)
+	}
+	if err := r.Close(); err != nil {
+		t.Fatal(err)
+	}
+	r = openRouter(t, Options{Backings: []Backing{fsBacking(t, "disk", data)}, StatePath: state})
+	afterRestart, err := r.GetBucket(ctx, "bucket")
+	if err != nil || afterRestart.InstanceID != first.InstanceID {
+		t.Fatalf("identity after restart: %+v, %v", afterRestart, err)
+	}
+	if err := r.DeleteBucket(ctx, "bucket"); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.CreateBucket(ctx, "bucket", storage.CreateBucketOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	recreated, err := r.GetBucket(ctx, "bucket")
+	if err != nil || recreated.InstanceID == "" || recreated.InstanceID == first.InstanceID {
+		t.Fatalf("identity after recreate: %+v, %v", recreated, err)
+	}
+}
+
+func TestVersionLimitDoesNotDisableBacking(t *testing.T) {
+	ctx := context.Background()
+	r := openRouter(t, Options{Backings: memBackings(2)})
+	src := r.topology.Load().backings["a"]
+	dst := r.topology.Load().backings["b"]
+	for _, b := range []*backing{src, dst} {
+		if err := b.Backend.CreateBucket(ctx, "bucket", storage.CreateBucketOptions{}); err != nil {
+			t.Fatal(err)
+		}
+		if err := b.Backend.SetBucketVersioning(ctx, "bucket", storage.VersioningEnabled); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for range copier.MaxKeyVersions + 1 {
+		put(t, src.Backend, "bucket", "hot", "x", storage.ObjectMeta{})
+	}
+	if err := r.syncKey(ctx, src, dst, "bucket", "hot", false, nil); !errors.Is(err, copier.ErrTooManyVersions) {
+		t.Fatalf("syncKey: %v", err)
+	}
+	if !src.healthy.Load() || !dst.healthy.Load() {
+		t.Fatal("version limit marked a backing unavailable")
 	}
 }
 

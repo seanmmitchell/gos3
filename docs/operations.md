@@ -537,9 +537,10 @@ manager a longer stop timeout than `shutdown_timeout`; the systemd unit uses
 
 ## Upgrades
 
-For the first full release, follow the
-[0.2.0 upgrade checklist](releases/0.2.0.md#upgrading-from-010), including the
-discovery defaults, policy and credential changes. Development-build storage
+For the current release, follow the
+[0.2.2 upgrade checklist](releases/0.2.2.md#upgrading-from-021). When upgrading
+from 0.1.0, also follow the [0.2.0 upgrade checklist](releases/0.2.0.md#upgrading-from-010)
+for discovery defaults, policies and credentials. Development-build storage
 migrations are covered separately below.
 
 1. Read the release notes.
