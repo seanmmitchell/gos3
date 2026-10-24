@@ -195,15 +195,12 @@ func TestRoundTrip(t *testing.T) {
 }
 
 func TestRestoreSpoolQuota(t *testing.T) {
-	tooLarge := &Runtime{}
-	large, err := tooLarge.Open(t.Context(), Location{Repository: "unused"}, strings.Repeat("0", 64), DefaultRestoreSpoolBytes+1)
-	if err != nil {
-		t.Fatal(err)
+	// A version larger than the limit is restored in windows of at most
+	// half of it (see TestObjectsLargerThanTheSpoolLimitAreReadInWindows),
+	// never refused whole.
+	if w := new(Runtime).restoreWindow(); crypt.EncryptedSize(w) > DefaultRestoreSpoolBytes/2 || w < DefaultRestoreSpoolBytes/2-crypt.ChunkSize-DefaultRestoreSpoolBytes/1024 {
+		t.Fatalf("default restore window %d", w)
 	}
-	if err := large.Prepare(); !errors.Is(err, ErrRestoreSpoolLimit) {
-		t.Fatalf("oversized restore: %v", err)
-	}
-	large.Close()
 
 	restictest.Install(t, "current")
 	loc, _ := localRepo(t)

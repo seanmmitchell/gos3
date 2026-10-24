@@ -26,8 +26,20 @@ import (
 	"github.com/seanmmitchell/gos3/internal/storage/restic/restictest"
 )
 
-// TestMain lets the test binary act as the fake restic of restictest.
-func TestMain(m *testing.M) { restictest.Main(m) }
+// envRunCLI makes the test binary run the gos3 command line (its
+// arguments) instead of the tests, for tests that need gos3 as a real
+// program. It has no GOS3_ prefix, so clearEnv keeps it and the
+// configuration never reads it.
+const envRunCLI = "GOS3TEST_RUN_CLI"
+
+// TestMain lets the test binary act as gos3 itself (envRunCLI) or as the
+// fake restic of restictest.
+func TestMain(m *testing.M) {
+	if os.Getenv(envRunCLI) == "1" {
+		os.Exit(run(context.Background(), os.Args[1:], os.Stdout, os.Stderr))
+	}
+	restictest.Main(m)
+}
 
 const (
 	resticTestAK = "resticcliaccess"
@@ -49,11 +61,24 @@ func TestShellQuoting(t *testing.T) {
 			t.Errorf("bashQuote(%q) = %s, want %s", in, got, want)
 		}
 	}
+	// Anything but printable ASCII is sent as base64, so that the output
+	// is ASCII and reads the same in every console code page.
+	b64 := func(s string) string {
+		return "[Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('" + base64.StdEncoding.EncodeToString([]byte(s)) + "'))"
+	}
 	ps := map[string]string{
-		"":               "''",
-		"it's":           "'it''s'",
-		"$env:X `n":      "'$env:X `n'",
-		"a\u2019b\u2018": "'a\u2019\u2019b\u2018\u2018'",
+		"":                     "''",
+		"it's":                 "'it''s'",
+		"$env:X `n":            "'$env:X `n'",
+		" !~":                  "' !~'",
+		"a\u2019b\u2018":       b64("a\u2019b\u2018"),
+		"a\nb":                 b64("a\nb"),
+		"tab\t":                b64("tab\t"),
+		"del\x7f":              b64("del\x7f"),
+		psPayload932:           b64(psPayload932),
+		psPayloadGBK:           b64(psPayloadGBK),
+		"caf\u00e9":            b64("caf\u00e9"),
+		"\U0001F512 emoji 's'": b64("\U0001F512 emoji 's'"),
 	}
 	for in, want := range ps {
 		if got := powerShellQuote(in); got != want {
@@ -62,6 +87,49 @@ func TestShellQuoting(t *testing.T) {
 	}
 	if got := commentSafe("a\nb\x7fc"); got != "a?b?c" {
 		t.Errorf("commentSafe = %q", got)
+	}
+	if got := asciiCommentSafe("a\nb\x7fc\u00e9\u4e01d"); got != "a?b?c??d" {
+		t.Errorf("asciiCommentSafe = %q", got)
+	}
+}
+
+// Values that broke out of powerShellQuote's single quotes: PowerShell
+// decodes the output of `gos3 restic env` with the console's code page,
+// and there the UTF-8 of an innocent character pair ends in a typographic
+// quote (U+2018). In code page 932 (Japanese) C2 81 65 (U+0081 'e') reads
+// as U+FF82 U+2018; in 936 (GBK) E4 B8 81 E1 A1 AE (U+4E01 U+186E) reads
+// with A1 AE as U+2018. The rest of the value then ran as code.
+const (
+	psPayload932 = "\u0081e; Set-Variable -Scope Global pwned 1; #"
+	psPayloadGBK = "\u4e01\u186e; Set-Variable -Scope Global pwned 1; #"
+)
+
+// psRepo is a repository from a malicious server that puts the payloads
+// in every value and comment of the PowerShell output.
+func psRepo() resticRepo {
+	return resticRepo{
+		bucket: "b", backing: "cold\u4e01\u186e\u0081e", purpose: purposeArchive,
+		loc: restic.Location{
+			Repository: "s3:http://127.0.0.1:9/b/p\u0081e\u4e01\u186e",
+			Password:   psPayload932,
+			Env:        []string{"AWS_ACCESS_KEY_ID=AK", "AWS_SECRET_ACCESS_KEY=" + psPayloadGBK},
+			Options:    []string{"s3.region=" + psPayloadGBK, "s3.bucket-lookup=" + psPayload932},
+		},
+	}
+}
+
+// TestWriteResticEnvPowerShellASCII checks that the PowerShell output is
+// ASCII, which every code page PowerShell might decode it with reads the
+// same.
+func TestWriteResticEnvPowerShellASCII(t *testing.T) {
+	var b bytes.Buffer
+	if err := writeResticEnv(&b, shellPowerShell, psRepo()); err != nil {
+		t.Fatal(err)
+	}
+	for i, c := range b.Bytes() {
+		if c >= 0x80 || (c < ' ' && c != '\n') || c == 0x7f {
+			t.Fatalf("byte %d of the output is %#x, want printable ASCII:\n%s", i, c, b.Bytes())
+		}
 	}
 }
 
@@ -169,6 +237,96 @@ func TestResticEnvShellRoundTrip(t *testing.T) {
 	if tested == 0 {
 		t.Skip("no shell found")
 	}
+}
+
+// TestResticEnvPowerShellCodePages runs the documented
+// `gos3 restic env --server URL --shell powershell | Out-String |
+// Invoke-Expression` against a malicious server, in PowerShell with the
+// console code pages that turned the payloads into a closing quote, and
+// checks that the values arrive intact and nothing ran.
+func TestResticEnvPowerShellCodePages(t *testing.T) {
+	clearEnv(t)
+	gos3, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	// One payload alone (the attack: the rest of the output parses, so
+	// the payload runs), then the payloads in every value and comment.
+	plain := resticRepo{bucket: "b", purpose: purposeArchive, loc: restic.Location{
+		Repository: "s3:http://127.0.0.1:9/b/p", Password: "pw",
+		Env: []string{"AWS_ACCESS_KEY_ID=AK", "AWS_SECRET_ACCESS_KEY=SK"},
+	}}
+	only932, onlyGBK := plain, plain
+	only932.loc.Password = psPayload932
+	onlyGBK.loc.Env = []string{"AWS_ACCESS_KEY_ID=AK", "AWS_SECRET_ACCESS_KEY=" + psPayloadGBK}
+	type answer struct {
+		name, url, want string
+	}
+	var answers []answer
+	for name, repo := range map[string]resticRepo{"932 password": only932, "GBK secret key": onlyGBK, "everywhere": psRepo()} {
+		env := map[string]string{}
+		for _, e := range repo.loc.Env {
+			k, v, _ := strings.Cut(e, "=")
+			env[k] = v
+		}
+		answers = append(answers, answer{name,
+			answerServer(t, map[string]any{
+				"backing": repo.backing, "purpose": repo.purpose, "repository": repo.loc.Repository,
+				"password": repo.loc.Password, "env": env, "options": repo.loc.Options,
+			}),
+			"False|" + repo.loc.Password + "|" + env["AWS_SECRET_ACCESS_KEY"] + "|" + repo.loc.Repository,
+		})
+	}
+	tested := 0
+	for _, exe := range []string{"pwsh", "powershell"} {
+		path, err := exec.LookPath(exe)
+		if err != nil {
+			continue
+		}
+		for _, a := range answers {
+			for _, cp := range []string{"932", "936"} {
+				if testPowerShellCodePage(t, path, cp, gos3, a.url, a.want, exe+", "+a.name) {
+					tested++
+				}
+			}
+		}
+	}
+	if tested == 0 {
+		t.Skip("no PowerShell with code pages 932 and 936 found")
+	}
+}
+
+// testPowerShellCodePage evaluates `gos3 restic env` with the server url
+// in the PowerShell exe under the console code page cp and checks the
+// result against want: whether the payload ran, then the values. It
+// reports whether the code page was available.
+func testPowerShellCodePage(t *testing.T, exe, cp, gos3, url, want, name string) bool {
+	t.Helper()
+	// GOS3TEST_ARGS holds gos3's arguments, so the script needs no quoting
+	// of the URL; the result is written as UTF-8.
+	script := `try { [Console]::OutputEncoding = [Text.Encoding]::GetEncoding(` + cp + `) } catch { [Console]::Out.Write('NOENC ' + $_); exit 0 }
+& $env:GOS3TEST_EXE @($env:GOS3TEST_ARGS -split ' ') | Out-String | Invoke-Expression
+[Console]::OutputEncoding = [Text.Encoding]::UTF8
+[Console]::Out.Write([string](Test-Path variable:global:pwned) + '|' + $env:RESTIC_PASSWORD + '|' + $env:AWS_SECRET_ACCESS_KEY + '|' + $env:RESTIC_REPOSITORY)`
+	cmd := exec.Command(exe, "-NoProfile", "-NonInteractive", "-Command", script)
+	cmd.Env = append(os.Environ(), envRunCLI+"=1", "GOS3TEST_EXE="+gos3,
+		"GOS3TEST_ARGS=restic env --bucket b --server "+url+" --access-key AK --secret-key SK --shell powershell")
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+	out, err := cmd.Output()
+	if err != nil {
+		t.Errorf("%s, code page %s: %v: %s", name, cp, err, stderr.Bytes())
+		return true
+	}
+	got := string(out)
+	if strings.HasPrefix(got, "NOENC") {
+		t.Logf("%s: code page %s unavailable: %s", name, cp, got)
+		return false
+	}
+	if got != want {
+		t.Errorf("%s, code page %s: got %q, want %q (stderr %s)", name, cp, got, want, stderr.Bytes())
+	}
+	return true
 }
 
 func TestResticUsageErrors(t *testing.T) {

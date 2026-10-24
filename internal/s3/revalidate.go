@@ -78,7 +78,7 @@ func (s *Server) checkCredentialsCurrent(rc *reqContext) error {
 // builds the same authzTarget as authorizeOpWith.
 func (s *Server) reauthorizeOp(ctx context.Context, r *http.Request, rc *reqContext, attrs map[string][]string) error {
 	op := rc.op
-	v := rc.versionID()
+	v := authzVersionID(op, rc)
 	t := authzTarget{
 		Action:         op.action(v),
 		VersionID:      v,

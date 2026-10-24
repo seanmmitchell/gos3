@@ -170,21 +170,86 @@ func TestRelayPresignedRangesAndErrors(t *testing.T) {
 	}
 }
 
+// relayUpstream serves body with exactly the given Content-Type values; nil
+// sends no Content-Type at all (and suppresses the upstream's own sniffing).
+func relayUpstream(t *testing.T, contentType []string, disposition, body string) *httptest.Server {
+	t.Helper()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header()["Content-Type"] = contentType
+		if disposition != "" {
+			w.Header().Set("Content-Disposition", disposition)
+		}
+		_, _ = io.WriteString(w, body)
+	}))
+	t.Cleanup(srv.Close)
+	return srv
+}
+
+// Anything a browser could render as a PDF must download under the console
+// origin, however the upstream spells or omits its Content-Type.
 func TestRelayPDFIsDownloaded(t *testing.T) {
 	e := newEnv(t)
-	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/pdf; charset=binary")
-		w.Header().Set("Content-Disposition", `inline; filename="report.pdf"`)
-		_, _ = w.Write([]byte("pdf bytes"))
-	}))
-	defer upstream.Close()
+	for _, tc := range []struct {
+		name        string
+		contentType []string
+		disposition string
+		want        string // exact Content-Disposition, or "attachment" for any attachment
+		wantType    string
+	}{
+		{"control", []string{"application/pdf; charset=binary"}, `inline; filename="report.pdf"`, `attachment; filename=report.pdf`, "application/pdf"},
+		// The relay must not let net/http sniff %PDF- into an inline application/pdf.
+		{"missing type", nil, `inline; filename="r.pdf"`, `attachment; filename=r.pdf`, "application/octet-stream"},
+		{"malformed parameters", []string{"application/pdf; charset"}, "inline", "attachment", "application/pdf"},
+		{"comma-listed types", []string{"text/plain, application/pdf"}, `inline; filename="a.pdf"`, `attachment; filename=a.pdf`, "application/pdf"},
+		{"duplicate headers", []string{"text/plain", "application/pdf"}, "", "attachment", "application/pdf"},
+		{"uppercase", []string{"Application/PDF"}, "inline", "attachment", "application/pdf"},
+		{"legacy alias text/pdf", []string{"text/pdf"}, "inline", "attachment", "application/pdf"},
+		{"legacy alias x-pdf", []string{"application/x-pdf"}, "", "attachment", "application/pdf"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			upstream := relayUpstream(t, tc.contentType, tc.disposition, "%PDF-1.4\n%\xe2\xe3\xcf\xd3\n")
+			r := e.do(&rootCreds, "GET", relayPath(t, relayRequest{URL: upstream.URL, Method: "GET"}), nil)
+			r.expectStatus(t, 200)
+			if types := r.header.Values("Content-Type"); len(types) != 1 || types[0] != tc.wantType {
+				t.Fatalf("PDF Content-Type not collapsed to %s: %q", tc.wantType, types)
+			}
+			disposition := r.header.Get("Content-Disposition")
+			if !strings.HasPrefix(disposition, "attachment") || (tc.want != "attachment" && disposition != tc.want) || len(r.header.Values("Content-Disposition")) != 1 {
+				t.Fatalf("PDF must download under the console origin: %q", r.header.Values("Content-Disposition"))
+			}
+			if !strings.Contains(r.header.Get("Content-Security-Policy"), "sandbox") {
+				t.Fatal("relay sandbox missing")
+			}
+		})
+	}
+}
+
+func TestRelayNonPDFStaysInline(t *testing.T) {
+	e := newEnv(t)
+	upstream := relayUpstream(t, []string{"text/plain; charset=utf-8"}, `inline; filename="notes.txt"`, "hello")
 	r := e.do(&rootCreds, "GET", relayPath(t, relayRequest{URL: upstream.URL, Method: "GET"}), nil)
 	r.expectStatus(t, 200)
-	if r.header.Get("Content-Type") != "application/pdf" || r.header.Get("Content-Disposition") != `attachment; filename=report.pdf` {
-		t.Fatalf("PDF must download under the console origin: %v", r.header)
+	if r.header.Get("Content-Type") != "text/plain; charset=utf-8" || r.header.Get("Content-Disposition") != `inline; filename="notes.txt"` {
+		t.Fatalf("non-PDF response changed: %v", r.header)
 	}
-	if !strings.Contains(r.header.Get("Content-Security-Policy"), "sandbox") {
-		t.Fatal("relay sandbox missing")
+	if !strings.Contains(r.header.Get("Content-Security-Policy"), "sandbox") || r.header.Get("X-Content-Type-Options") != "nosniff" {
+		t.Fatal("relay sandbox or nosniff missing")
+	}
+	// Without an upstream type the relay must not sniff one (e.g. text/html).
+	for _, contentType := range [][]string{nil, {""}, {" "}} {
+		upstream = relayUpstream(t, contentType, "", "<html><script>alert(1)</script></html>")
+		r = e.do(&rootCreds, "GET", relayPath(t, relayRequest{URL: upstream.URL, Method: "GET"}), nil)
+		r.expectStatus(t, 200)
+		if types := r.header.Values("Content-Type"); len(types) != 1 || types[0] != "application/octet-stream" || r.header.Get("Content-Disposition") != "attachment" {
+			t.Fatalf("untyped response (%q) sniffed or inline: %v", contentType, r.header)
+		}
+	}
+	// HEAD carries no body to sniff; object metadata keeps its absent type.
+	upstream = relayUpstream(t, nil, "", "")
+	r = e.do(&rootCreds, "HEAD", relayPath(t, relayRequest{URL: upstream.URL, Method: "HEAD"}), nil)
+	r.expectStatus(t, 200)
+	if r.header.Get("Content-Type") != "" || r.header.Get("Content-Disposition") != "" {
+		t.Fatalf("HEAD metadata invented: %v", r.header)
 	}
 }
 

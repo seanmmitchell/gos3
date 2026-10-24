@@ -436,7 +436,7 @@ func (s *Server) openFS(name, path string) (multi.Backing, error) {
 		log = log.With("backing", name)
 	}
 	b, err := fsbackend.Open(path, fsbackend.Options{FsyncData: s.cfg.Storage.FsyncData, Logger: log,
-		MaxRestoreSpoolBytes: s.cfg.Restic.RestoreSpoolBytes})
+		MaxRestoreSpoolBytes: s.cfg.Restic.RestoreSpoolBytes, MaxRestores: s.cfg.Restic.MaxRestores})
 	if err != nil {
 		return multi.Backing{}, err
 	}

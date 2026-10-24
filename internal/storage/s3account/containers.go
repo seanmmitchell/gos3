@@ -7,6 +7,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"github.com/seanmmitchell/gos3/internal/s3client"
 	"github.com/seanmmitchell/gos3/internal/storage"
@@ -137,8 +138,14 @@ func classifyContainerErr(id string, err error) error {
 }
 
 // storeOptions returns the s3store options of a store at bucket/prefix in
-// region, using the connection conn.
-func (b *Backend) storeOptions(conn *s3store.Connection, bucket, prefix, region, role string, create s3store.CreateMode, expectID, tempName string) s3store.Options {
+// region, using the connection conn. tempName is the name of the store's
+// temporary directory in Options.TempDir. It is derived from a container
+// ID (validContainerID), and anything but a single local path element is
+// refused, so the directory is never created outside Options.TempDir.
+func (b *Backend) storeOptions(conn *s3store.Connection, bucket, prefix, region, role string, create s3store.CreateMode, expectID, tempName string) (s3store.Options, error) {
+	if !filepath.IsLocal(tempName) || strings.ContainsAny(tempName, `/\`) {
+		return s3store.Options{}, fmt.Errorf("s3account: invalid temporary directory name %q", tempName)
+	}
 	signRegion := region
 	if signRegion == "" {
 		signRegion = conn.Region
@@ -166,7 +173,7 @@ func (b *Backend) storeOptions(conn *s3store.Connection, bucket, prefix, region,
 	if b.opts.Tune != nil {
 		b.opts.Tune(&o)
 	}
-	return o
+	return o, nil
 }
 
 // openStore opens an s3store with o, creating its temporary directory.
@@ -194,7 +201,11 @@ func (b *Backend) openContainer(rec containerRecord, create s3store.CreateMode, 
 		}
 		c.release = rel
 	}
-	st, err := openStore(b.storeOptions(conn, rec.Bucket, rec.Prefix, rec.Region, s3store.RoleContainer, create, expectID, "c-"+rec.ID))
+	o, err := b.storeOptions(conn, rec.Bucket, rec.Prefix, rec.Region, s3store.RoleContainer, create, expectID, "c-"+rec.ID)
+	var st *s3store.Backend
+	if err == nil {
+		st, err = openStore(o)
+	}
 	if err != nil {
 		c.failErr = err
 		c.release()

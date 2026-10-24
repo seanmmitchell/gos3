@@ -35,9 +35,16 @@ type opSpec struct {
 	// Action is the IAM action authorized for the primary resource.
 	Action string
 	// VersionAction, when set, replaces Action if the request carries a
-	// versionId query parameter (e.g. s3:GetObjectVersion).
+	// versionId query parameter (e.g. s3:GetObjectVersion). It implies
+	// Versioned.
 	VersionAction string
-	Kind          resourceKind
+	// Versioned: the operation acts on the version named by the versionId
+	// query parameter, so authorization evaluates that version (its
+	// s3:ExistingObjectTag keys, s3:VersionId). Other operations (writes in
+	// particular) ignore a versionId and are authorized against the
+	// current object; see authzVersionID.
+	Versioned bool
+	Kind      resourceKind
 	// AuthzByHandler: the core does not authorize the primary resource; the
 	// handler authorizes itself (DeleteObjects per key).
 	AuthzByHandler bool
@@ -69,6 +76,18 @@ func (o *opSpec) action(versionID string) string {
 		return o.VersionAction
 	}
 	return o.Action
+}
+
+// authzVersionID returns the version that authorizing op for rc addresses:
+// the versionId query parameter for operations that act on it (Versioned
+// or with a VersionAction), "" (the current object) for the others. A
+// write creates the current object even with a dummy versionId, so that
+// cannot select a version without the current object's tags (J-03).
+func authzVersionID(op *opSpec, rc *reqContext) string {
+	if op.Versioned || op.VersionAction != "" {
+		return rc.versionID()
+	}
+	return ""
 }
 
 // opPreflight is the pseudo-operation name of CORS preflight (OPTIONS)
@@ -153,10 +172,10 @@ var opTable = []*opSpec{
 	{Name: "DeleteObjectTagging", Action: "s3:DeleteObjectTagging", VersionAction: "s3:DeleteObjectVersionTagging", Kind: resObject, handler: (*Server).handleDeleteObjectTagging},
 	{Name: "GetObjectAcl", Action: "s3:GetObjectAcl", VersionAction: "s3:GetObjectVersionAcl", Kind: resObject, handler: (*Server).handleGetObjectAcl},
 	{Name: "PutObjectAcl", Action: "s3:PutObjectAcl", VersionAction: "s3:PutObjectVersionAcl", Kind: resObject, handler: (*Server).handlePutObjectAcl},
-	{Name: "GetObjectRetention", Action: "s3:GetObjectRetention", Kind: resObject, handler: (*Server).handleGetObjectRetention},
-	{Name: "PutObjectRetention", Action: "s3:PutObjectRetention", Kind: resObject, AuthzByHandler: true, handler: (*Server).handlePutObjectRetention},
-	{Name: "GetObjectLegalHold", Action: "s3:GetObjectLegalHold", Kind: resObject, handler: (*Server).handleGetObjectLegalHold},
-	{Name: "PutObjectLegalHold", Action: "s3:PutObjectLegalHold", Kind: resObject, AuthzByHandler: true, handler: (*Server).handlePutObjectLegalHold},
+	{Name: "GetObjectRetention", Action: "s3:GetObjectRetention", Versioned: true, Kind: resObject, handler: (*Server).handleGetObjectRetention},
+	{Name: "PutObjectRetention", Action: "s3:PutObjectRetention", Versioned: true, Kind: resObject, AuthzByHandler: true, handler: (*Server).handlePutObjectRetention},
+	{Name: "GetObjectLegalHold", Action: "s3:GetObjectLegalHold", Versioned: true, Kind: resObject, handler: (*Server).handleGetObjectLegalHold},
+	{Name: "PutObjectLegalHold", Action: "s3:PutObjectLegalHold", Versioned: true, Kind: resObject, AuthzByHandler: true, handler: (*Server).handlePutObjectLegalHold},
 	{Name: "GetObjectAttributes", Action: "s3:GetObjectAttributes", VersionAction: "s3:GetObjectVersionAttributes", Kind: resObject, RequiresObjectRead: true, handler: (*Server).handleGetObjectAttributes},
 	{Name: "RestoreObject", Action: "s3:RestoreObject", Kind: resObject, handler: (*Server).handleRestoreObject},
 	{Name: "SelectObjectContent", Action: "s3:GetObject", Kind: resObject, handler: (*Server).handleSelectObjectContent},

@@ -190,8 +190,13 @@ that the target cannot store fails the job.
   Jobs submitted before bucket pinning was introduced must be submitted
   again to continue safely.
 - **Per-key history is bounded**: a key with more than 4,096 versions or
-  delete markers stops a copy or replication pass with an explicit error
-  before that key is written. Remove unneeded old versions to resume.
+  delete markers on the source or the target is not copied. The job copies
+  every other key and lists that key in `errors`; a mirror keeps running
+  and retries it, a copy job's final pass fails with "N keys could not be
+  copied" and the job is retried rather than completed. Remove unneeded
+  old versions of the key to let it be copied. Bucket replicas and moves
+  treat such a key the same way and report it as `skippedKeys` (see
+  [admin-api.md](admin-api.md)).
 - **Locked versions are never deleted or replaced.** A target version
   under unexpired retention or a legal hold that the copy would delete or
   replace is left alone and reported as a **conflict** (`conflicts`,

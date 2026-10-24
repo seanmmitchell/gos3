@@ -6,6 +6,8 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"slices"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -13,19 +15,22 @@ import (
 )
 
 type workflowStep struct {
-	Name string            `yaml:"name"`
-	ID   string            `yaml:"id"`
-	Uses string            `yaml:"uses"`
-	Run  string            `yaml:"run"`
-	With map[string]string `yaml:"with"`
+	Name             string            `yaml:"name"`
+	ID               string            `yaml:"id"`
+	Uses             string            `yaml:"uses"`
+	Run              string            `yaml:"run"`
+	WorkingDirectory string            `yaml:"working-directory"`
+	With             map[string]string `yaml:"with"`
+	Env              map[string]string `yaml:"env"`
 }
 type workflowJob struct {
-	Steps   []workflowStep    `yaml:"steps"`
-	Outputs map[string]string `yaml:"outputs"`
-	If      string            `yaml:"if"`
-	Needs   yaml.Node         `yaml:"needs"`
-	Uses    string            `yaml:"uses"`
-	With    map[string]any    `yaml:"with"`
+	Steps       []workflowStep    `yaml:"steps"`
+	Outputs     map[string]string `yaml:"outputs"`
+	If          string            `yaml:"if"`
+	Needs       yaml.Node         `yaml:"needs"`
+	Uses        string            `yaml:"uses"`
+	With        map[string]any    `yaml:"with"`
+	Permissions map[string]string `yaml:"permissions"`
 }
 type releaseWorkflow struct {
 	On   map[string]any         `yaml:"on"`
@@ -117,7 +122,7 @@ func TestReleaseNeverPublishesAnExistingDraft(t *testing.T) {
   esac
 }
 `
-		out, err := workflowBash(t, mock+script, "TAG=v1.2.3", "GH_AUDIT_LOG="+filepath.ToSlash(log), "REFUSE_CREATE="+map[bool]string{false: "false", true: "true"}[refuse])
+		out, err := workflowBash(t, mock+script, "TAG=v1.2.3", "ASSETS=dist/a\ndist/checksums.txt", "GH_AUDIT_LOG="+filepath.ToSlash(log), "REFUSE_CREATE="+map[bool]string{false: "false", true: "true"}[refuse])
 		data, readErr := os.ReadFile(log)
 		if readErr != nil {
 			t.Fatal(readErr)
@@ -157,6 +162,190 @@ func TestEmbeddedArtifactBoundToProducer(t *testing.T) {
 		}
 	}
 	t.Fatal("UI download not found")
+}
+
+// releaseBinaries returns the bin-* artifact names build.yml's binaries
+// matrix uploads and the archive file names they hold for version.
+func releaseBinaries(version string) (artifacts, archives []string) {
+	for _, goos := range []string{"linux", "darwin", "windows"} {
+		ext := ".tar.gz"
+		if goos == "windows" {
+			ext = ".zip"
+		}
+		for _, goarch := range []string{"amd64", "arm64"} {
+			for _, suffix := range []string{"", "-headless"} {
+				artifacts = append(artifacts, "bin-"+goos+"-"+goarch+suffix)
+				archives = append(archives, "gos3_"+strings.TrimPrefix(version, "v")+"_"+goos+"_"+goarch+suffix+ext)
+			}
+		}
+	}
+	return artifacts, archives
+}
+
+// stepOutputs parses a $GITHUB_OUTPUT file, including name<<DELIMITER
+// multi-line values.
+func stepOutputs(t *testing.T, path string) map[string]string {
+	t.Helper()
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	out := map[string]string{}
+	lines := strings.Split(strings.ReplaceAll(string(data), "\r\n", "\n"), "\n")
+	for i := 0; i < len(lines); i++ {
+		if name, delim, ok := strings.Cut(lines[i], "<<"); ok {
+			var value []string
+			for i++; i < len(lines) && lines[i] != delim; i++ {
+				value = append(value, lines[i])
+			}
+			out[name] = strings.Join(value, "\n")
+		} else if name, value, ok := strings.Cut(lines[i], "="); ok {
+			out[name] = value
+		}
+	}
+	return out
+}
+
+func TestReleaseBinariesBoundToExpectedSet(t *testing.T) {
+	const (
+		filter = `.artifacts[] | [.id, .name, .expired] | @tsv`
+		url    = "repos/owner/repo/actions/runs/42/artifacts?per_page=100"
+	)
+	job := readWorkflow(t, "release.yml").Jobs["release"]
+	if job.Permissions["actions"] != "read" {
+		t.Error("release job cannot list the run's artifacts")
+	}
+	var verify, archives, publish *workflowStep
+	downloads := 0
+	for i := range job.Steps {
+		s := &job.Steps[i]
+		values := []string{s.Run}
+		for _, v := range s.With {
+			values = append(values, v)
+		}
+		for _, v := range values {
+			if strings.Contains(v, "dist/*") || strings.Contains(v, "gos3_*") {
+				t.Errorf("step %q selects release files by glob: %q", s.Name, v)
+			}
+		}
+		switch {
+		case s.ID == "artifacts":
+			verify = s
+		case s.ID == "archives":
+			archives = s
+		case s.Name == "Create, upload and publish the release":
+			publish = s
+		case strings.HasPrefix(s.Uses, "actions/download-artifact@"):
+			downloads++
+			if verify == nil || s.With["pattern"] != "" || s.With["name"] != "" || s.With["artifact-ids"] != "${{ steps.artifacts.outputs.ids }}" || s.With["path"] != "dist" {
+				t.Errorf("binaries are not downloaded by the verified artifact IDs: %v", s.With)
+			}
+		case strings.HasPrefix(s.Uses, "actions/attest-build-provenance@"):
+			if s.With["subject-path"] != "${{ steps.archives.outputs.subjects }}" {
+				t.Errorf("attestation subjects are not the verified archives: %q", s.With["subject-path"])
+			}
+		}
+	}
+	if downloads != 1 {
+		t.Errorf("release job has %d artifact downloads, want 1", downloads)
+	}
+	if verify == nil || archives == nil || publish == nil {
+		t.Fatal("artifact verification, archive verification or publishing step not found")
+	}
+	if publish.Env["ASSETS"] != "${{ steps.archives.outputs.assets }}" {
+		t.Errorf("release uploads %q, not the verified assets", publish.Env["ASSETS"])
+	}
+
+	names, files := releaseBinaries("v1.2.3")
+	listing := func(names ...string) string {
+		var b strings.Builder
+		b.WriteString("7\tui-embed\tfalse\n")
+		for i, n := range names {
+			b.WriteString(strconv.Itoa(1000+i) + "\t" + n + "\tfalse\n")
+		}
+		return b.String()
+	}
+	mock := `gh() {
+  if [ "$#" != 5 ] || [ "$1 $2 $3" != "api --paginate --jq" ] || [ "$4" != "$WANT_FILTER" ] || [ "$5" != "$WANT_URL" ]; then
+    echo "unexpected gh $*" >&2
+    return 2
+  fi
+  printf '%s' "$LISTING"
+}
+`
+	for _, tc := range []struct {
+		name    string
+		listing string
+		ok      bool
+	}{
+		{"exact", listing(names...), true},
+		{"extra bin-zz", listing(append(slices.Clone(names), "bin-zz")...), false},
+		{"extra same-archive name", listing(append(slices.Clone(names), "bin-linux-amd64-x")...), false},
+		{"missing", listing(names[:len(names)-1]...), false},
+		{"duplicate", listing(append(slices.Clone(names), names[0])...), false},
+		{"expired", strings.Replace(listing(names...), "bin-darwin-arm64\tfalse", "bin-darwin-arm64\ttrue", 1), false},
+		{"empty", "", false},
+	} {
+		output := filepath.Join(t.TempDir(), "output")
+		out, err := workflowBash(t, mock+verify.Run, "GH_REPO=owner/repo", "GITHUB_RUN_ID=42",
+			"GITHUB_OUTPUT="+filepath.ToSlash(output), "WANT_FILTER="+filter, "WANT_URL="+url, "LISTING="+tc.listing)
+		if (err == nil) != tc.ok {
+			t.Fatalf("artifact check %s: %v %s", tc.name, err, out)
+		}
+		if tc.ok {
+			ids := strings.Split(stepOutputs(t, output)["ids"], ",")
+			if len(ids) != len(names) || ids[0] != "1000" || slices.Contains(ids, "7") {
+				t.Fatalf("artifact check %s: ids %v", tc.name, ids)
+			}
+		}
+	}
+
+	for _, tc := range []struct {
+		name  string
+		files []string
+		ok    bool
+	}{
+		{"exact", files, true},
+		{"extra file", append(slices.Clone(files), "gos3_1.2.3_linux_amd64.tar.gz.sig"), false},
+		{"planted checksums", append(slices.Clone(files), "checksums.txt"), false},
+		{"other version", append(slices.Clone(files[1:]), "gos3_1.2.4_linux_amd64.tar.gz"), false},
+		{"missing", files[1:], false},
+	} {
+		dist := t.TempDir()
+		for _, f := range tc.files {
+			if err := os.WriteFile(filepath.Join(dist, f), []byte(f), 0o644); err != nil {
+				t.Fatal(err)
+			}
+		}
+		output := filepath.Join(t.TempDir(), "output")
+		out, err := workflowBash(t, "cd \""+filepath.ToSlash(dist)+"\"\n"+archives.Run, "TAG=v1.2.3", "GITHUB_OUTPUT="+filepath.ToSlash(output))
+		if (err == nil) != tc.ok {
+			t.Fatalf("archive check %s: %v %s", tc.name, err, out)
+		}
+		if !tc.ok {
+			continue
+		}
+		var subjects []string
+		for _, f := range files {
+			subjects = append(subjects, "dist/"+f)
+		}
+		outputs := stepOutputs(t, output)
+		if outputs["subjects"] != strings.Join(subjects, "\n") || outputs["assets"] != strings.Join(append(subjects, "dist/checksums.txt"), "\n") {
+			t.Fatalf("archive check outputs: %q", outputs)
+		}
+		sums, err := os.ReadFile(filepath.Join(dist, "checksums.txt"))
+		if err != nil || strings.Count(string(sums), "\n") != len(files) {
+			t.Fatalf("checksums: %v %q", err, sums)
+		}
+
+		log := filepath.Join(t.TempDir(), "commands.log")
+		out, err = workflowBash(t, `gh() { printf '%s\n' "$*" >> "$GH_AUDIT_LOG"; }
+`+publish.Run, "TAG=v1.2.3", "GH_AUDIT_LOG="+filepath.ToSlash(log), "ASSETS="+outputs["assets"])
+		commands, _ := os.ReadFile(log)
+		if err != nil || !strings.Contains(string(commands), "release upload v1.2.3 "+strings.Join(append(subjects, "dist/checksums.txt"), " ")+"\n") {
+			t.Fatalf("upload is not the verified assets: %v %s %s", err, out, commands)
+		}
+	}
 }
 
 func TestSecurityChecksBoundToPublisher(t *testing.T) {

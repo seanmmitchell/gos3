@@ -630,7 +630,7 @@ func TestListBucketsRaw(t *testing.T) {
 }
 
 func TestContinuationTokenRoundTrip(t *testing.T) {
-	for _, s := range append([]string{"a", "x/y/", "\xff\xfe", strings.Repeat("k", 1024)}, bktSpecialKeys...) {
+	for _, s := range append([]string{"a", "x/y/", strings.Repeat("k", 1024)}, bktSpecialKeys...) {
 		tok := encodeContinuationToken(s)
 		if strings.ContainsAny(tok, "+/= ") {
 			t.Errorf("token %q is not URL-safe", tok)
@@ -640,7 +640,8 @@ func TestContinuationTokenRoundTrip(t *testing.T) {
 			t.Errorf("round trip %q: %q, %v", s, got, err)
 		}
 	}
-	for _, bad := range []string{"", "!!!", strings.Repeat("A", maxContinuationToken+1), "a"} {
+	// Listed keys are valid UTF-8, so no token decodes to anything else.
+	for _, bad := range []string{"", "!!!", strings.Repeat("A", maxContinuationToken+1), "a", encodeContinuationToken("\xff\xfe")} {
 		if _, err := decodeContinuationToken(bad); err == nil {
 			t.Errorf("token %q accepted", bad)
 		}

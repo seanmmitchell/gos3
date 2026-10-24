@@ -121,25 +121,48 @@ func (g *writeGuard) Flush() {
 func (g *writeGuard) Unwrap() http.ResponseWriter { return g.ResponseWriter }
 
 // connLimiter caps the open client connections (server.max_connections)
-// without blocking Accept: when the cap is reached, a new connection first
-// makes room by closing an idle keep-alive connection; when every open
-// connection is busy the new one is closed at once. A plain semaphore
-// around Accept (netutil.LimitListener) would let one client that keeps
-// idle keep-alive connections (or half-sent headers) open hold every slot
-// and make health probes and other clients wait indefinitely. Connections
-// are counted through http.Server.ConnState (HTTP/2 connections report
-// idle when they have no open streams).
+// without blocking Accept. When the cap is reached, a new connection makes
+// room by closing, in this order:
+//
+//   - the longest-idle keep-alive connection;
+//   - else the oldest connection that has not started its first request
+//     (it sent nothing, only part of the request headers, or has not
+//     finished its TLS handshake) and has been open for at least the grace
+//     period (pendingGrace), which lets clients on slow links get their
+//     first request in.
+//
+// When neither exists (every open connection has a request in flight, or
+// is younger than the grace period) the new connection is closed at once.
+// A connection with a request in flight is never closed. A plain semaphore
+// around Accept (netutil.LimitListener), or a limiter that only evicts idle
+// connections, would let one client that keeps idle keep-alive connections,
+// silent sockets or half-sent headers open hold every slot (until
+// ReadHeaderTimeout, reconnecting after it) and lock health probes and
+// other clients out. Connections are counted through
+// http.Server.ConnState: net/http reports a connection new until its first
+// request's headers are read, and HTTP/2 connections report idle when they
+// have no open streams.
 type connLimiter struct {
 	max int
 	log func(msg string, args ...any)
 
-	mu   sync.Mutex
-	open int
-	idle map[net.Conn]time.Time // idle connections, by when they became idle
+	mu      sync.Mutex
+	grace   time.Duration // pendingGrace, shorter in tests
+	open    int
+	idle    map[net.Conn]time.Time // idle connections, by when they became idle
+	pending map[net.Conn]time.Time // StateNew connections, by when they were accepted
 }
 
+// pendingGrace is how long a connection that has not started its first
+// request is safe from eviction by newer connections.
+const pendingGrace = time.Second
+
 func newConnLimiter(max int, log func(string, ...any)) *connLimiter {
-	return &connLimiter{max: max, log: log, idle: map[net.Conn]time.Time{}}
+	return &connLimiter{
+		max: max, log: log, grace: pendingGrace,
+		idle:    map[net.Conn]time.Time{},
+		pending: map[net.Conn]time.Time{},
+	}
 }
 
 // connState is the http.Server ConnState hook.
@@ -149,51 +172,67 @@ func (l *connLimiter) connState(c net.Conn, st http.ConnState) {
 	switch st {
 	case http.StateNew:
 		l.open++
+		l.pending[c] = time.Now()
 	case http.StateIdle:
+		delete(l.pending, c)
 		l.idle[c] = time.Now()
 	case http.StateActive:
+		delete(l.pending, c)
 		delete(l.idle, c)
 	case http.StateClosed, http.StateHijacked:
-		if _, ok := l.idle[c]; ok {
-			delete(l.idle, c)
-		}
+		delete(l.pending, c)
+		delete(l.idle, c)
 		l.open--
 	}
 }
 
 // conns returns the number of connections counted as open and, of those,
-// as idle.
-func (l *connLimiter) conns() (open, idle int) {
+// as idle and as pending (not yet started their first request).
+func (l *connLimiter) conns() (open, idle, pending int) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	return l.open, len(l.idle)
+	return l.open, len(l.idle), len(l.pending)
 }
 
-// admit reports whether a newly accepted connection may be served, closing
-// the longest-idle keep-alive connection to make room when the cap is
-// reached.
+// admit reports whether a newly accepted connection may be served. When
+// the cap is reached it makes room by closing the longest-idle keep-alive
+// connection or, when none is idle, the oldest pending connection past the
+// grace period; it reports false when there is neither. The closed
+// connection stays counted as open until net/http reports it closed.
 func (l *connLimiter) admit() bool {
 	l.mu.Lock()
 	if l.open < l.max {
 		l.mu.Unlock()
 		return true
 	}
+	victim := oldestConn(l.idle, time.Time{})
+	if victim != nil {
+		delete(l.idle, victim)
+	} else if victim = oldestConn(l.pending, time.Now().Add(-l.grace)); victim != nil {
+		delete(l.pending, victim)
+	}
+	l.mu.Unlock()
+	if victim == nil {
+		return false
+	}
+	_ = victim.Close() // reported as StateClosed by net/http
+	return true
+}
+
+// oldestConn returns the connection of m with the earliest time, ignoring
+// those after notAfter (unless it is zero); nil when there is none.
+func oldestConn(m map[net.Conn]time.Time, notAfter time.Time) net.Conn {
 	var oldest net.Conn
 	var since time.Time
-	for c, t := range l.idle {
+	for c, t := range m {
+		if !notAfter.IsZero() && t.After(notAfter) {
+			continue
+		}
 		if oldest == nil || t.Before(since) {
 			oldest, since = c, t
 		}
 	}
-	if oldest != nil {
-		delete(l.idle, oldest)
-	}
-	l.mu.Unlock()
-	if oldest == nil {
-		return false
-	}
-	_ = oldest.Close() // reported as StateClosed by net/http
-	return true
+	return oldest
 }
 
 // limitedListener applies a connLimiter to Accept.
@@ -211,7 +250,7 @@ func (ln limitedListener) Accept() (net.Conn, error) {
 		if ln.l.admit() {
 			return c, nil
 		}
-		ln.l.log("connection refused: server.max_connections reached and no connection is idle",
+		ln.l.log("connection refused: server.max_connections reached and no connection is idle or waiting past the grace period for its first request",
 			"max", ln.l.max, "remote", c.RemoteAddr().String())
 		_ = c.Close()
 	}

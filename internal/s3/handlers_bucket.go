@@ -140,7 +140,8 @@ func encodeContinuationToken(after string) string {
 
 // decodeContinuationToken decodes a token made by encodeContinuationToken
 // (standard base64, padded or not, is accepted too). Empty, oversized or
-// undecodable tokens yield InvalidArgument.
+// undecodable tokens, and tokens that do not decode to valid UTF-8, yield
+// InvalidArgument.
 func decodeContinuationToken(tok string) (string, error) {
 	bad := s3err.ErrInvalidArgument.WithMessage("The continuation token provided is incorrect").
 		With("ArgumentName", "continuation-token").With("ArgumentValue", tok)
@@ -149,7 +150,9 @@ func decodeContinuationToken(tok string) (string, error) {
 	}
 	for _, enc := range []*base64.Encoding{base64.RawURLEncoding, base64.URLEncoding, base64.RawStdEncoding, base64.StdEncoding} {
 		if b, err := enc.DecodeString(tok); err == nil {
-			if len(b) == 0 {
+			// Tokens encode a listed key or common prefix: never empty, and
+			// valid UTF-8 (see validateListQuery).
+			if len(b) == 0 || !utf8.Valid(b) {
 				return "", bad
 			}
 			return string(b), nil

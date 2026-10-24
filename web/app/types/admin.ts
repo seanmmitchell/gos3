@@ -711,7 +711,8 @@ export type PlacementRole = 'primary' | 'replica' | 'move-target'
  * - in-sync:  receives every write synchronously, has no pending changes, or is the primary
  * - syncing:  initial or requested full copy running
  * - lagging:  changes are pending, copied in the background
- * - degraded: copying failed; retried with back-off (see lastError)
+ * - degraded: copying failed; retried with back-off, or skippedKeys keys
+ *             could not be copied (see lastError)
  * - offline:  the backing is unhealthy
  */
 export type MemberState = 'in-sync' | 'syncing' | 'lagging' | 'degraded' | 'offline'
@@ -736,6 +737,8 @@ export interface PlacementMember {
   /** Last completed full copy (omitted when none). */
   lastSyncAt?: Timestamp
   lastError: string
+  /** Keys not copied because a copy holds more than 4,096 versions of them (absent on older servers). */
+  skippedKeys?: number
 }
 
 export type MovePhase = 'copying' | 'cutover'

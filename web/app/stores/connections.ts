@@ -17,6 +17,12 @@
 // - Imports never point a stored secret at another endpoint, never change
 //   embedded/preset connections and never set `remember`
 //   (planConnectionImport in ~/utils/connections).
+// - A fallback relay ID (proxyConnectionId) always names a stored connection
+//   (or a reserved ID that no import can claim): removing a relay clears it
+//   on its dependents, hydrate and syncFromStorage drop dangling ones, and an
+//   import never takes an ID another connection names as its relay. Otherwise
+//   a connection added under a deleted relay's ID would receive the
+//   dependents' signed requests and presigned URLs.
 // - Other tabs of the console share localStorage: their writes are merged in
 //   through the 'storage' event (syncFromStorage), so a tab never writes back
 //   a stale list over another tab's changes. The active server and secrets
@@ -39,6 +45,7 @@ import {
   type ImportPlan,
   parseConnectionList,
   planConnectionImport,
+  pruneDanglingRelays,
   sameEndpoint
 } from '~/utils/connections'
 import { configureTransports, getTransport } from '~/utils/transport'
@@ -207,9 +214,10 @@ export const useConnectionsStore = defineStore('connections', () => {
     if (byId(id)) setStatus(id, { proxyConnectionId: relayId })
   })
 
-  function validateRelay(c: Connection): void {
+  /** Throws unless `c`'s fallback relay (looked up with `lookup`) is a different, direct gos3 connection. */
+  function validateRelay(c: Connection, lookup: (id: string) => Connection | undefined = byId): void {
     if (!c.proxyConnectionId) return
-    const relay = byId(c.proxyConnectionId)
+    const relay = lookup(c.proxyConnectionId)
     if (c.proxyConnectionId === c.id || (relay && (relay.endpoint === c.endpoint || relay.kind !== 'gos3' || relay.proxyConnectionId))) {
       throw new Error('Choose a different gos3 server that connects directly as the fallback relay')
     }
@@ -294,10 +302,14 @@ export const useConnectionsStore = defineStore('connections', () => {
           // skip corrupt entries
         }
       }
+      // Relay IDs left behind by a deleted relay (older versions kept them)
+      // are dropped for good, so no later connection can inherit the role.
+      const pruned = pruneDanglingRelays(list)
       connections.value = list
       activeId.value = state.activeId && list.some(c => c.id === state.activeId) ? state.activeId : null
       dismissedPresets.value = Array.isArray(state.dismissedPresets) ? state.dismissedPresets : []
       if (typeof state.defaultId === 'string' && state.defaultId) defaultId.value = state.defaultId
+      if (pruned) persist()
     }
     migrateLegacyDefault(state?.defaultId === undefined)
   }
@@ -323,6 +335,9 @@ export const useConnectionsStore = defineStore('connections', () => {
    * omitted). Definitions, the default server and dismissed presets are
    * adopted; this tab keeps its active server and the secrets it holds for
    * the session (sessionStorage is per tab) unless the access key changed.
+   * Dangling relay IDs are dropped as on hydrate, but only in memory: writing
+   * back here would answer every 'storage' event with another one, and the
+   * next change this tab persists stores the pruned list anyway.
    */
   function syncFromStorage(raw?: string | null): void {
     let state: PersistedState | undefined
@@ -335,18 +350,25 @@ export const useConnectionsStore = defineStore('connections', () => {
     const mine = new Map(connections.value.map(c => [c.id, c]))
     const list: Connection[] = []
     for (const stored of state.connections) {
-      let c: Connection
       try {
-        c = completeConnection(stored)
+        list.push(completeConnection(stored))
       } catch {
-        continue
+        // skip corrupt entries
       }
+    }
+    pruneDanglingRelays(list)
+    for (const c of list) {
       const own = mine.get(c.id)
       if (!c.remember && own && own.accessKeyId === c.accessKeyId) c.secretAccessKey = own.secretAccessKey
       if (own && signingChanged(own, c)) invalidate(c.id)
-      list.push(c)
     }
-    for (const id of mine.keys()) if (!list.some(c => c.id === id)) invalidate(id)
+    for (const id of mine.keys()) {
+      if (list.some(c => c.id === id)) continue
+      invalidate(id)
+      // As in remove(): connection objects this tab already handed out stop
+      // naming the removed relay.
+      for (const own of mine.values()) if (own.proxyConnectionId === id) delete own.proxyConnectionId
+    }
     connections.value = list
     if (activeId.value && !list.some(c => c.id === activeId.value)) activeId.value = null
     defaultId.value = typeof state.defaultId === 'string' && state.defaultId ? state.defaultId : null
@@ -391,12 +413,21 @@ export const useConnectionsStore = defineStore('connections', () => {
     return next
   }
 
+  /**
+   * Removes a connection. Connections that used it as their fallback relay
+   * connect directly from now on: a relay ID left behind would make whatever
+   * connection is later added under that ID (an import keeps the file's IDs)
+   * their relay.
+   */
   function remove(id: string): void {
     const c = byId(id)
     if (!c) return
     connections.value = connections.value.filter(x => x.id !== id)
     if (c.source === 'preset' && !dismissedPresets.value.includes(id)) dismissedPresets.value.push(id)
-    invalidate(id)
+    invalidate(id) // also invalidates the dependents, found by their relay ID
+    // In place, so connection objects already handed out (clients, pages)
+    // stop naming the removed relay too.
+    for (const d of connections.value) if (d.proxyConnectionId === id) delete d.proxyConnectionId
     if (activeId.value === id) activeId.value = null
     if (defaultId.value === id) defaultId.value = null
     persist()
@@ -470,12 +501,30 @@ export const useConnectionsStore = defineStore('connections', () => {
    * update it, others are added; see planConnectionImport for the rules that
    * keep an import from redirecting stored credentials or changing
    * embedded/preset connections. Throws SyntaxError on invalid JSON.
+   *
+   * New connections pass the checks of add(), against the list as it will
+   * be after the import (a relay may follow its dependents in the file): an
+   * unused ID and a valid fallback relay. When one fails, the import throws
+   * before changing anything. A relay ID that names no connection, not even
+   * one in the file, is dropped.
    */
   function importJson(json: string | unknown): { added: number, updated: number, skipped: number } {
     const plan = planImport(json)
+    const added = plan.steps.flatMap(step => (step.action === 'add' ? [completeConnection(step.input)] : []))
+    // Updates never change an endpoint, kind or relay, so they cannot affect these checks.
+    const after = [...connections.value, ...added]
+    for (const c of added) {
+      if (after.filter(x => x.id === c.id).length > 1) throw new Error(`A connection with id "${c.id}" already exists`)
+      try {
+        validateRelay(c, id => after.find(x => x.id === id))
+      } catch (e) {
+        throw new Error(`Cannot import "${c.name}": ${e instanceof Error ? e.message : String(e)}`)
+      }
+    }
+    pruneDanglingRelays(after)
+    connections.value.push(...added)
     for (const step of plan.steps) {
-      if (step.action === 'add') connections.value.push(completeConnection(step.input))
-      else if (step.action === 'update') update(step.target.id, step.patch)
+      if (step.action === 'update') update(step.target.id, step.patch)
     }
     persist()
     return { added: plan.added, updated: plan.updated, skipped: plan.skipped }
@@ -489,24 +538,33 @@ export const useConnectionsStore = defineStore('connections', () => {
    * (with a console warning); an access key ID only prefills the sign-in.
    * When a preset's endpoint changes, the secret the user entered for the
    * old endpoint is dropped instead of being signed for the new host.
+   * A preset's fallback relay must be another preset of the same list that
+   * the user has not removed, or the embedded server: any other ID may be
+   * free (a removed relay's) and later be taken by an imported connection.
    */
   function applyPresets(list: ConnectionInput[]): number {
+    const presetId = (p: ConnectionInput) => p.id ?? `preset-${endpointSlug(p.endpoint)}`
+    // A user connection under a preset's ID stays as it is (see below), so it
+    // is not a preset relay either.
+    const relayIds = new Set(list.map(presetId).filter(id => !dismissedPresets.value.includes(id) && (byId(id)?.source ?? 'preset') === 'preset'))
+    relayIds.add(EMBEDDED_CONNECTION_ID)
     let n = 0
     for (const raw of list) {
-      const { secretAccessKey: presetSecret, ...p } = raw
-      const id = p.id ?? `preset-${endpointSlug(p.endpoint)}`
+      const { secretAccessKey: presetSecret, proxyConnectionId: presetRelay, ...p } = raw
+      const id = presetId(raw)
       if (presetSecret) console.warn(`[gos3] preset "${id}" contains a secret key; ignoring it (anyone who can load the UI can read presets)`)
       if (dismissedPresets.value.includes(id)) continue
+      const proxyConnectionId = presetRelay && relayIds.has(presetRelay) ? presetRelay : undefined
       const existing = byId(id)
       if (existing) {
         if (existing.source === 'preset') {
           // Definition comes from the preset; credentials the user entered win
           // while the endpoint stays the same.
-          const moved = !sameEndpoint(existing.endpoint, p.endpoint) || p.proxyConnectionId !== existing.proxyConnectionId
+          const moved = !sameEndpoint(existing.endpoint, p.endpoint) || proxyConnectionId !== existing.proxyConnectionId
           update(id, {
             name: p.name ?? existing.name,
             endpoint: p.endpoint,
-            proxyConnectionId: p.proxyConnectionId,
+            proxyConnectionId,
             region: p.region ?? existing.region,
             kind: p.kind ?? existing.kind,
             forcePathStyle: p.forcePathStyle ?? existing.forcePathStyle,
@@ -516,7 +574,7 @@ export const useConnectionsStore = defineStore('connections', () => {
           })
         }
       } else {
-        connections.value.push(completeConnection({ ...p, id, source: 'preset', remember: p.remember ?? false }))
+        connections.value.push(completeConnection({ ...p, id, proxyConnectionId, source: 'preset', remember: p.remember ?? false }))
       }
       n++
     }

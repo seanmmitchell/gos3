@@ -63,12 +63,7 @@ func (s *Server) authorizeOp(ctx context.Context, r *http.Request, rc *reqContex
 // replaces the header-derived ones (see authzTarget.ObjectAttrs).
 func (s *Server) authorizeOpWith(ctx context.Context, r *http.Request, rc *reqContext, attrs map[string][]string) error {
 	op := rc.op
-	v := rc.versionID()
-	// Only operations with a version-specific action address the supplied
-	// version. A write creates the current object even with a dummy versionId.
-	if op.VersionAction == "" {
-		v = ""
-	}
+	v := authzVersionID(op, rc)
 	t := authzTarget{
 		Action:         op.action(v),
 		VersionID:      v,

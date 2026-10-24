@@ -75,7 +75,7 @@ type resticState struct {
 // snapshots being read are spooled (encrypted) in tmp/.
 func (b *Backend) resticRuntime() *restic.Runtime {
 	b.restic.once.Do(func() {
-		b.restic.rt = &restic.Runtime{Log: b.log, TempDir: b.tmpDir, MaxRestoreSpoolBytes: b.maxRestoreSpoolBytes}
+		b.restic.rt = &restic.Runtime{Log: b.log, TempDir: b.tmpDir, MaxRestoreSpoolBytes: b.maxRestoreSpoolBytes, MaxRestores: b.maxRestores}
 	})
 	return b.restic.rt
 }

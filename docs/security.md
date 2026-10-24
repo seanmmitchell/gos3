@@ -126,6 +126,17 @@ versus `SignatureDoesNotMatch` tells a caller whether an access key ID
 exists; rate-limit authentication failures at a reverse proxy if the
 endpoint is exposed.
 
+A `SignatureDoesNotMatch` response echoes the `StringToSign` and
+`CanonicalRequest` to help debug client signers, as AWS does. `SignedHeaders`
+may name any header, including ones a browser or proxy adds by itself
+(`Cookie`, `Authorization`, tokens injected by an authenticating proxy), so
+the echoed canonical request shows only the values of `host`, `content-*`,
+`x-amz-*`, `range`, `date` and `expect`; every other signed header's value
+is replaced by `<redacted>`. Otherwise a page allowed by a bucket CORS rule
+with credentials could send a deliberately mis-signed request and read the
+visitor's HttpOnly cookies or proxy tokens back from the error. The
+`StringToSign` carries only a hash of the real canonical request.
+
 Bucket-policy principals name users by name and keys by ID, so the two
 namespaces are kept apart: a key ID cannot equal a user name, `root`,
 `anonymous` or a 12-digit account ID, a user name cannot equal a key ID or
@@ -229,6 +240,28 @@ neither as `Resource` nor as `NotResource`: an Allow of `"Action": "*"` with
 namespaces it lists; a Deny's applies to everything not listed). The
 UI's capability flags (`GET /whoami`) reflect only unscoped grants.
 
+Service-level s3 actions (`s3:ListAllMyBuckets`, requests without a bucket)
+are covered by a statement whose Resource is `*` or an s3 ARN pattern that
+matches every s3 resource: the partition, service, region and account parts
+match `aws`, `s3` and empty (wildcards allowed) and the resource part is only
+`*`, such as `arn:aws:s3:::*`, `arn:aws:s3:::**`, `arn:*:s3:::*` or
+`arn:aws:s3:*:*:*`. This holds for Deny as well as Allow, so a Deny on any of
+these also blocks listing buckets. Patterns that match only some buckets
+(`arn:aws:s3:::b*`, `arn:aws:s3:::?`) never cover service-level actions.
+
+The IAM state is kept in memory and rewritten on every change, so a
+delegated administrator cannot grow it without bound: there are at most
+5,000 users, 1,000 custom policies (built-in policies do not count, and
+replacing an existing policy is always allowed), 10 access keys per user,
+20 KiB per identity policy with at most 1,000 values per condition key, and
+an `iam.json` of at most 32 MiB after any change (the server reads files up
+to 64 MiB, so it can always load what it wrote; deleting users, keys or
+policies is always possible). A request over a limit fails with 400
+`InvalidRequest` ("iam: limit exceeded: …"), a policy with too many
+condition values with 400 `InvalidPolicy`. Saving an IAM change does not
+block authentication: requests use the previous state until the new
+`iam.json` is written and synced.
+
 Setting an ACL or tags while writing an object needs more than
 `s3:PutObject`, as on AWS: PutObject, CopyObject (with the `REPLACE` tagging
 directive), CreateMultipartUpload and PostObject also require
@@ -251,7 +284,9 @@ tagging, retention and legal hold updates are made conditional on it,
 atomically in the storage backend. If another object took its place in the
 meantime (in unversioned and versioning-suspended buckets an overwrite
 reuses the version ID `null`), the request fails with `AccessDenied`
-instead of acting on an object the decision never saw. Each entry of a
+instead of acting on an object the decision never saw. Retention and legal
+hold requests with a `versionId` are authorized against that version (its
+`s3:ExistingObjectTag/*` keys and `s3:VersionId`), not the latest one. Each entry of a
 DeleteObjects request is decided on a fresh lookup of its object.
 CompleteMultipartUpload checks the upload's canned ACL against the bucket's
 current `BlockPublicAcls` (refusing a public ACL) and ownership controls
@@ -272,6 +307,16 @@ so other whitespace appended to a signed header breaks the signature. Query
 strings are decoded exactly as the signature covers them (`;` and invalid
 `%`-escapes stay literal), so a presigned parameter cannot be rewritten into
 one the server ignores.
+
+Listing parameters are checked the same way. ListObjects, ListObjectsV2,
+ListObjectVersions and ListMultipartUploads reject a `prefix`, `delimiter`,
+`max-keys`, `marker`, `start-after`, `key-marker`, `version-id-marker` or
+`upload-id-marker` longer than 1024 bytes or not valid UTF-8 (`400
+InvalidArgument`), and ListObjectsV2 rejects a continuation token that does
+not decode to valid UTF-8. The condition context holds at most 1024 bytes of
+a client value, so a longer `s3:prefix` or `s3:delimiter` would otherwise be
+evaluated truncated while the listing used the full value. No key is longer
+or invalid, so every refused listing has an equivalent one that is accepted.
 
 ## Data at rest
 
@@ -645,9 +690,15 @@ These limits are fixed (not configurable):
   makes no progress for 2 minutes.
 - `server.max_connections` (off by default) caps the open client
   connections: at the cap a new connection replaces the longest-idle
-  keep-alive connection, or is closed when all are busy. Without it the
-  process's file descriptor limit applies. Internet-facing servers should
-  sit behind a proxy with connection and rate limits.
+  keep-alive connection or, when none is idle, the oldest connection that
+  has waited at least 1 s without sending a complete request (silent
+  sockets, half-sent headers, unfinished TLS handshakes); it is closed
+  itself only when every connection has a request in flight or is younger
+  than 1 s. A connection with a request in flight is never closed, and a
+  client holding silent sockets cannot lock out health probes and other
+  clients. Without the setting the process's file descriptor limit applies.
+  Internet-facing servers should sit behind a proxy with connection and
+  rate limits.
 
 ### Request size limits
 
@@ -686,6 +737,31 @@ bytes, and parsed lifecycle configurations (looked up on object reads to
 report `x-amz-expiration`) are cached within a 64 MiB budget and recognised
 by a hash of the stored document, without copying it per request.
 
+### Restic restores
+
+Reading an object archived with restic runs `restic dump` into an encrypted
+temporary spool, and every distinct byte range restores on its own, so a
+client could otherwise start any number of restic processes or tie up the
+restore disk budget. Two limits bound this, process-wide across all
+backings:
+
+- `restic.max_restores` (default 4) caps the `restic dump` processes running
+  at once. A further restore waits for a slot only as long as its request
+  lasts and at most 30 s, then fails with `503 ServiceUnavailable`. Readers
+  of a range already being restored join that restore without a slot.
+- `restic.restore_spool_bytes` (default 1 GiB) caps the encrypted spool data
+  reserved at once, and no single restore reserves more than half of it:
+  larger objects and ranges are restored in windows of at most half the
+  limit, one at a time per reader. A client that opens a large object and
+  reads it slowly, or stalls, holds at most half the budget, and other
+  restic reads continue. Once the budget is reserved, further reads fail
+  with `503` instead of queuing.
+
+These limits bound the disk and processes restic reads consume; they do not
+rate-limit clients. Many concurrent readers can still keep every slot busy
+and get `503`s, so put restic-backed buckets that untrusted clients can read
+behind a proxy with per-client limits if that matters.
+
 ## Object responses
 
 Objects are served from the same origin (scheme, host and port) as the
@@ -707,6 +783,19 @@ override says, so a PDF is downloaded rather than rendered inline on the UI's
 origin.
 Browsers use the last type of a comma-separated list, so a list such as
 `application/pdf, text/html` is always sandboxed.
+
+Responses of the web UI's fallback relay (`/_gos3/admin/v1/proxy`) are
+served under the console origin with `Content-Security-Policy: sandbox;
+default-src 'none'`, `X-Content-Type-Options: nosniff`, `Referrer-Policy:
+no-referrer` and `Cache-Control: no-store`; upstream cookies, CORS, CSP and
+similar headers are dropped. Here the PDF check runs the other way and is
+deliberately lenient: the relay forces `Content-Disposition: attachment`
+(keeping the file name) and a single `Content-Type: application/pdf`
+whenever any upstream `Content-Type` value could be read as a PDF, whatever
+its case, in repeated or comma-separated headers or with malformed
+parameters. A body without a `Content-Type` is never sniffed: it is sent as
+`application/octet-stream` with `Content-Disposition: attachment`. HEAD
+responses keep the upstream's metadata.
 
 ## CORS
 

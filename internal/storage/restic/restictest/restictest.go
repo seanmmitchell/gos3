@@ -50,6 +50,10 @@
 //     (default 0.17.3);
 //   - EnvDumpDelay (FAKERESTIC_DUMP_DELAY): a duration each dump waits
 //     first;
+//   - EnvDumpActive (FAKERESTIC_DUMP_ACTIVE): a directory in which each dump
+//     keeps a marker file (named by its process ID) while it waits out
+//     EnvDumpDelay, so that tests can count the dumps running at once (see
+//     ActiveDumps);
 //   - EnvReread (FAKERESTIC_REREAD=1): tree backups read the files they
 //     would take from the parent, counting those whose content differs as
 //     changed (and storing what they read), like a restic that does not
@@ -75,6 +79,7 @@ import (
 	"runtime"
 	"slices"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -90,6 +95,7 @@ const (
 	EnvFail       = "FAKERESTIC_FAIL"
 	EnvVersion    = "FAKERESTIC_VERSION"
 	EnvDumpDelay  = "FAKERESTIC_DUMP_DELAY"
+	EnvDumpActive = "FAKERESTIC_DUMP_ACTIVE"
 	EnvReread     = "FAKERESTIC_REREAD"
 	EnvIncomplete = "FAKERESTIC_INCOMPLETE"
 )
@@ -155,7 +161,7 @@ func Install(t testing.TB, variant string) string {
 	t.Setenv("PATH", vdir+string(os.PathListSeparator)+os.Getenv("PATH"))
 	t.Setenv(EnvFake, "1")
 	t.Setenv(EnvLog, log)
-	for _, env := range []string{EnvFail, EnvVersion, EnvDumpDelay, EnvReread, EnvIncomplete} {
+	for _, env := range []string{EnvFail, EnvVersion, EnvDumpDelay, EnvDumpActive, EnvReread, EnvIncomplete} {
 		t.Setenv(env, "")
 	}
 	return log
@@ -176,6 +182,14 @@ func Calls(t testing.TB, log, cmd string) int {
 		}
 	}
 	return n
+}
+
+// ActiveDumps returns how many dumps hold a marker in dir (see
+// EnvDumpActive), that is, are running and still waiting out EnvDumpDelay.
+// It is safe to call from any goroutine; an unreadable dir counts as none.
+func ActiveDumps(dir string) int {
+	entries, _ := os.ReadDir(dir)
+	return len(entries)
 }
 
 // fatal reports a fatal error the way restic does and returns its exit
@@ -799,8 +813,18 @@ func diff(st store, fl flagSet) int {
 
 // dump writes a file of a snapshot, or a tar archive of a directory.
 func dump(st store, fl flagSet) int {
+	// The marker is removed before any output: a reader that has what it
+	// needs kills the dump, which then could not remove it.
+	var marker string
+	if dir := os.Getenv(EnvDumpActive); dir != "" {
+		marker = filepath.Join(dir, strconv.Itoa(os.Getpid()))
+		_ = os.WriteFile(marker, nil, 0o600)
+	}
 	if d, err := time.ParseDuration(os.Getenv(EnvDumpDelay)); err == nil {
 		time.Sleep(d)
+	}
+	if marker != "" {
+		_ = os.Remove(marker)
 	}
 	if len(fl.args) != 2 {
 		return fatal("bad dump arguments")

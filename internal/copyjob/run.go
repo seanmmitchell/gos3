@@ -803,10 +803,13 @@ func transient(err error) bool {
 
 // impossible reports errors that running the job again unchanged would
 // meet again: policies the target cannot satisfy, a bucket that is gone.
+// copier.ErrTooManyVersions is not among them: it concerns one key, which
+// fails alone (anyone allowed to write a key could otherwise stop the
+// whole job).
 func impossible(err error) bool {
 	for _, e := range []error{
 		copier.ErrPlaintext, copier.ErrEncryptionUnsupported, copier.ErrRetention, copier.ErrNoImport,
-		copier.ErrNotVersioned, copier.ErrTooManyVersions, storage.ErrBucketNotFound, jobs.ErrInvalidSpec, jobs.ErrConflict,
+		copier.ErrNotVersioned, storage.ErrBucketNotFound, jobs.ErrInvalidSpec, jobs.ErrConflict,
 	} {
 		if errors.Is(err, e) {
 			return true

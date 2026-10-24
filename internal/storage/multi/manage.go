@@ -64,6 +64,12 @@ type MemberStatus struct {
 	Progress   *Progress `json:"progress"`
 	LastSyncAt time.Time `json:"lastSyncAt,omitzero"`
 	LastError  string    `json:"lastError"`
+	// SkippedKeys counts the keys that could not be copied to the member
+	// because a copy holds more versions of them than
+	// copier.MaxKeyVersions. While there are any the member is degraded,
+	// a replica does not become synced and a move does not complete;
+	// LastError names one of them.
+	SkippedKeys int `json:"skippedKeys"`
 }
 
 // MoveStatus describes a move in progress.
@@ -201,13 +207,24 @@ func (r *Router) memberStatus(rec *placementRecord, ms *memberState, role string
 		out.Progress = &p
 	}
 	needFull, failures, fullDone := ms.needFull, ms.failures, ms.fullDone
+	out.SkippedKeys = len(ms.skipped)
+	if out.SkippedKeys > 0 && out.LastError == "" {
+		// Name the first skipped key.
+		first := ""
+		for k := range ms.skipped {
+			if first == "" || k < first {
+				first = k
+			}
+		}
+		out.LastError = fmt.Sprintf("%d keys could not be copied; the first: %v", out.SkippedKeys, ms.skipped[first])
+	}
 	ms.mu.Unlock()
 	switch {
 	case !out.Healthy:
 		out.State = StateOffline
 	case role == RolePrimary:
 		out.State = StateInSync
-	case failures > 0:
+	case failures > 0 || out.SkippedKeys > 0:
 		out.State = StateDegraded
 	case out.Progress != nil || needFull || (role == RoleReplica && !synced) || (role == RoleMoveTarget && !fullDone):
 		out.State = StateSyncing
@@ -223,9 +240,16 @@ func (r *Router) memberStatus(rec *placementRecord, ms *memberState, role string
 		out.State = StateInSync
 	}
 	if role == RolePrimary {
-		out.Pending, out.LastError = 0, ""
+		out.Pending, out.LastError, out.SkippedKeys = 0, "", 0
 	}
 	return out
+}
+
+// errSkippedKeys refuses a graceful promote of a replica that lacks n
+// keys whose histories are too long to copy.
+func errSkippedKeys(backingName string, n int) error {
+	return fmt.Errorf("%w: the replica on %q is missing %d keys with too many versions to copy (see its lastError; use force to promote it anyway)",
+		ErrConflict, backingName, n)
 }
 
 // backingByName validates a backing name from a request.
@@ -542,6 +566,7 @@ func (r *Router) Promote(ctx context.Context, bucket, backingName string, force 
 	if !force {
 		ms.mu.Lock()
 		busy := ms.needFull || ms.progress != nil || !ms.fullDone
+		skipped := len(ms.skipped)
 		ms.mu.Unlock()
 		switch {
 		case !rec.Members[i].Synced:
@@ -552,6 +577,8 @@ func (r *Router) Promote(ctx context.Context, bucket, backingName string, force 
 			return PlacementStatus{}, fmt.Errorf("%w: the primary backing %q is unhealthy, so the replica cannot catch up (use force to promote it anyway)", ErrConflict, prim.Name)
 		case busy:
 			return PlacementStatus{}, fmt.Errorf("%w: the replica on %q is still being compared with the primary; retry when it is in sync (or use force)", ErrConflict, backingName)
+		case skipped > 0:
+			return PlacementStatus{}, errSkippedKeys(backingName, skipped)
 		}
 		release, err := r.quiesce(ctx, bs)
 		if err != nil {
@@ -560,6 +587,9 @@ func (r *Router) Promote(ctx context.Context, bucket, backingName string, force 
 		defer release()
 		if err := r.drain(ctx, ms); err != nil {
 			return PlacementStatus{}, fmt.Errorf("%w: copying the last changes to %q: %w", ErrConflict, backingName, err)
+		}
+		if n := ms.skippedKeys(); n > 0 {
+			return PlacementStatus{}, errSkippedKeys(backingName, n)
 		}
 	}
 	r.mu.Lock()

@@ -80,8 +80,9 @@ type ServerConfig struct {
 	AllowedHosts []string `yaml:"allowed_hosts"`
 	// MaxConnections caps the number of simultaneously open client
 	// connections (0 = no limit, the default). At the cap a new connection
-	// closes the longest-idle keep-alive connection, or is closed itself
-	// when none is idle.
+	// closes the longest-idle keep-alive connection, else the oldest
+	// connection that has waited past a short grace period for its first
+	// request; it is closed itself when there is neither.
 	MaxConnections int `yaml:"max_connections"`
 }
 
@@ -258,6 +259,10 @@ type ResticConfig struct {
 	// RestoreSpoolBytes caps encrypted temporary data reserved by
 	// concurrent per-object restores across the server. Static.
 	RestoreSpoolBytes int64 `yaml:"restore_spool_bytes"`
+	// MaxRestores caps the per-object restores (restic dumps) running at
+	// once across the server (default DefaultMaxRestores,
+	// 1-MaxResticRestores). Further restores wait for a slot. Static.
+	MaxRestores int `yaml:"max_restores"`
 	// Snapshots configures the runs of whole-bucket snapshots.
 	Snapshots ResticSnapshotsConfig `yaml:"snapshots"`
 }

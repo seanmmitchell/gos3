@@ -2,6 +2,7 @@ package iam
 
 import (
 	"context"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -415,6 +416,51 @@ func TestAuthorizeServiceLevelResources(t *testing.T) {
 		{name: "bucket pattern admin", id: user("svc-bucket"), action: "admin:ServerInfo", want: false},
 		{name: "qmark does not cover service", id: user("svc-qmark"), action: "s3:ListAllMyBuckets", want: false},
 	})
+
+	// Every s3 ARN pattern that matches all s3 resources also covers
+	// service-level s3 actions, in Allow and (crucially) Deny statements.
+	// Patterns that only match some resources never do; none of them
+	// reaches admin actions.
+	patterns := []struct {
+		name, resource string
+		covers         bool
+	}{
+		{"exact", "arn:aws:s3:::*", true},
+		{"double star", "arn:aws:s3:::**", true},
+		{"any partition", "arn:*:s3:::*", true},
+		{"any region account", "arn:aws:s3:*:*:*", true},
+		{"all parts", "arn:*:*:*:*:*", true},
+		{"qmark", "arn:aws:s3:::?", false},
+		{"qmark region", "arn:aws:s3:?::*", false},
+		{"bucket prefix", "arn:aws:s3:::b*", false},
+		{"other service", "arn:aws:iam:::*", false},
+		{"other partition", "arn:aws-cn:s3:::*", false},
+	}
+	var cases []authzCase
+	for i, p := range patterns {
+		allow := fmt.Sprintf("svc-allow-%d", i)
+		deny := fmt.Sprintf("svc-deny-%d", i)
+		docs := map[string]string{
+			allow: `{"Statement":[{"Effect":"Allow","Action":["s3:ListAllMyBuckets","admin:ServerInfo"],"Resource":"` + p.resource + `"}]}`,
+			deny: `{"Statement":[{"Effect":"Allow","Action":["s3:ListAllMyBuckets","admin:ServerInfo"],"Resource":"*"},
+				{"Effect":"Deny","Action":["s3:ListAllMyBuckets","admin:ServerInfo"],"Resource":"` + p.resource + `"}]}`,
+		}
+		for name, doc := range docs {
+			if _, err := m.PutPolicy(ctx, name, "", mustPolicy(t, doc)); err != nil {
+				t.Fatalf("%s: %v", p.resource, err)
+			}
+			if _, err := m.CreateUser(ctx, UserSpec{Name: name, Policies: []string{name}}); err != nil {
+				t.Fatal(err)
+			}
+		}
+		cases = append(cases,
+			authzCase{name: "allow " + p.name + " s3", id: user(allow), action: "s3:ListAllMyBuckets", want: p.covers},
+			authzCase{name: "allow " + p.name + " admin", id: user(allow), action: "admin:ServerInfo", want: false},
+			authzCase{name: "deny " + p.name + " s3", id: user(deny), action: "s3:ListAllMyBuckets", want: !p.covers, wantDeny: p.covers},
+			authzCase{name: "deny " + p.name + " admin", id: user(deny), action: "admin:ServerInfo", want: true},
+		)
+	}
+	runAuthzCases(t, m, cases)
 }
 
 func TestAuthorizeDeniesOnlyAfterAllStatements(t *testing.T) {

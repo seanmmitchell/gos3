@@ -228,7 +228,11 @@ func (b *Backend) openHome(conn *s3store.Connection) error {
 	if err != nil {
 		return fmt.Errorf("s3account %q: home: %w", b.name, err)
 	}
-	st, err := openStore(b.storeOptions(conn, h.Bucket, h.Prefix, "", s3store.RoleHome, s3store.CreateIfNoData, "", "c-"+homeID))
+	o, err := b.storeOptions(conn, h.Bucket, h.Prefix, "", s3store.RoleHome, s3store.CreateIfNoData, "", "c-"+homeID)
+	var st *s3store.Backend
+	if err == nil {
+		st, err = openStore(o)
+	}
 	if err != nil {
 		rel()
 		return fmt.Errorf("s3account %q: home: %w", b.name, err)
@@ -362,10 +366,11 @@ func (b *Backend) readRecords(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("s3account %q: read the records: %w", b.name, err)
 	}
-	reg, orphans, err := decodeRegistry(recs)
+	reg, orphans, invalid, err := decodeRegistry(recs)
 	if err != nil {
 		return err
 	}
+	b.logInvalidRecords(invalid)
 	b.install(reg, epoch)
 	for _, p := range orphans {
 		if err := b.records.DeleteRecords(ctx, p); err != nil {
@@ -373,6 +378,14 @@ func (b *Backend) readRecords(ctx context.Context) error {
 		}
 	}
 	return nil
+}
+
+// logInvalidRecords logs the records decodeRegistry skipped.
+func (b *Backend) logInvalidRecords(invalid []error) {
+	for _, err := range invalid {
+		b.log.Warn("s3account: ignoring a record this build never writes (written by another tool?)",
+			"backing", b.name, "records", b.recordsWhere(), "err", err)
+	}
 }
 
 // install makes reg the registry (adminMu held): containers are opened,
@@ -498,11 +511,12 @@ func (b *Backend) reload(epoch uint64) {
 		b.log.Warn("s3account: re-reading the records after the home was reloaded failed; retrying", "backing", b.name, "err", err)
 		return
 	}
-	reg, _, err := decodeRegistry(recs)
+	reg, _, invalid, err := decodeRegistry(recs)
 	if err != nil {
 		b.log.Error("s3account: the records changed into ones this build cannot read", "backing", b.name, "err", err)
 		return
 	}
+	b.logInvalidRecords(invalid)
 	b.install(reg, epoch)
 	if err := b.reconcileContainer(b.ctx, b.containerByID(homeID)); err != nil && b.ctx.Err() == nil {
 		b.log.Warn("s3account: reconciling the home failed", "backing", b.name, "err", err)

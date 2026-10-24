@@ -7,6 +7,7 @@ import (
 	"unicode"
 	"unicode/utf8"
 
+	"github.com/seanmmitchell/gos3/internal/iam"
 	"github.com/seanmmitchell/gos3/internal/s3err"
 )
 
@@ -227,6 +228,36 @@ func parseMaxKeys(q url.Values, name string, def, limit int) (int, error) {
 		n = limit
 	}
 	return n, nil
+}
+
+// listQueryParams are the listing parameters validateListQuery checks.
+// prefix, delimiter and max-keys are condition keys (s3:prefix, ...); the
+// markers position a listing, which native backends pass to the remote.
+var listQueryParams = [...]string{"prefix", "delimiter", "max-keys", "marker", "start-after",
+	"key-marker", "version-id-marker", "upload-id-marker"}
+
+// validateListQuery checks the parameters of a listing (ListObjects,
+// ListObjectsV2, ListObjectVersions, ListMultipartUploads) before it is
+// authorized: a value longer than iam.MaxRequestValueLen or not valid
+// UTF-8 is InvalidArgument. A policy therefore always sees exactly the
+// value the listing uses (the condition context truncates longer values,
+// see conditionContext), and a native listing never gets a bound it would
+// have to loosen to a valid UTF-8 one (it pages from there to reach the
+// requested position). Keys are valid UTF-8 of at most maxKeyLength
+// (= iam.MaxRequestValueLen) bytes, so every refused listing has an
+// equivalent one that is accepted (a shorter marker, no delimiter).
+func validateListQuery(q url.Values) error {
+	for _, name := range listQueryParams {
+		if !q.Has(name) {
+			continue
+		}
+		v := q.Get(name)
+		if len(v) > iam.MaxRequestValueLen || !utf8.ValidString(v) {
+			return s3err.ErrInvalidArgument.WithMessage("%s must be valid UTF-8 of at most %d bytes", name, iam.MaxRequestValueLen).
+				With("ArgumentName", name).With("ArgumentValue", truncateValue(v))
+		}
+	}
+	return nil
 }
 
 // parsePartNumber parses a partNumber parameter (1..10000).

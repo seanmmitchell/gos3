@@ -131,8 +131,29 @@ export function isProtectedConnection(c: Pick<Connection, 'source'>): boolean {
 }
 
 /** IDs an imported entry may not claim: the embedded server and deterministic preset IDs. */
-function isReservedId(id: string): boolean {
+export function isReservedConnectionId(id: string): boolean {
   return id === EMBEDDED_CONNECTION_ID || id.startsWith('preset-')
+}
+
+/**
+ * Clears, in place, every fallback relay (proxyConnectionId) in `list` that
+ * names no connection in `list`, and returns whether any was cleared. A
+ * dangling relay ID is not harmless: a connection added later under that ID
+ * (an import keeps the IDs in its file) would silently become the relay and
+ * receive the dependent's signed requests and presigned URLs. Reserved IDs
+ * are kept: no import can claim them, and the embedded server and presets
+ * are merged in only after the stored list is loaded.
+ */
+export function pruneDanglingRelays(list: Connection[]): boolean {
+  let changed = false
+  for (const c of list) {
+    const relayId = c.proxyConnectionId
+    if (relayId && !isReservedConnectionId(relayId) && !list.some(r => r.id === relayId)) {
+      delete c.proxyConnectionId
+      changed = true
+    }
+  }
+  return changed
 }
 
 /** Fields an import may change on an existing connection (endpoint and kind never). */
@@ -197,6 +218,9 @@ function displayValue(field: ImportField, v: unknown): string {
  * - embedded and preset connections are never modified: a matching entry for
  *   another endpoint or kind is added as a new connection, otherwise it is
  *   skipped. New entries never claim their reserved IDs.
+ * - a new entry never claims an ID that an existing connection uses as its
+ *   fallback relay: it gets a fresh ID instead, so a file cannot slip a host
+ *   in as the relay of a stored connection.
  * - when an entry changes the access key ID without giving a secret, the
  *   stored secret (which belongs to the old key) is cleared.
  * - `remember` is ignored: only the user decides whether a secret is written
@@ -210,15 +234,25 @@ function displayValue(field: ImportField, v: unknown): string {
 export function planConnectionImport(existing: readonly Connection[], items: readonly ConnectionInput[]): ImportPlan {
   const work = [...existing]
   const steps: ImportStep[] = []
+  // Connections added by this import: only their relay references may name
+  // an ID the file supplies (a relay and its dependents imported together).
+  const added = new Set<string>()
+  // An ID that a connection the import did not add uses as its fallback relay
+  // (e.g. the ID of a deleted relay that an older version left behind). An
+  // entry claiming it would become that connection's relay and receive its
+  // signed requests and presigned URLs.
+  const referenced = (id: string) => work.some(c => c.proxyConnectionId === id && !added.has(c.id))
+  const taken = (id: string) => work.some(c => c.id === id) || referenced(id)
   const freshId = () => {
     let id = newConnectionId()
-    while (work.some(c => c.id === id)) id = newConnectionId()
+    while (taken(id)) id = newConnectionId()
     return id
   }
   const add = (input: ConnectionInput, instead?: { of: Connection, reason: ImportAddReason }) => {
-    const id = !instead && input.id && !isReservedId(input.id) ? input.id : freshId()
+    const id = !instead && input.id && !isReservedConnectionId(input.id) && !referenced(input.id) ? input.id : freshId()
     const step: ImportStep = { action: 'add', input: { ...input, id }, ...(instead ? { instead } : {}) }
     steps.push(step)
+    added.add(id)
     work.push(completeConnection(step.input))
   }
 

@@ -70,8 +70,9 @@ func ValidAdminRequestResource(r string) bool {
 	return slices.Contains(adminTypes, typ)
 }
 
-// s3ServiceARN is the resource that service-level s3 actions (Bucket == "",
-// e.g. s3:ListAllMyBuckets) are evaluated against besides "*".
+// s3ServiceARN is the canonical resource that service-level s3 actions
+// (Bucket == "", e.g. s3:ListAllMyBuckets) are evaluated against besides
+// "*"; resourceMatches accepts every pattern equivalent to it (s3All).
 const s3ServiceARN = s3ARNPrefix + "*"
 
 // BucketARN returns the resource ARN of a bucket (arn:aws:s3:::bucket).
@@ -228,8 +229,13 @@ func (c *evalCtx) actionMatches(patterns []string) bool {
 // start with "arn:gos3:admin:::" and s3 actions only patterns that do not,
 // so no s3 ARN (not even "arn:aws:s3:::*" or "arn:*") grants an admin
 // action and no admin ARN grants an s3 action. Service-level requests (no
-// resource) only match "arn:aws:s3:::*" for s3 actions and
-// an all-wildcard admin ARN for admin actions; per-target admin resources
+// resource) match, besides "*", the patterns that match every resource of
+// their namespace: for admin actions an all-wildcard admin ARN
+// (arn:gos3:admin:::*, arn:gos3:admin:::**), for s3 actions an all-s3 ARN
+// (see s3All: arn:aws:s3:::*, arn:aws:s3:::**, arn:*:s3:::*,
+// arn:aws:s3:*:*:*, ...). Patterns matching only some resources
+// (arn:aws:s3:::b*, arn:aws:s3:::?) never cover service-level requests, in
+// Allow or Deny statements. Per-target admin resources
 // (arn:gos3:admin:::user/<name>, ...) are glob-matched like s3 ARNs, policy
 // variables included.
 func (c *evalCtx) resourceMatches(patterns []string) bool {
@@ -242,7 +248,7 @@ func (c *evalCtx) resourceMatches(patterns []string) bool {
 		}
 		if c.resource == "" {
 			adminAll := c.isAdmin && len(p) > len(adminARNPrefix) && strings.Trim(p[len(adminARNPrefix):], "*") == ""
-			if adminAll || (!c.isAdmin && p == s3ServiceARN) {
+			if adminAll || (!c.isAdmin && c.s3All(p)) {
 				return true
 			}
 			continue
@@ -252,6 +258,31 @@ func (c *evalCtx) resourceMatches(patterns []string) bool {
 		}
 	}
 	return false
+}
+
+// s3All reports whether the s3 resource pattern p matches every s3 resource
+// ARN (arn:aws:s3:::<anything>), so that it covers service-level s3
+// requests the way "*" does. It is the s3 counterpart of the all-wildcard
+// admin ARN rule in resourceMatches: p must have the six ARN parts, the
+// partition, service, region and account parts must glob-match "aws",
+// "s3", "" and "" (so "*" is allowed in each), and the resource part must
+// consist only of '*'. The parts are matched one by one rather than p
+// against the literal s3ServiceARN: "arn:aws:s3:::?" glob-matches that
+// literal but names only one-character buckets.
+func (c *evalCtx) s3All(p string) bool {
+	if p == s3ServiceARN {
+		return true
+	}
+	parts := strings.SplitN(p, ":", 6)
+	if len(parts) != 6 || parts[5] == "" || strings.Trim(parts[5], "*") != "" {
+		return false
+	}
+	for i, want := range [...]string{"arn", "aws", "s3", "", ""} {
+		if !globMatchBudget(parts[i], want, false, false, c.budget) {
+			return false
+		}
+	}
+	return true
 }
 
 // namesNamespace reports whether some pattern is "*" or in the request's

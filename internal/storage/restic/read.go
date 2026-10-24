@@ -9,6 +9,7 @@ import (
 	"io"
 	"os"
 	"sync"
+	"time"
 
 	"github.com/seanmmitchell/gos3/internal/storage"
 	"github.com/seanmmitchell/gos3/internal/storage/crypt"
@@ -28,10 +29,20 @@ func (rt *Runtime) Open(ctx context.Context, loc Location, snapshot string, size
 	return &Reader{rt: rt, ctx: ctx, loc: loc, snapshot: snapshot, size: size}, nil
 }
 
-// Reader reads a restic version. On first use it restores the version into
-// a spool shared with concurrent readers of the same snapshot (see spool)
-// and then reads that. It implements io.ReadSeekCloser, io.ReaderAt and
-// storage.PreparingReader, and is safe for concurrent use.
+// Reader reads a restic version. On first use it restores the part of the
+// version it needs into a spool shared with concurrent readers of the same
+// snapshot (see spool) and then reads that. It implements
+// io.ReadSeekCloser, io.ReaderAt and storage.PreparingReader, and is safe
+// for concurrent use.
+//
+// The reader's span (the whole version, or the range given to
+// PrepareRange) is restored in windows of at most Runtime.restoreWindow
+// bytes, [start+k*W, min(end, start+(k+1)*W)): a span no larger than one
+// window is a single window, restored as before windows existed. The
+// reader holds at most one window at a time; a read outside it releases it
+// before the window holding the offset is restored. One reader, however
+// slow, so never reserves more than half of the restore spool limit, and a
+// version larger than the limit can still be read.
 type Reader struct {
 	rt       *Runtime
 	ctx      context.Context
@@ -39,12 +50,15 @@ type Reader struct {
 	snapshot string
 	size     int64
 
-	mu    sync.Mutex
-	off   int64 // Read/Seek offset
-	spool *spool
-	file  *os.File
-	data  *crypt.Reader
-	// A nonzero rangeSize means PrepareRange selected a partial spool.
+	mu  sync.Mutex
+	off int64 // Read/Seek offset
+	// The current window, [winStart, winStart+winSize), when data is set.
+	spool             *spool
+	file              *os.File
+	data              *crypt.Reader
+	winStart, winSize int64
+	// A nonzero rangeSize means PrepareRange restricted the reader to a
+	// range.
 	rangeStart, rangeSize int64
 	err                   error // sticky preparation error
 	closed                bool
@@ -61,27 +75,123 @@ var (
 var errReaderClosed = errors.New("restic: read from a closed object reader")
 
 // DefaultRestoreSpoolBytes bounds disk reservations across concurrent
-// restores in this process. A full restore over this size is refused before
-// restic starts; ranged reads reserve only their requested bytes.
+// restores in this process. One spool (see Reader) reserves at most half of
+// it; ranged reads reserve only their requested bytes.
 const DefaultRestoreSpoolBytes int64 = 1 << 30
 
+// DefaultMaxRestores bounds the restic dumps restoring objects at once in
+// this process.
+const DefaultMaxRestores = 4
+
+// ErrRestoreSpoolLimit is returned when a restore would exceed the restore
+// spool limit, or found no free restore slot (see Runtime.MaxRestores) in
+// time. It wraps storage.ErrResourceLimit (a 503 for S3 clients).
 var ErrRestoreSpoolLimit = fmt.Errorf("restic: restore spool limit exceeded: %w", storage.ErrResourceLimit)
 
+// restoreSlotWait bounds how long a restore waits for a free slot (a
+// variable for tests).
+var restoreSlotWait = 30 * time.Second
+
+// restoreSpoolBudget is the disk reserved by the restores of every runtime
+// in the process (see Runtime.MaxRestoreSpoolBytes).
 var restoreSpoolBudget struct {
 	sync.Mutex
 	bytes int64
 }
 
-// Prepare restores the version now (see storage.PreparingReader).
+// restoreSlots counts the restores (restic dumps) running in the process
+// (see Runtime.MaxRestores).
+var restoreSlots struct {
+	sync.Mutex
+	running int
+	freed   chan struct{} // closed (and cleared) when a slot is freed
+}
+
+// restoreLimit returns the restore spool limit of rt.
+func (rt *Runtime) restoreLimit() int64 {
+	if rt.MaxRestoreSpoolBytes > 0 {
+		return rt.MaxRestoreSpoolBytes
+	}
+	return DefaultRestoreSpoolBytes
+}
+
+// restoreWindow returns the most plaintext one spool of rt covers: the
+// whole encryption chunks whose encrypted size fits in half the restore
+// spool limit (the limit applies on this runtime and across the process
+// alike), and at least one chunk.
+func (rt *Runtime) restoreWindow() int64 {
+	chunks := rt.restoreLimit() / 2 / crypt.EncryptedSize(crypt.ChunkSize)
+	return max(chunks, 1) * crypt.ChunkSize
+}
+
+// maxRestores returns the restore slot limit of rt.
+func (rt *Runtime) maxRestores() int {
+	if rt.MaxRestores > 0 {
+		return rt.MaxRestores
+	}
+	return DefaultMaxRestores
+}
+
+// acquireRestoreSlot takes one of the process-wide restore slots: it waits
+// while rt.maxRestores() or more restores run in the process (so runtimes
+// with different limits each keep to their own), until ctx ends or for at
+// most restoreSlotWait. waiting is called (once) when no slot is free.
+// The caller must call the returned release when its restore is over.
+func (rt *Runtime) acquireRestoreSlot(ctx context.Context, waiting func()) (release func(), err error) {
+	limit := rt.maxRestores()
+	var timeout <-chan time.Time
+	for {
+		restoreSlots.Lock()
+		if restoreSlots.running < limit {
+			restoreSlots.running++
+			restoreSlots.Unlock()
+			return sync.OnceFunc(releaseRestoreSlot), nil
+		}
+		if restoreSlots.freed == nil {
+			restoreSlots.freed = make(chan struct{})
+		}
+		freed := restoreSlots.freed
+		restoreSlots.Unlock()
+		if timeout == nil {
+			timer := time.NewTimer(restoreSlotWait)
+			defer timer.Stop()
+			timeout = timer.C
+			waiting()
+		}
+		select {
+		case <-freed:
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-timeout:
+			return nil, fmt.Errorf("%w: %d object restores already running, none finished within %v", ErrRestoreSpoolLimit, limit, restoreSlotWait)
+		}
+	}
+}
+
+// releaseRestoreSlot frees a slot taken by acquireRestoreSlot and wakes the
+// restores waiting for one.
+func releaseRestoreSlot() {
+	restoreSlots.Lock()
+	restoreSlots.running--
+	if restoreSlots.freed != nil {
+		close(restoreSlots.freed)
+		restoreSlots.freed = nil
+	}
+	restoreSlots.Unlock()
+}
+
+// Prepare restores the version now (see storage.PreparingReader): the
+// window holding the read offset (the first one when the offset is outside
+// the version).
 func (r *Reader) Prepare() error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	return r.prepare()
 }
 
-// PrepareRange restores only [start, start+length). The reader is then
-// restricted to that range. A caller that needs arbitrary access uses
-// Prepare instead.
+// PrepareRange restores only [start, start+length) (its first window, see
+// Reader, when the range is larger). The reader is then restricted to that
+// range. A caller that needs arbitrary access uses Prepare instead.
 func (r *Reader) PrepareRange(start, length int64) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -101,28 +211,49 @@ func (r *Reader) PrepareRange(start, length int64) error {
 	return r.prepare()
 }
 
-// prepare implements Prepare; r.mu is held.
+// prepare implements Prepare: it makes sure a window is restored, the one
+// holding the read offset or else the span's first. r.mu is held.
 func (r *Reader) prepare() error {
+	if r.data != nil {
+		return nil
+	}
+	start, end := r.readBounds()
+	off := r.off
+	if off < start || off >= end {
+		off = start
+	}
+	return r.load(off)
+}
+
+// load makes the window holding off (inside the span) the current one,
+// releasing the previous window first, so that the reader never holds two.
+// r.mu is held.
+func (r *Reader) load(off int64) error {
 	switch {
 	case r.closed:
 		return errReaderClosed
-	case r.data != nil || r.size == 0:
+	case r.size == 0:
+		return nil
+	case r.data != nil && off >= r.winStart && off-r.winStart < r.winSize:
 		return nil
 	case r.err != nil:
 		return r.err
 	}
-	start, length := int64(0), r.size
-	if r.rangeSize != 0 {
-		start, length = r.rangeStart, r.rangeSize
+	if r.data != nil {
+		_ = r.file.Close()
+		r.rt.releaseSpool(r.spool)
+		r.file, r.data, r.spool = nil, nil, nil
 	}
+	start, length := r.window(off)
 	sp, err := r.rt.acquireSpool(r.ctx, r.loc, r.snapshot, r.size, start, length)
 	if err != nil {
 		r.err = err
 		return err
 	}
 	f, err := os.Open(sp.path)
+	var data *crypt.Reader
 	if err == nil {
-		if r.data, err = crypt.NewReader(f, sp.dataKey, length); err != nil {
+		if data, err = crypt.NewReader(f, sp.dataKey, length); err != nil {
 			_ = f.Close()
 		}
 	}
@@ -131,11 +262,24 @@ func (r *Reader) prepare() error {
 		r.err = fmt.Errorf("restic: open restored object: %w", err)
 		return r.err
 	}
-	r.spool, r.file = sp, f
+	r.spool, r.file, r.data, r.winStart, r.winSize = sp, f, data, start, length
 	return nil
 }
 
-// Read implements io.Reader.
+// window returns the window of the span holding off (see Reader). r.mu is
+// held.
+func (r *Reader) window(off int64) (start, length int64) {
+	start, end := r.readBounds()
+	w := r.rt.restoreWindow()
+	if end-start <= w {
+		return start, end - start
+	}
+	start += (off - start) / w * w
+	return start, min(end-start, w)
+}
+
+// Read implements io.Reader. It returns at most the rest of the current
+// window.
 func (r *Reader) Read(p []byte) (int, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -152,13 +296,13 @@ func (r *Reader) Read(p []byte) (int, error) {
 	if r.off >= end {
 		return 0, io.EOF
 	}
-	if err := r.prepare(); err != nil {
+	if err := r.load(r.off); err != nil {
 		return 0, err
 	}
-	if rest := end - r.off; int64(len(p)) > rest {
+	if rest := r.winStart + r.winSize - r.off; int64(len(p)) > rest {
 		p = p[:rest]
 	}
-	n, err := r.data.ReadAt(p, r.off-start)
+	n, err := r.data.ReadAt(p, r.off-r.winStart)
 	r.off += int64(n)
 	if err == io.EOF && n == len(p) {
 		err = nil
@@ -166,7 +310,7 @@ func (r *Reader) Read(p []byte) (int, error) {
 	return n, err
 }
 
-// ReadAt implements io.ReaderAt.
+// ReadAt implements io.ReaderAt, restoring each window p spans in turn.
 func (r *Reader) ReadAt(p []byte, off int64) (int, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -186,18 +330,29 @@ func (r *Reader) ReadAt(p []byte, off int64) (int, error) {
 	if off >= end {
 		return 0, io.EOF
 	}
-	short := r.rangeSize != 0 && int64(len(p)) > end-off
-	if short {
-		p = p[:end-off]
+	if len(p) == 0 {
+		return 0, r.prepare()
 	}
-	if err := r.prepare(); err != nil {
-		return 0, err
+	n := 0
+	for n < len(p) && off < end {
+		if err := r.load(off); err != nil {
+			return n, err
+		}
+		part := p[n:]
+		if rest := r.winStart + r.winSize - off; int64(len(part)) > rest {
+			part = part[:rest]
+		}
+		m, err := r.data.ReadAt(part, off-r.winStart)
+		n += m
+		off += int64(m)
+		if err != nil && (err != io.EOF || m != len(part)) {
+			return n, err
+		}
 	}
-	n, err := r.data.ReadAt(p, off-start)
-	if short && err == nil {
-		err = io.EOF
+	if n < len(p) {
+		return n, io.EOF
 	}
-	return n, err
+	return n, nil
 }
 
 // readBounds returns the logical offsets available from this reader.
@@ -246,12 +401,12 @@ func (r *Reader) Close() error {
 	return err
 }
 
-// spool is one restored restic version: `restic dump` output in an
-// encrypted temporary file (bounded memory, random access, no plaintext on
-// disk). Concurrent readers of the same snapshot share it, so parallel
-// ranged downloads restore an object once. The restore runs on its own
-// context, canceled when every reader waiting for it has gone; the file is
-// removed when its last reader closes.
+// spool is one restored window of a restic version (see Reader): `restic
+// dump` output in an encrypted temporary file (bounded memory, random
+// access, no plaintext on disk). Concurrent readers of the same window of
+// a snapshot share it, so parallel ranged downloads restore it once. The
+// restore runs on its own context, canceled when every reader waiting for
+// it has gone; the file is removed when its last reader closes.
 type spool struct {
 	id        string // Runtime.spools key
 	size      int64  // encrypted file size reserved against the disk quota
@@ -263,6 +418,7 @@ type spool struct {
 	refs     int
 	finished bool
 	charged  bool // size is included in Runtime.spoolBytes
+	waiting  bool // the restore waits for a free slot (see MaxRestores)
 
 	// Set before done is closed.
 	path    string
@@ -270,9 +426,12 @@ type spool struct {
 	err     error
 }
 
-// acquireSpool returns the restored snapshot of the repository loc,
-// starting its restore when no reader has one, and waits until it is
-// complete or ctx ends. The caller must releaseSpool it.
+// acquireSpool returns the restored bytes [start, start+length) of the
+// snapshot in the repository loc, starting their restore when no reader
+// has one, and waits until it is complete or ctx ends. A new restore
+// reserves its encrypted size against the restore spool limit at once and
+// then waits for a restore slot (see runSpool); readers joining it need
+// none. The caller must releaseSpool it.
 func (rt *Runtime) acquireSpool(ctx context.Context, loc Location, snapshot string, size, start, length int64) (*spool, error) {
 	charge := crypt.EncryptedSize(length)
 	if charge < 0 {
@@ -288,10 +447,7 @@ func (rt *Runtime) acquireSpool(ctx context.Context, loc Location, snapshot stri
 	}
 	sp := rt.spools[k]
 	if sp == nil {
-		limit := rt.MaxRestoreSpoolBytes
-		if limit <= 0 {
-			limit = DefaultRestoreSpoolBytes
-		}
+		limit := rt.restoreLimit()
 		restoreSpoolBudget.Lock()
 		if charge > limit-rt.spoolBytes || charge > limit-restoreSpoolBudget.bytes {
 			reserved := restoreSpoolBudget.bytes
@@ -315,7 +471,13 @@ func (rt *Runtime) acquireSpool(ctx context.Context, loc Location, snapshot stri
 	select {
 	case <-sp.done:
 	case <-ctx.Done():
+		rt.mu.Lock()
+		waiting := sp.waiting
+		rt.mu.Unlock()
 		rt.releaseSpool(sp)
+		if waiting {
+			return nil, fmt.Errorf("%w: no object restore slot was free before the request ended (%w)", ErrRestoreSpoolLimit, ctx.Err())
+		}
 		return nil, fmt.Errorf("restic: retrieve object: %w", ctx.Err())
 	}
 	if sp.err != nil {
@@ -325,9 +487,24 @@ func (rt *Runtime) acquireSpool(ctx context.Context, loc Location, snapshot stri
 	return sp, nil
 }
 
-// runSpool restores the spool sp.
+// runSpool restores the spool sp once a restore slot is free.
 func (rt *Runtime) runSpool(ctx context.Context, sp *spool, loc Location, snapshot string, size, start, length int64) {
-	path, key, err := rt.dump(ctx, loc, snapshot, size, start, length)
+	var path string
+	var key []byte
+	release, err := rt.acquireRestoreSlot(ctx, func() {
+		rt.mu.Lock()
+		sp.waiting = true
+		rt.mu.Unlock()
+	})
+	rt.mu.Lock()
+	sp.waiting = false
+	rt.mu.Unlock()
+	if err == nil {
+		path, key, err = rt.dump(ctx, loc, snapshot, size, start, length)
+		release()
+	} else if ctx.Err() != nil {
+		err = fmt.Errorf("restic: retrieve object: %w", ctx.Err())
+	}
 	rt.mu.Lock()
 	sp.path, sp.dataKey, sp.err, sp.finished = path, key, err, true
 	orphan := err == nil && sp.refs == 0
