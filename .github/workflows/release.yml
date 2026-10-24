@@ -146,14 +146,14 @@ jobs:
       # artifact, so the producer cannot be checked directly.)
       - name: Only the expected binary artifacts
         id: artifacts
+        # Plain bash 3 (no associative arrays), so the tests run it anywhere.
         run: |
-          declare -A want=() found=()
-          expected=()
+          expected=() found=()
           for os in linux darwin windows; do
             for arch in amd64 arm64; do
               for suffix in "" -headless; do
                 expected+=("bin-$os-$arch$suffix")
-                want["bin-$os-$arch$suffix"]=1
+                found+=("")
               done
             done
           done
@@ -162,26 +162,30 @@ jobs:
           fail=0
           while IFS=$'\t' read -r id name expired; do
             [[ $name == bin-* ]] || continue
-            if [[ -z ${want[$name]:-} ]]; then
+            i=-1
+            for j in "${!expected[@]}"; do
+              if [ "${expected[$j]}" = "$name" ]; then i=$j; fi
+            done
+            if [ "$i" -lt 0 ]; then
               echo "::error::Unexpected artifact $name ($id) in this run."
               fail=1
-            elif [[ -n ${found[$name]:-} ]]; then
+            elif [ -n "${found[$i]}" ]; then
               echo "::error::Artifact $name appears more than once."
               fail=1
             elif [[ $expired != false || ! $id =~ ^[1-9][0-9]*$ ]]; then
               echo "::error::Artifact $name ($id) is expired or has no valid ID."
               fail=1
             else
-              found[$name]=$id
+              found[$i]=$id
             fi
           done <<<"$listing"
           ids=()
-          for name in "${expected[@]}"; do
-            if [[ -z ${found[$name]:-} ]]; then
-              echo "::error::Artifact $name is missing."
+          for i in "${!expected[@]}"; do
+            if [ -z "${found[$i]}" ]; then
+              echo "::error::Artifact ${expected[$i]} is missing."
               fail=1
             else
-              ids+=("${found[$name]}")
+              ids+=("${found[$i]}")
             fi
           done
           [ "$fail" = 0 ] || exit 1
@@ -207,7 +211,7 @@ jobs:
               done
             done
           done
-          if ! diff <(printf '%s\n' "${want[@]}" | LC_ALL=C sort) <(find . -mindepth 1 -printf '%P\n' | LC_ALL=C sort); then
+          if ! diff <(printf '%s\n' "${want[@]}" | LC_ALL=C sort) <(find . -mindepth 1 | sed 's|^\./||' | LC_ALL=C sort); then
             echo "::error::dist does not hold exactly the 12 archives of $TAG."
             exit 1
           fi
@@ -217,7 +221,11 @@ jobs:
               exit 1
             fi
           done
-          sha256sum -- "${want[@]}" > checksums.txt
+          if command -v sha256sum >/dev/null; then
+            sha256sum -- "${want[@]}" > checksums.txt
+          else
+            shasum -a 256 -- "${want[@]}" > checksums.txt # macOS (tests)
+          fi
           cat checksums.txt
           {
             echo "subjects<<EOF"
@@ -245,7 +253,10 @@ jobs:
         env:
           ASSETS: ${{ steps.archives.outputs.assets }}
         run: |
-          mapfile -t assets <<<"$ASSETS"
+          assets=()
+          while IFS= read -r a; do
+            if [ -n "$a" ]; then assets+=("$a"); fi
+          done <<<"$ASSETS"
           # Create fails if any release already exists, including a draft.
           # Never upload to or publish a release this run did not create.
           gh release create "$TAG" --verify-tag --draft --title "gos3 $TAG" --generate-notes

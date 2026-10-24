@@ -263,7 +263,12 @@ func TestResticEnvPowerShellCodePages(t *testing.T) {
 		name, url, want string
 	}
 	var answers []answer
-	for name, repo := range map[string]resticRepo{"932 password": only932, "GBK secret key": onlyGBK, "everywhere": psRepo()} {
+	cases := map[string]resticRepo{
+		"cp932 payload in RESTIC_PASSWORD":     only932,
+		"GBK payload in AWS_SECRET_ACCESS_KEY": onlyGBK,
+		"payloads everywhere":                  psRepo(),
+	}
+	for name, repo := range cases {
 		env := map[string]string{}
 		for _, e := range repo.loc.Env {
 			k, v, _ := strings.Cut(e, "=")
