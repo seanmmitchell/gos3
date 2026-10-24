@@ -29,6 +29,14 @@ const fileVersion = 1
 // maxStateFileSize bounds the size of iam.json read at startup.
 const maxStateFileSize = 64 << 20
 
+// maxStateWriteSize bounds the size of iam.json written by a mutation (see
+// persist): half of maxStateFileSize, so whatever the server writes it can
+// load again. A variable so tests can lower it.
+var maxStateWriteSize = maxStateFileSize / 2
+
+// writeStateFile writes iam.json; tests replace it to slow writes down.
+var writeStateFile = writeFileAtomic
+
 // stateFile is the on-disk schema of iam.json.
 type stateFile struct {
 	Version  int           `json:"version"`
@@ -55,11 +63,16 @@ type keyRec struct {
 
 // state is an immutable snapshot of all IAM data. Mutations clone the maps
 // (shallow) and replace records, then swap the snapshot under the lock, so
-// readers can use a snapshot without holding the lock.
+// readers can use a snapshot without holding the lock (see mutate).
 type state struct {
 	users    map[string]*userRec
 	keys     map[string]*keyRec
 	policies map[string]*NamedPolicy // custom policies
+
+	// size is the length of the iam.json content this state was loaded
+	// from or written as; 0 when unknown (in-memory managers, a fresh
+	// clone). persist uses it to let an oversized state shrink.
+	size int
 }
 
 func newState() *state {
@@ -135,6 +148,7 @@ func open(opts Options) (*Manager, error) {
 	if err != nil {
 		return nil, fmt.Errorf("iam: load %s: %w", m.path, err)
 	}
+	st.size = len(data)
 	m.st = st
 	m.warnAmbiguousNames()
 	return m, nil
@@ -271,9 +285,16 @@ func encodeState(st *state) ([]byte, error) {
 	return json.MarshalIndent(f, "", "  ")
 }
 
-// persist writes st to iam.json atomically (temp file + fsync + rename +
-// directory fsync). It is a no-op for in-memory managers.
-func (m *Manager) persist(st *state) error {
+// persist writes st, the successor of prev, to iam.json atomically (temp
+// file + fsync + rename + directory fsync) and records its size in st. It
+// is a no-op for in-memory managers.
+//
+// It refuses with ErrLimitExceeded, writing nothing, a state that encodes
+// to more than maxStateWriteSize bytes, so that iam.json always stays
+// loadable (maxStateFileSize) with room to spare. The one exception is a
+// state no larger than prev's: a file written by an older version above
+// the limit can still shrink, by deleting users or policies.
+func (m *Manager) persist(st, prev *state) error {
 	if m.path == "" {
 		return nil
 	}
@@ -281,9 +302,14 @@ func (m *Manager) persist(st *state) error {
 	if err != nil {
 		return fmt.Errorf("iam: encode state: %w", err)
 	}
-	if err := writeFileAtomic(m.path, data); err != nil {
+	if len(data) > maxStateWriteSize && (prev.size == 0 || len(data) > prev.size) {
+		return wrapf(ErrLimitExceeded, fmt.Sprintf("the IAM state would take %d bytes, more than the %d allowed; "+
+			"delete unused users, access keys or policies, or make policies smaller", len(data), maxStateWriteSize))
+	}
+	if err := writeStateFile(m.path, data); err != nil {
 		return fmt.Errorf("iam: write %s: %w", m.path, err)
 	}
+	st.size = len(data)
 	return nil
 }
 
@@ -340,17 +366,26 @@ func syncDir(dir string) error {
 
 // mutate runs fn on a copy of the current state, persists the result and
 // publishes it. On any error the current state is left unchanged.
+//
+// Mutations are serialized by writeMu. Cloning, fn and persist (encoding,
+// write and fsync of iam.json) run without m.mu, so authentication and
+// authorization (snapshot) keep using the published state meanwhile;
+// m.mu is only held to swap in the new state. mutate is the only writer
+// of m.st after open, so reading m.st under writeMu alone is safe.
 func (m *Manager) mutate(fn func(st *state) error) error {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	next := m.st.clone()
+	m.writeMu.Lock()
+	defer m.writeMu.Unlock()
+	cur := m.st
+	next := cur.clone()
 	if err := fn(next); err != nil {
 		return err
 	}
-	if err := m.persist(next); err != nil {
+	if err := m.persist(next, cur); err != nil {
 		return err
 	}
+	m.mu.Lock()
 	m.st = next
+	m.mu.Unlock()
 	return nil
 }
 

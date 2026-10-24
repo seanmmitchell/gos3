@@ -223,8 +223,9 @@ type Manager struct {
 	opts Options
 	path string // iam.json path; "" when in-memory
 
-	mu sync.RWMutex
-	st *state // copy-on-write: replaced wholesale by mutations
+	writeMu sync.Mutex   // serializes mutations (see mutate)
+	mu      sync.RWMutex // guards st
+	st      *state       // copy-on-write: replaced wholesale by mutations
 
 	warned sync.Map // ids already logged by warnOnce
 }

@@ -194,8 +194,18 @@ type Runtime struct {
 	TempDir string
 	// MaxRestoreSpoolBytes caps encrypted object restores both on this
 	// runtime and across all restic runtimes in the process. Zero uses
-	// DefaultRestoreSpoolBytes.
+	// DefaultRestoreSpoolBytes. One spool covers at most half of it (see
+	// Reader), so a version larger than the limit is read in windows.
 	MaxRestoreSpoolBytes int64
+	// MaxRestores caps the object restores (restic dumps) running at once
+	// across all restic runtimes in the process: a restore of this runtime
+	// starts only while fewer than MaxRestores run in the whole process,
+	// waiting up to 30 seconds (or until its request ends) for one to
+	// finish, and fails with ErrRestoreSpoolLimit otherwise. Runtimes with
+	// different values thus each keep to their own, and the process never
+	// runs more than the largest. Readers joining a restore in progress
+	// need no slot. Zero uses DefaultMaxRestores.
+	MaxRestores int
 	// LookPath finds the restic executable (default exec.LookPath; tests
 	// replace it).
 	LookPath func(file string) (string, error)

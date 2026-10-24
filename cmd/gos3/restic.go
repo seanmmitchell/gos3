@@ -301,21 +301,23 @@ func bashQuote(s string) string {
 	return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'"
 }
 
-// powerShellQuote quotes s for PowerShell: inside single quotes, where
-// every single quotation mark (PowerShell also takes the typographic ones
-// U+2018-U+201B as quotes) is doubled.
+// powerShellQuote quotes s for PowerShell as ASCII. Printable ASCII goes
+// inside single quotes, where only the single quote itself is doubled;
+// anything else is sent as the base64 of its UTF-8 and decoded by
+// PowerShell. The output must be ASCII: PowerShell decodes a program's
+// output with the console's code page (`gos3 restic env | Out-String |
+// Invoke-Expression`), not UTF-8, and in some code pages (932, 936) the
+// UTF-8 of innocent characters reads as a typographic quote (U+2018-U+201B,
+// which PowerShell takes as single quotes), so a value from a malicious
+// server would end its quotes and run as code.
 func powerShellQuote(s string) string {
-	var b strings.Builder
-	b.WriteByte('\'')
-	for _, r := range s {
-		switch r {
-		case '\'', '‘', '’', '‚', '‛':
-			b.WriteRune(r)
+	for i := 0; i < len(s); i++ {
+		if s[i] < ' ' || s[i] > '~' {
+			return "[Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('" +
+				base64.StdEncoding.EncodeToString([]byte(s)) + "'))"
 		}
-		b.WriteRune(r)
 	}
-	b.WriteByte('\'')
-	return b.String()
+	return "'" + strings.ReplaceAll(s, "'", "''") + "'"
 }
 
 // commentSafe makes s safe in a shell comment (no line breaks or other
@@ -323,6 +325,17 @@ func powerShellQuote(s string) string {
 func commentSafe(s string) string {
 	return strings.Map(func(r rune) rune {
 		if r < ' ' || r == 0x7f {
+			return '?'
+		}
+		return r
+	}, s)
+}
+
+// asciiCommentSafe is commentSafe that also replaces every character
+// beyond ASCII with '?', for PowerShell's comments (see powerShellQuote).
+func asciiCommentSafe(s string) string {
+	return strings.Map(func(r rune) rune {
+		if r < ' ' || r >= 0x7f {
 			return '?'
 		}
 		return r
@@ -366,14 +379,18 @@ func writeResticEnv(w io.Writer, shell string, repo resticRepo) error {
 			Options []string          `json:"options"`
 		}{repo.bucket, repo.backing, repo.purpose, env, opts})
 	}
+	comment := commentSafe
+	if shell == shellPowerShell {
+		comment = asciiCommentSafe // the whole output is ASCII
+	}
 	var b strings.Builder
-	fmt.Fprintf(&b, "# gos3 restic: %s\n", commentSafe(describeRepo(repo)))
+	fmt.Fprintf(&b, "# gos3 restic: %s\n", comment(describeRepo(repo)))
 	if len(repo.loc.Options) > 0 {
 		var o []string
 		for _, opt := range repo.loc.Options {
 			o = append(o, "-o "+opt)
 		}
-		fmt.Fprintf(&b, "# restic reads no options from the environment: add %s to every restic command\n", commentSafe(strings.Join(o, " ")))
+		fmt.Fprintf(&b, "# restic reads no options from the environment: add %s to every restic command\n", comment(strings.Join(o, " ")))
 	}
 	for _, v := range vars {
 		if shell == shellPowerShell {

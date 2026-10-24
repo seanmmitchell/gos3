@@ -99,6 +99,7 @@ var envVars = []EnvVar{
 	{"GOS3_COMPRESSION_SKIP_CONTENT_TYPES", "compression.skip_content_types", "media types stored uncompressed (\"video/*\" wildcards), comma-separated", list(func(c *Config) *[]string { return &c.Compression.SkipContentTypes })},
 	{"GOS3_JOBS_WORKERS", "jobs.workers", "background jobs (copy, mirror, snapshots) running at once, 1-64", integer(func(c *Config) *int { return &c.Jobs.Workers })},
 	{"GOS3_RESTIC_RESTORE_SPOOL_BYTES", "restic.restore_spool_bytes", "encrypted temporary data reserved by concurrent object restores, bytes or 1GiB-style (at least 64MiB)", size(func(c *Config) *int64 { return &c.Restic.RestoreSpoolBytes })},
+	{"GOS3_RESTIC_MAX_RESTORES", "restic.max_restores", "per-object restic restores running at once, 1-64", integer(func(c *Config) *int { return &c.Restic.MaxRestores })},
 	{"GOS3_RESTIC_SNAPSHOTS_WORKERS", "restic.snapshots.workers", "whole-bucket snapshot, restore and prune jobs running restic at once, 1-64", integer(func(c *Config) *int { return &c.Restic.Snapshots.Workers })},
 	{"GOS3_RESTIC_SNAPSHOTS_STAGE_DIR", "restic.snapshots.stage_dir", "stage directory of snapshot runs (default: restic-stage in the system directory)", str(func(c *Config) *string { return &c.Restic.Snapshots.StageDir })},
 	{"GOS3_RESTIC_SNAPSHOTS_SPOOL_BYTES", "restic.snapshots.spool_bytes", "data a snapshot run stages before a partial snapshot, bytes or 8GiB-style (at least 64MiB)", size(func(c *Config) *int64 { return &c.Restic.Snapshots.SpoolBytes })},

@@ -65,6 +65,8 @@ func (r *Router) readers(bs *bucketState, spread bool) []*backing {
 	for _, m := range rec.Members[1:] {
 		ms := bs.members[m.Backing]
 		switch {
+		case ms.skippedKeys() > 0:
+			continue // it lacks the latest versions of those keys
 		case rec.Mode == ModeActiveActive && ms.syncMode:
 		case rec.Mode == ModeActivePassive && m.Synced:
 		default:

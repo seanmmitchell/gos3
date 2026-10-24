@@ -225,9 +225,36 @@ func requestHost(r *http.Request) string {
 	return ""
 }
 
+// redactedHeaderValue replaces a signed header's value in the canonical
+// request echoed by SignatureDoesNotMatch (see echoHeaderValue).
+const redactedHeaderValue = "<redacted>"
+
+// echoHeaderValue reports whether a signed header's value may be echoed in a
+// SignatureDoesNotMatch body. SignedHeaders may name any header, including
+// ones a browser or proxy adds without the caller seeing them (Cookie,
+// Authorization, proxy-injected tokens); with a CORS rule that allows
+// credentials, echoing those would let a page read them back. Only the
+// headers that matter for debugging signers and that the client sets itself
+// are echoed.
+func echoHeaderValue(name string) bool {
+	lname := strings.ToLower(name)
+	switch lname {
+	case "host", "range", "date", "expect":
+		return true
+	}
+	return strings.HasPrefix(lname, "content-") || strings.HasPrefix(lname, "x-amz-")
+}
+
 // canonicalHeaders builds the canonical headers block for the given signed
 // header names (in the order given), using host for the host header.
 func canonicalHeaders(r *http.Request, names []string, host string) string {
+	return writeCanonicalHeaders(r, names, host, false)
+}
+
+// writeCanonicalHeaders is canonicalHeaders; with redact set, the value of
+// every header echoHeaderValue rejects is replaced by redactedHeaderValue
+// (for the error echo only; it never feeds a signature).
+func writeCanonicalHeaders(r *http.Request, names []string, host string, redact bool) string {
 	var b strings.Builder
 	for _, name := range names {
 		lname := strings.ToLower(name)
@@ -259,6 +286,9 @@ func canonicalHeaders(r *http.Request, names []string, host string) string {
 		}
 		b.WriteString(name)
 		b.WriteByte(':')
+		if redact && len(vals) > 0 && !echoHeaderValue(lname) {
+			vals = []string{redactedHeaderValue}
+		}
 		for i, v := range vals {
 			if i > 0 {
 				b.WriteByte(',')
@@ -331,10 +361,12 @@ func hostCandidates(r *http.Request) []string {
 // matchSignature computes the signature for every candidate canonical form
 // and reports whether provided matches one of them (constant time per
 // comparison). On mismatch it returns the first candidate's string to sign
-// and canonical request for the error response.
+// and, for the error response, its canonical request with sensitive header
+// values redacted (the string to sign carries only the real one's hash).
 func matchSignature(in sigInput, provided string) (ok bool, sts, creq string) {
 	uris := pathCandidates(in.r)
-	for _, host := range hostCandidates(in.r) {
+	hosts := hostCandidates(in.r)
+	for _, host := range hosts {
 		headers := canonicalHeaders(in.r, in.signedNames, host)
 		for _, uri := range uris {
 			cr := buildCanonicalRequest(in.r.Method, uri, in.query,
@@ -345,10 +377,12 @@ func matchSignature(in sigInput, provided string) (ok bool, sts, creq string) {
 				return true, s, cr
 			}
 			if sts == "" {
-				sts, creq = s, cr
+				sts = s
 			}
 		}
 	}
+	creq = buildCanonicalRequest(in.r.Method, uris[0], in.query,
+		writeCanonicalHeaders(in.r, in.signedNames, hosts[0], true), in.signedHeaders, in.payloadHash)
 	return false, sts, creq
 }
 

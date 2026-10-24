@@ -615,6 +615,174 @@ func TestVersionLimitDoesNotDisableBacking(t *testing.T) {
 	}
 }
 
+// A key with more versions than copier.MaxKeyVersions must not stop a
+// replica's or a move's copy at that key: the other keys are copied, the
+// key is reported, and the replica is never marked synced nor the move
+// completed until the key can be copied (here: once a version is deleted).
+func TestKeyWithTooManyVersionsIsSkipped(t *testing.T) {
+	ctx := context.Background()
+	setup := func(t *testing.T) (*Router, storage.ObjectInfo) {
+		bk := memBackings(2)
+		r := openRouter(t, Options{Backings: bk})
+		if err := r.CreateBucket(ctx, "hist", storage.CreateBucketOptions{}); err != nil {
+			t.Fatal(err)
+		}
+		if err := r.SetBucketVersioning(ctx, "hist", storage.VersioningEnabled); err != nil {
+			t.Fatal(err)
+		}
+		put(t, r, "hist", "aaa-before", "a", storage.ObjectMeta{})
+		oldest := put(t, r, "hist", "u/x", "x", storage.ObjectMeta{})
+		for range copier.MaxKeyVersions {
+			put(t, r, "hist", "u/x", "x", storage.ObjectMeta{})
+		}
+		put(t, r, "hist", "zzz-after", "z", storage.ObjectMeta{})
+		return r, oldest
+	}
+	member := func(r *Router, name string) *memberState {
+		r.mu.RLock()
+		defer r.mu.RUnlock()
+		return r.buckets["hist"].members[name]
+	}
+	// settled waits until b's copy has gone through the whole bucket and
+	// its worker stopped: the point where it would have become synced or
+	// cut over.
+	settled := func(t *testing.T, r *Router, role string) MemberStatus {
+		t.Helper()
+		var got MemberStatus
+		waitFor(t, "the copy to skip u/x", func() bool {
+			ms := member(r, "b")
+			if ms == nil {
+				return false
+			}
+			ms.mu.Lock()
+			idle := ms.fullDone && !ms.running
+			ms.mu.Unlock()
+			st, err := r.Placement("hist")
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, m := range st.Members {
+				if m.Backing == "b" && m.Role == role {
+					got = m
+				}
+			}
+			return idle && got.SkippedKeys == 1
+		})
+		if got.State != StateDegraded || !strings.Contains(got.LastError, "u/x") {
+			t.Fatalf("member status %+v", got)
+		}
+		for _, k := range []string{"aaa-before", "zzz-after"} {
+			if _, err := backendOf(r, "b").GetObjectInfo(ctx, "hist", k, ""); err != nil {
+				t.Fatalf("%s was not copied: %v", k, err)
+			}
+		}
+		return got
+	}
+
+	t.Run("replica", func(t *testing.T) {
+		r, oldest := setup(t)
+		if _, err := r.SetReplication(ctx, "hist", ModeActivePassive, []string{"b"}); err != nil {
+			t.Fatal(err)
+		}
+		settled(t, r, RoleReplica)
+		r.mu.RLock()
+		rec := r.buckets["hist"].rec
+		r.mu.RUnlock()
+		if rec.Members[rec.member("b")].Synced {
+			t.Fatal("a replica missing a key was marked synced")
+		}
+		// With one version fewer the key fits: it is copied when it changes.
+		if _, err := r.DeleteObject(ctx, "hist", "u/x", oldest.VersionID); err != nil {
+			t.Fatal(err)
+		}
+		st := waitState(t, r, "hist", StateInSync)
+		if st.Members[1].SkippedKeys != 0 || st.Members[1].LastError != "" {
+			t.Fatalf("status after the fix %+v", st.Members[1])
+		}
+		if vs, err := copier.KeyVersions(ctx, backendOf(r, "b"), "hist", "u/x"); err != nil || len(vs) != copier.MaxKeyVersions {
+			t.Fatalf("replica u/x: %d versions, %v", len(vs), err)
+		}
+	})
+
+	// A synced replica whose key outgrows the limit later is degraded, is
+	// not promoted gracefully, and retries the key on its own: here its
+	// history shrinks on the backing, unseen by the router.
+	t.Run("synced replica", func(t *testing.T) {
+		old := skippedRetryInterval
+		skippedRetryInterval = 20 * time.Millisecond
+		t.Cleanup(func() { skippedRetryInterval = old })
+		r := openRouter(t, Options{Backings: memBackings(2)})
+		if err := r.CreateBucket(ctx, "hist", storage.CreateBucketOptions{}); err != nil {
+			t.Fatal(err)
+		}
+		if err := r.SetBucketVersioning(ctx, "hist", storage.VersioningEnabled); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := r.SetReplication(ctx, "hist", ModeActivePassive, []string{"b"}); err != nil {
+			t.Fatal(err)
+		}
+		waitState(t, r, "hist", StateInSync)
+		put(t, r, "hist", "aaa-before", "a", storage.ObjectMeta{})
+		oldest := put(t, r, "hist", "u/x", "x", storage.ObjectMeta{})
+		for range copier.MaxKeyVersions {
+			put(t, r, "hist", "u/x", "x", storage.ObjectMeta{})
+		}
+		put(t, r, "hist", "zzz-after", "z", storage.ObjectMeta{})
+		settled(t, r, RoleReplica)
+		if _, err := r.Promote(ctx, "hist", "b", false); !errors.Is(err, ErrConflict) || !strings.Contains(err.Error(), "too many versions") {
+			t.Fatalf("graceful promote of a replica missing a key: %v", err)
+		}
+		// Although still marked synced, it neither serves reads nor takes
+		// over when the primary fails.
+		r.mu.RLock()
+		bs := r.buckets["hist"]
+		r.mu.RUnlock()
+		if rd := r.readers(bs, false); len(rd) != 1 || rd[0].Name != "a" {
+			t.Fatalf("readers include the replica missing a key: %d", len(rd))
+		}
+		primary := r.topology.Load().backings["a"]
+		primary.healthy.Store(false)
+		r.failover(bs, "a")
+		primary.healthy.Store(true)
+		if st, _ := r.Placement("hist"); st.Primary != "a" {
+			t.Fatalf("failed over to a replica missing a key: %+v", st)
+		}
+		if _, err := backendOf(r, "a").DeleteObject(ctx, "hist", "u/x", oldest.VersionID); err != nil {
+			t.Fatal(err)
+		}
+		waitState(t, r, "hist", StateInSync)
+		if vs, err := copier.KeyVersions(ctx, backendOf(r, "b"), "hist", "u/x"); err != nil || len(vs) != copier.MaxKeyVersions {
+			t.Fatalf("replica u/x: %d versions, %v", len(vs), err)
+		}
+	})
+
+	t.Run("move", func(t *testing.T) {
+		r, oldest := setup(t)
+		if _, err := r.Move(ctx, "hist", "", "b", nil); err != nil {
+			t.Fatal(err)
+		}
+		settled(t, r, RoleMoveTarget)
+		if st, _ := r.Placement("hist"); st.Move == nil || st.Primary != "a" {
+			t.Fatalf("the move completed without u/x: %+v", st)
+		}
+		if _, err := r.DeleteObject(ctx, "hist", "u/x", oldest.VersionID); err != nil {
+			t.Fatal(err)
+		}
+		waitFor(t, "the move to complete", func() bool {
+			st, _ := r.Placement("hist")
+			return st.Move == nil && st.Primary == "b"
+		})
+		if vs, err := copier.KeyVersions(ctx, backendOf(r, "b"), "hist", "u/x"); err != nil || len(vs) != copier.MaxKeyVersions {
+			t.Fatalf("moved u/x: %d versions, %v", len(vs), err)
+		}
+	})
+}
+
+// backendOf returns the backend of backing name of r.
+func backendOf(r *Router, name string) storage.Backend {
+	return r.topology.Load().backings[name].Backend
+}
+
 func TestGateQuiesce(t *testing.T) {
 	var g gate
 	ctx := context.Background()

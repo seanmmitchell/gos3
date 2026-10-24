@@ -11,9 +11,11 @@ import (
 	"maps"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/seanmmitchell/gos3/internal/storage"
 	"github.com/seanmmitchell/gos3/internal/storage/native"
+	"github.com/seanmmitchell/gos3/internal/storage/s3store"
 )
 
 // The registry
@@ -82,6 +84,18 @@ func configKey(bucket, key string) string { return configPrefix(bucket) + key + 
 func trimRecordKey(k, prefix string) string {
 	return strings.TrimSuffix(strings.TrimPrefix(k, prefix), "/")
 }
+
+// validContainerID reports whether id is a container ID this package
+// generates: the home's, or "c" and 8 lowercase hex digits
+// (newContainerID). The records of a home are not authenticated, and a
+// container's ID names its temporary directory (storeOptions), so every
+// other ID is refused.
+func validContainerID(id string) bool {
+	return id == homeID || len(id) == 9 && id[0] == 'c' && isLowerHex(id[1:])
+}
+
+// isLowerHex reports whether s is non-empty and only lowercase hex digits.
+func isLowerHex(s string) bool { return s != "" && strings.Trim(s, "0123456789abcdef") == "" }
 
 // schemaRecord is the record v.
 type schemaRecord struct {
@@ -193,17 +207,25 @@ var errNewerRecords = errors.New("s3account: the backing's records were written 
 // decodeRegistry builds the registry from the records. orphans are the
 // configuration prefixes of buckets that are not native buckets (left by an
 // interrupted bucket creation or deletion), which the caller deletes.
-func decodeRegistry(recs map[string][]byte) (reg *registry, orphans []string, err error) {
+//
+// The records of a home are read from the remote and not authenticated:
+// records this build would never write (a container ID, backing ID, bucket
+// name or configuration key of another form) are skipped, each reported in
+// invalid, which the caller logs. They are kept, not deleted.
+func decodeRegistry(recs map[string][]byte) (reg *registry, orphans []string, invalid []error, err error) {
 	reg = newRegistry()
+	skip := func(k, format string, args ...any) {
+		invalid = append(invalid, fmt.Errorf("s3account: record %q skipped: "+format, append([]any{k}, args...)...))
+	}
 	for k, v := range recs {
 		switch {
 		case k == keySchema:
 			var s schemaRecord
 			if err := json.Unmarshal(v, &s); err != nil {
-				return nil, nil, fmt.Errorf("s3account: record %s: %w", k, err)
+				return nil, nil, nil, fmt.Errorf("s3account: record %s: %w", k, err)
 			}
 			if s.Schema > registrySchema {
-				return nil, nil, fmt.Errorf("%w (schema %d; this build reads %d)", errNewerRecords, s.Schema, registrySchema)
+				return nil, nil, nil, fmt.Errorf("%w (schema %d; this build reads %d)", errNewerRecords, s.Schema, registrySchema)
 			}
 			reg.schema = s.Schema
 		case k == keyDefaultContainer:
@@ -211,7 +233,11 @@ func decodeRegistry(recs map[string][]byte) (reg *registry, orphans []string, er
 				ID string `json:"id"`
 			}
 			if err := json.Unmarshal(v, &d); err != nil {
-				return nil, nil, fmt.Errorf("s3account: record %s: %w", k, err)
+				return nil, nil, nil, fmt.Errorf("s3account: record %s: %w", k, err)
+			}
+			if d.ID != "" && !validContainerID(d.ID) {
+				skip(k, "invalid container ID %q", d.ID)
+				continue
 			}
 			reg.defaultContainer = d.ID
 		case k == keyLegacyMetaKey:
@@ -219,22 +245,40 @@ func decodeRegistry(recs map[string][]byte) (reg *registry, orphans []string, er
 		case strings.HasPrefix(k, prefixContainers) && strings.HasSuffix(k, "/"):
 			var c containerRecord
 			if err := json.Unmarshal(v, &c); err != nil {
-				return nil, nil, fmt.Errorf("s3account: record %s: %w", k, err)
+				return nil, nil, nil, fmt.Errorf("s3account: record %s: %w", k, err)
 			}
 			c.ID = trimRecordKey(k, prefixContainers)
+			if !validContainerID(c.ID) {
+				skip(k, "invalid container ID %q", c.ID)
+				continue
+			}
+			if c.ID != homeID && !s3store.ValidBackingID(c.BackingID) {
+				// AddContainer records the ID of the loaded store, which is
+				// always set.
+				skip(k, "invalid backing ID %q", c.BackingID)
+				continue
+			}
 			reg.containers[c.ID] = c
 		case strings.HasPrefix(k, prefixBuckets) && strings.HasSuffix(k, "/"):
 			var b bucketRecord
 			if err := json.Unmarshal(v, &b); err != nil {
-				return nil, nil, fmt.Errorf("s3account: record %s: %w", k, err)
+				return nil, nil, nil, fmt.Errorf("s3account: record %s: %w", k, err)
 			}
 			name := trimRecordKey(k, prefixBuckets)
+			if err := validBucketName(name); err != nil {
+				skip(k, "%w", err)
+				continue
+			}
 			b.Info.Name, b.Info.Kind, b.Info.Location = name, "", ""
 			reg.buckets[name] = &bucketEntry{bucketRecord: b}
 		case strings.HasPrefix(k, prefixConfigs) && strings.HasSuffix(k, "/"):
 			rest := strings.TrimSuffix(strings.TrimPrefix(k, prefixConfigs), "/")
 			bucket, key, ok := strings.Cut(rest, "/")
 			if !ok || bucket == "" || key == "" {
+				continue
+			}
+			if err := validBucketName(bucket); err != nil || strings.Contains(key, "/") || !utf8.ValidString(key) {
+				skip(k, "invalid bucket name or configuration key")
 				continue
 			}
 			if reg.configs[bucket] == nil {
@@ -251,7 +295,7 @@ func decodeRegistry(recs map[string][]byte) (reg *registry, orphans []string, er
 			delete(reg.configs, bucket)
 		}
 	}
-	return reg, orphans, nil
+	return reg, orphans, invalid, nil
 }
 
 // equalRecords reports whether two record sets are identical.

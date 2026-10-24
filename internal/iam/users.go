@@ -137,6 +137,9 @@ func (m *Manager) createUser(ctx context.Context, spec UserSpec) (User, error) {
 		if st.users[spec.Name] != nil || st.keys[spec.Name] != nil || spec.Name == m.opts.RootAccessKey {
 			return ErrUserExists
 		}
+		if len(st.users) >= maxUsers {
+			return wrapf(ErrLimitExceeded, fmt.Sprintf("at most %d users", maxUsers))
+		}
 		pols := dedupe(spec.Policies)
 		if err := checkPolicies(st, pols); err != nil {
 			return err
@@ -444,6 +447,8 @@ func (m *Manager) putPolicy(ctx context.Context, name, description string, doc P
 		p := &NamedPolicy{Name: name, Description: description, Document: d, CreatedAt: now, UpdatedAt: now}
 		if old := st.policies[name]; old != nil {
 			p.CreatedAt = old.CreatedAt
+		} else if len(st.policies) >= maxCustomPolicies {
+			return wrapf(ErrLimitExceeded, fmt.Sprintf("at most %d custom policies", maxCustomPolicies))
 		}
 		st.policies[name] = p
 		out = copyPolicy(p)

@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"slices"
+	"strings"
 	"testing"
 
 	"github.com/seanmmitchell/gos3/internal/storage"
@@ -86,19 +87,73 @@ func TestZipWalkPairsKeys(t *testing.T) {
 	}
 }
 
+// A key with too long a history on either side is delivered flagged, with
+// that side's entries dropped, and the walk goes on with the other keys
+// (one such key must not stop a whole copy).
 func TestVersionHistoryLimit(t *testing.T) {
 	src := memEndpoint(t, "source", "", storage.VersioningEnabled)
 	dst := memEndpoint(t, "target", "", storage.VersioningEnabled)
+	putText(t, src, "aaa-before", "a")
 	for range MaxKeyVersions + 1 {
 		putText(t, src, "hot", "x")
 	}
+	putText(t, dst, "hot", "old")
+	for range MaxKeyVersions + 1 {
+		putText(t, dst, "hot-target", "y")
+	}
+	putText(t, src, "zzz-after", "z")
 	if _, err := KeyVersions(t.Context(), src.Backend, src.Bucket, "hot"); !errors.Is(err, ErrTooManyVersions) {
 		t.Fatalf("KeyVersions: %v", err)
 	}
-	called := false
-	err := ZipWalk(t.Context(), src, dst, "", true, func([]KeyPair) error { called = true; return nil })
-	if !errors.Is(err, ErrTooManyVersions) || called {
-		t.Fatalf("ZipWalk: error %v, callback called %t", err, called)
+	if _, err := LookupPair(t.Context(), src, dst, "hot", true); !errors.Is(err, ErrTooManyVersions) {
+		t.Fatalf("LookupPair: %v", err)
+	}
+	var got []KeyPair
+	maxBatch := 0
+	err := ZipWalk(t.Context(), src, dst, "", true, func(ps []KeyPair) error {
+		n := 0
+		for _, p := range ps {
+			n += len(p.Src) + len(p.Dst)
+		}
+		maxBatch = max(maxBatch, n)
+		got = append(got, ps...)
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("ZipWalk: %v", err)
+	}
+	want := []pairDesc{
+		{"aaa-before", "aaa-before", 1, 0},
+		{"hot", "hot", 0, 1},
+		{"hot-target", "hot-target", 0, 0},
+		{"zzz-after", "zzz-after", 1, 0},
+	}
+	if d := describe(got); !slices.Equal(d, want) {
+		t.Fatalf("pairs:\n got %+v\nwant %+v", d, want)
+	}
+	for i, p := range got {
+		flagged := p.SrcKey == "hot" || p.SrcKey == "hot-target"
+		if flagged != errors.Is(p.Err, ErrTooManyVersions) {
+			t.Fatalf("pair %d (%s): Err = %v", i, p.SrcKey, p.Err)
+		}
+	}
+	if !strings.Contains(got[1].Err.Error(), "source") || !strings.Contains(got[2].Err.Error(), "target") {
+		t.Fatalf("errors do not name the side: %v; %v", got[1].Err, got[2].Err)
+	}
+	if maxBatch > batchVersions {
+		t.Fatalf("a batch held %d entries", maxBatch)
+	}
+	// The sync functions refuse a flagged pair without writing.
+	for _, pol := range []Policy{{}, {Versions: VersionsCurrent}} {
+		if _, err := SyncKey(t.Context(), src, dst, got[1], pol); !errors.Is(err, ErrTooManyVersions) {
+			t.Fatalf("SyncKey(hot): %v", err)
+		}
+		if _, err := SyncKeyFingerprint(t.Context(), src, dst, got[1], NewMemStore(), pol); !errors.Is(err, ErrTooManyVersions) {
+			t.Fatalf("SyncKeyFingerprint(hot): %v", err)
+		}
+	}
+	if vs := history(t, dst, "hot"); len(vs) != 1 {
+		t.Fatalf("target hot changed: %d versions", len(vs))
 	}
 }
 

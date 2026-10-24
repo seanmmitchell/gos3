@@ -3,9 +3,9 @@
   "review_date": "2026-10-17",
   "scope": "The pasted inventory was available; the referenced full scratchpad audit reports were not present in this checkout. Source triage alone is not exploit validation. Proposed fixes are not merged.",
   "counts": {
-    "fixed-in-proposed-pr": 29,
+    "fixed-in-proposed-pr": 32,
     "partly-addressed": 1,
-    "open": 62
+    "open": 59
   },
   "severity_counts": {
     "Medium": 1,
@@ -62,7 +62,7 @@
       "original_status": "new",
       "status": "partly-addressed",
       "validation": "source-triage-only; no independent exploit reproduction claimed",
-      "assessment": "Reproduced impossible-byte prefixes making remote LIST calls. Those now return immediately and walks stop past their prefix range. Incomplete UTF-8 byte prefixes and loose marker lower bounds retain compatibility; aggregate page-work limits remain unresolved. Do not close this finding.",
+      "assessment": "Reproduced impossible-byte prefixes making remote LIST calls. Those now return immediately and walks stop past their prefix range. Incomplete UTF-8 byte prefixes and loose marker lower bounds retain compatibility; aggregate page-work limits remain unresolved. Do not close this finding. N-02 rejects invalid UTF-8 (and over-long) prefix, delimiter, marker and continuation-token values on all S3 list operations, closing the incomplete-UTF-8 prefix and loose-marker paths; aggregate page-work limits remain open.",
       "branch": "codex/security-remote-storage",
       "regression": "TestInvalidPrefixDoesNotScanRemote",
       "pull_request": "https://github.com/seanmmitchell/gos3/pull/67"
@@ -173,9 +173,10 @@
       "title": "Copier and replication load every version of a key into memory",
       "audited_location": "internal/storage/copier/zipwalk.go:144; compare.go:82",
       "original_status": "new",
-      "status": "open",
-      "validation": "source-triage-only; no independent exploit reproduction claimed",
-      "assessment": "zipwalk bounds a batch only when a new key starts, and KeyVersions collects every version of a key. Source supports unbounded per-key memory."
+      "status": "fixed-in-proposed-pr",
+      "validation": "TestVersionHistoryLimit (see N-04)",
+      "assessment": "zipwalk bounds a batch only when a new key starts, and KeyVersions collects every version of a key. Source supports unbounded per-key memory. Per-key memory is capped at copier.MaxKeyVersions (#90); N-04 makes an over-limit key a skipped per-key error instead of a failed pass.",
+      "branch": "claude/security-audit-n-fixes"
     },
     {
       "id": "J-13",
@@ -257,9 +258,10 @@
       "title": "Restic restores unbounded (1-byte range forces a full restore, no cap)",
       "audited_location": "internal/storage/restic/read.go:68",
       "original_status": "open",
-      "status": "open",
-      "validation": "source-triage-only; no independent exploit reproduction claimed",
-      "assessment": "Restic Reader.prepare restores the full object before satisfying a read. Resource/concurrency bounds require a separate design and workload test."
+      "status": "fixed-in-proposed-pr",
+      "validation": "TestConcurrentRestoresAreLimited; TestStalledReaderLeavesRestoreBudget (see N-03)",
+      "assessment": "Restic Reader.prepare restores the full object before satisfying a read. Resource/concurrency bounds require a separate design and workload test. Bounded by N-03: a process-wide restic.max_restores limit and windowed spools of at most half of restic.restore_spool_bytes.",
+      "branch": "claude/security-audit-n-fixes"
     },
     {
       "id": "G-07",
@@ -339,9 +341,10 @@
       "title": "arn:gos3:admin:::** misses service-level actions",
       "audited_location": "internal/iam/parse.go:231",
       "original_status": "open",
-      "status": "open",
-      "validation": "source-triage-only; no independent exploit reproduction claimed",
-      "assessment": "Parser accepts all-star admin ARN suffixes, while service matching special-cases the single-star ARN. Add Allow and Deny service-action regressions."
+      "status": "fixed-in-proposed-pr",
+      "validation": "TestAuthorizeServiceLevelResources (Allow and Deny service-action cases, see N-10)",
+      "assessment": "Parser accepts all-star admin ARN suffixes, while service matching special-cases the single-star ARN. Add Allow and Deny service-action regressions.",
+      "branch": "claude/security-audit-n-fixes"
     },
     {
       "id": "G-15",
@@ -833,7 +836,8 @@
       "branch": "codex/security-release-integrity",
       "validation": "TestEmbeddedArtifactBoundToProducer",
       "baseline_reproduced": true,
-      "pull_request": "https://github.com/seanmmitchell/gos3/pull/68"
+      "pull_request": "https://github.com/seanmmitchell/gos3/pull/68",
+      "note": "The final bin-* collection in release.yml was not bound the same way; see N-08."
     },
     {
       "id": "J-19",
@@ -977,7 +981,8 @@
       "branch": "codex/security-remote-storage",
       "validation": "TestMarkerRejectsPathBackingID",
       "baseline_reproduced": true,
-      "pull_request": "https://github.com/seanmmitchell/gos3/pull/67"
+      "pull_request": "https://github.com/seanmmitchell/gos3/pull/67",
+      "note": "Container IDs from home records had the same path issue; see N-11."
     },
     {
       "id": "H-32",
@@ -1038,7 +1043,6 @@
     "J-11",
     "J-16",
     "J-19",
-    "G-06",
     "G-09",
     "G-12",
     "G-18",
@@ -1051,5 +1055,155 @@
     "codex/security-storage-integrity": "https://github.com/seanmmitchell/gos3/pull/66",
     "codex/security-remote-storage": "https://github.com/seanmmitchell/gos3/pull/67",
     "codex/security-release-integrity": "https://github.com/seanmmitchell/gos3/pull/68"
+  },
+  "audit_2026_10_23": {
+    "audited_commit": "72d53576c54127bcc769790b1443587f1c96705c",
+    "review_date": "2026-10-23",
+    "scope": "Multi-agent audit of dev for RCE, XSS, injection, authn/authz bypass, privilege escalation, path traversal, SSRF, secret leaks and cheap DoS. Earlier G-/H-/J- findings were excluded unless their fix was incomplete. Every finding was verified by an executed PoC except N-08 (plausible); each PoC is now a regression test that fails on the audited commit.",
+    "severity_counts": {
+      "Medium": 6,
+      "Low": 7
+    },
+    "pull_request_branch": "claude/security-audit-n-fixes",
+    "findings": [
+      {
+        "id": "N-01",
+        "severity": "Medium",
+        "title": "Retention and legal hold with ?versionId are authorized against the latest version's tags (regression from the J-03 fix)",
+        "audited_location": "internal/s3/authz.go:66; internal/s3/ops.go:156",
+        "status": "fixed-in-proposed-pr",
+        "branch": "claude/security-audit-n-fixes",
+        "validation": "TestLockOpsEvaluateAddressedVersion; TestReauthorizeIgnoresDummyVersion",
+        "baseline_reproduced": true,
+        "related": "J-03"
+      },
+      {
+        "id": "N-02",
+        "severity": "Medium",
+        "title": "Truncated s3:prefix/s3:delimiter in the condition context lets a crafted delimiter satisfy delimiter-scoped listing policies",
+        "audited_location": "internal/s3/authz.go:447; internal/iam/match.go:36",
+        "status": "fixed-in-proposed-pr",
+        "branch": "claude/security-audit-n-fixes",
+        "validation": "TestListQueryMatchesPolicyView; TestContinuationTokenMustBeUTF8",
+        "baseline_reproduced": true,
+        "related": "J-02"
+      },
+      {
+        "id": "N-03",
+        "severity": "Medium",
+        "title": "Distinct ranged GETs on restic-backed objects each start an unlimited restic dump; one slow reader holds the whole restore budget",
+        "audited_location": "internal/storage/restic/read.go:276",
+        "status": "fixed-in-proposed-pr",
+        "branch": "claude/security-audit-n-fixes",
+        "validation": "TestConcurrentRestoresAreLimited; TestRestoreSlotWaitEndsWithTheRequest; TestStalledReaderLeavesRestoreBudget; TestObjectsLargerThanTheSpoolLimitAreReadInWindows",
+        "baseline_reproduced": true,
+        "related": "G-06"
+      },
+      {
+        "id": "N-04",
+        "severity": "Low",
+        "title": "A key with more than 4096 versions permanently fails mirror/copy jobs and stalls replica sync and moves",
+        "audited_location": "internal/storage/copier/compare.go:97; zipwalk.go:153",
+        "status": "fixed-in-proposed-pr",
+        "branch": "claude/security-audit-n-fixes",
+        "validation": "TestVersionHistoryLimit; TestMirrorSkipsKeyWithTooManyVersions; TestCopySkipsKeyWithTooManyVersions; TestKeyWithTooManyVersionsIsSkipped",
+        "baseline_reproduced": true,
+        "related": "J-12"
+      },
+      {
+        "id": "N-05",
+        "severity": "Medium",
+        "title": "gos3 restic env --shell powershell lets a server answer inject PowerShell code on cp932/cp936 consoles",
+        "audited_location": "cmd/gos3/restic.go:307",
+        "status": "fixed-in-proposed-pr",
+        "branch": "claude/security-audit-n-fixes",
+        "validation": "TestWriteResticEnvPowerShellASCII; TestResticEnvPowerShellCodePages (ran against Windows PowerShell 5.1)",
+        "baseline_reproduced": true
+      },
+      {
+        "id": "N-06",
+        "severity": "Low",
+        "title": "SignatureDoesNotMatch echoes the values of any signed header (Cookie, proxy tokens), readable cross-origin through a credentialed bucket CORS rule",
+        "audited_location": "internal/auth/sigv4.go:360",
+        "status": "fixed-in-proposed-pr",
+        "branch": "claude/security-audit-n-fixes",
+        "validation": "TestSignatureMismatchRedactsHeaderValues; TestEchoedHeaderValueRedaction",
+        "baseline_reproduced": true
+      },
+      {
+        "id": "N-07",
+        "severity": "Medium",
+        "title": "Unbounded IAM state lets a scoped admin stall authentication during saves and push iam.json past the size the server can load",
+        "audited_location": "internal/iam/store.go:349",
+        "status": "fixed-in-proposed-pr",
+        "branch": "claude/security-audit-n-fixes",
+        "validation": "TestUserLimit; TestCustomPolicyLimit; TestConditionValueLimit; TestPersistSizeLimitLeavesStateUnchanged; TestReadsDoNotWaitForPersist",
+        "baseline_reproduced": true
+      },
+      {
+        "id": "N-08",
+        "severity": "Medium",
+        "title": "Release job downloads every bin-* artifact of the run, so untrusted test jobs could add or replace attested release archives",
+        "audited_location": ".github/workflows/release.yml:136",
+        "status": "fixed-in-proposed-pr",
+        "branch": "claude/security-audit-n-fixes",
+        "validation": "TestReleaseBinariesBoundToExpectedSet",
+        "baseline_reproduced": true,
+        "related": "H-28",
+        "note": "Reported as plausible (not exploited). Binding relies on artifact names being unique within a run and on no job with the runtime token running after binaries; the artifacts API does not expose the producing job."
+      },
+      {
+        "id": "N-09",
+        "severity": "Low",
+        "title": "Relay PDF download rule fails open for missing, malformed, comma-listed or duplicated upstream Content-Type",
+        "audited_location": "internal/admin/relay.go:231",
+        "status": "fixed-in-proposed-pr",
+        "branch": "claude/security-audit-n-fixes",
+        "validation": "TestRelayPDFIsDownloaded; TestRelayNonPDFStaysInline",
+        "baseline_reproduced": true
+      },
+      {
+        "id": "N-10",
+        "severity": "Low",
+        "title": "Deny on s3 service-level actions is skipped for wildcard s3 ARNs other than exactly arn:aws:s3:::*",
+        "audited_location": "internal/iam/eval.go:243",
+        "status": "fixed-in-proposed-pr",
+        "branch": "claude/security-audit-n-fixes",
+        "validation": "TestAuthorizeServiceLevelResources",
+        "baseline_reproduced": true,
+        "related": "G-14"
+      },
+      {
+        "id": "N-11",
+        "severity": "Low",
+        "title": "Container ID from unauthenticated home records is joined into a local temp path",
+        "audited_location": "internal/storage/s3account/containers.go:164; registry.go:220",
+        "status": "fixed-in-proposed-pr",
+        "branch": "claude/security-audit-n-fixes",
+        "validation": "TestRegistryRejectsPathContainerID; TestDecodeRegistrySkipsInvalidIDs; TestStoreOptionsRejectsPathTempName",
+        "baseline_reproduced": true,
+        "related": "H-31"
+      },
+      {
+        "id": "N-12",
+        "severity": "Low",
+        "title": "With server.max_connections set, silent or partial-header connections cannot be evicted and lock out all clients and health probes",
+        "audited_location": "internal/server/conn.go:175",
+        "status": "fixed-in-proposed-pr",
+        "branch": "claude/security-audit-n-fixes",
+        "validation": "TestMaxConnectionsSilentClients; TestMaxConnections",
+        "baseline_reproduced": true
+      },
+      {
+        "id": "N-13",
+        "severity": "Low",
+        "title": "Web UI: an imported connection can take over a deleted relay's dangling ID and receive another connection's signed traffic",
+        "audited_location": "web/app/stores/connections.ts:394; web/app/utils/connections.ts:219",
+        "status": "fixed-in-proposed-pr",
+        "branch": "claude/security-audit-n-fixes",
+        "validation": "web/test/unit/transport.test.ts: never makes an imported connection the relay of a deleted relay's dependents (N-13), and six related cases",
+        "baseline_reproduced": true
+      }
+    ]
   }
 }

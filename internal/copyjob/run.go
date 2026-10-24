@@ -77,9 +77,10 @@ type run struct {
 
 	// The current pass (or batch of changed keys); guarded by the lock of
 	// syncItems while its workers run.
-	frozen   bool     // the checkpoint stopped at a failed key
-	passErrs int      // keys that failed
-	failed   []string // their source keys
+	frozen      bool     // the checkpoint stopped at a failed key
+	passErrs    int      // keys that failed
+	passTooMany int      // of those, keys with too many versions to copy
+	failed      []string // their source keys
 }
 
 // run runs job h of kind (see Runner.Run).
@@ -515,7 +516,7 @@ func (r *run) syncChanged(ctx context.Context) (retry bool, err error) {
 		items[i] = item{pair: copier.KeyPair{SrcKey: k}, lookup: true}
 	}
 	ok := make([]bool, len(keys))
-	r.passErrs, r.failed = 0, nil
+	r.passErrs, r.passTooMany, r.failed = 0, 0, nil
 	err = r.syncItems(ctx, items, func(i int, failed bool) { ok[i] = !failed })
 	var again []string
 	for i, k := range keys {
@@ -539,7 +540,7 @@ func (r *run) pass(ctx context.Context, phase string, final bool) error {
 	if after == "" {
 		r.tr.startPass()
 	}
-	r.frozen, r.passErrs, r.failed = false, 0, nil
+	r.frozen, r.passErrs, r.passTooMany, r.failed = false, 0, 0, nil
 	err := copier.ZipWalk(ctx, r.src, r.dst, after, r.sp.all(), func(batch []copier.KeyPair) error {
 		return r.batch(ctx, batch, final)
 	})
@@ -553,6 +554,11 @@ func (r *run) pass(ctx context.Context, phase string, final bool) error {
 		return err
 	}
 	if final && r.passErrs > 0 {
+		if r.passTooMany == r.passErrs {
+			// Every other key was copied; running again cannot copy these
+			// until versions are removed, so the job ends.
+			return jobs.Permanent(fmt.Errorf("copyjob: %d keys were not copied (see the job's errors): %w", r.passErrs, copier.ErrTooManyVersions))
+		}
 		return fmt.Errorf("%d keys could not be copied (see the job's errors); retrying from %q", r.passErrs, r.after())
 	}
 	r.tr.update(func(st *Status) {
@@ -636,12 +642,20 @@ func (r *run) syncItems(ctx context.Context, items []item, done func(i int, fail
 					cancel()
 				default:
 					r.passErrs++
+					if errors.Is(err, copier.ErrTooManyVersions) {
+						r.passTooMany++
+					}
 					r.failed = append(r.failed, key)
 					r.tr.keyError(key, err, time.Now())
 					r.log.Warn("copy job: a key could not be copied", "key", key, "error", err)
 					done(i, true)
 					if r.passErrs >= maxPassErrors {
 						fatal = fmt.Errorf("%d keys could not be copied; the last, %q: %w", r.passErrs, key, err)
+						if r.w == nil && r.passTooMany == r.passErrs {
+							// A copy job: running again cannot copy these
+							// keys until versions are removed (see pass).
+							fatal = jobs.Permanent(fatal)
+						}
 						cancel()
 					}
 				}
@@ -803,10 +817,13 @@ func transient(err error) bool {
 
 // impossible reports errors that running the job again unchanged would
 // meet again: policies the target cannot satisfy, a bucket that is gone.
+// copier.ErrTooManyVersions is not among them: it concerns one key, which
+// fails alone (anyone allowed to write a key could otherwise stop the
+// whole job); a copy job ends once every other key is copied (see pass).
 func impossible(err error) bool {
 	for _, e := range []error{
 		copier.ErrPlaintext, copier.ErrEncryptionUnsupported, copier.ErrRetention, copier.ErrNoImport,
-		copier.ErrNotVersioned, copier.ErrTooManyVersions, storage.ErrBucketNotFound, jobs.ErrInvalidSpec, jobs.ErrConflict,
+		copier.ErrNotVersioned, storage.ErrBucketNotFound, jobs.ErrInvalidSpec, jobs.ErrConflict,
 	} {
 		if errors.Is(err, e) {
 			return true

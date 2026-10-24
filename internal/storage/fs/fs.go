@@ -122,6 +122,9 @@ var ErrClosed = errors.New("fs: backend closed")
 type Options struct {
 	// MaxRestoreSpoolBytes caps encrypted per-object restic restores.
 	MaxRestoreSpoolBytes int64
+	// MaxRestores caps the per-object restic restores running at once
+	// (restic.Runtime.MaxRestores).
+	MaxRestores int
 	// FsyncData fsyncs every data file (and its directory) before the
 	// metadata referencing it is committed. Slower, but committed objects
 	// survive power loss.
@@ -160,6 +163,7 @@ type Backend struct {
 	orphanDir            string
 	retention            time.Duration
 	maxRestoreSpoolBytes int64
+	maxRestores          int
 	fsync                bool
 	log                  *slog.Logger
 	db                   *bbolt.DB
@@ -201,6 +205,7 @@ func Open(root string, opts Options) (*Backend, error) {
 	}
 	b := &Backend{
 		maxRestoreSpoolBytes: opts.MaxRestoreSpoolBytes,
+		maxRestores:          opts.MaxRestores,
 		root:                 abs,
 		sysDir:               filepath.Join(abs, ".gos3"),
 		fsync:                opts.FsyncData,

@@ -1,8 +1,9 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import { createPinia, setActivePinia } from 'pinia'
-import { completeConnection, planConnectionImport } from '~/utils/connections'
+import type { Connection } from '~/types/connection'
+import { completeConnection, EMBEDDED_CONNECTION_ID, planConnectionImport } from '~/utils/connections'
 import { ConnectionTransport, configureTransports, getTransport } from '~/utils/transport'
-import { useConnectionsStore } from '~/stores/connections'
+import { LOCAL_STORAGE_KEY, useConnectionsStore } from '~/stores/connections'
 import { getAdminClient, getS3Client } from '~/utils/clients'
 import { AwsClient } from '~/utils/s3/signing'
 import { sha256Hex } from '~/utils/s3/hash'
@@ -151,5 +152,105 @@ describe('relay connection persistence and invalidation', () => {
     await expect(getS3Client(target).createBucket('bucket')).rejects.toMatchObject({ code: 'WriteOutcomeUnknown' })
     const fresh = completeConnection({ ...target, id: 'second' }); store.add(fresh)
     await expect(getAdminClient(fresh).createUser({ name: 'new-user', policies: [], disabled: false })).rejects.toMatchObject({ code: 'WriteOutcomeUnknown' })
+  })
+  it('never makes an imported connection the relay of a deleted relay\'s dependents (N-13)', async () => {
+    const store = useConnectionsStore()
+    store.add({ id: 'k3x9a1qz', endpoint: 'https://office-gw.test', kind: 'gos3', accessKeyId: 'gw-key', secretAccessKey: 'gw-secret' })
+    store.add({ id: 'nas', endpoint: 'https://nas.test', accessKeyId: 'nas-key', secretAccessKey: 'nas-secret', proxyConnectionId: 'k3x9a1qz' })
+    const held = store.byId('nas')!
+    store.remove('k3x9a1qz')
+    store.importJson({ type: 'gos3-connections', connections: [{ id: 'k3x9a1qz', endpoint: 'https://evil.example', kind: 'gos3', accessKeyId: 'atk', secretAccessKey: 'atk' }] })
+    const fetch = vi.fn(async (request: Request) => {
+      if (request.url.startsWith('https://nas.test')) throw new TypeError('unreachable')
+      if (request.url.endsWith('/whoami')) return Response.json({ capabilities: { proxy: true } })
+      return upstream()
+    })
+    vi.stubGlobal('fetch', fetch)
+    for (const nas of [store.byId('nas')!, held]) {
+      await getS3Client(nas).listBuckets().catch(() => {})
+      const aws = new AwsClient({ accessKeyId: nas.accessKeyId, secretAccessKey: nas.secretAccessKey, region: nas.region, service: 's3' })
+      const destination = (await aws.sign(nas.endpoint + '/bucket/file?X-Amz-Expires=60', { aws: { signQuery: true } } as RequestInit)).url
+      expect(new URL(await getTransport(nas).presign(destination, 900).catch(() => destination)).origin).toBe('https://nas.test')
+    }
+    expect(fetch.mock.calls.length).toBeGreaterThan(0)
+    expect(fetch.mock.calls.filter(([r]) => new URL(r.url).hostname === 'evil.example')).toEqual([])
+  })
+  it('clears and persists the relay of a removed relay\'s dependents', () => {
+    const store = useConnectionsStore(); store.add(relay); store.add(target)
+    const held = store.byId(target.id)!
+    store.remove(relay.id)
+    expect(store.byId(target.id)?.proxyConnectionId).toBeUndefined()
+    expect(held.proxyConnectionId).toBeUndefined()
+    expect(JSON.parse(localStorage.getItem(LOCAL_STORAGE_KEY)!).connections.find((c: Connection) => c.id === target.id)).not.toHaveProperty('proxyConnectionId')
+    store.resetState(); store.hydrate()
+    expect(store.byId(target.id)?.proxyConnectionId).toBeUndefined()
+  })
+  it('drops dangling relay IDs on hydrate and persists the result', () => {
+    const state = { version: 1, activeId: null, dismissedPresets: [], connections: [
+      { id: 'nas', endpoint: 'https://nas.test', proxyConnectionId: 'k3x9a1qz' },
+      { id: 'peer', endpoint: 'https://peer.test', proxyConnectionId: EMBEDDED_CONNECTION_ID },
+      relay, target
+    ] }
+    localStorage.setItem(LOCAL_STORAGE_KEY, JSON.stringify(state))
+    const store = useConnectionsStore(); store.hydrate()
+    expect(store.byId('nas')?.proxyConnectionId).toBeUndefined()
+    // Reserved IDs can never be taken by an import; the embedded server is merged in later.
+    expect(store.byId('peer')?.proxyConnectionId).toBe(EMBEDDED_CONNECTION_ID)
+    expect(store.byId(target.id)?.proxyConnectionId).toBe(relay.id)
+    const stored = JSON.parse(localStorage.getItem(LOCAL_STORAGE_KEY)!).connections as Connection[]
+    expect(stored.map(c => c.proxyConnectionId)).toEqual([undefined, EMBEDDED_CONNECTION_ID, undefined, relay.id])
+    expect(store.importJson([{ id: 'k3x9a1qz', endpoint: 'https://evil.example', accessKeyId: 'atk', secretAccessKey: 'atk' }]).added).toBe(1)
+    expect(store.byId('nas')?.proxyConnectionId).toBeUndefined()
+  })
+  it('drops dangling relay IDs another tab stored, without writing back', () => {
+    const tabA = useConnectionsStore(createPinia()); tabA.hydrate(); tabA.add(relay); tabA.add(target)
+    const held = tabA.byId(target.id)!
+    // Another tab removes the relay.
+    const tabB = useConnectionsStore(createPinia()); tabB.hydrate(); tabB.remove(relay.id)
+    tabA.syncFromStorage(localStorage.getItem(LOCAL_STORAGE_KEY))
+    expect(tabA.byId(relay.id)).toBeUndefined()
+    expect(tabA.byId(target.id)?.proxyConnectionId).toBeUndefined()
+    expect(held.proxyConnectionId).toBeUndefined()
+    // A list written by an older version still names the deleted relay.
+    const raw = JSON.stringify({ version: 1, activeId: null, dismissedPresets: [], connections: [{ ...target, secretAccessKey: '' }] })
+    localStorage.setItem(LOCAL_STORAGE_KEY, raw)
+    tabA.syncFromStorage(raw)
+    expect(tabA.byId(target.id)?.proxyConnectionId).toBeUndefined()
+    expect(tabA.byId(target.id)?.secretAccessKey).toBe(target.secretAccessKey)
+    expect(localStorage.getItem(LOCAL_STORAGE_KEY)).toBe(raw)
+  })
+  it('gives an imported entry a fresh ID when a stored connection names that ID as its relay', () => {
+    const nas = completeConnection({ id: 'nas', endpoint: 'https://nas.test', proxyConnectionId: 'k3x9a1qz' })
+    const plan = planConnectionImport([nas], [{ id: 'k3x9a1qz', endpoint: 'https://evil.example', kind: 'gos3' }])
+    expect(plan.steps).toHaveLength(1)
+    expect(plan.steps[0]).toMatchObject({ action: 'add', input: { endpoint: 'https://evil.example' } })
+    expect(plan.steps[0]?.action === 'add' && plan.steps[0].input.id).not.toBe('k3x9a1qz')
+    // A relay imported together with its dependents keeps its ID, in either order.
+    const pair = planConnectionImport([], [{ id: 'dep', endpoint: 'https://dep.test', proxyConnectionId: 'gw' }, { id: 'gw', endpoint: 'https://gw.test' }])
+    expect(pair.steps.map(s => s.action === 'add' && s.input.id)).toEqual(['dep', 'gw'])
+  })
+  it('validates the relays of imported connections like add()', () => {
+    const store = useConnectionsStore(); store.add(relay); store.add(target)
+    const before = localStorage.getItem(LOCAL_STORAGE_KEY)
+    // A chain (the relay has a relay itself) aborts the import before anything changes.
+    expect(() => store.importJson([{ id: 'new', endpoint: 'https://new.test' }, { id: 'chained', endpoint: 'https://chained.test', proxyConnectionId: target.id }])).toThrow(/relay/)
+    expect(store.byId('new')).toBeUndefined()
+    expect(localStorage.getItem(LOCAL_STORAGE_KEY)).toBe(before)
+    // A relay that follows its dependent in the file is accepted; one that names nothing is dropped.
+    store.importJson([{ id: 'dep', endpoint: 'https://dep.test', proxyConnectionId: 'gw' }, { id: 'gw', endpoint: 'https://gw.test' }, { id: 'lone', endpoint: 'https://lone.test', proxyConnectionId: 'nowhere' }])
+    expect(store.byId('dep')?.proxyConnectionId).toBe('gw')
+    expect(store.byId('lone')?.proxyConnectionId).toBeUndefined()
+  })
+  it('never restores a preset relay that the user removed', () => {
+    const store = useConnectionsStore()
+    const presets = [{ id: 'p', endpoint: 'https://p.test', proxyConnectionId: 'gw' }, { id: 'gw', endpoint: 'https://gw.test' }]
+    store.applyPresets(presets)
+    expect(store.byId('p')?.proxyConnectionId).toBe('gw')
+    store.setCredentials('p', { accessKeyId: 'pk', secretAccessKey: 'ps' })
+    store.remove('gw')
+    store.importJson([{ id: 'gw', endpoint: 'https://evil.example', accessKeyId: 'atk', secretAccessKey: 'atk' }])
+    store.applyPresets(presets) // the next start
+    expect(store.byId('p')?.proxyConnectionId).toBeUndefined()
+    expect(store.byId('p')?.secretAccessKey).toBe('ps')
   })
 })

@@ -553,7 +553,8 @@ backing definitions on restart, like the runtime settings overlay.
       "pending": 0,            // changed keys not yet copied to this member
       "progress": { "keys": 120, "versions": 130, "bytes": 1048576 } | null, // running full copy
       "lastSyncAt": "…",       // last completed full copy (omitted when none)
-      "lastError": "" } ],
+      "lastError": "",
+      "skippedKeys": 0 } ],    // keys not copied: a copy holds more than 4,096 versions of them
   "move": { "from": "default", "to": "archive", "startedAt": "…",
             "phase": "copying" | "cutover",
             "target": { "kind": "wrapped", "container": "c-7f3a" } } | null } // target: when the move chose a container
@@ -562,8 +563,15 @@ backing definitions on restart, like the runtime settings overlay.
 Member states: `in-sync` (an active-active replica receiving every write
 synchronously, a replica with no pending changes, or the primary); `syncing`
 (initial or requested full copy running); `lagging` (changes are pending,
-copied in the background); `degraded` (copying failed; retried with
-back-off, see `lastError`); `offline` (the backing is unhealthy).
+copied in the background); `degraded` (copying failed and is retried with
+back-off, or `skippedKeys` keys could not be copied because a copy holds
+more than 4,096 versions of them; see `lastError`, which names one);
+`offline` (the backing is unhealthy). While `skippedKeys` is above 0, a
+replica does not become in-sync, an active-active replica does not take
+synchronous writes, a move does not complete, a graceful promote is
+refused (use `force`), and the replica neither serves reads nor takes over
+in an automatic failover, even if it was in sync before. Skipped keys are retried whenever they change, on
+every full copy and every few minutes.
 
 `BucketSummary` (`GET /buckets`, `GET /buckets/{name}`) also has
 `"placement": {"mode": "single", "primary": "default", "replicas": [], "moving": false}`.

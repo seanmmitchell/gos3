@@ -5,7 +5,10 @@ import (
 	"errors"
 	"fmt"
 	"sync"
+	"sync/atomic"
 	"time"
+
+	"github.com/seanmmitchell/gos3/internal/storage/copier"
 )
 
 // Move phases.
@@ -51,7 +54,19 @@ type memberState struct {
 	progress   *Progress           // running full comparison
 	lastSyncAt time.Time           // last completed full comparison
 	lastErr    string
+	// skipped holds the keys that could not be copied because a copy
+	// holds more than copier.MaxKeyVersions versions of them, with the
+	// error. The member's other keys are copied, but while any key is
+	// skipped the member is degraded and onIdle completes nothing.
+	skipped   map[string]error
+	nskipped  atomic.Int32 // len(skipped), for readers that take no lock (see skippedKeys)
+	skipRetry *time.Timer  // pending retry of the skipped keys
 }
+
+// skippedRetryInterval is how long a member with skipped keys waits before
+// it tries them again (they are also tried whenever they change, and by
+// every full comparison). A variable for tests.
+var skippedRetryInterval = 5 * time.Minute
 
 // Progress counts the work of a running full copy.
 type Progress struct {
@@ -61,7 +76,59 @@ type Progress struct {
 }
 
 func (r *Router) newMemberState(bs *bucketState, backingName string) *memberState {
-	return &memberState{bucket: bs, backing: r.topology.Load().backings[backingName], dirty: map[string]struct{}{}}
+	return &memberState{bucket: bs, backing: r.topology.Load().backings[backingName], dirty: map[string]struct{}{},
+		skipped: map[string]error{}}
+}
+
+// skipKey records that key could not be copied to ms because its history
+// is too long (err wraps copier.ErrTooManyVersions), so that the copy of
+// the other keys can go on. This says nothing about the backings' health.
+func (r *Router) skipKey(ms *memberState, key string, err error) {
+	ms.mu.Lock()
+	_, known := ms.skipped[key]
+	ms.skipped[key] = err
+	ms.nskipped.Store(int32(len(ms.skipped)))
+	ms.mu.Unlock()
+	if !known {
+		r.log.Warn("a key has too many versions to be copied to a bucket copy; skipping it until it changes",
+			"bucket", ms.bucket.name, "backing", ms.backing.Name, "key", key, "err", err)
+	}
+}
+
+// unskip forgets that key was skipped (it was copied).
+func (ms *memberState) unskip(key string) {
+	ms.mu.Lock()
+	delete(ms.skipped, key)
+	ms.nskipped.Store(int32(len(ms.skipped)))
+	ms.mu.Unlock()
+}
+
+// skippedKeys returns the number of skipped keys without taking ms.mu, so
+// that the read path (readers) does not contend with the worker.
+func (ms *memberState) skippedKeys() int { return int(ms.nskipped.Load()) }
+
+// retrySkipped marks the member's skipped keys changed after
+// skippedRetryInterval, unless a retry is pending already. A key's history
+// can shrink without the router seeing it (a native bucket changed on its
+// own side, say).
+func (r *Router) retrySkipped(ms *memberState) {
+	ms.mu.Lock()
+	defer ms.mu.Unlock()
+	if ms.skipRetry != nil || ms.canceled || len(ms.skipped) == 0 {
+		return
+	}
+	ms.skipRetry = time.AfterFunc(skippedRetryInterval, func() {
+		ms.mu.Lock()
+		ms.skipRetry = nil
+		keys := make([]string, 0, len(ms.skipped))
+		for k := range ms.skipped {
+			keys = append(keys, k)
+		}
+		ms.mu.Unlock()
+		for _, k := range keys {
+			r.markDirty(ms, k)
+		}
+	})
 }
 
 // markDirty records that key changed and must be copied to the member.
@@ -107,6 +174,10 @@ func (r *Router) cancelMember(ms *memberState) {
 	if ms.retry != nil {
 		ms.retry.Stop()
 		ms.retry = nil
+	}
+	if ms.skipRetry != nil {
+		ms.skipRetry.Stop()
+		ms.skipRetry = nil
 	}
 	ms.dirty = map[string]struct{}{}
 	ms.mu.Unlock()
@@ -216,7 +287,12 @@ func (r *Router) work(ms *memberState) {
 			}
 			ms.mu.Unlock()
 			for i, key := range keys {
-				if err := r.syncMemberKey(r.ctx, ms, key, nil); err != nil {
+				err := r.syncMemberKey(r.ctx, ms, key, nil)
+				if errors.Is(err, copier.ErrTooManyVersions) {
+					r.skipKey(ms, key, err)
+					continue
+				}
+				if err != nil {
 					ms.mu.Lock()
 					for _, k := range keys[i:] {
 						ms.dirty[k] = struct{}{}
@@ -286,13 +362,18 @@ func (r *Router) fail(ms *memberState, err error) {
 // onIdle runs when a member has no pending changes: a replica that
 // finished its initial copy is marked synced, an active-active replica
 // switches to synchronous writes, and a move target takes the source's
-// place.
+// place. None of this happens while the member has skipped keys (it is
+// not a full copy); they are retried later instead.
 func (r *Router) onIdle(ms *memberState) error {
 	bs := ms.bucket
 	ms.mu.Lock()
-	fullDone := ms.fullDone
+	fullDone, skipped := ms.fullDone, len(ms.skipped)
 	ms.mu.Unlock()
 	if !fullDone {
+		return nil
+	}
+	if skipped > 0 {
+		r.retrySkipped(ms)
 		return nil
 	}
 	r.mu.RLock()
@@ -347,7 +428,8 @@ func (r *Router) updateRec(bs *bucketState, fn func(p *placementRecord) bool) bo
 }
 
 // drain copies every pending change of ms while the bucket's gate is
-// closed, so that no new change arrives.
+// closed, so that no new change arrives. A key with too many versions is
+// skipped (see skipKey): callers check skippedKeys afterwards.
 func (r *Router) drain(ctx context.Context, ms *memberState) error {
 	for {
 		ms.mu.Lock()
@@ -365,7 +447,12 @@ func (r *Router) drain(ctx context.Context, ms *memberState) error {
 			return nil
 		}
 		for i, key := range keys {
-			if err := r.syncMemberKey(ctx, ms, key, nil); err != nil {
+			err := r.syncMemberKey(ctx, ms, key, nil)
+			if errors.Is(err, copier.ErrTooManyVersions) {
+				r.skipKey(ms, key, err)
+				continue
+			}
+			if err != nil {
 				ms.mu.Lock()
 				for _, k := range keys[i:] {
 					ms.dirty[k] = struct{}{}
@@ -400,6 +487,10 @@ func (r *Router) enterSyncMode(ms *memberState) error {
 	defer release()
 	if err := r.drain(r.ctx, ms); err != nil {
 		return err
+	}
+	if ms.skippedKeys() > 0 {
+		r.retrySkipped(ms) // a key changed meanwhile and cannot be copied
+		return nil
 	}
 	r.mu.Lock()
 	ok := !bs.removed && bs.rec.Mode == ModeActiveActive && bs.rec.member(ms.backing.Name) > 0 &&
@@ -453,6 +544,12 @@ func (r *Router) cutover(target *memberState) error {
 	if err := r.drain(r.ctx, target); err != nil {
 		reset()
 		return err
+	}
+	if target.skippedKeys() > 0 {
+		// A key changed meanwhile and cannot be copied: the move waits.
+		reset()
+		r.retrySkipped(target)
+		return nil
 	}
 	var source *memberState
 	r.mu.Lock()
@@ -518,7 +615,9 @@ func (r *Router) failover(bs *bucketState, down string) {
 	pick := -1
 	for i := 1; i < len(rec.Members); i++ {
 		ms := bs.members[rec.Members[i].Backing]
-		if ms == nil || !ms.backing.healthy.Load() || !rec.Members[i].Synced {
+		// A replica with skipped keys lacks their latest versions, even if
+		// it was synced before they were skipped.
+		if ms == nil || !ms.backing.healthy.Load() || !rec.Members[i].Synced || ms.skippedKeys() > 0 {
 			continue
 		}
 		if rec.Mode == ModeActiveActive && !ms.syncMode {
@@ -563,6 +662,8 @@ func (r *Router) promoteLocked(bs *bucketState, i int, forced bool) {
 	newPrimary.syncMode = false
 	newPrimary.mu.Lock()
 	newPrimary.dirty = map[string]struct{}{}
+	newPrimary.skipped = map[string]error{}
+	newPrimary.nskipped.Store(0)
 	newPrimary.needFull = false
 	newPrimary.mu.Unlock()
 	oldPrimary := bs.members[old.Backing]

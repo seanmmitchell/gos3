@@ -13,6 +13,12 @@ import (
 // or bucket policy), as in AWS (20 KiB).
 const MaxPolicySize = 20 * 1024
 
+// maxConditionValues is the most values one condition key of a new
+// identity policy may list. Each value costs evaluation time on every
+// request, and short values ("") grow several times over in the indented
+// iam.json, so a 20 KiB document could otherwise expand to over 100 KiB.
+const maxConditionValues = 1000
+
 // Policy versions accepted by the parsers ("" is treated as 2008-10-17,
 // which in gos3 only differs in that policy variables are always expanded).
 const (
@@ -184,6 +190,9 @@ func validateNewIdentityPolicy(doc *PolicyDocument) string {
 	if reason := validateVarRefs(doc); reason != "" {
 		return reason
 	}
+	if reason := validateConditionValueCounts(doc); reason != "" {
+		return reason
+	}
 	for i := range doc.Statement {
 		for _, r := range resourcesOf(&doc.Statement[i]) {
 			if strings.HasPrefix(r, "arn:gos3:") && !validAdminResource(r) {
@@ -216,6 +225,24 @@ func validateVarRefs(doc *PolicyDocument) string {
 					if strings.Count(v, "${") > maxVarRefs {
 						return fmt.Sprintf("Policy has more than %d policy variables in a Condition value for %s %s", maxVarRefs, opName, key)
 					}
+				}
+			}
+		}
+	}
+	return ""
+}
+
+// validateConditionValueCounts refuses condition keys with more than
+// maxConditionValues values. Like validateVarRefs it only applies to new
+// identity policies: a stored policy (iam.json) with more still loads, and
+// bucket policies, which are parsed with the same rules on PUT and on
+// every load and are not part of iam.json, are left alone.
+func validateConditionValueCounts(doc *PolicyDocument) string {
+	for i := range doc.Statement {
+		for opName, kv := range doc.Statement[i].Condition {
+			for key, vals := range kv {
+				if len(vals) > maxConditionValues {
+					return fmt.Sprintf("Condition %s for key %s has more than %d values", opName, key, maxConditionValues)
 				}
 			}
 		}
