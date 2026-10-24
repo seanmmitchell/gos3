@@ -150,12 +150,17 @@ func TestCopySkipsKeyWithTooManyVersions(t *testing.T) {
 	e := newEnv(t, router, "")
 	j := e.mustSubmit(map[string]any{"kind": KindCopy, "source": map[string]any{"bucket": "src"},
 		"target": map[string]any{"bucket": "dst", "create": map[string]any{}}})
-	j = e.waitJob(j.ID, "the copy to retry its final pass", func(j jobs.Job) bool {
-		if j.State.Finished() {
-			t.Fatalf("copy finished: %s %s", j.State, j.LastError)
+	// Every other key is copied, then the job fails instead of retrying
+	// forever.
+	j = e.waitJob(j.ID, "the copy to fail after copying the other keys", func(j jobs.Job) bool {
+		if j.State == jobs.StateSucceeded {
+			t.Fatalf("copy succeeded without u/x")
 		}
-		return j.State == jobs.StateWaiting && strings.Contains(j.LastError, "1 keys could not be copied")
+		return j.State == jobs.StateFailed
 	})
+	if !strings.Contains(j.LastError, "1 keys were not copied") || !strings.Contains(j.LastError, "too many versions") {
+		t.Fatalf("last error %q", j.LastError)
+	}
 	if got := keys(t, router, "dst"); !slices.Equal(got, []string{"aaa-before", "zzz-after"}) {
 		t.Fatalf("target keys %v", got)
 	}

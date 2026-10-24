@@ -732,6 +732,21 @@ func TestKeyWithTooManyVersionsIsSkipped(t *testing.T) {
 		if _, err := r.Promote(ctx, "hist", "b", false); !errors.Is(err, ErrConflict) || !strings.Contains(err.Error(), "too many versions") {
 			t.Fatalf("graceful promote of a replica missing a key: %v", err)
 		}
+		// Although still marked synced, it neither serves reads nor takes
+		// over when the primary fails.
+		r.mu.RLock()
+		bs := r.buckets["hist"]
+		r.mu.RUnlock()
+		if rd := r.readers(bs, false); len(rd) != 1 || rd[0].Name != "a" {
+			t.Fatalf("readers include the replica missing a key: %d", len(rd))
+		}
+		primary := r.topology.Load().backings["a"]
+		primary.healthy.Store(false)
+		r.failover(bs, "a")
+		primary.healthy.Store(true)
+		if st, _ := r.Placement("hist"); st.Primary != "a" {
+			t.Fatalf("failed over to a replica missing a key: %+v", st)
+		}
 		if _, err := backendOf(r, "a").DeleteObject(ctx, "hist", "u/x", oldest.VersionID); err != nil {
 			t.Fatal(err)
 		}

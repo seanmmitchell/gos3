@@ -192,9 +192,10 @@ that the target cannot store fails the job.
 - **Per-key history is bounded**: a key with more than 4,096 versions or
   delete markers on the source or the target is not copied. The job copies
   every other key and lists that key in `errors`; a mirror keeps running
-  and retries it, a copy job's final pass fails with "N keys could not be
-  copied" and the job is retried rather than completed. Remove unneeded
-  old versions of the key to let it be copied. Bucket replicas and moves
+  and retries it, and a copy job fails once every other key is copied
+  ("N keys were not copied ... too many versions"; resume it after removing
+  versions). Remove unneeded old versions of the key to let it be
+  copied. Bucket replicas and moves
   treat such a key the same way and report it as `skippedKeys` (see
   [admin-api.md](admin-api.md)).
 - **Locked versions are never deleted or replaced.** A target version

@@ -149,7 +149,26 @@ func TestRestoreSlotWaitEndsWithTheRequest(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	err = b.Prepare()
+	bDone := make(chan error, 1)
+	go func() { bDone <- b.Prepare() }()
+	waitFor(t, "the second restore to wait for a slot", func() bool {
+		rt.mu.Lock()
+		defer rt.mu.Unlock()
+		for _, sp := range rt.spools {
+			if sp.waiting {
+				return true
+			}
+		}
+		return false
+	})
+	// A restore waiting for a slot reserves none of the restore budget.
+	rt.mu.Lock()
+	reserved := rt.spoolBytes
+	rt.mu.Unlock()
+	if want := crypt.EncryptedSize(4); reserved != want {
+		t.Errorf("%d bytes reserved while a restore waits for a slot, want %d (the running restore's)", reserved, want)
+	}
+	err = <-bDone
 	_ = b.Close()
 	if !errors.Is(err, ErrRestoreSpoolLimit) || !errors.Is(err, storage.ErrResourceLimit) {
 		t.Fatalf("restore without a free slot: %v", err)

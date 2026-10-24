@@ -125,11 +125,12 @@ func (g *writeGuard) Unwrap() http.ResponseWriter { return g.ResponseWriter }
 // room by closing, in this order:
 //
 //   - the longest-idle keep-alive connection;
-//   - else the oldest connection that has not started its first request
-//     (it sent nothing, only part of the request headers, or has not
-//     finished its TLS handshake) and has been open for at least the grace
-//     period (pendingGrace), which lets clients on slow links get their
-//     first request in.
+//   - else a connection that has not started its first request (it sent
+//     nothing, only part of the request headers, or has not finished its
+//     TLS handshake) and has been open for at least the grace period
+//     (pendingGrace), which lets clients on slow links get their first
+//     request in: the oldest of the remote address with the most such
+//     connections, so a client flooding the cap evicts its own first.
 //
 // When neither exists (every open connection has a request in flight, or
 // is younger than the grace period) the new connection is closed at once.
@@ -151,6 +152,8 @@ type connLimiter struct {
 	open    int
 	idle    map[net.Conn]time.Time // idle connections, by when they became idle
 	pending map[net.Conn]time.Time // StateNew connections, by when they were accepted
+	group   map[net.Conn]string    // address group (see addrGroup) of each pending connection
+	groups  map[string]int         // pending connections per address group
 }
 
 // pendingGrace is how long a connection that has not started its first
@@ -162,6 +165,8 @@ func newConnLimiter(max int, log func(string, ...any)) *connLimiter {
 		max: max, log: log, grace: pendingGrace,
 		idle:    map[net.Conn]time.Time{},
 		pending: map[net.Conn]time.Time{},
+		group:   map[net.Conn]string{},
+		groups:  map[string]int{},
 	}
 }
 
@@ -173,16 +178,32 @@ func (l *connLimiter) connState(c net.Conn, st http.ConnState) {
 	case http.StateNew:
 		l.open++
 		l.pending[c] = time.Now()
+		g := addrGroup(c)
+		l.group[c] = g
+		l.groups[g]++
 	case http.StateIdle:
-		delete(l.pending, c)
+		l.dropPending(c)
 		l.idle[c] = time.Now()
 	case http.StateActive:
-		delete(l.pending, c)
+		l.dropPending(c)
 		delete(l.idle, c)
 	case http.StateClosed, http.StateHijacked:
-		delete(l.pending, c)
+		l.dropPending(c)
 		delete(l.idle, c)
 		l.open--
+	}
+}
+
+// dropPending forgets that c is pending. l.mu is held.
+func (l *connLimiter) dropPending(c net.Conn) {
+	delete(l.pending, c)
+	g, ok := l.group[c]
+	if !ok {
+		return
+	}
+	delete(l.group, c)
+	if l.groups[g]--; l.groups[g] <= 0 {
+		delete(l.groups, g)
 	}
 }
 
@@ -205,11 +226,11 @@ func (l *connLimiter) admit() bool {
 		l.mu.Unlock()
 		return true
 	}
-	victim := oldestConn(l.idle, time.Time{})
+	victim := oldestConn(l.idle)
 	if victim != nil {
 		delete(l.idle, victim)
-	} else if victim = oldestConn(l.pending, time.Now().Add(-l.grace)); victim != nil {
-		delete(l.pending, victim)
+	} else if victim = l.pendingVictim(time.Now().Add(-l.grace)); victim != nil {
+		l.dropPending(victim)
 	}
 	l.mu.Unlock()
 	if victim == nil {
@@ -219,15 +240,52 @@ func (l *connLimiter) admit() bool {
 	return true
 }
 
-// oldestConn returns the connection of m with the earliest time, ignoring
-// those after notAfter (unless it is zero); nil when there is none.
-func oldestConn(m map[net.Conn]time.Time, notAfter time.Time) net.Conn {
+// pendingVictim returns the pending connection to close, of those accepted
+// at or before notAfter: the oldest of the address group (see addrGroup)
+// with the most pending connections, so that a client opening connections
+// at the cap evicts its own before a slow client elsewhere (behind a
+// reverse proxy every connection has the proxy's address, and this is the
+// oldest one). nil when there is none. l.mu is held.
+func (l *connLimiter) pendingVictim(notAfter time.Time) net.Conn {
+	var victim net.Conn
+	var most int
+	var since time.Time
+	for c, t := range l.pending {
+		if t.After(notAfter) {
+			continue
+		}
+		if n := l.groups[l.group[c]]; victim == nil || n > most || n == most && t.Before(since) {
+			victim, most, since = c, n, t
+		}
+	}
+	return victim
+}
+
+// addrGroup returns the group of c's remote address that pendingVictim
+// counts together: the IP for IPv4, the /64 prefix for IPv6 (one client
+// commonly holds a whole /64).
+func addrGroup(c net.Conn) string {
+	a := c.RemoteAddr()
+	if a == nil {
+		return ""
+	}
+	host, _, err := net.SplitHostPort(a.String())
+	if err != nil {
+		return a.String()
+	}
+	ip := net.ParseIP(host)
+	if ip == nil || ip.To4() != nil {
+		return host
+	}
+	return ip.Mask(net.CIDRMask(64, 128)).String() + "/64"
+}
+
+// oldestConn returns the connection of m with the earliest time; nil when
+// there is none.
+func oldestConn(m map[net.Conn]time.Time) net.Conn {
 	var oldest net.Conn
 	var since time.Time
 	for c, t := range m {
-		if !notAfter.IsZero() && t.After(notAfter) {
-			continue
-		}
 		if oldest == nil || t.Before(since) {
 			oldest, since = c, t
 		}

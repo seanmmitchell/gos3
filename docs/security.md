@@ -690,9 +690,12 @@ These limits are fixed (not configurable):
   makes no progress for 2 minutes.
 - `server.max_connections` (off by default) caps the open client
   connections: at the cap a new connection replaces the longest-idle
-  keep-alive connection or, when none is idle, the oldest connection that
-  has waited at least 1 s without sending a complete request (silent
-  sockets, half-sent headers, unfinished TLS handshakes); it is closed
+  keep-alive connection or, when none is idle, a connection that has
+  waited at least 1 s without sending a complete request (silent sockets,
+  half-sent headers, unfinished TLS handshakes): the oldest of the client
+  address (for IPv6, its /64) with the most pending connections, so a
+  client flooding the cap
+  evicts its own before a slow client elsewhere; it is closed
   itself only when every connection has a request in flight or is younger
   than 1 s. A connection with a request in flight is never closed, and a
   client holding silent sockets cannot lock out health probes and other
@@ -754,8 +757,10 @@ backings:
   larger objects and ranges are restored in windows of at most half the
   limit, one at a time per reader. A client that opens a large object and
   reads it slowly, or stalls, holds at most half the budget, and other
-  restic reads continue. Once the budget is reserved, further reads fail
-  with `503` instead of queuing.
+  restic reads continue. A restore waiting for a slot reserves nothing until
+  it starts. Once the budget is reserved, new reads fail with `503`
+  instead of queuing, while a download already under way waits up to 30 s
+  for room for its next window rather than being cut short.
 
 These limits bound the disk and processes restic reads consume; they do not
 rate-limit clients. Many concurrent readers can still keep every slot busy

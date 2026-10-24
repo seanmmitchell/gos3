@@ -86,6 +86,14 @@ func (m Marker) CheckKEK(kek []byte) (KEKState, error) {
 	return KEKVerified, ErrWrongKEK
 }
 
+// ValidBackingID reports whether id has the form of the backing IDs this
+// package generates (randomID(16): 128 bits as lowercase hex). IDs read
+// from a remote are untrusted and become path components, so callers
+// refuse every other form.
+func ValidBackingID(id string) bool {
+	return len(id) == 32 && strings.Trim(id, "0123456789abcdef") == ""
+}
+
 // validate checks that the marker describes a backing this package can
 // open and, when want is set, that it is the backing with ID want.
 func (m Marker) validate(want string) error {
@@ -93,8 +101,8 @@ func (m Marker) validate(want string) error {
 		return fmt.Errorf("%w: format %d, kind %q", ErrMarkerMismatch, m.Format, m.Kind)
 	}
 	// The ID is later used as a cache path component. A remote marker is
-	// untrusted and must use the 128-bit lowercase hex form gos3 generates.
-	if len(m.BackingID) != 32 || strings.Trim(m.BackingID, "0123456789abcdef") != "" {
+	// untrusted and must use the form gos3 generates.
+	if !ValidBackingID(m.BackingID) {
 		return fmt.Errorf("%w: invalid backing ID", ErrMarkerMismatch)
 	}
 	if want != "" && m.BackingID != want {

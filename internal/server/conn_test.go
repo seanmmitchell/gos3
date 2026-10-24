@@ -331,6 +331,43 @@ func TestConnLimiterKeepsActiveConnections(t *testing.T) {
 	}
 }
 
+// addrConn is a net.Conn with a chosen remote address.
+type addrConn struct {
+	net.Conn
+	remote net.Addr
+}
+
+func (c addrConn) RemoteAddr() net.Addr { return c.remote }
+
+// TestConnLimiterEvictsBusiestAddressFirst: at the cap, a client that keeps
+// opening connections evicts its own pending connections before an older
+// one of a slow client elsewhere.
+func TestConnLimiterEvictsBusiestAddressFirst(t *testing.T) {
+	conn := func(ip string) net.Conn {
+		c, peer := net.Pipe()
+		t.Cleanup(func() { _ = c.Close(); _ = peer.Close() })
+		return addrConn{Conn: c, remote: &net.TCPAddr{IP: net.ParseIP(ip), Port: 40000}}
+	}
+	l := newConnLimiter(3, func(string, ...any) {})
+	l.grace = 0
+	// The flooding client uses two addresses of one IPv6 /64.
+	slow, flood1, flood2 := conn("192.0.2.1"), conn("2001:db8:1:2::7"), conn("2001:db8:1:2::8")
+	for i, c := range []net.Conn{slow, flood1, flood2} {
+		l.connState(c, http.StateNew)
+		l.pending[c] = time.Now().Add(time.Duration(i-10) * time.Second) // slow is the oldest
+	}
+	if !l.admit() {
+		t.Fatal("refused although pending connections are past the grace period")
+	}
+	l.mu.Lock()
+	_, slowKept := l.pending[slow]
+	_, flood1Kept := l.pending[flood1]
+	l.mu.Unlock()
+	if !slowKept || flood1Kept {
+		t.Fatal("want the flooding address's oldest pending connection evicted, not the slow client's")
+	}
+}
+
 // TestMaxConnectionsSilentClients: connections that never send a request
 // (or never finish their TLS handshake) count toward server.max_connections
 // until ReadHeaderTimeout. They used to be impossible to evict, so a client

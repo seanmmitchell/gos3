@@ -15,6 +15,7 @@ import (
 
 	"github.com/seanmmitchell/gos3/internal/storage"
 	"github.com/seanmmitchell/gos3/internal/storage/native"
+	"github.com/seanmmitchell/gos3/internal/storage/s3store"
 )
 
 // The registry
@@ -92,10 +93,6 @@ func trimRecordKey(k, prefix string) string {
 func validContainerID(id string) bool {
 	return id == homeID || len(id) == 9 && id[0] == 'c' && isLowerHex(id[1:])
 }
-
-// validBackingID reports whether id has the form of an s3store backing ID
-// (32 lowercase hex digits, as s3store generates and validates them).
-func validBackingID(id string) bool { return len(id) == 32 && isLowerHex(id) }
 
 // isLowerHex reports whether s is non-empty and only lowercase hex digits.
 func isLowerHex(s string) bool { return s != "" && strings.Trim(s, "0123456789abcdef") == "" }
@@ -255,7 +252,7 @@ func decodeRegistry(recs map[string][]byte) (reg *registry, orphans []string, in
 				skip(k, "invalid container ID %q", c.ID)
 				continue
 			}
-			if c.ID != homeID && !validBackingID(c.BackingID) {
+			if c.ID != homeID && !s3store.ValidBackingID(c.BackingID) {
 				// AddContainer records the ID of the loaded store, which is
 				// always set.
 				skip(k, "invalid backing ID %q", c.BackingID)

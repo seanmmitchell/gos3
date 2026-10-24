@@ -568,8 +568,9 @@ back-off, or `skippedKeys` keys could not be copied because a copy holds
 more than 4,096 versions of them; see `lastError`, which names one);
 `offline` (the backing is unhealthy). While `skippedKeys` is above 0, a
 replica does not become in-sync, an active-active replica does not take
-synchronous writes, a move does not complete and a graceful promote is
-refused (use `force`). Skipped keys are retried whenever they change, on
+synchronous writes, a move does not complete, a graceful promote is
+refused (use `force`), and the replica neither serves reads nor takes over
+in an automatic failover, even if it was in sync before. Skipped keys are retried whenever they change, on
 every full copy and every few minutes.
 
 `BucketSummary` (`GET /buckets`, `GET /buckets/{name}`) also has

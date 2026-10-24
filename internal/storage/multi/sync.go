@@ -465,6 +465,7 @@ func (r *Router) fullSync(ctx context.Context, ms *memberState) error {
 	for k := range stale {
 		delete(ms.skipped, k)
 	}
+	ms.nskipped.Store(int32(len(ms.skipped)))
 	ms.mu.Unlock()
 	return nil
 }

@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/seanmmitchell/gos3/internal/storage/copier"
@@ -58,7 +59,8 @@ type memberState struct {
 	// error. The member's other keys are copied, but while any key is
 	// skipped the member is degraded and onIdle completes nothing.
 	skipped   map[string]error
-	skipRetry *time.Timer // pending retry of the skipped keys
+	nskipped  atomic.Int32 // len(skipped), for readers that take no lock (see skippedKeys)
+	skipRetry *time.Timer  // pending retry of the skipped keys
 }
 
 // skippedRetryInterval is how long a member with skipped keys waits before
@@ -85,6 +87,7 @@ func (r *Router) skipKey(ms *memberState, key string, err error) {
 	ms.mu.Lock()
 	_, known := ms.skipped[key]
 	ms.skipped[key] = err
+	ms.nskipped.Store(int32(len(ms.skipped)))
 	ms.mu.Unlock()
 	if !known {
 		r.log.Warn("a key has too many versions to be copied to a bucket copy; skipping it until it changes",
@@ -96,15 +99,13 @@ func (r *Router) skipKey(ms *memberState, key string, err error) {
 func (ms *memberState) unskip(key string) {
 	ms.mu.Lock()
 	delete(ms.skipped, key)
+	ms.nskipped.Store(int32(len(ms.skipped)))
 	ms.mu.Unlock()
 }
 
-// skippedKeys returns the number of skipped keys.
-func (ms *memberState) skippedKeys() int {
-	ms.mu.Lock()
-	defer ms.mu.Unlock()
-	return len(ms.skipped)
-}
+// skippedKeys returns the number of skipped keys without taking ms.mu, so
+// that the read path (readers) does not contend with the worker.
+func (ms *memberState) skippedKeys() int { return int(ms.nskipped.Load()) }
 
 // retrySkipped marks the member's skipped keys changed after
 // skippedRetryInterval, unless a retry is pending already. A key's history
@@ -614,7 +615,9 @@ func (r *Router) failover(bs *bucketState, down string) {
 	pick := -1
 	for i := 1; i < len(rec.Members); i++ {
 		ms := bs.members[rec.Members[i].Backing]
-		if ms == nil || !ms.backing.healthy.Load() || !rec.Members[i].Synced {
+		// A replica with skipped keys lacks their latest versions, even if
+		// it was synced before they were skipped.
+		if ms == nil || !ms.backing.healthy.Load() || !rec.Members[i].Synced || ms.skippedKeys() > 0 {
 			continue
 		}
 		if rec.Mode == ModeActiveActive && !ms.syncMode {
@@ -660,6 +663,7 @@ func (r *Router) promoteLocked(bs *bucketState, i int, forced bool) {
 	newPrimary.mu.Lock()
 	newPrimary.dirty = map[string]struct{}{}
 	newPrimary.skipped = map[string]error{}
+	newPrimary.nskipped.Store(0)
 	newPrimary.needFull = false
 	newPrimary.mu.Unlock()
 	oldPrimary := bs.members[old.Backing]

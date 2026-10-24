@@ -246,6 +246,21 @@ func (r *Reader) load(off int64) error {
 	}
 	start, length := r.window(off)
 	sp, err := r.rt.acquireSpool(r.ctx, r.loc, r.snapshot, r.size, start, length)
+	// A later window is restored while the response is already under way:
+	// rather than cut it short when other restores hold the limit or every
+	// slot, wait for room, as long as the request lasts and at most
+	// restoreSlotWait (readers without a deadline, and Close, which waits
+	// for r.mu, are not held up for longer).
+	spanStart, _ := r.readBounds()
+	giveUp := time.Now().Add(restoreSlotWait)
+	for delay := 50 * time.Millisecond; err != nil && start > spanStart && errors.Is(err, ErrRestoreSpoolLimit) &&
+		r.ctx.Err() == nil && time.Now().Before(giveUp); delay = min(2*delay, time.Second) {
+		select {
+		case <-r.ctx.Done():
+		case <-time.After(delay):
+		}
+		sp, err = r.rt.acquireSpool(r.ctx, r.loc, r.snapshot, r.size, start, length)
+	}
 	if err != nil {
 		r.err = err
 		return err
@@ -428,10 +443,11 @@ type spool struct {
 
 // acquireSpool returns the restored bytes [start, start+length) of the
 // snapshot in the repository loc, starting their restore when no reader
-// has one, and waits until it is complete or ctx ends. A new restore
-// reserves its encrypted size against the restore spool limit at once and
-// then waits for a restore slot (see runSpool); readers joining it need
-// none. The caller must releaseSpool it.
+// has one, and waits until it is complete or ctx ends. A new restore is
+// refused at once when the restore spool limit has no room for it; it then
+// waits for a restore slot and reserves its encrypted size only when it
+// starts (see runSpool), so restores waiting for a slot hold no budget.
+// Readers joining a restore need neither. The caller must releaseSpool it.
 func (rt *Runtime) acquireSpool(ctx context.Context, loc Location, snapshot string, size, start, length int64) (*spool, error) {
 	charge := crypt.EncryptedSize(length)
 	if charge < 0 {
@@ -455,11 +471,9 @@ func (rt *Runtime) acquireSpool(ctx context.Context, loc Location, snapshot stri
 			rt.mu.Unlock()
 			return nil, fmt.Errorf("%w: %d-byte encrypted restore, %d bytes already reserved across backings, %d-byte limit", ErrRestoreSpoolLimit, charge, reserved, limit)
 		}
-		restoreSpoolBudget.bytes += charge
 		restoreSpoolBudget.Unlock()
 		dumpCtx, cancel := context.WithCancel(context.Background())
-		sp = &spool{id: k, size: charge, plainSize: length, charged: true, done: make(chan struct{}), cancel: cancel}
-		rt.spoolBytes += charge
+		sp = &spool{id: k, size: charge, plainSize: length, done: make(chan struct{}), cancel: cancel}
 		rt.spools[k] = sp
 		rt.restores.Go(func() { rt.runSpool(dumpCtx, sp, loc, snapshot, size, start, length) })
 	} else if sp.plainSize != length {
@@ -500,7 +514,9 @@ func (rt *Runtime) runSpool(ctx context.Context, sp *spool, loc Location, snapsh
 	sp.waiting = false
 	rt.mu.Unlock()
 	if err == nil {
-		path, key, err = rt.dump(ctx, loc, snapshot, size, start, length)
+		if err = rt.chargeSpool(sp); err == nil {
+			path, key, err = rt.dump(ctx, loc, snapshot, size, start, length)
+		}
 		release()
 	} else if ctx.Err() != nil {
 		err = fmt.Errorf("restic: retrieve object: %w", ctx.Err())
@@ -526,6 +542,24 @@ func (rt *Runtime) runSpool(ctx context.Context, sp *spool, loc Location, snapsh
 	}
 	sp.cancel()
 	close(sp.done)
+}
+
+// chargeSpool reserves sp's encrypted size against the restore spool limit,
+// on this runtime and across the process, when its restore starts.
+func (rt *Runtime) chargeSpool(sp *spool) error {
+	limit := rt.restoreLimit()
+	rt.mu.Lock()
+	defer rt.mu.Unlock()
+	restoreSpoolBudget.Lock()
+	defer restoreSpoolBudget.Unlock()
+	if sp.size > limit-rt.spoolBytes || sp.size > limit-restoreSpoolBudget.bytes {
+		return fmt.Errorf("%w: %d-byte encrypted restore, %d bytes already reserved across backings, %d-byte limit",
+			ErrRestoreSpoolLimit, sp.size, restoreSpoolBudget.bytes, limit)
+	}
+	restoreSpoolBudget.bytes += sp.size
+	rt.spoolBytes += sp.size
+	sp.charged = true
+	return nil
 }
 
 // releaseSpool drops a reference to sp, canceling its restore or removing
