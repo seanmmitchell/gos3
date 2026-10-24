@@ -22,7 +22,7 @@
 # ---------------------------------------------------------------------------
 # Web UI: static SPA with base /_gos3/ui/ (web/.output/public)
 # ---------------------------------------------------------------------------
-FROM --platform=$BUILDPLATFORM node:24-bookworm-slim@sha256:a5f4366e834695d5f363b920c104953a535d3a9864d1bdf74566a0ebe01daee5 AS ui
+FROM --platform=$BUILDPLATFORM node:25-bookworm-slim@sha256:81db02c4b671288a03915da9534dbd54f96d0e7c24d80ccc54f5b36b2e684370 AS ui
 ENV PNPM_HOME=/pnpm \
     NUXT_TELEMETRY_DISABLED=1 \
     CI=true
@@ -48,7 +48,7 @@ RUN --mount=type=cache,id=gos3-pnpm,target=/pnpm/store \
 # ---------------------------------------------------------------------------
 # Go binary with the UI embedded (internal/webui/dist)
 # ---------------------------------------------------------------------------
-FROM --platform=$BUILDPLATFORM golang:1.27-bookworm@sha256:5c3e9b43cfd3bb95c7937462e29d87ada57b481a96fa23ad0eb61778d7a00110 AS go-base
+FROM --platform=$BUILDPLATFORM golang:1.27-bookworm@sha256:972b4110ba0f47539a975c31e52c64765e1ff19f2d74469ae4a595c6676e80a5 AS go-base
 ARG TARGETOS
 ARG TARGETARCH
 ARG VERSION=dev
@@ -109,7 +109,7 @@ RUN --mount=type=cache,target=/go/pkg/mod \
 # (whose tests check that it names this version). The golang image is reused
 # for curl and to decompress the .bz2 with Go's compress/bzip2.
 # ---------------------------------------------------------------------------
-FROM --platform=$BUILDPLATFORM golang:1.27-bookworm@sha256:5c3e9b43cfd3bb95c7937462e29d87ada57b481a96fa23ad0eb61778d7a00110 AS restic
+FROM --platform=$BUILDPLATFORM golang:1.27-bookworm@sha256:972b4110ba0f47539a975c31e52c64765e1ff19f2d74469ae4a595c6676e80a5 AS restic
 ARG TARGETOS
 ARG TARGETARCH
 ARG RESTIC_VERSION=0.19.1
