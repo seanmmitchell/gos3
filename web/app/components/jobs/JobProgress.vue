@@ -5,7 +5,7 @@ import { copyStatusOf, jobProgress, jobTiming, snapshotStatusOf } from './-jobs'
 /**
  * Progress of one job: for copy and mirror jobs a bar from bytesDone /
  * totalBytes (indeterminate while the total is being computed), the bytes,
- * and the ETA or, for a mirror, its lag and pending changes; for restic
+ * lifetime transfer activity, and the ETA or a qualified mirror status; for restic
  * jobs the keys and bytes processed and the snapshot written.
  */
 const props = defineProps<{ job: Job }>()
@@ -18,17 +18,19 @@ const timing = computed(() => jobTiming(props.job))
 const bytesLine = computed(() => {
   const p = progress.value
   if (!p) return ''
-  if (p.total) return `${formatBytes(p.done)} of ${formatBytes(p.total)}`
-  return p.done ? `${formatBytes(p.done)} copied` : ''
+  if (p.total) return `${formatBytes(p.done)} of ${formatBytes(p.total)} examined`
+  return p.done ? `${formatBytes(p.done)} examined` : ''
 })
 
 const counts = computed(() => {
   const c = copy.value
   if (c) {
     const parts: string[] = []
-    if (c.keysCopied || c.keysScanned) parts.push(`${formatNumber(c.keysCopied)} of ${formatNumber(c.totalKeys || c.keysScanned)} keys`)
-    if (c.keysDeleted) parts.push(`${formatNumber(c.keysDeleted)} deleted`)
-    if (c.conflicts) parts.push(`${formatNumber(c.conflicts)} conflict${c.conflicts === 1 ? '' : 's'}`)
+    if (c.totalsKnown && c.sourceKeysDone !== undefined && c.sourceKeysDone <= c.totalKeys) parts.push(`${formatNumber(c.sourceKeysDone)} of ${formatNumber(c.totalKeys)} source keys examined`)
+    else if (c.keysScanned) parts.push(`${formatNumber(c.keysScanned)} keys examined`)
+    if (c.keysCopied || c.bytesCopied) parts.push(`Lifetime: ${formatNumber(c.keysCopied)} key writes · ${formatBytes(c.bytesCopied)} copied`)
+    if (c.keysDeleted) parts.push(`${formatNumber(c.keysDeleted)} lifetime deletes`)
+    if (c.conflicts) parts.push(`${formatNumber(c.conflicts)} conflict${c.conflicts === 1 ? '' : 's'} in full pass`)
     return parts.join(' · ')
   }
   const r = restic.value
@@ -48,12 +50,13 @@ const speed = computed(() => (props.job.state === 'running' && copy.value?.bytes
 <template>
   <div class="min-w-40 space-y-1" data-testid="job-progress">
     <template v-if="progress">
+      <p class="text-xs text-muted">{{ job.kind === 'mirror' && job.state === 'running' && job.phase === 'watching' ? 'Source changes' : copy?.passComplete ? 'Last full pass' : 'Full pass progress' }}</p>
       <div class="flex items-center gap-2">
         <UProgress
           :model-value="progress.percent"
           size="sm"
           class="flex-1"
-          :color="job.state === 'failed' ? 'error' : job.state === 'paused' ? 'warning' : 'primary'"
+          :color="job.state === 'failed' ? 'error' : job.state === 'paused' || copy?.pending || copy?.unresolved || copy?.checkRequired ? 'warning' : 'primary'"
           :aria-label="progress.percent === null ? 'Progress unknown' : `Progress ${progress.percent}%`"
         />
         <span class="w-12 text-right text-xs tabular-nums text-muted" data-testid="job-percent">{{ progress.percent === null ? '—' : `${progress.percent}%` }}</span>

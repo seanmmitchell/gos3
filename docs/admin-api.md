@@ -675,7 +675,7 @@ the system directory; in memory without one) and report progress. See
 | GET | `/jobs?kind=&state=&bucket=` | ListJobs | `{"jobs": Job[]}`, newest first; `bucket` matches the source or target bucket |
 | POST | `/jobs` | CreateCopyJob on **both** `bucket/<source>` and `bucket/<target>` | body `CopyJobSpec` → 201 `Job`; with `"dryRun": true` → 200 `{"spec": CopyJobSpec, "warnings": ["…"]}` (validated and normalized, nothing created) |
 | GET | `/jobs/{id}` | GetJob on `bucket/<source>` and `bucket/<target>` | `Job` |
-| POST | `/jobs/{id}/pause` \| `/resume` \| `/cancel` \| `/run` | UpdateJob on `bucket/<source>` and `bucket/<target>` | `Job`. `run` starts a waiting job (a mirror pass, a retry) now; on a queued or running job it does nothing (a running mirror makes another pass right after this one), on a paused or finished job it is 409; `resume` also retries a failed job from its checkpoint |
+| POST | `/jobs/{id}/pause` \| `/resume` \| `/cancel` \| `/run` | UpdateJob on `bucket/<source>` and `bucket/<target>` | `Job`. `run` requests a full mirror reconciliation, including with no pending source changes; a running mirror runs again if needed to include the request. Other waiting jobs retry now. A queued job stays queued; paused or finished jobs return 409. The response acknowledges scheduling, not successful comparison. `resume` also retries a failed job from its checkpoint |
 | DELETE | `/jobs/{id}` | UpdateJob (as above) | 204; 409 unless the job is finished (succeeded, failed or canceled) |
 | GET | `/buckets/{name}/jobs` | GetJob on `bucket/<name>` | `{"jobs": Job[]}`: jobs whose source or target is the bucket (also after it was deleted), newest first, `kind` and `state` filters as for `/jobs`; only the jobs the caller may also get by ID (GetJob on their other bucket) |
 
@@ -746,6 +746,8 @@ state change the job's state does not allow; 404 for unknown jobs.
 
 // CopyStatus
 { "keysScanned": 0, "keysCopied": 0, "versionsCopied": 0, "bytesCopied": 0, "bytesDone": 0, "keysDeleted": 0,
+  "sourceKeysDone": 0, "passComplete": false, "totalsKnown": false,
+  "unresolved": 0, "checkRequired": true,
   "conflicts": 0, "conflictSamples": [ { "key": "k", "reason": "locked version" } ],
   "totalKeys": 0, "totalBytes": 0, "bytesPerSecond": 0, "etaSeconds": 0,
   "pending": 0, "lagSeconds": 0, "lastPassAt": "…", "nextPassAt": "…", "passes": 0,   // mirror
@@ -753,6 +755,26 @@ state change the job's state does not allow; 404 for unknown jobs.
   "mode": "identity" | "fingerprint",          // how keys are compared (see jobs.md)
   "warnings": [ "…" ] }                         // what the job skipped on purpose (e.g. a policy it cannot rewrite)
 ```
+
+Copy status separates lifetime writes (`keysCopied`, `versionsCopied`,
+`bytesCopied`, `keysDeleted`) from the current/last full pass
+(`keysScanned`, `sourceKeysDone`, `bytesDone`, `totalKeys`, `totalBytes`).
+Incremental runs do not add to pass progress. Use a ratio only when
+`totalsKnown` is true; zero-byte sources can use `sourceKeysDone/totalKeys`.
+`passComplete` says the comparison finished, including empty sources,
+not that all copies succeeded. Totals are remeasured for each full pass
+and finalized to the source keys/bytes examined when it completes.
+
+For mirrors, `pending` includes queued/in-flight source changes and
+`lagSeconds` their oldest age at the time of the API read. `unresolved`
+counts distinct keys with current errors/conflicts and survives restart;
+successful per-key work clears it. Historical `errors` and pass conflict
+samples do not imply current failure. `checkRequired` qualifies a pending
+or incomplete full comparison, including restart and manual-run requests.
+`lastPassAt` is completion time, not proof of current target agreement.
+Full passes reconcile according to the configured policy and backend
+comparison rules. External changes can remain unseen until the next full
+pass. The Jobs and bucket jobs endpoints use the same live assessment.
 
 ### Whole-bucket restic snapshots
 

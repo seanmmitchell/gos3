@@ -1356,11 +1356,19 @@ export interface CopyJobDryRun {
 
 /** Progress of a copy or mirror job (Job.status). */
 export interface CopyStatus {
+  /** Progress describes one full comparison, independently of lifetime activity. */
+  passComplete?: boolean
+  totalsKnown?: boolean
+  sourceKeysDone?: number
+  /** Distinct keys with a currently unresolved error or conflict. */
+  unresolved?: number
+  /** A full comparison is pending or incomplete. */
+  checkRequired?: boolean
   keysScanned: number
   keysCopied: number
   versionsCopied: number
   bytesCopied: number
-  /** Bytes copied or found identical (progress against totalBytes). */
+  /** Source bytes examined in the full pass, including unsuccessful keys. */
   bytesDone: number
   keysDeleted: number
   conflicts: number

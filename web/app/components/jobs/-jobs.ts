@@ -186,7 +186,7 @@ export function copySpecOf(job: Job): CopyJobSpec | undefined {
 export interface JobProgress {
   /** 0–100, or null when the total is unknown (indeterminate). */
   percent: number | null
-  /** Bytes done (copied or found identical). */
+  /** Source bytes examined in the full pass. */
   done: number
   /** Total bytes (0 = unknown). */
   total: number
@@ -194,15 +194,23 @@ export interface JobProgress {
 
 /**
  * Byte progress of a copy or mirror job from bytesDone / totalBytes, or
- * null for other jobs. Finished-successfully jobs show 100%.
+ * null for other jobs. A completed full pass shows 100%, independently
+ * of unresolved work and of current mirror freshness.
  */
 export function jobProgress(job: Job): JobProgress | null {
   const s = copyStatusOf(job)
   if (!s) return null
-  const total = s.totalBytes
-  const done = s.bytesDone || s.bytesCopied
-  if (job.state === 'succeeded') return { percent: 100, done: total || done, total }
-  if (!total) return { percent: null, done, total }
+  if (job.kind === 'mirror' && job.state === 'running' && job.phase === 'watching') return { percent: null, done: 0, total: 0 }
+  const done = s.bytesDone
+  const total = s.totalsKnown === true && done <= s.totalBytes ? s.totalBytes : 0
+  if (s.passComplete) return { percent: 100, done, total }
+  if (s.totalsKnown !== true || done > s.totalBytes) return { percent: null, done, total: 0 }
+  // Zero-byte objects still have key work; an empty pass completes only
+  // when the backend says so. Legacy servers cannot qualify their totals.
+  if (!total) {
+    const keys = num(s.sourceKeysDone)
+    return { percent: s.totalKeys > 0 && keys <= s.totalKeys ? Math.round(keys / s.totalKeys * 1000) / 10 : null, done, total }
+  }
   return { percent: Math.max(0, Math.min(100, Math.round((done / total) * 1000) / 10)), done, total }
 }
 
@@ -227,8 +235,21 @@ export function jobTiming(job: Job): string {
   if (job.kind === 'mirror') {
     const pending = num(s.pending)
     const lag = formatEta(s.lagSeconds)
-    if (pending > 0) return `${pending.toLocaleString()} pending${lag ? ` · lag ${lag}` : ''}`
-    if (job.state === 'waiting' || job.phase === 'watching') return 'In sync'
+    const parts: string[] = []
+    if (pending > 0) parts.push(`${pending.toLocaleString()} pending${lag ? ` · lag ${lag}` : ''}`)
+    if (num(s.unresolved) > 0) parts.push(`${num(s.unresolved).toLocaleString()} unresolved keys`)
+    // Older servers have only pass conflict counters. They cannot assert
+    // recovery, so qualify those reports instead of calling them current.
+    if (s.unresolved === undefined && s.conflicts > 0) parts.push(`${s.conflicts.toLocaleString()} conflicts reported`)
+    if (job.lastError) parts.push('Last run failed')
+    if (parts.length) return parts.join(' · ')
+    if (job.state === 'running') return job.phase === 'watching' ? 'Processing source changes' : 'Full comparison in progress'
+    if (s.checkRequired) return 'Full comparison required'
+    if (job.state === 'queued') return 'Comparison queued'
+    if (job.state === 'paused') return 'Mirror paused'
+    if (job.state === 'failed' || job.state === 'canceled') return ''
+    if (s.lastPassAt) return `No known pending changes · last full comparison ${s.lastPassAt}`
+    return 'No full comparison reported'
   }
   if (job.state === 'running') {
     const eta = formatEta(s.etaSeconds)
@@ -252,7 +273,7 @@ export function jobActions(job: Pick<Job, 'state'>): (JobAction | 'delete')[] {
 }
 
 export const JOB_ACTIONS: Readonly<Record<JobAction | 'delete', { label: string, icon: string, done: string }>> = {
-  run: { label: 'Run now', icon: 'i-lucide-play', done: 'started' },
+  run: { label: 'Run now', icon: 'i-lucide-play', done: 'queued' },
   pause: { label: 'Pause', icon: 'i-lucide-pause', done: 'paused' },
   resume: { label: 'Resume', icon: 'i-lucide-play', done: 'resumed' },
   cancel: { label: 'Cancel', icon: 'i-lucide-circle-x', done: 'canceled' },

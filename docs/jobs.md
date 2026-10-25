@@ -221,15 +221,36 @@ keep writers off a mirror's target.
 | Source | How changes are found |
 |---|---|
 | any, writes through gos3 | every write, delete and metadata change made through gos3 (S3 API, lifecycle, other jobs) marks its key; after about a second, which batches bursts, the mirror runs and copies the marked keys. More than 100,000 marked keys turn into a full pass. Keys that fail are tried again after 30 seconds |
-| native, writes by other tools | a full pass compares the source's listing with the job's records every `pollInterval` (default `5m`, at least `30s`): one full listing of the source per poll |
+| native, writes by other tools | a full pass compares the source's listing with the job's records every `pollInterval` (default `5m`, at least `30s`) |
 | any | a full **verify pass** compares everything every `verifyInterval` (default `24h`, at least `1m`) and after every restart, since marked keys are kept in memory only |
 
-A mirror shows its lag in its status: `pending` (keys changed and not yet
-copied, as of its last run), `lagSeconds` (the age of the oldest of
-them), `lastPassAt`, `nextPassAt` (the next full pass) and `passes`.
+A mirror reports `pending` (known source changes queued or in flight),
+`lagSeconds` (the age of the oldest), and `unresolved` (distinct keys with
+an unresolved copy error or conflict). `checkRequired` means a full
+comparison is pending or incomplete, including after a restart.
+`lastPassAt` records the last completed full comparison, `nextPassAt` the
+next scheduled one, and `passes` the number completed. Completion means
+the comparison finished; inspect outstanding work and errors too.
 Between runs it is `waiting` and holds no worker; **Run now**
-(`POST /jobs/{id}/run`) starts a run at once, and on a running mirror
-makes it run again right after.
+(`POST /jobs/{id}/run`) requests a full comparison and queues it at once.
+On a running mirror it requests another full comparison after the current
+run if the request was not already included. The action acknowledges a
+queued comparison, not successful verification. Full comparisons reconcile
+objects under the job's existing copy/delete policy; they can change the
+target.
+
+Each full pass lists the source to measure progress before comparing the
+source and target listings, so progress measurement adds a source listing
+to each full pass, including native-source polls.
+
+An empty source-change queue does not prove current source/target agreement.
+The UI shows **No known pending changes** with the last full comparison
+time, separately from pass completion. Target-only edits and writes to a
+native source outside gos3 are detected at a full pass, not continuously.
+Comparison follows prefixes, version mode, merge/adopt, and deletion
+options; retained target-only data allowed by policy is not a failure.
+Fingerprint mode uses listing fingerprints, not byte-by-byte validation
+or detection of metadata-only external changes.
 
 Deleting the source or the target bucket fails the mirror.
 
@@ -239,17 +260,26 @@ Deleting the source or the target bucket fails the mirror.
 |---|---|
 | `mode` | `identity` or `fingerprint` (see [above](#how-changes-are-detected)) |
 | `keysScanned` | keys compared in the current (or last) full pass |
-| `bytesDone` | the source bytes those keys hold, against `totalBytes` |
+| `sourceKeysDone`, `bytesDone` | source keys and source bytes examined in that full pass, including unsuccessful keys; these do not prove destination agreement |
+| `passComplete` | that full comparison finished; it may still have unresolved keys |
+| `totalsKnown` | the full-pass denominator is available; false while measuring, for legacy status, or if observed growth exceeds the estimate |
 | `keysCopied`, `versionsCopied`, `bytesCopied` | keys written to (copied versions or updated metadata), versions and delete markers written, and their content bytes, over the job's life |
 | `keysDeleted` | target keys removed because the source no longer has them |
-| `totalKeys`, `totalBytes` | the source's keys and the bytes of the versions copied, counted when the job prepared |
+| `totalKeys`, `totalBytes` | source keys and version bytes measured at the start of each full pass; at completion, the source keys/bytes actually examined |
 | `bytesPerSecond`, `etaSeconds` | the copy rate (averaged over about a minute) and the estimated time left in the current pass |
 | `conflicts`, `conflictSamples` | what the job will not do (locked versions, unmappable keys) in the current pass; the last 20 |
 | `errors` | the last 20 keys that could not be copied, with the error and time |
+| `unresolved` | distinct keys with a currently unresolved copy error or conflict; persisted across restart and cleared per key only after a successful retry/comparison under the policy |
+| `pending`, `lagSeconds`, `checkRequired` | queued/in-flight source changes, their age, and whether a full comparison is pending or incomplete |
 | `warnings` | what the job skipped on purpose, such as a bucket policy that cannot be rewritten for the target |
 
-The totals are counted once, so the estimate drifts when the source
-changes a lot during the copy.
+Incremental changes update lifetime transfer activity without changing the
+last full pass's progress. Rewrites count as repeated lifetime key writes,
+not distinct destination keys. The UI labels pass progress and lifetime
+activity separately; unknown totals are indeterminate, and zero-byte
+sources use key progress. Totals are estimates while the source changes.
+Historical error/conflict samples do not keep a recovered mirror behind.
+A failed comparison cannot clear previously known unresolved work.
 
 ## Controlling jobs
 
@@ -266,7 +296,7 @@ changes a lot during the copy.
 | Pause | stops the job; a running pass is interrupted and the job resumes later from its last checkpoint |
 | Resume | queues a paused job again; also retries a failed job from its checkpoint |
 | Cancel | ends the job. What it copied stays in the target |
-| Run now | starts a waiting job at once: a mirror run or a pending retry (409 for paused and finished jobs) |
+| Run now | queues a full reconciliation for a mirror, or starts a pending retry for another job (409 for paused and finished jobs) |
 | Delete | removes a finished job from the history, with its database |
 
 - **Retries.** A run that fails because something is unavailable (a
