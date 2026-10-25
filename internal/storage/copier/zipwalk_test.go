@@ -1,6 +1,7 @@
 package copier
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"slices"
@@ -268,4 +269,201 @@ func TestLookupPair(t *testing.T) {
 	if _, err := LookupPair(t.Context(), src, dst, "other/z", true); err == nil {
 		t.Fatal("LookupPair accepted a key outside the prefix")
 	}
+}
+
+// Generate large histories without storing every synthetic version in the
+// fixture, so these tests measure the walk's buffers rather than a backend.
+type historyListing struct {
+	storage.Backend
+	keys     []string
+	versions map[string]int // optional per-key counts
+}
+
+func (b *historyListing) WalkVersions(ctx context.Context, bucket, prefix, after, versionID string, fn func(storage.ObjectInfo) error) error {
+	for _, key := range b.keys {
+		if key <= after || !strings.HasPrefix(key, prefix) {
+			continue
+		}
+		n := MaxKeyVersions + 2
+		if strings.HasSuffix(key, "healthy") {
+			n = 1
+		}
+		if count, ok := b.versions[key]; ok {
+			n = count
+		}
+		for i := range n {
+			if err := ctx.Err(); err != nil {
+				return err
+			}
+			if err := fn(storage.ObjectInfo{Key: key, VersionID: fmt.Sprint(i)}); err != nil {
+				if errors.Is(err, storage.ErrStopWalk) {
+					return nil
+				}
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+func TestCursorBatchesOversizedHistories(t *testing.T) {
+	old := batchVersions
+	batchVersions = 3
+	t.Cleanup(func() { batchVersions = old })
+	keys := []string{"p/a", "p/b", "p/c", "p/d", "p/e", "p/f", "p/g", "p/z-healthy"}
+	c := &cursor{ep: Endpoint{Backend: &historyListing{keys: keys}, Bucket: "s", Prefix: "p/"}, side: "source", versions: true}
+	var seen []string
+	for !c.done {
+		if err := c.fill(t.Context()); err != nil {
+			t.Fatal(err)
+		}
+		if len(c.groups) > batchVersions {
+			t.Fatalf("cursor retained %d groups, limit %d", len(c.groups), batchVersions)
+		}
+		for !c.empty() {
+			g := c.next()
+			seen = append(seen, g.key)
+			if strings.HasSuffix(g.key, "healthy") {
+				if g.err != nil || len(g.entries) != 1 {
+					t.Fatalf("healthy group: %+v", g)
+				}
+			} else if !errors.Is(g.err, ErrTooManyVersions) || len(g.entries) != 0 {
+				t.Fatalf("oversized group: %+v", g)
+			}
+		}
+		if c.after != seen[len(seen)-1] {
+			t.Fatalf("resume marker %q after %v", c.after, seen)
+		}
+	}
+	if !slices.Equal(seen, keys) {
+		t.Fatalf("keys %v, want %v", seen, keys)
+	}
+}
+
+func TestZipWalkBatchesOversizedHistories(t *testing.T) {
+	old := batchVersions
+	batchVersions = 3
+	t.Cleanup(func() { batchVersions = old })
+	keys := []string{"a", "b", "c", "d", "e", "f", "g"}
+	for _, mode := range []string{"source", "target", "both", "interleaved"} {
+		t.Run(mode, func(t *testing.T) {
+			var sk, dk []string
+			for i, k := range keys {
+				if mode == "source" || mode == "both" || mode == "interleaved" && i%2 == 0 {
+					sk = append(sk, "in/"+k)
+				}
+				if mode == "target" || mode == "both" || mode == "interleaved" && i%2 == 1 {
+					dk = append(dk, "out/"+k)
+				}
+			}
+			sk = append(sk, "in/z-healthy")
+			dk = append(dk, "out/z-healthy")
+			src := Endpoint{Backend: &historyListing{keys: sk}, Bucket: "s", Prefix: "in/"}
+			dst := Endpoint{Backend: &historyListing{keys: dk}, Bucket: "d", Prefix: "out/"}
+			var seen []string
+			_, batches := collect(t, src, dst, "", true)
+			for _, ps := range batches {
+				if len(ps) > batchVersions {
+					t.Fatalf("callback retained %d pairs, limit %d", len(ps), batchVersions)
+				}
+				for _, p := range ps {
+					k := strings.TrimPrefix(p.SrcKey, "in/")
+					seen = append(seen, k)
+					if p.DstKey != "out/"+k {
+						t.Fatalf("target key = %q for %s", p.DstKey, k)
+					}
+					if k == "z-healthy" {
+						if p.Err != nil || len(p.Src) != 1 || len(p.Dst) != 1 {
+							t.Fatalf("healthy pair: %+v", p)
+						}
+					} else if !errors.Is(p.Err, ErrTooManyVersions) || len(p.Src)+len(p.Dst) != 0 {
+						t.Fatalf("oversized pair: %+v", p)
+					}
+				}
+			}
+			want := append(slices.Clone(keys), "z-healthy")
+			if !slices.Equal(seen, want) {
+				t.Fatalf("keys %v, want %v", seen, want)
+			}
+			resumed, _ := collect(t, src, dst, "in/d", true)
+			var got []string
+			for _, p := range resumed {
+				got = append(got, p.SrcKey)
+			}
+			if !slices.Equal(got, []string{"in/e", "in/f", "in/g", "in/z-healthy"}) {
+				t.Fatalf("resumed keys: %v", got)
+			}
+		})
+	}
+}
+
+// Flagging one side must preserve a healthy history on the other. Mixing
+// both types across batch boundaries must also preserve every resume point
+// and stop immediately when a callback fails.
+func TestZipWalkMixedHistoriesAndResume(t *testing.T) {
+	old := batchVersions
+	batchVersions = 3
+	t.Cleanup(func() { batchVersions = old })
+	scounts := []int{MaxKeyVersions + 1, 1, 0, MaxKeyVersions, MaxKeyVersions + 2, 0, 2, 1}
+	dcounts := []int{1, MaxKeyVersions + 1, 2, 0, MaxKeyVersions + 1, MaxKeyVersions, 0, 1}
+	endpoint := func(bucket, prefix string, counts []int) Endpoint {
+		b := &historyListing{versions: make(map[string]int)}
+		for i, n := range counts {
+			if n == 0 {
+				continue
+			}
+			key := fmt.Sprintf("%s%c", prefix, 'a'+i)
+			b.keys = append(b.keys, key)
+			b.versions[key] = n
+		}
+		return Endpoint{Backend: b, Bucket: bucket, Prefix: prefix}
+	}
+	src, dst := endpoint("s", "in/", scounts), endpoint("d", "out/", dcounts)
+	check := func(ps []KeyPair, start int) {
+		t.Helper()
+		if len(ps) != len(scounts)-start {
+			t.Fatalf("after index %d: got %d pairs, want %d", start, len(ps), len(scounts)-start)
+		}
+		for j, p := range ps {
+			i := start + j
+			if p.SrcKey != fmt.Sprintf("in/%c", 'a'+i) || p.DstKey != fmt.Sprintf("out/%c", 'a'+i) {
+				t.Fatalf("pair %d: keys %q, %q", i, p.SrcKey, p.DstKey)
+			}
+			ns, nd := scounts[i], dcounts[i]
+			flagged := ns > MaxKeyVersions || nd > MaxKeyVersions
+			if ns > MaxKeyVersions {
+				ns = 0
+			}
+			if nd > MaxKeyVersions {
+				nd = 0
+			}
+			if len(p.Src) != ns || len(p.Dst) != nd || errors.Is(p.Err, ErrTooManyVersions) != flagged || !flagged && p.Err != nil {
+				t.Fatalf("pair %d: source=%d target=%d error=%v, want source=%d target=%d flagged=%t", i, len(p.Src), len(p.Dst), p.Err, ns, nd, flagged)
+			}
+		}
+	}
+	all, batches := collect(t, src, dst, "", true)
+	check(all, 0)
+	for _, ps := range batches {
+		if len(ps) > batchVersions {
+			t.Fatalf("callback got %d pairs, limit %d", len(ps), batchVersions)
+		}
+	}
+	for i, p := range all {
+		resumed, _ := collect(t, src, dst, p.SrcKey, true)
+		check(resumed, i+1)
+	}
+	stop := errors.New("stop after first batch")
+	calls := 0
+	var first []KeyPair
+	err := ZipWalk(t.Context(), src, dst, "", true, func(ps []KeyPair) error {
+		calls++
+		first = ps
+		return stop
+	})
+	if !errors.Is(err, stop) || calls != 1 || len(first) == 0 {
+		t.Fatalf("callback error: %v, %d calls, %d pairs", err, calls, len(first))
+	}
+	resumed, _ := collect(t, src, dst, first[len(first)-1].SrcKey, true)
+	check(append(first, resumed...), 0)
 }

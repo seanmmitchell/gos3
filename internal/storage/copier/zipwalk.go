@@ -14,7 +14,8 @@ import (
 // is suspended and its keys are paired, and roughly the number of entries
 // ZipWalk passes to its callback at once. Batches end at key boundaries,
 // so a key with more versions than this is still delivered whole, up to
-// MaxKeyVersions. A variable for tests.
+// MaxKeyVersions. A flagged key or pair with no retained entries counts as
+// one entry so error records also stay bounded. A variable for tests.
 var batchVersions = 1000
 
 // ZipWalk pairs the keys under src with those under dst, in ascending key
@@ -95,7 +96,7 @@ func ZipWalk(ctx context.Context, src, dst Endpoint, after string, versions bool
 				p = KeyPair{SrcKey: src.Prefix + sk, DstKey: dst.Prefix + dk, Src: s.entries, Dst: d.entries, Err: cmp.Or(s.err, d.err)}
 			}
 			batch = append(batch, p)
-			entries += len(p.Src) + len(p.Dst)
+			entries += max(1, len(p.Src)+len(p.Dst))
 			if entries >= batchVersions {
 				if err := fn(batch); err != nil {
 					return err
@@ -162,7 +163,7 @@ func (c *cursor) fill(ctx context.Context) error {
 	}
 	var (
 		groups []group
-		total  int // entries held
+		total  int // entries held, plus one per flagged group
 		full   bool
 	)
 	collect := func(oi storage.ObjectInfo) error {
@@ -179,7 +180,7 @@ func (c *cursor) fill(ctx context.Context) error {
 			// Draining a key with too many versions.
 		case len(g.entries) >= MaxKeyVersions:
 			g.err = fmt.Errorf("%w: %s/%s on the %s exceeds %d", ErrTooManyVersions, c.ep.Bucket, oi.Key, c.side, MaxKeyVersions)
-			total -= len(g.entries)
+			total -= len(g.entries) - 1 // retain a charge for the group and its error
 			g.entries = nil
 		default:
 			g.entries = append(g.entries, oi)
