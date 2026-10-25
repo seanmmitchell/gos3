@@ -13,6 +13,9 @@ func TestHeadlessBuild(t *testing.T) {
 	if srv.UIEnabled() || srv.UIBuilt() || srv.Info().Endpoints.UI != "" {
 		t.Fatal("headless binary enabled or advertised UI")
 	}
+	if srv.updates != nil {
+		t.Fatal("headless binary created a release checker")
+	}
 	cfg.UI.Enabled = true
 	if s, err := New(cfg, nil); err == nil {
 		s.Close()

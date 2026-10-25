@@ -26,6 +26,8 @@ type EnvVar struct {
 // syntax ("30s", "1h"); sizes accept unit suffixes ("5GiB", see ParseSize).
 var envVars = []EnvVar{
 	{EnvConfig, "", "path of the JSON or YAML config file", nil},
+	{"GOS3_UPDATES_ENABLED", "updates.enabled", "check published gos3 releases daily on UI-enabled servers (bool, default false)", boolean(func(c *Config) *bool { return &c.Updates.Enabled })},
+	{"GOS3_UPDATES_NOTIFY_FOR", "updates.notify_for", "release notice types, comma-separated patch,minor,major (empty = no notices)", list(func(c *Config) *[]string { return &c.Updates.NotifyFor })},
 	{"GOS3_ADMIN_ENABLED", "admin.enabled", "enable management API and saved UI settings (bool); false also disables UI", boolean(func(c *Config) *bool { return &c.Admin.Enabled })},
 	{"GOS3_ADDRESS", "server.address", "listen address, [host]:port", str(func(c *Config) *string { return &c.Server.Address })},
 	{"GOS3_NAME", "server.name", "server name (default: host name)", str(func(c *Config) *string { return &c.Server.Name })},

@@ -37,6 +37,7 @@ type Config struct {
 	Compression CompressionConfig `yaml:"compression"`
 	Jobs        JobsConfig        `yaml:"jobs"`
 	Restic      ResticConfig      `yaml:"restic"`
+	Updates     UpdatesConfig     `yaml:"updates"`
 }
 
 // ServerConfig configures the HTTP listener and identity.
@@ -306,6 +307,7 @@ type Settings struct {
 	Lifecycle     LifecycleSettings   `json:"lifecycle"`
 	MetricsPublic bool                `json:"metricsPublic"`
 	Compression   CompressionSettings `json:"compression"`
+	Updates       UpdatesConfig       `json:"updates"`
 }
 
 // CompressionSettings is the runtime-editable form of CompressionConfig.
@@ -397,6 +399,7 @@ func (s *Store) Subscribe(fn func(old, new Settings)) {
 // cloneSettings deep-copies in. Nil and empty slices are preserved as such.
 func cloneSettings(in Settings) Settings {
 	out := in
+	out.Updates.NotifyFor = slices.Clone(in.Updates.NotifyFor)
 	out.Domains = slices.Clone(in.Domains)
 	out.CORS = cloneCORS(in.CORS)
 	out.Discovery.Seeds = slices.Clone(in.Discovery.Seeds)

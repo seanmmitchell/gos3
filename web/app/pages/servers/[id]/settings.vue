@@ -43,6 +43,9 @@ const { connection, requireAdmin } = useConnection()
 const { capabilities, status } = useWhoAmI()
 const confirm = useConfirm()
 const toast = useToast()
+const { updateStatus, updateError, refreshUpdates } = useUpdates()
+const updateTypes = ['patch', 'minor', 'major'] as const
+const checkTime = (value: string | null | undefined) => value ? new Date(value).toLocaleString() : 'Never'
 
 const mode = computed(() => settingsPageMode(connection.value?.kind, capabilities.value))
 const pending = computed(() => identityPending(connection.value?.kind, status.value))
@@ -128,6 +131,7 @@ async function save() {
   try {
     const updated = await requireAdmin().putConfig(formToSettings(form.value, loaded.value ?? undefined))
     loaded.value = updated
+    void refreshUpdates()
     original.value = settingsToForm(updated)
     form.value = settingsToForm(updated)
     submitted.value = false
@@ -219,6 +223,32 @@ const compressionModeItems: { label: string, description: string, value: string 
         <!-- Every section stays mounted (v-show) so list input not yet added survives a switch. -->
         <div id="settings-panel" role="tabpanel" :aria-label="sectionLabel">
           <fieldset :disabled="readonly" class="min-w-0">
+            <UCard v-if="form.updates" v-show="section === 'updates'">
+              <template #header>
+                <h2 class="font-semibold text-highlighted">Updates</h2>
+                <p class="text-sm text-muted">Optional release notices for this gos3 server. Updates are never installed automatically.</p>
+              </template>
+              <div class="space-y-5">
+                <UAlert v-if="updateStatus && !updateStatus.supported" color="neutral" variant="subtle" title="Checks require a UI-enabled gos3 server" description="This server does not run release checks. A standalone console uses the connected server's cached result." />
+                <USwitch v-model="form.updates.enabled" label="Check for updates" description="Check GitHub's published releases at most once every 24 hours. No token is needed." :disabled="readonly || updateStatus?.supported === false" />
+                <fieldset class="space-y-2" :disabled="readonly || !form.updates.enabled || updateStatus?.supported === false">
+                  <legend class="mb-2 text-sm font-medium">Notify me about</legend>
+                  <UCheckbox v-for="typ in updateTypes" :key="typ" :model-value="form.updates.notifyFor.includes(typ)" :label="`${typ.charAt(0).toUpperCase() + typ.slice(1)} releases`" @update:model-value="value => { if (form.updates) form.updates.notifyFor = value ? [...form.updates.notifyFor, typ] : form.updates.notifyFor.filter(t => t !== typ) }" />
+                </fieldset>
+                <div class="rounded-lg border border-default p-4 text-sm" aria-live="polite">
+                  <h3 class="mb-3 font-medium text-highlighted">Release check status</h3>
+                  <dl class="grid grid-cols-[auto_1fr] gap-x-6 gap-y-2">
+                    <dt class="text-muted">Installed version</dt><dd>{{ updateStatus?.installedVersion || store.statusOf(id)?.info?.version || 'Unknown' }}</dd>
+                    <dt class="text-muted">Current result</dt><dd>{{ !updateStatus?.enabled ? 'Checking is off' : !updateStatus.comparable ? 'Development or unknown build; no release notices' : updateStatus.available ? `${updateStatus.available.version} available (${updateStatus.available.type})` : updateStatus.lastSuccess ? 'No eligible newer release' : 'Waiting for the first check' }}</dd>
+                    <dt class="text-muted">Last check</dt><dd>{{ checkTime(updateStatus?.lastCheck) }}</dd>
+                    <dt class="text-muted">Last successful check</dt><dd>{{ checkTime(updateStatus?.lastSuccess) }}</dd>
+                  </dl>
+                  <p v-if="updateStatus?.error || updateError" class="mt-3 text-warning">{{ updateStatus?.error || updateError }}</p>
+                  <UButton v-if="updateStatus?.available" :to="updateStatus.available.url" target="_blank" rel="noopener noreferrer" variant="link" class="mt-2 px-0" trailing-icon="i-lucide-external-link">View release notes</UButton>
+                </div>
+                <p class="text-sm text-muted">Saved settings override updates.enabled and updates.notify_for in your configuration and environment. Dismissals and skipped versions apply only to this browser and server.</p>
+              </div>
+            </UCard>
             <!-- General -->
             <UCard v-show="section === 'general'">
               <template #header>

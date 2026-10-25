@@ -186,6 +186,7 @@ func (a *api) routes() []route {
 		{"DELETE", "/whoami/keys/{accessKey}", "", service, a.deleteOwnKey}, // unless admin:DeleteOwnAccessKey is denied
 		// Server
 		{"GET", "/info", "ServerInfo", service, a.serverInfo},
+		{"GET", "/updates", "", service, a.updateStatus},
 		{"GET", "/stats", "GetStats", service, a.stats},
 		{"GET", "/config", "GetConfig", service, a.getConfig},
 		{"PUT", "/config", "UpdateConfig", service, a.putConfig},

@@ -325,6 +325,8 @@ export interface CompressionSettings {
 
 /** config.Settings — GET/PUT /config. PUT takes the full document. */
 export interface Settings {
+  /** Absent from older servers. */
+  updates?: UpdatesSettings
   name: string
   region: string
   publicUrl: string
@@ -338,6 +340,21 @@ export interface Settings {
   metricsPublic: boolean
   /** Absent from servers without compression support. */
   compression?: CompressionSettings
+}
+
+export type UpdateType = 'patch' | 'minor' | 'major'
+export interface UpdatesSettings {
+  enabled: boolean
+  notifyFor: UpdateType[]
+}
+export interface UpdateStatus extends UpdatesSettings {
+  supported: boolean
+  installedVersion: string
+  comparable: boolean
+  lastCheck: string | null
+  lastSuccess: string | null
+  error: string
+  available: { version: string, type: UpdateType, url: string } | null
 }
 
 // ---------------------------------------------------------------------------

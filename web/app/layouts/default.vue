@@ -189,4 +189,5 @@ watch(() => connection.value?.id, (id) => {
       </template>
     </UDashboardPanel>
   </UDashboardGroup>
+  <CommonUpdateNotice />
 </template>

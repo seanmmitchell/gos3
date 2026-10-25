@@ -307,6 +307,38 @@ random pair you can use instead. See
 | `ui.enabled` | `GOS3_UI_ENABLED` | `--no-ui` (sets false) | `true` | | Serve the embedded web UI at `/_gos3/ui/`. |
 | `ui.redirect_root` | `GOS3_UI_REDIRECT` | | `true` | `uiRedirect` | Redirect an anonymous browser `GET /` (`Accept: text/html`) to `/_gos3/ui/`. Signed requests and virtual-host requests are never redirected. |
 
+### `updates`
+
+Optional release checks run only on gos3 servers with the web UI enabled.
+Headless and S3-only servers never check. The default is off; when enabled,
+all three notification types are selected by default:
+
+```yaml
+updates:
+  enabled: false       # GOS3_UPDATES_ENABLED (runtime)
+  notify_for: [patch, minor, major] # GOS3_UPDATES_NOTIFY_FOR (runtime, comma-separated)
+```
+
+Types must be unique entries from `patch`, `minor`, and `major`; an empty list
+keeps checks enabled but suppresses notices. Classification compares numeric
+version components, including `0.x` versions. The newest eligible stable,
+published release is selected, even when a newer release is excluded by type.
+Development, prerelease, and unknown installed builds do not produce notices
+or make outbound checks.
+
+Checks run when due shortly after startup or enabling, then at most once per
+24 hours, with a 10-second timeout. Failed attempts also consume the daily
+budget. `<data>/.gos3/updates.json` stores the last attempt, last successful
+release list, and error across restarts (memory only without a data path).
+GitHub outages and rate limits leave the last successful result available.
+The server reads public release metadata from GitHub, with no token or asset
+downloads. It never installs anything.
+
+**Settings → Updates** and admin `PUT /config` change these values live. Saved
+`settings.json` fields (`updates.enabled` and `updates.notifyFor`) override the
+static file and environment, including saved `false` and empty selections.
+Remove the saved fields to restore static configuration precedence.
+
 ### `cors`
 
 The global CORS policy. It applies to the admin API and to S3 requests on

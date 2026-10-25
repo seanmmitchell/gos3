@@ -55,6 +55,7 @@ import (
 	"github.com/seanmmitchell/gos3/internal/storage/memory"
 	"github.com/seanmmitchell/gos3/internal/storage/multi"
 	"github.com/seanmmitchell/gos3/internal/storage/s3account"
+	"github.com/seanmmitchell/gos3/internal/updates"
 	"github.com/seanmmitchell/gos3/internal/version"
 	"github.com/seanmmitchell/gos3/internal/webui"
 )
@@ -122,6 +123,7 @@ type Server struct {
 	admin       http.Handler
 	ui          http.Handler // nil when the UI is disabled
 	uiBuilt     bool
+	updates     *updates.Service
 	disc        *discovery.Service
 	lifecycle   *lifecycle.Worker
 	jobs        *jobs.Manager       // background jobs (jobs.go)
@@ -316,6 +318,15 @@ func New(cfg config.Config, logger *slog.Logger, opts ...Option) (_ *Server, err
 		ClientIP:      s.clientIP,
 	})
 	s.disc = discovery.New(st.Discovery, s.Info, logger)
+	if cfg.UI.Enabled {
+		cachePath := ""
+		if s.systemDir != "" {
+			cachePath = filepath.Join(s.systemDir, "updates.json")
+		}
+		s.updates = updates.New(s.version, cachePath)
+		s.updates.Configure(st.Updates)
+		s.settings.Subscribe(func(_, next config.Settings) { s.updates.Configure(next.Updates) })
+	}
 	if cfg.Admin.Enabled {
 		s.admin = s.instrumentAdmin(admin.NewHandler(admin.Deps{
 			Backend:     s.backend,
@@ -331,6 +342,7 @@ func New(cfg config.Config, logger *slog.Logger, opts ...Option) (_ *Server, err
 			Jobs:        s.jobs,
 			CopyJobs:    s.copyJobs,
 			Snapshots:   s.snapshots,
+			Updates:     s.updates,
 
 			TrustProxyHeaders: s.clientIP,
 		}))

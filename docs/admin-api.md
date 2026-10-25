@@ -860,6 +860,43 @@ ListJobs, GetJob and GetBucketSnapshots.
 | POST | `/discovery/probe` | ProbeNetwork | body `{"url": "http://host:9000"}` → `discovery.Peer` (400 `InvalidRequest` ending in `address not allowed` when the target is, or resolves to, a cloud metadata, unspecified, multicast or broadcast address; 502 `ProbeFailed` on failure, with only a coarse reason: `unreachable`, `timed out`, `HTTP <status>` or `not a gos3 server`; 429 `TooManyRequests` while 4 probes are already running on the server; each probe is bounded by 10 s) |
 | POST | `/discovery/scan` | ScanNetwork | body `discovery.ScanRequest` → `discovery.ScanResult` (403 when `allowScan` is false; 400 when the targets expand to more than `maxScanHosts` hosts, or for more than 256 targets, more than 64 ports, a port outside 1–65535, a scheme other than http/https, a `timeout` outside 0–60 s or `concurrency` outside 0–1024; 429 `TooManyRequests` while 2 scans are already running on the server; the whole scan is bounded by 5 minutes) |
 
+## Cached release checks — `GET /_gos3/admin/v1/updates`
+
+Any authenticated identity may read this endpoint, including users without
+`admin:GetConfig` or `admin:UpdateConfig`. Reads never contact GitHub. Example:
+
+```json
+{
+  "supported": true,
+  "enabled": true,
+  "installedVersion": "v0.2.2",
+  "comparable": true,
+  "notifyFor": ["patch", "minor", "major"],
+  "lastCheck": "2026-10-25T12:00:00Z",
+  "lastSuccess": "2026-10-25T12:00:01Z",
+  "error": "",
+  "available": {
+    "version": "v0.2.3",
+    "type": "patch",
+    "url": "https://github.com/seanmmitchell/gos3/releases/tag/v0.2.3"
+  }
+}
+```
+
+Timestamps and `available` may be null. `supported: false` means this server
+has no enabled web UI and runs no release checker. A failed attempt sets
+`error` without discarding the last successful result. Disabled checking
+always returns `available: null`. Unknown/development installed versions have
+`comparable: false` and produce no notice.
+
+The runtime `GET/PUT /config` document includes
+`"updates": {"enabled": false, "notifyFor": ["patch", "minor", "major"]}`.
+Allowed notification types are unique `patch`, `minor`, `major`; `[]` means
+no notices. Invalid values return `400 InvalidSettings`. These settings persist
+and take effect without restart, overriding static configuration/environment.
+An older client's PUT that omits `updates` preserves the current values.
+Dismissal and skipped releases are browser-local choices, not API mutations.
+
 ## Public endpoints (no `/admin/v1` prefix; served by `internal/server`)
 
 | Method | Path | Auth | Response |
