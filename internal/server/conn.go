@@ -30,19 +30,13 @@ const (
 	http2PingTimeout = 15 * time.Second
 )
 
-// writeGuard bounds the writes of a response: before each write (of at
-// most maxGuardedWrite bytes) it makes sure the write deadline of the
-// connection (HTTP/1) or stream (HTTP/2) is at least 3/4 of idle away,
-// re-arming it to now+idle only when the last arming is more than idle/4
-// old (on HTTP/2 every arming is a message to the connection's serve loop
-// and a timer reset, so it is not done per write). A client that stops
-// reading, or that never opens its HTTP/2 flow control window, then
-// releases the handler goroutine, its buffers and open files within idle
-// instead of holding them forever. The deadline stays armed between
-// writes: a handler that pauses for most of idle after writing part of a
-// response (none of gos3's do; slow operations write keep-alive bytes
-// every few seconds) may be cut off on HTTP/2. Body reads are bounded
-// separately (bodyguard.go, s3 countingBody).
+// writeGuard bounds each response write to idle without progress, splitting
+// large writes into pieces of at most maxGuardedWrite bytes. Within a large
+// write it refreshes the deadline at most every idle/4 to limit HTTP/2 timer
+// traffic. Successful writes and flushes clear the deadline: preparing the
+// next response bytes (such as a later restic restore window) can take longer
+// than idle even for a healthy client. Body reads are bounded separately
+// (bodyguard.go, s3 countingBody).
 type writeGuard struct {
 	http.ResponseWriter
 	ctl     *http.ResponseController // nil: deadlines unsupported
@@ -89,7 +83,12 @@ func (g *writeGuard) set(t time.Time) {
 
 func (g *writeGuard) Write(p []byte) (int, error) {
 	if len(p) == 0 {
-		return g.ResponseWriter.Write(p)
+		g.arm(false)
+		n, err := g.ResponseWriter.Write(p)
+		if err == nil {
+			g.disarm()
+		}
+		return n, err
 	}
 	n := 0
 	for len(p) > 0 {
@@ -104,17 +103,28 @@ func (g *writeGuard) Write(p []byte) (int, error) {
 		}
 		p = p[m:]
 	}
+	g.disarm()
 	return n, nil
 }
 
-// Flush implements http.Flusher when the underlying writer does.
-func (g *writeGuard) Flush() {
-	f, ok := g.ResponseWriter.(http.Flusher)
-	if !ok {
-		return
-	}
+// disarm leaves server-side work between writes outside the write-idle
+// allowance. The next write must receive a fresh allowance.
+func (g *writeGuard) disarm() {
+	g.set(time.Time{})
+	g.armedAt = time.Time{}
+}
+
+// Flush implements http.Flusher. FlushError also lets ResponseController
+// report a failed flush, whose deadline must stay armed like a failed write.
+func (g *writeGuard) Flush() { _ = g.FlushError() }
+
+func (g *writeGuard) FlushError() error {
 	g.arm(false)
-	f.Flush()
+	if err := http.NewResponseController(g.ResponseWriter).Flush(); err != nil {
+		return err
+	}
+	g.disarm()
+	return nil
 }
 
 // Unwrap lets http.ResponseController reach the underlying writer.

@@ -4,9 +4,11 @@ import (
 	"bytes"
 	"context"
 	"crypto/tls"
+	"fmt"
 	"io"
 	"net"
 	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
 	"time"
@@ -105,8 +107,26 @@ func TestHTTP2StalledStreamReleased(t *testing.T) {
 	}
 	s.writeIdle = 300 * time.Millisecond
 	srv := serve(t, s)
-	addr := strings.TrimPrefix(srv.url, "https://")
+	assertHTTP2StalledStreamReleased(t, strings.TrimPrefix(srv.url, "https://"), http2MaxStreams)
+}
 
+// A body too large for net/http's response buffer must time out inside
+// Write too, not only during the final flush after the handler returns.
+func TestHTTP2StalledBodyWriteReleased(t *testing.T) {
+	s := &Server{writeIdle: 300 * time.Millisecond}
+	ts := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w, finish := s.guardWrites(w)
+		defer finish()
+		_, _ = w.Write(make([]byte, 2*maxGuardedWrite))
+	}))
+	ts.EnableHTTP2 = true
+	ts.StartTLS()
+	defer ts.Close()
+	assertHTTP2StalledStreamReleased(t, strings.TrimPrefix(ts.URL, "https://"), 0)
+}
+
+func assertHTTP2StalledStreamReleased(t *testing.T, addr string, wantMaxStreams uint32) {
+	t.Helper()
 	conn, err := tls.Dial("tcp", addr, &tls.Config{InsecureSkipVerify: true, NextProtos: []string{"h2"}})
 	if err != nil {
 		t.Fatal(err)
@@ -154,8 +174,8 @@ func TestHTTP2StalledStreamReleased(t *testing.T) {
 			if d := time.Since(start); d > 10*time.Second {
 				t.Errorf("stream reset after %v", d)
 			}
-			if maxStreams != http2MaxStreams {
-				t.Errorf("SETTINGS_MAX_CONCURRENT_STREAMS = %d, want %d", maxStreams, http2MaxStreams)
+			if wantMaxStreams != 0 && maxStreams != wantMaxStreams {
+				t.Errorf("SETTINGS_MAX_CONCURRENT_STREAMS = %d, want %d", maxStreams, wantMaxStreams)
 			}
 			return
 		}
@@ -490,4 +510,62 @@ func TestReadyHidesBackendErrors(t *testing.T) {
 // signReq signs req with the root credentials.
 func signReq(req *http.Request) error {
 	return auth.SignRequest(req, rootCreds, "us-east-1", "s3", "", time.Now())
+}
+
+// Later restic windows can take longer to prepare than the write-idle
+// timeout. A healthy HTTP/2 client must be able to receive the next window
+// after either a successful Write or an explicit Flush.
+func TestHTTP2ResponsePreparationPause(t *testing.T) {
+	for _, flush := range []bool{false, true} {
+		t.Run(fmt.Sprintf("flush=%t", flush), func(t *testing.T) {
+			const idle = 300 * time.Millisecond
+			first := bytes.Repeat([]byte("a"), 128<<10)
+			if flush {
+				first = first[:64]
+			}
+			s := &Server{writeIdle: idle}
+			handlerErr := make(chan error, 1)
+			ts := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w, finish := s.guardWrites(w)
+				defer finish()
+				if _, err := w.Write(first); err != nil {
+					handlerErr <- err
+					return
+				}
+				if flush {
+					if err := http.NewResponseController(w).Flush(); err != nil {
+						handlerErr <- err
+						return
+					}
+				}
+				time.Sleep(3 * idle)
+				_, err := io.WriteString(w, "next window")
+				handlerErr <- err
+			}))
+			ts.EnableHTTP2 = true
+			ts.StartTLS()
+			defer ts.Close()
+			client := ts.Client()
+			client.Timeout = 5 * time.Second
+			resp, err := client.Get(ts.URL)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer resp.Body.Close()
+			if resp.ProtoMajor != 2 {
+				t.Fatalf("protocol = %s, want HTTP/2", resp.Proto)
+			}
+			got, err := io.ReadAll(resp.Body)
+			if err != nil {
+				t.Fatalf("download interrupted while preparing the next window: %v", err)
+			}
+			want := append(bytes.Clone(first), []byte("next window")...)
+			if !bytes.Equal(got, want) {
+				t.Fatalf("downloaded %d bytes, want %d", len(got), len(want))
+			}
+			if err := <-handlerErr; err != nil {
+				t.Fatalf("handler write: %v", err)
+			}
+		})
+	}
 }
