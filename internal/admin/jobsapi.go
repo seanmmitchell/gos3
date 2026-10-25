@@ -49,7 +49,12 @@ func jobBuckets(j jobs.Job) []string {
 
 // publicJob returns j as the API shows it: without its checkpoint (a
 // runner's internal resume state).
-func publicJob(j jobs.Job) jobs.Job {
+func (a *api) publicJob(j jobs.Job) jobs.Job {
+	if reporter, ok := a.d.CopyJobs.(interface {
+		JobStatus(jobs.Job) json.RawMessage
+	}); ok {
+		j.Status = reporter.JobStatus(j)
+	}
 	j.Checkpoint = nil
 	return j
 }
@@ -59,10 +64,10 @@ type jobList struct {
 	Jobs []jobs.Job `json:"jobs"`
 }
 
-func newJobList(js []jobs.Job) jobList {
+func (a *api) newJobList(js []jobs.Job) jobList {
 	out := jobList{Jobs: make([]jobs.Job, 0, len(js))}
 	for _, j := range js {
-		out.Jobs = append(out.Jobs, publicJob(j))
+		out.Jobs = append(out.Jobs, a.publicJob(j))
 	}
 	return out
 }
@@ -110,7 +115,7 @@ func (a *api) listJobs(rc *reqCtx) (int, any, error) {
 	if b := rc.r.URL.Query().Get("bucket"); b != "" {
 		f.Match = onBucket(b)
 	}
-	return http.StatusOK, newJobList(a.d.Jobs.List(f)), nil
+	return http.StatusOK, a.newJobList(a.d.Jobs.List(f)), nil
 }
 
 // listBucketJobs implements GET /buckets/{name}/jobs (admin:GetJob on the
@@ -146,7 +151,7 @@ func (a *api) listBucketJobs(rc *reqCtx) (int, any, error) {
 		}
 		return true
 	}
-	return http.StatusOK, newJobList(a.d.Jobs.List(f)), nil
+	return http.StatusOK, a.newJobList(a.d.Jobs.List(f)), nil
 }
 
 // copyJobHead is the part of a CopyJobSpec the API needs before handing
@@ -244,7 +249,7 @@ func (a *api) createJob(rc *reqCtx) (int, any, error) {
 	}
 	a.log.Info("admin: job created", "job", j.ID, "kind", j.Kind, "source", source, "target", target,
 		"by", describeIdentity(rc.id))
-	return http.StatusCreated, publicJob(j), nil
+	return http.StatusCreated, a.publicJob(j), nil
 }
 
 // Authorize the effective backing before validation or submission. Pin
@@ -391,7 +396,7 @@ func (a *api) getJob(rc *reqCtx) (int, any, error) {
 	if err != nil {
 		return 0, nil, err
 	}
-	return http.StatusOK, publicJob(j), nil
+	return http.StatusOK, a.publicJob(j), nil
 }
 
 // updateJob returns the handler of POST /jobs/{id}/<op>: it applies op to
@@ -409,7 +414,7 @@ func (a *api) updateJob(name string, op func(m *jobs.Manager, j jobs.Job) error)
 		if j, err = a.d.Jobs.Get(j.ID); err != nil {
 			return 0, nil, err
 		}
-		return http.StatusOK, publicJob(j), nil
+		return http.StatusOK, a.publicJob(j), nil
 	}
 }
 
@@ -417,15 +422,18 @@ func pauseJob(m *jobs.Manager, j jobs.Job) error  { return m.Pause(j.ID) }
 func resumeJob(m *jobs.Manager, j jobs.Job) error { return m.Resume(j.ID) }
 func cancelJob(m *jobs.Manager, j jobs.Job) error { return m.Cancel(j.ID) }
 
-// runJob starts a waiting job now (a mirror's next pass, a retry). A
-// queued or running job is left to run (a running mirror makes another
-// pass right after this one); paused and finished jobs are 409.
-func runJob(m *jobs.Manager, j jobs.Job) error {
+// runJob requests a full mirror comparison or starts a pending retry.
+// A queued job stays queued; a running mirror runs again if needed to
+// include the comparison request. Paused and finished jobs are 409.
+func (a *api) runJob(m *jobs.Manager, j jobs.Job) error {
 	switch {
 	case j.State == jobs.StatePaused:
 		return errorf(http.StatusConflict, codeConflict, "job %s is paused: resume it instead", j.ID)
 	case j.State.Finished():
 		return errorf(http.StatusConflict, codeConflict, "job %s is %s and cannot run again", j.ID, j.State)
+	}
+	if requester, ok := a.d.CopyJobs.(interface{ RequestFullPass(jobs.Job) }); ok {
+		requester.RequestFullPass(j)
 	}
 	m.Kick(j.ID)
 	return nil

@@ -69,6 +69,7 @@ type run struct {
 	tr       *tracker
 	w        *watch // mirrors
 	conc     int
+	fullPass bool // only full passes update comparison progress
 
 	cpMu      sync.Mutex
 	cp        checkpoint
@@ -140,6 +141,7 @@ func (s *Service) newRun(h *jobs.Handle, kind string) (*run, error) {
 	if r.st, err = s.openStore(h, job.ID); err != nil {
 		return nil, err
 	}
+	r.tr.update(func(st *Status) { st.Unresolved = int64(len(r.st.UnresolvedKeys())) })
 	return r, nil
 }
 
@@ -320,11 +322,6 @@ func (r *run) prepare(ctx context.Context) error {
 	if err := r.copyConfigs(ctx); err != nil {
 		return err
 	}
-	keys, bytes, err := measure(ctx, r)
-	if err != nil {
-		return fmt.Errorf("measuring the source: %w", err)
-	}
-	r.tr.update(func(st *Status) { st.TotalKeys, st.TotalBytes = keys, bytes })
 	r.setCP(func(cp *checkpoint) { cp.Phase, cp.After = phaseCopying, "" })
 	r.saveCheckpoint(true)
 	return nil
@@ -413,10 +410,11 @@ func (r *run) mirror(ctx context.Context) error {
 	r.cpMu.Lock()
 	inFull, lastFull := r.cp.Full, r.cp.LastFullAt
 	r.cpMu.Unlock()
-	if overflow || inFull || !w.isVerified() || !time.Now().Before(lastFull.Add(interval)) {
+	requested := w.takeFullRequest()
+	if requested || overflow || inFull || !w.isVerified() || !time.Now().Before(lastFull.Add(interval)) {
 		// After an overflow, changes behind an interrupted pass's
 		// checkpoint are lost: start over.
-		if err := r.fullMirrorPass(ctx, inFull && !overflow); err != nil {
+		if err := r.fullMirrorPass(ctx, inFull && !overflow && !requested); err != nil {
 			if overflow {
 				w.mu.Lock()
 				w.overflow = true
@@ -503,6 +501,8 @@ func (r *run) syncChanged(ctx context.Context) (retry bool, err error) {
 	if len(keys) == 0 {
 		return false, nil
 	}
+	w.setInFlight(since)
+	defer w.setInFlight(nil)
 	var oldest time.Time
 	for _, at := range since {
 		if oldest.IsZero() || at.Before(oldest) {
@@ -517,7 +517,10 @@ func (r *run) syncChanged(ctx context.Context) (retry bool, err error) {
 	}
 	ok := make([]bool, len(keys))
 	r.passErrs, r.passTooMany, r.failed = 0, 0, nil
-	err = r.syncItems(ctx, items, func(i int, failed bool) { ok[i] = !failed })
+	err = r.syncItems(ctx, items, func(i int, failed bool) {
+		ok[i] = !failed
+		w.finishKey(keys[i])
+	})
 	var again []string
 	for i, k := range keys {
 		if !ok[i] {
@@ -536,9 +539,19 @@ func (r *run) syncChanged(ctx context.Context) (retry bool, err error) {
 // marked changed (also when the pass is interrupted).
 func (r *run) pass(ctx context.Context, phase string, final bool) error {
 	r.h.SetPhase(phase)
+	r.fullPass = true
+	defer func() { r.fullPass = false }()
+	if r.w != nil {
+		r.tr.update(func(st *Status) { st.CheckRequired = true })
+	}
 	after := r.after()
 	if after == "" {
 		r.tr.startPass()
+		keys, bytes, err := measure(ctx, r)
+		if err != nil {
+			return fmt.Errorf("measuring the source: %w", err)
+		}
+		r.tr.update(func(st *Status) { st.TotalKeys, st.TotalBytes, st.TotalsKnown = keys, bytes, true })
 	}
 	r.frozen, r.passErrs, r.passTooMany, r.failed = false, 0, 0, nil
 	err := copier.ZipWalk(ctx, r.src, r.dst, after, r.sp.all(), func(batch []copier.KeyPair) error {
@@ -548,6 +561,11 @@ func (r *run) pass(ctx context.Context, phase string, final bool) error {
 		// The checkpoint moved past the keys that failed: whatever ends
 		// the pass, a mirror copies them as changed keys.
 		r.w.requeue(r.failed, nil)
+		// Revisit known keys absent from both listings too: their work may
+		// have been resolved by deletion since the previous attempt.
+		if err == nil {
+			r.w.requeue(r.st.UnresolvedKeys(), nil)
+		}
 	}
 	r.saveCheckpoint(true)
 	if err != nil {
@@ -564,6 +582,11 @@ func (r *run) pass(ctx context.Context, phase string, final bool) error {
 	r.tr.update(func(st *Status) {
 		st.Passes++
 		st.LastPassAt = time.Now().UTC()
+		st.PassComplete = true
+		st.CheckRequired = false
+		// Report what this comparison examined, independently of lifetime
+		// writes and of current target contents.
+		st.TotalKeys, st.TotalBytes = st.SourceKeysDone, st.BytesDone
 	})
 	return nil
 }
@@ -677,9 +700,19 @@ func (r *run) syncItem(ctx context.Context, it item) (string, error) {
 	if it.lookup {
 		lp, err := copier.LookupPair(ctx, r.src, r.dst, p.SrcKey, all)
 		if err != nil {
+			r.recordUnresolved(p.SrcKey, true)
 			return p.SrcKey, err
 		}
 		p = lp
+	}
+	if p.Err == nil && !hasSource(p, all) && len(p.Dst) == 0 {
+		// A previously blocked key can disappear from both sides, even
+		// when its mapping was invalid. There is no outstanding copy work.
+		r.recordUnresolved(p.SrcKey, false)
+		if r.fullPass {
+			r.tr.record(p, all, copier.Result{}, true)
+		}
+		return p.SrcKey, nil
 	}
 	var (
 		res copier.Result
@@ -690,14 +723,21 @@ func (r *run) syncItem(ctx context.Context, it item) (string, error) {
 	} else {
 		res, err = copier.SyncKeyFingerprint(ctx, r.src, r.dst, p, r.st, r.pol)
 	}
-	r.tr.record(p, all, res)
+	r.tr.record(p, all, res, r.fullPass)
+	defer func() { r.recordUnresolved(p.SrcKey, err != nil || res.Deferred || len(res.Conflicts) > 0) }()
 	switch {
 	case err != nil:
 		return p.SrcKey, err
 	case res.Deferred:
 		return p.SrcKey, errDeferred
 	}
-	return p.SrcKey, r.markOwned(p, res)
+	err = r.markOwned(p, res)
+	return p.SrcKey, err
+}
+
+func (r *run) recordUnresolved(key string, unresolved bool) {
+	delta := r.st.SetUnresolved(key, unresolved)
+	r.tr.update(func(st *Status) { st.Unresolved += delta })
 }
 
 // markOwned records whether the job owns the target key of p after it was
@@ -790,7 +830,7 @@ func (r *run) report() (stop func()) {
 				return
 			case now := <-t.C:
 				r.tr.tick(now)
-				_ = r.h.SetStatus(r.tr.snapshot())
+				_ = r.h.SetStatus(r.status())
 			}
 		}
 	}()
@@ -803,8 +843,17 @@ func (r *run) report() (stop func()) {
 // flush hands the final status and checkpoint of the run to the Manager.
 func (r *run) flush() {
 	r.tr.tick(time.Now())
-	_ = r.h.SetStatus(r.tr.snapshot())
+	_ = r.h.SetStatus(r.status())
 	r.saveCheckpoint(true)
+}
+
+func (r *run) status() Status {
+	st := r.tr.snapshot()
+	if r.w != nil {
+		n, oldest := r.w.pending()
+		st.Pending, st.LagSeconds = int64(n), lag(oldest)
+	}
+	return st
 }
 
 // transient reports errors that a later run may not meet: unavailable

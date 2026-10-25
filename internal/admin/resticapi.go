@@ -206,7 +206,7 @@ func (a *api) runSnapshot(rc *reqCtx) (int, any, error) {
 		return 0, nil, snapshotJobError(err)
 	}
 	a.log.Info("admin: whole-bucket snapshot started", "bucket", bucket, "job", j.ID, "by", describeIdentity(rc.id))
-	return http.StatusAccepted, publicJob(j), nil
+	return http.StatusAccepted, a.publicJob(j), nil
 }
 
 // pruneSnapshots implements POST /buckets/{name}/restic/prune: a
@@ -222,7 +222,7 @@ func (a *api) pruneSnapshots(rc *reqCtx) (int, any, error) {
 		return 0, nil, snapshotJobError(err)
 	}
 	a.log.Info("admin: snapshot repository prune started", "bucket", bucket, "job", j.ID, "by", describeIdentity(rc.id))
-	return http.StatusAccepted, publicJob(j), nil
+	return http.StatusAccepted, a.publicJob(j), nil
 }
 
 // snapshotJobError explains a snapshot or prune job that cannot start for
@@ -334,7 +334,7 @@ func (a *api) restoreSnapshot(rc *reqCtx) (int, any, error) {
 	}
 	a.log.Info("admin: whole-bucket snapshot restore started", "bucket", bucket, "snapshot", id,
 		"target", target, "job", j.ID, "by", describeIdentity(rc.id))
-	return http.StatusAccepted, publicJob(j), nil
+	return http.StatusAccepted, a.publicJob(j), nil
 }
 
 // readJSONObject reads a required body that must be one JSON object (its

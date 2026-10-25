@@ -21,6 +21,10 @@ import (
 // no longer has them. Methods are safe for concurrent use.
 type store interface {
 	copier.FingerprintStore
+	// UnresolvedKeys lists known unsuccessful keys, including conflicts.
+	UnresolvedKeys() []string
+	// SetUnresolved records an outcome and returns the change in the count.
+	SetUnresolved(key string, unresolved bool) int64
 	// Owned reports whether the job wrote target key key.
 	Owned(key string) (bool, error)
 	// SetOwned records whether the job owns target key key.
@@ -42,8 +46,9 @@ const maxPending = 10_000
 
 // bbolt buckets of a job's database.
 var (
-	fpBucket    = []byte("fingerprints")
-	ownedBucket = []byte("owned")
+	fpBucket     = []byte("fingerprints")
+	ownedBucket  = []byte("owned")
+	issuesBucket = []byte("unresolved")
 )
 
 // openStore opens the job's database in its state directory, or, for jobs
@@ -83,8 +88,10 @@ type boltStore struct {
 	flushMu sync.Mutex // serializes Flush
 	mu      sync.Mutex
 	// fp holds buffered records (nil: deleted); owned buffered marks.
-	fp    map[string]*copier.Record
-	owned map[string]bool
+	fp           map[string]*copier.Record
+	owned        map[string]bool
+	issues       map[string]bool
+	issueChanges map[string]bool
 }
 
 func openBolt(path string) (*boltStore, error) {
@@ -93,7 +100,7 @@ func openBolt(path string) (*boltStore, error) {
 		return nil, fmt.Errorf("copyjob: opening the job database %s: %w", path, err)
 	}
 	err = db.Update(func(tx *bbolt.Tx) error {
-		for _, b := range [][]byte{fpBucket, ownedBucket} {
+		for _, b := range [][]byte{fpBucket, ownedBucket, issuesBucket} {
 			if _, err := tx.CreateBucketIfNotExists(b); err != nil {
 				return err
 			}
@@ -104,7 +111,18 @@ func openBolt(path string) (*boltStore, error) {
 		_ = db.Close()
 		return nil, fmt.Errorf("copyjob: preparing the job database %s: %w", path, err)
 	}
-	return &boltStore{db: db, fp: map[string]*copier.Record{}, owned: map[string]bool{}}, nil
+	b := &boltStore{db: db, fp: map[string]*copier.Record{}, owned: map[string]bool{}, issues: map[string]bool{}, issueChanges: map[string]bool{}}
+	err = db.View(func(tx *bbolt.Tx) error {
+		return tx.Bucket(issuesBucket).ForEach(func(k, _ []byte) error {
+			b.issues[string(k)] = true
+			return nil
+		})
+	})
+	if err != nil {
+		_ = db.Close()
+		return nil, err
+	}
+	return b, nil
 }
 
 // Get implements copier.FingerprintStore.
@@ -188,7 +206,7 @@ func (b *boltStore) SetOwned(key string, owned bool) error {
 func (b *boltStore) buffer(f func()) error {
 	b.mu.Lock()
 	f()
-	full := len(b.fp)+len(b.owned) >= maxPending
+	full := len(b.fp)+len(b.owned)+len(b.issueChanges) >= maxPending
 	b.mu.Unlock()
 	if full {
 		return b.Flush()
@@ -202,8 +220,9 @@ func (b *boltStore) Flush() error {
 	defer b.flushMu.Unlock()
 	b.mu.Lock()
 	fp, owned := maps.Clone(b.fp), maps.Clone(b.owned)
+	issues := maps.Clone(b.issueChanges)
 	b.mu.Unlock()
-	if len(fp)+len(owned) == 0 {
+	if len(fp)+len(owned)+len(issues) == 0 {
 		return nil
 	}
 	err := b.db.Update(func(tx *bbolt.Tx) error {
@@ -234,6 +253,17 @@ func (b *boltStore) Flush() error {
 				return err
 			}
 		}
+		for k, unresolved := range issues {
+			var err error
+			if unresolved {
+				err = tx.Bucket(issuesBucket).Put([]byte(k), []byte{1})
+			} else {
+				err = tx.Bucket(issuesBucket).Delete([]byte(k))
+			}
+			if err != nil {
+				return err
+			}
+		}
 		return nil
 	})
 	if err != nil {
@@ -249,6 +279,11 @@ func (b *boltStore) Flush() error {
 	for k, o := range owned {
 		if cur, ok := b.owned[k]; ok && cur == o {
 			delete(b.owned, k)
+		}
+	}
+	for k, unresolved := range issues {
+		if cur, ok := b.issueChanges[k]; ok && cur == unresolved {
+			delete(b.issueChanges, k)
 		}
 	}
 	b.mu.Unlock()
@@ -267,8 +302,60 @@ func (b *boltStore) Close() error {
 // memStore is a store in memory, for jobs without a state directory.
 type memStore struct {
 	*copier.MemStore
-	mu    sync.Mutex
-	owned map[string]bool
+	mu     sync.Mutex
+	owned  map[string]bool
+	issues map[string]bool
+}
+
+func issueKeys(issues map[string]bool) []string {
+	keys := make([]string, 0, len(issues))
+	for key := range issues {
+		keys = append(keys, key)
+	}
+	return keys
+}
+
+func setIssue(issues map[string]bool, key string, unresolved bool) int64 {
+	if issues[key] == unresolved {
+		return 0
+	}
+	if unresolved {
+		issues[key] = true
+		return 1
+	}
+	delete(issues, key)
+	return -1
+}
+
+func (b *boltStore) UnresolvedKeys() []string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return issueKeys(b.issues)
+}
+
+func (b *boltStore) SetUnresolved(key string, unresolved bool) int64 {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	delta := setIssue(b.issues, key, unresolved)
+	if delta != 0 {
+		b.issueChanges[key] = unresolved
+	}
+	return delta
+}
+
+func (m *memStore) UnresolvedKeys() []string {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return issueKeys(m.issues)
+}
+
+func (m *memStore) SetUnresolved(key string, unresolved bool) int64 {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.issues == nil {
+		m.issues = map[string]bool{}
+	}
+	return setIssue(m.issues, key, unresolved)
 }
 
 // Owned implements store.

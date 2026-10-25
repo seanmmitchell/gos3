@@ -1,6 +1,7 @@
 package copyjob
 
 import (
+	"maps"
 	"slices"
 	"strings"
 	"sync"
@@ -23,7 +24,9 @@ type watch struct {
 
 	mu sync.Mutex
 	// dirty maps changed source keys to when they first changed.
-	dirty map[string]time.Time
+	dirty         map[string]time.Time
+	inFlight      map[string]time.Time
+	fullRequested bool
 	// overflow: more than maxDirty keys changed; a full pass is due.
 	overflow bool
 	// configDirty: the source's configuration (or versioning) changed.
@@ -259,12 +262,41 @@ func (w *watch) pending() (int, time.Time) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	var oldest time.Time
+	n := len(w.dirty)
 	for _, at := range w.dirty {
 		if oldest.IsZero() || at.Before(oldest) {
 			oldest = at
 		}
 	}
-	return len(w.dirty), oldest
+	for key, at := range w.inFlight {
+		if _, ok := w.dirty[key]; !ok {
+			n++
+		}
+		if oldest.IsZero() || at.Before(oldest) {
+			oldest = at
+		}
+	}
+	return n, oldest
+}
+
+func (w *watch) setInFlight(keys map[string]time.Time) {
+	w.mu.Lock()
+	w.inFlight = maps.Clone(keys)
+	w.mu.Unlock()
+}
+
+func (w *watch) finishKey(key string) {
+	w.mu.Lock()
+	delete(w.inFlight, key)
+	w.mu.Unlock()
+}
+
+func (w *watch) takeFullRequest() bool {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	requested := w.fullRequested
+	w.fullRequested = false
+	return requested
 }
 
 func (w *watch) setLive(live bool) {

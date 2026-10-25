@@ -13,8 +13,9 @@
 //     Router.CreateBucket, so the backing's placement and default replicas
 //     apply), its versioning is set to follow the source's when every
 //     version is copied, the bucket configuration is copied (Options
-//     "configs"; see syncConfigs) and the source is measured for the ETA;
-//   - copying: the keys are copied (copier.ZipWalk over both buckets,
+//     "configs"; see syncConfigs);
+//   - copying: the source is measured for pass progress and the keys are
+//     copied (copier.ZipWalk over both buckets,
 //     "concurrency" keys at once), resuming after the low-watermark key of
 //     the checkpoint;
 //   - verifying: a second pass ("finalPass") copies what changed during the
@@ -31,7 +32,7 @@
 // A mirror copies everything once, then watches: changes made through the
 // router to the source (Router.Subscribe) mark keys dirty and kick the job
 // (debounced); a run copies the dirty keys, or makes a full pass when more
-// than 100,000 keys are dirty, when verifyInterval has passed, after every
+// than 100,000 keys are dirty, when verifyInterval has passed, on Run now, after every
 // restart of the server and, for native sources (which other tools may
 // change), every pollInterval. Deletes propagate unless propagateDeletes is
 // false; target keys the source does not have are deleted only when the job
