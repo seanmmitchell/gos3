@@ -275,7 +275,8 @@ func TestLookupPair(t *testing.T) {
 // fixture, so these tests measure the walk's buffers rather than a backend.
 type historyListing struct {
 	storage.Backend
-	keys []string
+	keys     []string
+	versions map[string]int // optional per-key counts
 }
 
 func (b *historyListing) WalkVersions(ctx context.Context, bucket, prefix, after, versionID string, fn func(storage.ObjectInfo) error) error {
@@ -286,6 +287,9 @@ func (b *historyListing) WalkVersions(ctx context.Context, bucket, prefix, after
 		n := MaxKeyVersions + 2
 		if strings.HasSuffix(key, "healthy") {
 			n = 1
+		}
+		if count, ok := b.versions[key]; ok {
+			n = count
 		}
 		for i := range n {
 			if err := ctx.Err(); err != nil {
@@ -391,4 +395,75 @@ func TestZipWalkBatchesOversizedHistories(t *testing.T) {
 			}
 		})
 	}
+}
+
+// Flagging one side must preserve a healthy history on the other. Mixing
+// both types across batch boundaries must also preserve every resume point
+// and stop immediately when a callback fails.
+func TestZipWalkMixedHistoriesAndResume(t *testing.T) {
+	old := batchVersions
+	batchVersions = 3
+	t.Cleanup(func() { batchVersions = old })
+	scounts := []int{MaxKeyVersions + 1, 1, 0, MaxKeyVersions, MaxKeyVersions + 2, 0, 2, 1}
+	dcounts := []int{1, MaxKeyVersions + 1, 2, 0, MaxKeyVersions + 1, MaxKeyVersions, 0, 1}
+	endpoint := func(bucket, prefix string, counts []int) Endpoint {
+		b := &historyListing{versions: make(map[string]int)}
+		for i, n := range counts {
+			if n == 0 {
+				continue
+			}
+			key := fmt.Sprintf("%s%c", prefix, 'a'+i)
+			b.keys = append(b.keys, key)
+			b.versions[key] = n
+		}
+		return Endpoint{Backend: b, Bucket: bucket, Prefix: prefix}
+	}
+	src, dst := endpoint("s", "in/", scounts), endpoint("d", "out/", dcounts)
+	check := func(ps []KeyPair, start int) {
+		t.Helper()
+		if len(ps) != len(scounts)-start {
+			t.Fatalf("after index %d: got %d pairs, want %d", start, len(ps), len(scounts)-start)
+		}
+		for j, p := range ps {
+			i := start + j
+			if p.SrcKey != fmt.Sprintf("in/%c", 'a'+i) || p.DstKey != fmt.Sprintf("out/%c", 'a'+i) {
+				t.Fatalf("pair %d: keys %q, %q", i, p.SrcKey, p.DstKey)
+			}
+			ns, nd := scounts[i], dcounts[i]
+			flagged := ns > MaxKeyVersions || nd > MaxKeyVersions
+			if ns > MaxKeyVersions {
+				ns = 0
+			}
+			if nd > MaxKeyVersions {
+				nd = 0
+			}
+			if len(p.Src) != ns || len(p.Dst) != nd || errors.Is(p.Err, ErrTooManyVersions) != flagged || !flagged && p.Err != nil {
+				t.Fatalf("pair %d: source=%d target=%d error=%v, want source=%d target=%d flagged=%t", i, len(p.Src), len(p.Dst), p.Err, ns, nd, flagged)
+			}
+		}
+	}
+	all, batches := collect(t, src, dst, "", true)
+	check(all, 0)
+	for _, ps := range batches {
+		if len(ps) > batchVersions {
+			t.Fatalf("callback got %d pairs, limit %d", len(ps), batchVersions)
+		}
+	}
+	for i, p := range all {
+		resumed, _ := collect(t, src, dst, p.SrcKey, true)
+		check(resumed, i+1)
+	}
+	stop := errors.New("stop after first batch")
+	calls := 0
+	var first []KeyPair
+	err := ZipWalk(t.Context(), src, dst, "", true, func(ps []KeyPair) error {
+		calls++
+		first = ps
+		return stop
+	})
+	if !errors.Is(err, stop) || calls != 1 || len(first) == 0 {
+		t.Fatalf("callback error: %v, %d calls, %d pairs", err, calls, len(first))
+	}
+	resumed, _ := collect(t, src, dst, first[len(first)-1].SrcKey, true)
+	check(append(first, resumed...), 0)
 }
