@@ -118,6 +118,13 @@ func validateSettings(s *Settings) *FieldError {
 		err.Field = "compression." + err.Field
 		return err
 	}
+	seenTypes := make(map[string]bool)
+	for i, typ := range s.Updates.NotifyFor {
+		if (typ != "patch" && typ != "minor" && typ != "major") || seenTypes[typ] {
+			return fieldErr(fmt.Sprintf("updates.notifyFor[%d]", i), "expected unique patch, minor or major notification types")
+		}
+		seenTypes[typ] = true
+	}
 	return nil
 }
 

@@ -8,7 +8,7 @@
 // are null in the form and left out of the saved document.
 //
 // File name starts with "-" so Nuxt does not register it as a component.
-import type { CompressionMode, Settings } from '~/types/admin'
+import type { CompressionMode, Settings, UpdatesSettings } from '~/types/admin'
 import { nsToSeconds, secondsToNs } from '~/utils/format'
 
 export const LOG_LEVELS = ['debug', 'info', 'warn', 'error'] as const
@@ -16,6 +16,7 @@ export const LOG_FORMATS = ['text', 'json'] as const
 export const COMPRESSION_MODES = ['optional', 'enforced', 'disabled'] as const satisfies readonly CompressionMode[]
 
 export interface SettingsForm {
+  updates: UpdatesSettings | null
   name: string
   region: string
   publicUrl: string
@@ -99,6 +100,7 @@ function nsToFormSeconds(ns: number | null | undefined): number {
 export function emptySettingsForm(): SettingsForm {
   return {
     name: '',
+    updates: null,
     region: '',
     publicUrl: '',
     domains: [],
@@ -129,6 +131,7 @@ export function emptySettingsForm(): SettingsForm {
 export function settingsToForm(s: Settings): SettingsForm {
   return {
     name: s.name ?? '',
+    updates: s.updates ? { enabled: s.updates.enabled, notifyFor: [...s.updates.notifyFor] } : null,
     region: s.region ?? '',
     publicUrl: s.publicUrl ?? '',
     domains: [...(s.domains ?? [])],
@@ -185,6 +188,7 @@ export function settingsToForm(s: Settings): SettingsForm {
 export function formToSettings(f: SettingsForm, base?: Settings): Settings {
   return {
     ...(base ?? {}),
+    ...(f.updates ? { updates: { enabled: f.updates.enabled, notifyFor: [...f.updates.notifyFor] } } : {}),
     name: f.name.trim(),
     region: f.region.trim(),
     publicUrl: f.publicUrl.trim().replace(/\/+$/, ''),
@@ -436,7 +440,7 @@ export function validateSettingsForm(f: SettingsForm): SettingsErrors {
 }
 
 /** A section of the server settings page (one chip each). */
-export type SettingsSection = 'general' | 'cors' | 'discovery' | 'logging' | 'lifecycle' | 'compression'
+export type SettingsSection = 'general' | 'cors' | 'discovery' | 'logging' | 'lifecycle' | 'compression' | 'updates'
 
 export interface SettingsSectionDef {
   value: SettingsSection
@@ -451,12 +455,13 @@ export const SETTINGS_SECTIONS: readonly SettingsSectionDef[] = [
   { value: 'discovery', label: 'Discovery', icon: 'i-lucide-radar' },
   { value: 'logging', label: 'Logging', icon: 'i-lucide-scroll-text' },
   { value: 'lifecycle', label: 'Lifecycle worker', icon: 'i-lucide-timer' },
-  { value: 'compression', label: 'Compression', icon: 'i-lucide-file-archive' }
+  { value: 'compression', label: 'Compression', icon: 'i-lucide-file-archive' },
+  { value: 'updates', label: 'Updates', icon: 'i-lucide-bell' }
 ]
 
 /** The sections a form has: compression only when the server reported it. */
 export function settingsSections(f: SettingsForm | null | undefined): readonly SettingsSectionDef[] {
-  return SETTINGS_SECTIONS.filter(s => s.value !== 'compression' || !!f?.compression)
+  return SETTINGS_SECTIONS.filter(s => (s.value !== 'compression' || !!f?.compression) && (s.value !== 'updates' || !!f?.updates))
 }
 
 /** Normalises a `?tab=` query value to one of `sections` (default general). */
@@ -468,7 +473,7 @@ export function resolveSettingsSection(v: unknown, sections: readonly SettingsSe
 /** Which form section a field path belongs to (for error badges on section chips). */
 export function sectionOf(path: string): SettingsSection {
   const head = path.split('.')[0]
-  if (head === 'cors' || head === 'discovery' || head === 'logging' || head === 'lifecycle' || head === 'compression') return head
+  if (head === 'cors' || head === 'discovery' || head === 'logging' || head === 'lifecycle' || head === 'compression' || head === 'updates') return head
   return 'general'
 }
 

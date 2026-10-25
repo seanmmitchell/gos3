@@ -169,7 +169,8 @@ func Default() Config {
 			MinSize:          DefaultCompressionMinSize,
 			SkipContentTypes: slices.Clone(DefaultSkipContentTypes),
 		},
-		Jobs: JobsConfig{Workers: DefaultJobsWorkers},
+		Updates: UpdatesConfig{NotifyFor: []string{"patch", "minor", "major"}},
+		Jobs:    JobsConfig{Workers: DefaultJobsWorkers},
 		Restic: ResticConfig{RestoreSpoolBytes: DefaultRestoreSpoolBytes, MaxRestores: DefaultMaxRestores, Snapshots: ResticSnapshotsConfig{
 			Workers:     DefaultSnapshotWorkers,
 			SpoolBytes:  DefaultSnapshotSpoolBytes,
@@ -274,6 +275,7 @@ var yamlSections = map[string]string{
 	"config.ReplicationConfig":     "storage.replication",
 	"config.AuthConfig":            "auth",
 	"config.UIConfig":              "ui",
+	"config.UpdatesConfig":         "updates",
 	"config.CORSConfig":            "cors",
 	"discovery.Config":             "discovery",
 	"config.LoggingConfig":         "logging",
@@ -669,6 +671,7 @@ func SettingsFrom(c Config) Settings {
 		Lifecycle:     LifecycleSettings{Enabled: c.Lifecycle.Enabled, IntervalSeconds: int64(interval / time.Second)},
 		MetricsPublic: c.Metrics.Public,
 		Compression:   comp,
+		Updates:       c.Updates,
 	}
 	return normalizeSettings(cloneSettings(s))
 }
@@ -683,6 +686,7 @@ func normalizeSettings(s Settings) Settings {
 		return v
 	}
 	s.Domains = nn(s.Domains)
+	s.Updates.NotifyFor = nn(s.Updates.NotifyFor)
 	s.CORS.AllowedOrigins = nn(s.CORS.AllowedOrigins)
 	s.CORS.AllowedHeaders = nn(s.CORS.AllowedHeaders)
 	s.CORS.ExposeHeaders = nn(s.CORS.ExposeHeaders)

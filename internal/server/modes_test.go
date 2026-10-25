@@ -29,6 +29,9 @@ func TestDeploymentModes(t *testing.T) {
 				}
 			}
 			wantUI := mode.admin && mode.ui
+			if (srv.updates != nil) != wantUI {
+				t.Fatal("release checker must exist only when UI is enabled")
+			}
 			r := do(t, "GET", srv.url+"/_gos3/ui/", nil, nil, nil)
 			if (r.status == 200) != wantUI {
 				t.Fatalf("UI: %d", r.status)
