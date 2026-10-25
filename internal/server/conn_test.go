@@ -107,25 +107,41 @@ func TestHTTP2StalledStreamReleased(t *testing.T) {
 	}
 	s.writeIdle = 300 * time.Millisecond
 	srv := serve(t, s)
-	assertHTTP2StalledStreamReleased(t, strings.TrimPrefix(srv.url, "https://"), http2MaxStreams)
+	assertHTTP2StalledStreamReleased(t, strings.TrimPrefix(srv.url, "https://"), http2MaxStreams, 0)
 }
 
 // A body too large for net/http's response buffer must time out inside
 // Write too, not only during the final flush after the handler returns.
 func TestHTTP2StalledBodyWriteReleased(t *testing.T) {
-	s := &Server{writeIdle: 300 * time.Millisecond}
-	ts := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w, finish := s.guardWrites(w)
-		defer finish()
-		_, _ = w.Write(make([]byte, 2*maxGuardedWrite))
-	}))
-	ts.EnableHTTP2 = true
-	ts.StartTLS()
-	defer ts.Close()
-	assertHTTP2StalledStreamReleased(t, strings.TrimPrefix(ts.URL, "https://"), 0)
+	for _, afterSuccess := range []bool{false, true} {
+		t.Run(fmt.Sprintf("afterSuccess=%t", afterSuccess), func(t *testing.T) {
+			s := &Server{writeIdle: 300 * time.Millisecond}
+			ts := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w, finish := s.guardWrites(w)
+				defer finish()
+				if afterSuccess {
+					if _, err := w.Write([]byte("a")); err != nil {
+						return
+					}
+					if err := http.NewResponseController(w).Flush(); err != nil {
+						return
+					}
+				}
+				_, _ = w.Write(make([]byte, 2*maxGuardedWrite))
+			}))
+			ts.EnableHTTP2 = true
+			ts.StartTLS()
+			defer ts.Close()
+			var window uint32
+			if afterSuccess {
+				window = 1 // the first successful flush exhausts the client's window
+			}
+			assertHTTP2StalledStreamReleased(t, strings.TrimPrefix(ts.URL, "https://"), 0, window)
+		})
+	}
 }
 
-func assertHTTP2StalledStreamReleased(t *testing.T, addr string, wantMaxStreams uint32) {
+func assertHTTP2StalledStreamReleased(t *testing.T, addr string, wantMaxStreams, initialWindow uint32) {
 	t.Helper()
 	conn, err := tls.Dial("tcp", addr, &tls.Config{InsecureSkipVerify: true, NextProtos: []string{"h2"}})
 	if err != nil {
@@ -137,7 +153,7 @@ func assertHTTP2StalledStreamReleased(t *testing.T, addr string, wantMaxStreams 
 		t.Fatal(err)
 	}
 	fr := http2.NewFramer(conn, conn)
-	if err := fr.WriteSettings(http2.Setting{ID: http2.SettingInitialWindowSize, Val: 0}); err != nil {
+	if err := fr.WriteSettings(http2.Setting{ID: http2.SettingInitialWindowSize, Val: initialWindow}); err != nil {
 		t.Fatal(err)
 	}
 	var hb bytes.Buffer
@@ -150,6 +166,7 @@ func assertHTTP2StalledStreamReleased(t *testing.T, addr string, wantMaxStreams 
 	}
 	start := time.Now()
 	maxStreams := uint32(0)
+	dataBytes := uint32(0)
 	for {
 		f, err := fr.ReadFrame()
 		if err != nil {
@@ -164,12 +181,16 @@ func assertHTTP2StalledStreamReleased(t *testing.T, addr string, wantMaxStreams 
 				_ = fr.WriteSettingsAck()
 			}
 		case *http2.DataFrame:
-			if len(f.Data()) > 0 {
-				t.Fatalf("DATA sent although the window is 0")
+			dataBytes += uint32(len(f.Data()))
+			if dataBytes > initialWindow {
+				t.Fatalf("received %d DATA bytes with a %d-byte window", dataBytes, initialWindow)
 			}
 		case *http2.RSTStreamFrame:
 			if f.StreamID != 1 {
 				continue
+			}
+			if dataBytes != initialWindow {
+				t.Errorf("received %d DATA bytes, want %d before the stall", dataBytes, initialWindow)
 			}
 			if d := time.Since(start); d > 10*time.Second {
 				t.Errorf("stream reset after %v", d)
