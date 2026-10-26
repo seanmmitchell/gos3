@@ -517,6 +517,35 @@ func TestHomeReloadClearsCompletedNativeDeletion(t *testing.T) {
 	noErr(t, "reuse bucket name", b.CreateBucket(ctx, "gone", storage.CreateBucketOptions{Target: nativeTarget("", false)}))
 }
 
+func TestCompletedNativeDeletionReleasableWithoutRestart(t *testing.T) {
+	r := s3clienttest.Start(t)
+	ctx := context.Background()
+	var fd *failingDeletes
+	h := testHooks()
+	h.wrapRecords = func(s s3store.AuxStore) s3store.AuxStore {
+		fd = &failingDeletes{AuxStore: s}
+		return fd
+	}
+	b := openReadyWith(t, localOptions(t, r, NewClaims(), t.TempDir()), h)
+	noErr(t, "create", b.CreateBucket(ctx, "gone", storage.CreateBucketOptions{}))
+	path := filepath.Join(t.TempDir(), "placements.json")
+	router, err := multi.Open(ctx, multi.Options{Backings: []multi.Backing{{Name: "remote", Backend: b}}, StatePath: path})
+	noErr(t, "open router", err)
+	key := bucketKey("gone")
+	fd.fail.Store(&key)
+	wantErr(t, "delete record", router.DeleteBucket(ctx, "gone"), storage.ErrBackingUnavailable)
+	b.mu.RLock()
+	e := b.reg.buckets["gone"]
+	completed := e != nil && e.Deleting && e.Detached
+	b.mu.RUnlock()
+	if !completed {
+		t.Fatal("failed record deletion did not leave a completed tombstone")
+	}
+	noErr(t, "release completed deletion", router.ReleaseBucket(ctx, "gone"))
+	noErr(t, "reuse bucket name", router.CreateBucket(ctx, "gone", storage.CreateBucketOptions{}))
+	noErr(t, "close router", router.Close())
+}
+
 // TestReloadAfterHomeSession: when the home was reloaded (a new session),
 // the records are read again and changes made meanwhile (by another
 // server) are applied.
