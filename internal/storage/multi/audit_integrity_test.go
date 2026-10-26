@@ -3,6 +3,7 @@ package multi
 import (
 	"context"
 	"errors"
+	"os"
 	"path/filepath"
 	"sync/atomic"
 	"testing"
@@ -21,6 +22,27 @@ type pauseConfigRead struct {
 type retainedDeletionBacking struct {
 	storage.Backend
 	down, retained atomic.Bool
+}
+
+type afterDeleteBacking struct {
+	storage.Backend
+	afterDelete func()
+}
+
+func (b *afterDeleteBacking) BucketCaps(ctx context.Context, name string) (storage.BucketCaps, error) {
+	return storage.CapsOf(ctx, b.Backend, name)
+}
+
+func (b *afterDeleteBacking) NewBucketCaps(ctx context.Context, opts storage.CreateBucketOptions) (storage.BucketCaps, error) {
+	return storage.NewCapsOf(ctx, b.Backend, opts)
+}
+
+func (b *afterDeleteBacking) DeleteBucket(ctx context.Context, name string) error {
+	if err := b.Backend.DeleteBucket(ctx, name); err != nil {
+		return err
+	}
+	b.afterDelete()
+	return nil
 }
 
 func (b *retainedDeletionBacking) ListBuckets(ctx context.Context) ([]storage.BucketInfo, error) {
@@ -331,6 +353,50 @@ func TestDeleteRequiresDurableIntent(t *testing.T) {
 	}
 	if _, err := bk[0].Backend.GetBucket(ctx, "vault"); err != nil {
 		t.Fatalf("primary was deleted before intent persisted: %v", err)
+	}
+}
+
+func TestDeleteContinuesAfterFinalStateSaveFails(t *testing.T) {
+	bk := []Backing{
+		fsBacking(t, "a", filepath.Join(t.TempDir(), "a")),
+		fsBacking(t, "b", filepath.Join(t.TempDir(), "b")),
+	}
+	root := t.TempDir()
+	stateDir := filepath.Join(root, "state")
+	if err := os.Mkdir(stateDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	statePath := filepath.Join(stateDir, "placements.json")
+	savedDir := filepath.Join(root, "saved")
+	bk[0].Backend = &afterDeleteBacking{Backend: bk[0].Backend, afterDelete: func() {
+		// The first save has succeeded; only the post-delete save fails.
+		if err := os.Rename(stateDir, savedDir); err != nil {
+			panic(err)
+		}
+		if err := os.WriteFile(stateDir, nil, 0o600); err != nil {
+			panic(err)
+		}
+	}}
+	r := openRouter(t, Options{Backings: bk, StatePath: statePath, NewBucketMode: ModeActivePassive, NewBucketReplicas: []string{"b"}})
+	ctx := context.Background()
+	if err := r.CreateBucket(ctx, "vault", storage.CreateBucketOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	waitState(t, r, "vault", StateInSync)
+	var changes changeLog
+	unsubscribe := r.Subscribe(changes.add)
+	defer unsubscribe()
+	if err := r.DeleteBucket(ctx, "vault"); err != nil {
+		t.Fatalf("completed delete failed because of the final state save: %v", err)
+	}
+	changes.expect(t, "completed delete", Change{Kind: ChangeBucketDeleted, Bucket: "vault"})
+	waitFor(t, "replica purge after the final save failed", func() bool {
+		_, err := bk[1].Backend.GetBucket(ctx, "vault")
+		return errors.Is(err, storage.ErrBucketNotFound)
+	})
+	st, err := loadState(filepath.Join(savedDir, "placements.json"))
+	if err != nil || !st.Deleting["vault"] {
+		t.Fatalf("durable deletion intent = %+v, %v", st, err)
 	}
 }
 

@@ -689,8 +689,11 @@ func (r *Router) deleteBucket(ctx context.Context, name string) error {
 	for _, ms := range cancel {
 		r.cancelMember(ms)
 	}
+	// The deletion intent was saved before touching the primary. Once the
+	// primary is gone, a failed final save cannot undo the deletion: keep
+	// cleaning up the replicas and let reconciliation finish after restart.
 	if err := r.save(); err != nil {
-		return fmt.Errorf("persisting bucket deletion: %w", err)
+		r.log.Error("could not save the completed bucket deletion", "bucket", name, "path", r.opts.StatePath, "err", err)
 	}
 	r.mu.RLock()
 	for bname := range bs.members {
