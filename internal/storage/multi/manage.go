@@ -498,7 +498,22 @@ func (r *Router) releaseBucket(ctx context.Context, name string) error {
 	defer r.adminMu.Unlock()
 	bs, err := r.lookup(name)
 	if err != nil {
-		return err
+		// A failed native deletion keeps the ordinary lookup unavailable,
+		// but explicit release must still reach its retained binding.
+		r.mu.RLock()
+		candidate := r.buckets[name]
+		deleting := r.deleting[name]
+		var primary *backing
+		if candidate != nil && deleting {
+			if ms := candidate.members[candidate.rec.primary()]; ms != nil {
+				primary = ms.backing
+			}
+		}
+		r.mu.RUnlock()
+		if !deleting || !retainsBucketForRecovery(primary, name) {
+			return err
+		}
+		bs = candidate
 	}
 	r.mu.RLock()
 	rec := bs.rec
@@ -521,6 +536,7 @@ func (r *Router) releaseBucket(ctx context.Context, name string) error {
 	r.mu.Lock()
 	bs.removed = true
 	delete(r.buckets, name)
+	delete(r.deleting, name)
 	for _, ms := range bs.members {
 		cancel = append(cancel, ms)
 	}

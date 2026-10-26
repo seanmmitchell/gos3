@@ -454,6 +454,16 @@ func (r *Router) listAll(ctx context.Context) (lists map[string][]storage.Bucket
 	return lists, unknown, nil
 }
 
+// retainsBucketForRecovery reports a hidden bucket record that an operator
+// can explicitly release without touching the remote bucket.
+func retainsBucketForRecovery(b *backing, name string) bool {
+	if b == nil {
+		return false
+	}
+	recovery, ok := b.Backend.(interface{ RetainsBucketForRecovery(string) bool })
+	return ok && recovery.RetainsBucketForRecovery(name)
+}
+
 // reconcile turns the loaded state into the runtime state, checking it
 // against the buckets the backings hold. It returns the backings whose
 // buckets could not be listed ("unknown"): they are assumed to still hold
@@ -489,12 +499,7 @@ func (r *Router) reconcile(ctx context.Context, st *stateFile) ([]*backing, erro
 		// A backing may hide an interrupted native deletion from listings
 		// while retaining its record for an explicit release. Keep that
 		// placement so the release route can still reach the backing.
-		if b := r.topology.Load().backings[backing]; b != nil {
-			if recovery, ok := b.Backend.(interface{ RetainsBucketForRecovery(string) bool }); ok {
-				return recovery.RetainsBucketForRecovery(bucket)
-			}
-		}
-		return false
+		return retainsBucketForRecovery(r.topology.Load().backings[backing], bucket)
 	}
 
 	for _, p := range st.Purges {
@@ -734,7 +739,7 @@ func (r *Router) adoptListed(b *backing, infos []storage.BucketInfo) bool {
 		}
 		delete(r.deleting, name)
 		changed = true
-		if present[name] {
+		if present[name] || retainsBucketForRecovery(b, name) {
 			for backing, ms := range bs.members {
 				if backing != b.Name {
 					resume = append(resume, ms)

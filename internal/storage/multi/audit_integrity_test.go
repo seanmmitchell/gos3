@@ -18,6 +18,30 @@ type pauseConfigRead struct {
 	started, release chan struct{}
 }
 
+type retainedDeletionBacking struct {
+	storage.Backend
+	down, retained atomic.Bool
+}
+
+func (b *retainedDeletionBacking) ListBuckets(ctx context.Context) ([]storage.BucketInfo, error) {
+	if b.down.Load() {
+		return nil, errFault
+	}
+	return nil, nil // the interrupted deletion is hidden from listings
+}
+
+func (b *retainedDeletionBacking) RetainsBucketForRecovery(name string) bool {
+	return name == "vault" && b.retained.Load()
+}
+
+func (b *retainedDeletionBacking) ReleaseBucket(_ context.Context, name string) error {
+	if !b.RetainsBucketForRecovery(name) {
+		return storage.ErrBucketNotFound
+	}
+	b.retained.Store(false)
+	return nil
+}
+
 func (b *pauseConfigRead) GetBucketConfig(ctx context.Context, bucket, key string) ([]byte, error) {
 	data, err := b.Backend.GetBucketConfig(ctx, bucket, key)
 	if key == storage.ConfigPolicy && b.armed.CompareAndSwap(true, false) {
@@ -227,6 +251,36 @@ func TestInterruptedDeleteWaitsForUnknownPrimary(t *testing.T) {
 		_, err := bk[1].Backend.GetBucket(ctx, "vault")
 		return errors.Is(err, storage.ErrBucketNotFound)
 	})
+}
+
+func TestRecoveredBackingKeepsHiddenBucketReleasable(t *testing.T) {
+	bk := memBackings(1)
+	b := &retainedDeletionBacking{Backend: bk[0].Backend}
+	b.down.Store(true)
+	b.retained.Store(true)
+	bk[0].Backend = b
+	path := filepath.Join(t.TempDir(), "placements.json")
+	if err := writeState(path, &stateFile{
+		Version: stateVersion,
+		Buckets: map[string]*placementRecord{"vault": {
+			Mode: ModeSingle, Members: []memberRecord{{Backing: "a", Synced: true}},
+		}},
+		Deleting: map[string]bool{"vault": true},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	r := openRouter(t, Options{Backings: bk, StatePath: path})
+	if _, err := r.lookup("vault"); !errors.Is(err, storage.ErrBucketUnavailable) {
+		t.Fatalf("unresolved deletion was served: %v", err)
+	}
+	b.down.Store(false)
+	r.adoptPending(r.topology.Load().backings["a"])
+	if err := r.ReleaseBucket(context.Background(), "vault"); err != nil {
+		t.Fatalf("hidden bucket could not be released after recovery: %v", err)
+	}
+	if b.retained.Load() {
+		t.Fatal("backing retained the released bucket")
+	}
 }
 
 func TestInterruptedDeleteDropsUnconfiguredReplicaBeforeRecovery(t *testing.T) {

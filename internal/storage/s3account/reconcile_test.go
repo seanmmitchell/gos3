@@ -428,7 +428,7 @@ func TestFailedNativeDetachPreservesRecoverableRecord(t *testing.T) {
 	noErr(t, "adopt released bucket", b.CreateBucket(ctx, "recover", storage.CreateBucketOptions{Target: nativeTarget("", true)}))
 }
 
-func TestInterruptedNativeDeletionReleasableAfterRouterRestart(t *testing.T) {
+func TestInterruptedNativeDeletionReleasableImmediatelyAndAfterRouterRestart(t *testing.T) {
 	remote := s3clienttest.Start(t)
 	ctx := context.Background()
 	o := localOptions(t, remote, NewClaims(), t.TempDir())
@@ -440,6 +440,7 @@ func TestInterruptedNativeDeletionReleasableAfterRouterRestart(t *testing.T) {
 		return native.Open(opts)
 	}
 	b := openReadyWith(t, o, h)
+	noErr(t, "create immediate", b.CreateBucket(ctx, "immediate", storage.CreateBucketOptions{}))
 	noErr(t, "create", b.CreateBucket(ctx, "recover", storage.CreateBucketOptions{}))
 	path := filepath.Join(t.TempDir(), "placements.json")
 	openRouter := func(backing *Backend) *multi.Router {
@@ -449,6 +450,13 @@ func TestInterruptedNativeDeletionReleasableAfterRouterRestart(t *testing.T) {
 		return router
 	}
 	router := openRouter(b)
+	state.fail.Store(true)
+	wantErr(t, "delete immediate with failed local cleanup", router.DeleteBucket(ctx, "immediate"), errCrash)
+	state.fail.Store(false)
+	noErr(t, "release before restart", router.ReleaseBucket(ctx, "immediate"))
+	if !remoteHasBucket(t, remote, "immediate") {
+		t.Fatal("immediate release deleted the remote bucket")
+	}
 	state.fail.Store(true)
 	wantErr(t, "delete with failed local cleanup", router.DeleteBucket(ctx, "recover"), errCrash)
 	state.fail.Store(false)
