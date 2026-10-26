@@ -380,7 +380,15 @@ func TestNativeCrashPoints(t *testing.T) {
 
 type failingNativeState struct {
 	native.StateStore
-	fail atomic.Bool
+	fail     atomic.Bool
+	failRead atomic.Bool
+}
+
+func (s *failingNativeState) Records(ctx context.Context) (map[string][]byte, error) {
+	if s.failRead.Load() {
+		return nil, errCrash
+	}
+	return s.StateStore.Records(ctx)
 }
 
 func (s *failingNativeState) DeleteRecords(ctx context.Context, prefix string) error {
@@ -479,6 +487,101 @@ func TestInterruptedNativeDeletionReleasableImmediatelyAndAfterRouterRestart(t *
 	}
 	noErr(t, "adopt through router", router.CreateBucket(ctx, "recover", storage.CreateBucketOptions{Target: nativeTarget("", true)}))
 	noErr(t, "close recovered router", router.Close())
+}
+
+func TestInterruptedNativeReleaseClearsDurableUploads(t *testing.T) {
+	remote := s3clienttest.Start(t)
+	proxy, requests := countingProxy(t, remote)
+	ctx := context.Background()
+	o := localOptions(t, remote, NewClaims(), t.TempDir())
+	o.Conn = proxyConn(t, proxy)
+	var state *failingNativeState
+	h := testHooks()
+	h.openNative = func(opts native.Options) (NativeStore, error) {
+		state = &failingNativeState{StateStore: opts.State}
+		opts.State = state
+		return native.Open(opts)
+	}
+	b := openReadyWith(t, o, h)
+	for _, name := range []string{"old", "neighbor"} {
+		noErr(t, "create "+name, b.CreateBucket(ctx, name, storage.CreateBucketOptions{}))
+	}
+	old, err := b.CreateMultipartUpload(ctx, "old", "key", storage.ObjectMeta{}, "")
+	noErr(t, "create old upload", err)
+	w, err := b.NewPartWriter(ctx, "old", "key", old.UploadID, 1)
+	noErr(t, "old part writer", err)
+	_, err = w.Write([]byte("old part"))
+	noErr(t, "write old part", err)
+	_, err = w.Commit(ctx, storage.PartMeta{})
+	noErr(t, "commit old part", err)
+	neighbor, err := b.CreateMultipartUpload(ctx, "neighbor", "keep", storage.ObjectMeta{}, "")
+	noErr(t, "create neighbor upload", err)
+	state.fail.Store(true)
+	wantErr(t, "delete with failed native cleanup", b.DeleteBucket(ctx, "old"), errCrash)
+	state.fail.Store(false)
+	state.failRead.Store(true)
+	wantErr(t, "release with failed state read", b.ReleaseBucket(ctx, "old"), errCrash)
+	state.failRead.Store(false)
+	state.fail.Store(true)
+	wantErr(t, "release with failed upload deletion", b.ReleaseBucket(ctx, "old"), errCrash)
+	state.fail.Store(false)
+	_, err = b.GetBucket(ctx, "old")
+	wantErr(t, "failed release kept tombstone", err, storage.ErrBucketUnavailable)
+	before := requests.Load()
+	noErr(t, "release after state recovery", b.ReleaseBucket(ctx, "old"))
+	if got := requests.Load() - before; got != 0 {
+		t.Fatalf("recovery release sent %d remote requests", got)
+	}
+	noErr(t, "rebind old name", b.CreateBucket(ctx, "old", storage.CreateBucketOptions{Target: nativeTarget("", true)}))
+	uploads, err := b.ListMultipartUploads(ctx, "old")
+	noErr(t, "list rebound uploads", err)
+	if len(uploads) != 0 {
+		t.Fatalf("old uploads returned after rebinding: %+v", uploads)
+	}
+	_, err = b.CompleteMultipartUpload(ctx, "old", "key", old.UploadID, []int{1}, storage.ObjectMeta{}, storage.CommitOptions{})
+	wantErr(t, "complete old upload", err, storage.ErrUploadNotFound)
+	uploads, err = b.ListMultipartUploads(ctx, "neighbor")
+	noErr(t, "list neighbor uploads", err)
+	if len(uploads) != 1 || uploads[0].UploadID != neighbor.UploadID {
+		t.Fatalf("neighbor uploads changed: %+v", uploads)
+	}
+	noErr(t, "close", b.Close())
+	b = openReadyWith(t, o, h)
+	uploads, err = b.ListMultipartUploads(ctx, "old")
+	noErr(t, "list uploads after restart", err)
+	if len(uploads) != 0 {
+		t.Fatalf("old uploads returned after restart: %+v", uploads)
+	}
+	noErr(t, "release rebound name", b.ReleaseBucket(ctx, "old"))
+	noErr(t, "adopt under different name", b.CreateBucket(ctx, "renamed", storage.CreateBucketOptions{Target: nativeTarget("old", true)}))
+	uploads, err = b.ListMultipartUploads(ctx, "renamed")
+	noErr(t, "list renamed uploads", err)
+	if len(uploads) != 0 {
+		t.Fatalf("old uploads returned under a different name: %+v", uploads)
+	}
+	noErr(t, "create restart bucket", b.CreateBucket(ctx, "restart", storage.CreateBucketOptions{}))
+	restarted, err := b.CreateMultipartUpload(ctx, "restart", "key", storage.ObjectMeta{}, "")
+	noErr(t, "create restart upload", err)
+	state.fail.Store(true)
+	wantErr(t, "interrupt restart deletion", b.DeleteBucket(ctx, "restart"), errCrash)
+	state.fail.Store(false)
+	noErr(t, "close before pending release", b.Close())
+	b = openReady(t, o)
+	_, err = b.GetBucket(ctx, "restart")
+	wantErr(t, "restarted tombstone stayed hidden", err, storage.ErrBucketUnavailable)
+	before = requests.Load()
+	noErr(t, "release after restart", b.ReleaseBucket(ctx, "restart"))
+	if got := requests.Load() - before; got != 0 {
+		t.Fatalf("release after restart sent %d remote requests", got)
+	}
+	noErr(t, "rebind after restart", b.CreateBucket(ctx, "restart", storage.CreateBucketOptions{Target: nativeTarget("", true)}))
+	uploads, err = b.ListMultipartUploads(ctx, "restart")
+	noErr(t, "list uploads after pending release", err)
+	if len(uploads) != 0 {
+		t.Fatalf("restarted upload returned after release: %+v", uploads)
+	}
+	_, err = b.CompleteMultipartUpload(ctx, "restart", "key", restarted.UploadID, []int{1}, storage.ObjectMeta{}, storage.CommitOptions{})
+	wantErr(t, "complete restarted upload", err, storage.ErrUploadNotFound)
 }
 
 func TestHomeReloadClearsCompletedNativeDeletion(t *testing.T) {

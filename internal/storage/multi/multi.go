@@ -211,6 +211,10 @@ type Router struct {
 	probeNow chan *backing
 
 	saveMu sync.Mutex // serializes state file writes
+	// stateWriter is a test seam for failures after a durable deletion
+	// intent. Nil uses writeState. Replacements are atomic because purge
+	// workers can save in the background.
+	stateWriter atomic.Pointer[stateWriter]
 
 	keys keyLocks
 	jobs *workQueue
@@ -227,6 +231,8 @@ type Router struct {
 	closeOnce sync.Once
 	closeErr  error
 }
+
+type stateWriter func(string, *stateFile) error
 
 // bucketState is the runtime state of one bucket.
 type bucketState struct {
@@ -464,6 +470,30 @@ func retainsBucketForRecovery(b *backing, name string) bool {
 	return ok && recovery.RetainsBucketForRecovery(name)
 }
 
+type deletionPrimaryState uint8
+
+const (
+	deletionPrimaryUnknown deletionPrimaryState = iota
+	deletionPrimaryRetained
+	deletionPrimaryLive
+	deletionPrimaryAbsent
+)
+
+// classifyDeletionPrimary keeps a hidden recovery record distinct from a
+// listed bucket. Both startup and delayed adoption use the same decision.
+func classifyDeletionPrimary(b *backing, unknown, listed bool, name string) deletionPrimaryState {
+	switch {
+	case unknown:
+		return deletionPrimaryUnknown
+	case retainsBucketForRecovery(b, name):
+		return deletionPrimaryRetained
+	case listed:
+		return deletionPrimaryLive
+	default:
+		return deletionPrimaryAbsent
+	}
+}
+
 // reconcile turns the loaded state into the runtime state, checking it
 // against the buckets the backings hold. It returns the backings whose
 // buckets could not be listed ("unknown"): they are assumed to still hold
@@ -496,10 +526,7 @@ func (r *Router) reconcile(ctx context.Context, st *stateFile) ([]*backing, erro
 		if ok {
 			return true
 		}
-		// A backing may hide an interrupted native deletion from listings
-		// while retaining its record for an explicit release. Keep that
-		// placement so the release route can still reach the backing.
-		return retainsBucketForRecovery(r.topology.Load().backings[backing], bucket)
+		return false
 	}
 
 	for _, p := range st.Purges {
@@ -517,9 +544,11 @@ func (r *Router) reconcile(ctx context.Context, st *stateFile) ([]*backing, erro
 	}
 
 	for name, rec := range st.Buckets {
-		if st.Deleting[name] {
-			primary := rec.primary()
-			if isUnknown[primary] {
+		primary := rec.primary()
+		_, listed := present[primary][name]
+		primaryState := classifyDeletionPrimary(r.topology.Load().backings[primary], isUnknown[primary], listed, name)
+		if st.Deleting[name] || primaryState == deletionPrimaryRetained {
+			if primaryState == deletionPrimaryUnknown || primaryState == deletionPrimaryRetained {
 				// Keep the intent hidden until the primary can be listed, but
 				// discard members whose backings cannot be used after recovery.
 				rec = rec.clone()
@@ -545,7 +574,7 @@ func (r *Router) reconcile(ctx context.Context, st *stateFile) ([]*backing, erro
 				r.buckets[name] = r.newBucketState(name, rec)
 				continue
 			}
-			if !has(primary, name) {
+			if primaryState == deletionPrimaryAbsent {
 				// The primary deletion completed. Purge every remaining copy;
 				// a replica must never become the new primary.
 				for _, m := range rec.Members {
@@ -558,7 +587,7 @@ func (r *Router) reconcile(ctx context.Context, st *stateFile) ([]*backing, erro
 				}
 				continue
 			}
-			// The primary still exists: deletion did not complete.
+			// A listed, live primary means deletion did not complete.
 		}
 		rec = rec.clone()
 		// Forget members on backings that are no longer configured.
@@ -732,14 +761,31 @@ func (r *Router) adoptListed(b *backing, infos []storage.BucketInfo) bool {
 	r.mu.Lock()
 	delete(r.pendingAdopt, b.Name)
 	changed := false
+	// A backing can acquire a tombstone while it could not be listed. Even
+	// without a saved router intent, discovering it must hide the placement.
+	for name, bs := range r.buckets {
+		if bs.rec.primary() != b.Name || r.deleting[name] || !retainsBucketForRecovery(b, name) {
+			continue
+		}
+		r.deleting[name] = true
+		changed = true
+		for backing, ms := range bs.members {
+			if backing != b.Name {
+				cancel = append(cancel, ms)
+			}
+		}
+	}
 	for name := range r.deleting {
 		bs := r.buckets[name]
 		if bs == nil || bs.rec.primary() != b.Name {
 			continue
 		}
+		if classifyDeletionPrimary(b, false, present[name], name) == deletionPrimaryRetained {
+			continue // keep the placement hidden and releasable
+		}
 		delete(r.deleting, name)
 		changed = true
-		if present[name] || retainsBucketForRecovery(b, name) {
+		if present[name] {
 			for backing, ms := range bs.members {
 				if backing != b.Name {
 					resume = append(resume, ms)
@@ -841,6 +887,9 @@ func (r *Router) save() error {
 			}
 			return cmpString(a.Backing, b.Backing)
 		})
+	}
+	if writer := r.stateWriter.Load(); writer != nil {
+		return (*writer)(r.opts.StatePath, st)
 	}
 	return writeState(r.opts.StatePath, st)
 }

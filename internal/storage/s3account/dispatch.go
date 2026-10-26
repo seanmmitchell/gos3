@@ -488,6 +488,15 @@ func (b *Backend) ReleaseBucket(ctx context.Context, name string) error {
 	if interrupted {
 		// Releasing a pending native deletion is an explicit way to
 		// recover its record without contacting a potentially reused name.
+		cleaner, ok := b.nat.(interface {
+			DiscardBucketLocalState(context.Context, string) error
+		})
+		if !ok {
+			return fmt.Errorf("s3account %q: native store cannot clear local state before releasing bucket %q: %w", b.name, name, storage.ErrNotSupported)
+		}
+		if err := cleaner.DiscardBucketLocalState(ctx, name); err != nil {
+			return err
+		}
 		if err := b.dropBucket(context.WithoutCancel(ctx), name); err != nil {
 			return err
 		}

@@ -3,7 +3,7 @@ package multi
 import (
 	"context"
 	"errors"
-	"os"
+	"fmt"
 	"path/filepath"
 	"sync/atomic"
 	"testing"
@@ -297,11 +297,134 @@ func TestRecoveredBackingKeepsHiddenBucketReleasable(t *testing.T) {
 	}
 	b.down.Store(false)
 	r.adoptPending(r.topology.Load().backings["a"])
+	if _, err := r.lookup("vault"); !errors.Is(err, storage.ErrBucketUnavailable) {
+		t.Fatalf("retained deletion became available after adoption: %v", err)
+	}
+	saved, err := loadState(path)
+	if err != nil || !saved.Deleting["vault"] {
+		t.Fatalf("recovered deletion intent = %+v, %v", saved, err)
+	}
 	if err := r.ReleaseBucket(context.Background(), "vault"); err != nil {
 		t.Fatalf("hidden bucket could not be released after recovery: %v", err)
 	}
 	if b.retained.Load() {
 		t.Fatal("backing retained the released bucket")
+	}
+}
+
+func TestStartupRetainsHiddenDeletionIntent(t *testing.T) {
+	for _, withIntent := range []bool{false, true} {
+		t.Run(fmt.Sprint("saved intent=", withIntent), func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "placements.json")
+			st := &stateFile{Version: stateVersion, Buckets: map[string]*placementRecord{"vault": {
+				Mode: ModeSingle, Members: []memberRecord{{Backing: "a", Synced: true}},
+			}}}
+			if withIntent {
+				st.Deleting = map[string]bool{"vault": true}
+			}
+			if err := writeState(path, st); err != nil {
+				t.Fatal(err)
+			}
+			open := func() (*Router, *retainedDeletionBacking) {
+				b := &retainedDeletionBacking{Backend: memBackings(1)[0].Backend}
+				b.retained.Store(true)
+				return openRouter(t, Options{Backings: []Backing{{Name: "a", Backend: b}}, StatePath: path}), b
+			}
+			r, _ := open()
+			if _, err := r.lookup("vault"); !errors.Is(err, storage.ErrBucketUnavailable) {
+				t.Fatalf("retained deletion became available on startup: %v", err)
+			}
+			saved, err := loadState(path)
+			if err != nil || !saved.Deleting["vault"] {
+				t.Fatalf("startup deletion intent = %+v, %v", saved, err)
+			}
+			if err := r.Close(); err != nil {
+				t.Fatal(err)
+			}
+			r, b := open()
+			if _, err := r.lookup("vault"); !errors.Is(err, storage.ErrBucketUnavailable) {
+				t.Fatalf("retained deletion became available after another restart: %v", err)
+			}
+			if err := r.ReleaseBucket(context.Background(), "vault"); err != nil || b.retained.Load() {
+				t.Fatalf("release after restart: %v, retained=%v", err, b.retained.Load())
+			}
+		})
+	}
+}
+
+func TestDelayedAdoptionDiscoversRetainedDeletion(t *testing.T) {
+	bk := memBackings(1)
+	b := &retainedDeletionBacking{Backend: bk[0].Backend}
+	b.down.Store(true)
+	bk[0].Backend = b
+	path := filepath.Join(t.TempDir(), "placements.json")
+	if err := writeState(path, &stateFile{Version: stateVersion, Buckets: map[string]*placementRecord{"vault": {
+		Mode: ModeSingle, Members: []memberRecord{{Backing: "a", Synced: true}},
+	}}}); err != nil {
+		t.Fatal(err)
+	}
+	r := openRouter(t, Options{Backings: bk, StatePath: path})
+	b.retained.Store(true)
+	b.down.Store(false)
+	r.adoptPending(r.topology.Load().backings["a"])
+	if _, err := r.lookup("vault"); !errors.Is(err, storage.ErrBucketUnavailable) {
+		t.Fatalf("newly discovered tombstone became available: %v", err)
+	}
+	saved, err := loadState(path)
+	if err != nil || !saved.Deleting["vault"] {
+		t.Fatalf("newly discovered deletion intent = %+v, %v", saved, err)
+	}
+	if err := r.ReleaseBucket(context.Background(), "vault"); err != nil {
+		t.Fatalf("release discovered tombstone: %v", err)
+	}
+}
+
+func TestRetainedDeletionNeverServesReplica(t *testing.T) {
+	bk := memBackings(2)
+	b := &retainedDeletionBacking{Backend: bk[0].Backend}
+	b.retained.Store(true)
+	bk[0].Backend = b
+	ctx := context.Background()
+	if err := bk[1].Backend.CreateBucket(ctx, "vault", storage.CreateBucketOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(t.TempDir(), "placements.json")
+	if err := writeState(path, &stateFile{Version: stateVersion, Buckets: map[string]*placementRecord{"vault": {
+		Mode: ModeActivePassive, Members: []memberRecord{{Backing: "a", Synced: true}, {Backing: "b", Synced: true}},
+	}}, Deleting: map[string]bool{"vault": true}}); err != nil {
+		t.Fatal(err)
+	}
+	r := openRouter(t, Options{Backings: bk, StatePath: path})
+	if _, err := r.GetBucket(ctx, "vault"); !errors.Is(err, storage.ErrBucketUnavailable) {
+		t.Fatalf("retained deletion served a replica: %v", err)
+	}
+	if _, err := bk[1].Backend.GetBucket(ctx, "vault"); err != nil {
+		t.Fatalf("retained replica was purged: %v", err)
+	}
+	if err := r.ReleaseBucket(ctx, "vault"); !errors.Is(err, ErrConflict) {
+		t.Fatalf("release with a replica: %v, want conflict", err)
+	}
+}
+
+func TestInterruptedDeleteWithLivePrimaryRecovers(t *testing.T) {
+	bk := memBackings(1)
+	ctx := context.Background()
+	if err := bk[0].Backend.CreateBucket(ctx, "vault", storage.CreateBucketOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(t.TempDir(), "placements.json")
+	if err := writeState(path, &stateFile{Version: stateVersion, Buckets: map[string]*placementRecord{"vault": {
+		Mode: ModeSingle, Members: []memberRecord{{Backing: "a", Synced: true}},
+	}}, Deleting: map[string]bool{"vault": true}}); err != nil {
+		t.Fatal(err)
+	}
+	r := openRouter(t, Options{Backings: bk, StatePath: path})
+	if _, err := r.GetBucket(ctx, "vault"); err != nil {
+		t.Fatalf("live primary did not recover: %v", err)
+	}
+	saved, err := loadState(path)
+	if err != nil || saved.Deleting["vault"] {
+		t.Fatalf("live primary kept deletion intent: %+v, %v", saved, err)
 	}
 }
 
@@ -361,23 +484,20 @@ func TestDeleteContinuesAfterFinalStateSaveFails(t *testing.T) {
 		fsBacking(t, "a", filepath.Join(t.TempDir(), "a")),
 		fsBacking(t, "b", filepath.Join(t.TempDir(), "b")),
 	}
-	root := t.TempDir()
-	stateDir := filepath.Join(root, "state")
-	if err := os.Mkdir(stateDir, 0o700); err != nil {
-		t.Fatal(err)
-	}
-	statePath := filepath.Join(stateDir, "placements.json")
-	savedDir := filepath.Join(root, "saved")
+	statePath := filepath.Join(t.TempDir(), "placements.json")
+	var failFinal atomic.Bool
 	bk[0].Backend = &afterDeleteBacking{Backend: bk[0].Backend, afterDelete: func() {
 		// The first save has succeeded; only the post-delete save fails.
-		if err := os.Rename(stateDir, savedDir); err != nil {
-			panic(err)
-		}
-		if err := os.WriteFile(stateDir, nil, 0o600); err != nil {
-			panic(err)
-		}
+		failFinal.Store(true)
 	}}
 	r := openRouter(t, Options{Backings: bk, StatePath: statePath, NewBucketMode: ModeActivePassive, NewBucketReplicas: []string{"b"}})
+	writer := stateWriter(func(path string, st *stateFile) error {
+		if failFinal.Load() {
+			return errors.New("injected final save failure")
+		}
+		return writeState(path, st)
+	})
+	r.stateWriter.Store(&writer)
 	ctx := context.Background()
 	if err := r.CreateBucket(ctx, "vault", storage.CreateBucketOptions{}); err != nil {
 		t.Fatal(err)
@@ -394,7 +514,7 @@ func TestDeleteContinuesAfterFinalStateSaveFails(t *testing.T) {
 		_, err := bk[1].Backend.GetBucket(ctx, "vault")
 		return errors.Is(err, storage.ErrBucketNotFound)
 	})
-	st, err := loadState(filepath.Join(savedDir, "placements.json"))
+	st, err := loadState(statePath)
 	if err != nil || !st.Deleting["vault"] {
 		t.Fatalf("durable deletion intent = %+v, %v", st, err)
 	}
