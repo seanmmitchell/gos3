@@ -608,7 +608,7 @@ func (r *Router) failover(bs *bucketState, down string) {
 	}
 	r.mu.Lock()
 	rec := bs.rec
-	if bs.removed || rec.primary() != down || r.topology.Load().backings[down].healthy.Load() {
+	if bs.removed || r.deleting[bs.name] || rec.primary() != down || r.topology.Load().backings[down].healthy.Load() {
 		r.mu.Unlock()
 		return
 	}

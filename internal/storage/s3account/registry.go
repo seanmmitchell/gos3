@@ -139,6 +139,9 @@ type bucketRecord struct {
 	// deleting the bucket deletes it. Adopted remote buckets are never
 	// deleted.
 	Created bool `json:"created,omitempty"`
+	// Deleting is persisted before detaching the remote bucket. A restart
+	// discards this record without contacting a possibly reused remote name.
+	Deleting bool `json:"deleting,omitempty"`
 	// Info is the bucket's info: authoritative for native buckets, a cache
 	// of the container's for wrapped ones (served while the container is
 	// not loaded). Kind and Location are never stored.

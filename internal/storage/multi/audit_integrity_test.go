@@ -166,6 +166,85 @@ func TestReconcileRefusesUnsyncedPrimaryReplacement(t *testing.T) {
 	}
 }
 
+func TestInterruptedDeleteDoesNotPromoteReplica(t *testing.T) {
+	bk := memBackings(2)
+	ctx := context.Background()
+	if err := bk[1].Backend.CreateBucket(ctx, "vault", storage.CreateBucketOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(t.TempDir(), "placements.json")
+	st := &stateFile{
+		Version: stateVersion,
+		Buckets: map[string]*placementRecord{"vault": {
+			Mode:    ModeActivePassive,
+			Members: []memberRecord{{Backing: "a", Synced: true}, {Backing: "b", Synced: true}},
+		}},
+		Deleting: map[string]bool{"vault": true},
+	}
+	if err := writeState(path, st); err != nil {
+		t.Fatal(err)
+	}
+	r := openRouter(t, Options{Backings: bk, StatePath: path})
+	if _, err := r.GetBucket(ctx, "vault"); !errors.Is(err, storage.ErrBucketNotFound) {
+		t.Fatalf("deleted bucket was resurrected: %v", err)
+	}
+	waitFor(t, "replica purged", func() bool {
+		_, err := bk[1].Backend.GetBucket(ctx, "vault")
+		return errors.Is(err, storage.ErrBucketNotFound)
+	})
+}
+
+func TestInterruptedDeleteWaitsForUnknownPrimary(t *testing.T) {
+	bk := memBackings(2)
+	ctx := context.Background()
+	if err := bk[1].Backend.CreateBucket(ctx, "vault", storage.CreateBucketOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(t.TempDir(), "placements.json")
+	if err := writeState(path, &stateFile{
+		Version: stateVersion,
+		Buckets: map[string]*placementRecord{"vault": {
+			Mode:    ModeActivePassive,
+			Members: []memberRecord{{Backing: "a", Synced: true}, {Backing: "b", Synced: true}},
+		}},
+		Deleting: map[string]bool{"vault": true},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	f := &faulty{Backend: bk[0].Backend}
+	f.down.Store(true)
+	bk[0].Backend = f
+	r := openRouter(t, Options{Backings: bk, StatePath: path})
+	if _, err := r.GetBucket(ctx, "vault"); !errors.Is(err, storage.ErrBucketUnavailable) {
+		t.Fatalf("deletion intent was served from replica: %v", err)
+	}
+	f.down.Store(false)
+	r.adoptPending(r.topology.Load().backings["a"])
+	if _, err := r.GetBucket(ctx, "vault"); !errors.Is(err, storage.ErrBucketNotFound) {
+		t.Fatalf("deleted bucket was resurrected after primary recovered: %v", err)
+	}
+	waitFor(t, "replica purged", func() bool {
+		_, err := bk[1].Backend.GetBucket(ctx, "vault")
+		return errors.Is(err, storage.ErrBucketNotFound)
+	})
+}
+
+func TestDeleteRequiresDurableIntent(t *testing.T) {
+	bk := memBackings(1)
+	r := openRouter(t, Options{Backings: bk, StatePath: filepath.Join(t.TempDir(), "placements.json")})
+	ctx := context.Background()
+	if err := r.CreateBucket(ctx, "vault", storage.CreateBucketOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	r.opts.StatePath = filepath.Join(t.TempDir(), "missing", "placements.json")
+	if err := r.DeleteBucket(ctx, "vault"); err == nil {
+		t.Fatal("delete succeeded without persisting its intent")
+	}
+	if _, err := bk[0].Backend.GetBucket(ctx, "vault"); err != nil {
+		t.Fatalf("primary was deleted before intent persisted: %v", err)
+	}
+}
+
 func TestPurgeDoesNotImportIntoRecreatedBucket(t *testing.T) {
 	r, a, b := lockedBucket(t)
 	ctx := context.Background()

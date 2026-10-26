@@ -68,6 +68,9 @@ func (b *Backend) lookupAny(ctx context.Context, bucket string) (t target, unusa
 	if e == nil {
 		return target{}, nil, fmt.Errorf("%w: %q", storage.ErrBucketNotFound, bucket)
 	}
+	if e.Deleting {
+		return target{}, nil, fmt.Errorf("%w: %q is being deleted", storage.ErrBucketUnavailable, bucket)
+	}
 	t = target{name: bucket, rec: e.bucketRecord}
 	if t.native() {
 		t.nat = b.nat
@@ -108,6 +111,9 @@ func (b *Backend) ListBuckets(ctx context.Context) ([]storage.BucketInfo, error)
 	targets := make([]target, 0, len(b.reg.buckets))
 	used := map[string]*container{}
 	for name, e := range b.reg.buckets {
+		if e.Deleting {
+			continue
+		}
 		t := target{name: name, rec: e.bucketRecord}
 		if !t.native() {
 			t.c = b.containers[e.Container]
@@ -406,6 +412,13 @@ func (b *Backend) DeleteBucket(ctx context.Context, name string) error {
 	}
 	if t.native() {
 		if err := t.nat.CheckEmpty(ctx, name); err != nil {
+			return err
+		}
+		// Save a tombstone before touching the remote bucket. A crash after
+		// remote deletion must not leave a live binding to this name.
+		deleting := t.rec
+		deleting.Deleting = true
+		if err := b.putBucket(context.WithoutCancel(ctx), name, deleting, nil); err != nil {
 			return err
 		}
 		if err := t.nat.DetachBucket(ctx, name, t.rec.Created); err != nil {

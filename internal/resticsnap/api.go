@@ -255,7 +255,7 @@ func (s *Service) Forget(ctx context.Context, bucket, snapshotID string) error {
 	if !ok {
 		return fmt.Errorf("%w: bucket %q has no snapshot repository", restic.ErrSnapshotNotFound, bucket)
 	}
-	err = s.rt.Forget(ctx, loc, []string{snapshotID}, snapshotGuard(bucket))
+	err = s.forget(ctx, loc, []string{snapshotID}, snapshotGuard(bucket))
 	s.invalidate(bucket)
 	if errors.Is(err, restic.ErrForgetRefused) {
 		return fmt.Errorf("%w: %w: snapshot %s is not a whole-bucket snapshot of bucket %q", jobs.ErrInvalidSpec, err, snapshotID, bucket)
@@ -334,7 +334,7 @@ func (r pruneRunner) Run(ctx context.Context, h *jobs.Handle) error {
 		return jobs.Permanent(fmt.Errorf("bucket %q has no snapshot repository", spec.Bucket))
 	}
 	_ = h.SetStatus(jobStatus{Repository: info.Repository})
-	if err := s.rt.Prune(ctx, loc, restic.PruneOptions{RetryLock: pruneRetryLock}); err != nil {
+	if err := s.prune(ctx, loc, restic.PruneOptions{RetryLock: pruneRetryLock}); err != nil {
 		return err
 	}
 	s.updateState(spec.Bucket, func(st *bucketState) { st.LastPruneAt = s.now() })

@@ -343,8 +343,8 @@ func TestMigrateGatewayHome(t *testing.T) {
 
 // TestNativeCrashPoints interrupts native bucket creations and deletions
 // between the remote change and the record: a creation leaves an unused
-// remote bucket (which can be adopted), a deletion a record that a second
-// delete removes.
+// remote bucket (which can be adopted), while a deletion leaves a
+// tombstone that is discarded on restart.
 func TestNativeCrashPoints(t *testing.T) {
 	r := s3clienttest.Start(t)
 	ctx := context.Background()
@@ -358,16 +358,19 @@ func TestNativeCrashPoints(t *testing.T) {
 	wantErr(t, "delete", b.DeleteBucket(ctx, "doomed"), errCrash)
 	crash.Store(nil)
 	noErr(t, "Close", b.Close())
+	// A different owner can acquire the globally reusable remote name
+	// before gos3 restarts. The tombstone must not expose or delete it.
+	r.CreateBucket(t, "doomed")
 
 	b = openReady(t, o)
 	kinds := bucketKinds(t, b)
-	if _, ok := kinds["limbo"]; ok || kinds["doomed"] != storage.BucketKindNative {
+	if _, ok := kinds["limbo"]; ok || len(kinds) != 0 {
 		t.Fatalf("buckets %v", kinds)
 	}
-	if !remoteHasBucket(t, r, "limbo") || remoteHasBucket(t, r, "doomed") {
+	if !remoteHasBucket(t, r, "limbo") || !remoteHasBucket(t, r, "doomed") {
 		t.Fatal("remote buckets not as expected")
 	}
-	noErr(t, "delete again", b.DeleteBucket(ctx, "doomed"))
+	wantErr(t, "deleted bucket stays gone", b.DeleteBucket(ctx, "doomed"), storage.ErrBucketNotFound)
 	wantErr(t, "create over the leftover", b.CreateBucket(ctx, "limbo", storage.CreateBucketOptions{}), storage.ErrRemoteBucketExists)
 	noErr(t, "adopt the leftover", b.CreateBucket(ctx, "limbo", storage.CreateBucketOptions{Target: nativeTarget("", true)}))
 }

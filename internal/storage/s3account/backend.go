@@ -370,6 +370,18 @@ func (b *Backend) readRecords(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
+	for name, e := range reg.buckets {
+		if !e.Deleting {
+			continue
+		}
+		// Never retry the remote deletion after a restart: the globally
+		// unique name may already belong to another account.
+		if err := b.records.DeleteRecords(ctx, bucketKey(name)); err != nil {
+			return fmt.Errorf("s3account %q: clear deletion intent for bucket %q: %w", b.name, name, err)
+		}
+		delete(reg.buckets, name)
+		orphans = append(orphans, configPrefix(name))
+	}
 	b.logInvalidRecords(invalid)
 	b.install(reg, epoch)
 	for _, p := range orphans {
