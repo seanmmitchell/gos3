@@ -15,6 +15,7 @@ import (
 	"github.com/seanmmitchell/gos3/internal/s3client"
 	"github.com/seanmmitchell/gos3/internal/s3client/s3clienttest"
 	"github.com/seanmmitchell/gos3/internal/storage"
+	"github.com/seanmmitchell/gos3/internal/storage/native"
 	"github.com/seanmmitchell/gos3/internal/storage/s3store"
 )
 
@@ -373,6 +374,56 @@ func TestNativeCrashPoints(t *testing.T) {
 	wantErr(t, "deleted bucket stays gone", b.DeleteBucket(ctx, "doomed"), storage.ErrBucketNotFound)
 	wantErr(t, "create over the leftover", b.CreateBucket(ctx, "limbo", storage.CreateBucketOptions{}), storage.ErrRemoteBucketExists)
 	noErr(t, "adopt the leftover", b.CreateBucket(ctx, "limbo", storage.CreateBucketOptions{Target: nativeTarget("", true)}))
+}
+
+type failingNativeState struct {
+	native.StateStore
+	fail atomic.Bool
+}
+
+func (s *failingNativeState) DeleteRecords(ctx context.Context, prefix string) error {
+	if s.fail.Load() {
+		return errCrash
+	}
+	return s.StateStore.DeleteRecords(ctx, prefix)
+}
+
+func TestFailedNativeDetachPreservesRecoverableRecord(t *testing.T) {
+	r := s3clienttest.Start(t)
+	ctx := context.Background()
+	o := localOptions(t, r, NewClaims(), t.TempDir())
+	var state *failingNativeState
+	h := testHooks()
+	h.openNative = func(opts native.Options) (NativeStore, error) {
+		state = &failingNativeState{StateStore: opts.State}
+		opts.State = state
+		return native.Open(opts)
+	}
+	b := openReadyWith(t, o, h)
+	noErr(t, "create", b.CreateBucket(ctx, "recover", storage.CreateBucketOptions{}))
+	state.fail.Store(true)
+	wantErr(t, "delete with failed local cleanup", b.DeleteBucket(ctx, "recover"), errCrash)
+	if !remoteHasBucket(t, r, "recover") {
+		t.Fatal("failed cleanup deleted the remote bucket")
+	}
+	state.fail.Store(false)
+	noErr(t, "close", b.Close())
+
+	b = openReady(t, o)
+	b.mu.RLock()
+	e := b.reg.buckets["recover"]
+	pending := e != nil && e.Deleting && !e.Detached
+	b.mu.RUnlock()
+	if !pending {
+		t.Fatal("restart discarded the interrupted deletion record")
+	}
+	_, err := b.GetBucket(ctx, "recover")
+	wantErr(t, "pending bucket is unavailable", err, storage.ErrBucketUnavailable)
+	noErr(t, "release pending record", b.ReleaseBucket(ctx, "recover"))
+	if !remoteHasBucket(t, r, "recover") {
+		t.Fatal("release of pending record deleted the remote bucket")
+	}
+	noErr(t, "adopt released bucket", b.CreateBucket(ctx, "recover", storage.CreateBucketOptions{Target: nativeTarget("", true)}))
 }
 
 // TestReloadAfterHomeSession: when the home was reloaded (a new session),

@@ -229,6 +229,41 @@ func TestInterruptedDeleteWaitsForUnknownPrimary(t *testing.T) {
 	})
 }
 
+func TestInterruptedDeleteDropsUnconfiguredReplicaBeforeRecovery(t *testing.T) {
+	bk := memBackings(3)
+	ctx := context.Background()
+	if err := bk[0].Backend.CreateBucket(ctx, "vault", storage.CreateBucketOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(t.TempDir(), "placements.json")
+	if err := writeState(path, &stateFile{
+		Version: stateVersion,
+		Buckets: map[string]*placementRecord{"vault": {
+			Mode:    ModeActivePassive,
+			Members: []memberRecord{{Backing: "a", Synced: true}, {Backing: "b", Synced: true}},
+		}},
+		Deleting: map[string]bool{"vault": true},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	f := &faulty{Backend: bk[0].Backend}
+	f.down.Store(true)
+	bk[0].Backend = f
+	r := openRouter(t, Options{Backings: []Backing{bk[0], bk[2]}, StatePath: path})
+	if _, err := r.GetBucket(ctx, "vault"); !errors.Is(err, storage.ErrBucketUnavailable) {
+		t.Fatalf("unresolved deletion was served: %v", err)
+	}
+	f.down.Store(false)
+	r.adoptPending(r.topology.Load().backings["a"])
+	if _, err := r.GetBucket(ctx, "vault"); err != nil {
+		t.Fatalf("existing primary did not recover: %v", err)
+	}
+	placement, err := r.Placement("vault")
+	if err != nil || placement.Mode != ModeSingle || len(placement.Members) != 1 || placement.Members[0].Backing != "a" {
+		t.Fatalf("recovered placement = %+v, %v", placement, err)
+	}
+}
+
 func TestDeleteRequiresDurableIntent(t *testing.T) {
 	bk := memBackings(1)
 	r := openRouter(t, Options{Backings: bk, StatePath: filepath.Join(t.TempDir(), "placements.json")})

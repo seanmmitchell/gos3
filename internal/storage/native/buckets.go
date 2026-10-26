@@ -423,6 +423,11 @@ func (s *Store) DetachBucket(ctx context.Context, bucket string, removeRemote bo
 	if err := s.dropBucketOverlays(ctx, bucket); err != nil {
 		errs = append(errs, err)
 	}
+	// Do not remove the remote bucket after local cleanup failed: the
+	// account layer retains the binding for explicit recovery.
+	if len(errs) > 0 {
+		return errors.Join(errs...)
+	}
 	if terr == nil {
 		if removeRemote {
 			err := s.call(ctx, t, func(c *s3client.Client) error { return c.DeleteBucket(ctx, t.b.Remote) })

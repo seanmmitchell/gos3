@@ -374,6 +374,11 @@ func (b *Backend) readRecords(ctx context.Context) error {
 		if !e.Deleting {
 			continue
 		}
+		if !e.Detached {
+			b.log.Warn("s3account: native bucket deletion was interrupted; keeping its record unavailable for recovery",
+				"backing", b.name, "bucket", name)
+			continue
+		}
 		// Never retry the remote deletion after a restart: the globally
 		// unique name may already belong to another account.
 		if err := b.records.DeleteRecords(ctx, bucketKey(name)); err != nil {

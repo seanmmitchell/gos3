@@ -504,9 +504,29 @@ func (r *Router) reconcile(ctx context.Context, st *stateFile) ([]*backing, erro
 		if st.Deleting[name] {
 			primary := rec.primary()
 			if isUnknown[primary] {
-				// Keep the intent and placement hidden until the primary can be listed.
+				// Keep the intent hidden until the primary can be listed, but
+				// discard members whose backings cannot be used after recovery.
+				rec = rec.clone()
+				kept := rec.Members[:0]
+				for _, m := range rec.Members {
+					if r.topology.Load().backings[m.Backing] == nil {
+						r.log.Warn("bucket copy on a backing that is no longer configured is forgotten",
+							"bucket", name, "backing", m.Backing)
+						continue
+					}
+					if !slices.ContainsFunc(kept, func(k memberRecord) bool { return k.Backing == m.Backing }) {
+						kept = append(kept, m)
+					}
+				}
+				rec.Members = kept
+				if len(kept) == 1 {
+					rec.Mode = ModeSingle
+				}
+				if mv := rec.Move; mv != nil && (r.topology.Load().backings[mv.To] == nil || rec.member(mv.From) < 0 || rec.member(mv.To) >= 0) {
+					rec.Move = nil
+				}
 				r.deleting[name] = true
-				r.buckets[name] = r.newBucketState(name, rec.clone())
+				r.buckets[name] = r.newBucketState(name, rec)
 				continue
 			}
 			if !has(primary, name) {

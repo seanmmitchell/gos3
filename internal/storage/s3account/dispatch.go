@@ -422,6 +422,12 @@ func (b *Backend) DeleteBucket(ctx context.Context, name string) error {
 			return err
 		}
 		if err := t.nat.DetachBucket(ctx, name, t.rec.Created); err != nil {
+			// Cleanup can already have removed local upload or overlay state.
+			// Keep the binding tombstoned for explicit recovery on restart.
+			return err
+		}
+		deleting.Detached = true
+		if err := b.putBucket(context.WithoutCancel(ctx), name, deleting, nil); err != nil {
 			return err
 		}
 		if err := b.step("delete-native:detached"); err != nil {
@@ -448,11 +454,26 @@ func (b *Backend) DeleteBucket(ctx context.Context, name string) error {
 
 // ReleaseBucket implements storage.BucketReleaser: a native bucket is
 // forgotten without touching its remote bucket or objects (its uploads in
-// progress are aborted); wrapped buckets cannot be released
+// progress are aborted). An interrupted native deletion can be released
+// without contacting the remote bucket. Wrapped buckets cannot be released
 // (storage.ErrNotSupported: their data would be orphaned).
 func (b *Backend) ReleaseBucket(ctx context.Context, name string) error {
 	b.adminMu.Lock()
 	defer b.adminMu.Unlock()
+	if err := b.serving(ctx); err != nil {
+		return err
+	}
+	b.mu.RLock()
+	var interrupted bool
+	if e := b.reg.buckets[name]; e != nil {
+		interrupted = e.Kind == storage.BucketKindNative && e.Deleting
+	}
+	b.mu.RUnlock()
+	if interrupted {
+		// Releasing a pending native deletion is an explicit way to
+		// recover its record without contacting a potentially reused name.
+		return b.dropBucket(context.WithoutCancel(ctx), name)
+	}
 	t, _, err := b.lookupAny(ctx, name)
 	if err != nil {
 		return err
