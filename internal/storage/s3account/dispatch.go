@@ -157,6 +157,20 @@ func (b *Backend) ListBuckets(ctx context.Context) ([]storage.BucketInfo, error)
 	return out, nil
 }
 
+// RetainsBucketForRecovery reports an interrupted native deletion whose
+// placement must survive router reconciliation. The bucket remains hidden
+// from listings and unavailable for ordinary operations, but can be released
+// explicitly without contacting its remote name.
+func (b *Backend) RetainsBucketForRecovery(name string) bool {
+	b.mu.RLock()
+	defer b.mu.RUnlock()
+	if b.reg == nil {
+		return false
+	}
+	e := b.reg.buckets[name]
+	return e != nil && e.Kind == storage.BucketKindNative && e.Deleting && !e.Detached
+}
+
 // validBucketName reports whether name can be a record key.
 func validBucketName(name string) error {
 	if name == "" || strings.Contains(name, "/") || !utf8.ValidString(name) {

@@ -483,7 +483,18 @@ func (r *Router) reconcile(ctx context.Context, st *stateFile) ([]*backing, erro
 			return true
 		}
 		_, ok := present[backing][bucket]
-		return ok
+		if ok {
+			return true
+		}
+		// A backing may hide an interrupted native deletion from listings
+		// while retaining its record for an explicit release. Keep that
+		// placement so the release route can still reach the backing.
+		if b := r.topology.Load().backings[backing]; b != nil {
+			if recovery, ok := b.Backend.(interface{ RetainsBucketForRecovery(string) bool }); ok {
+				return recovery.RetainsBucketForRecovery(bucket)
+			}
+		}
+		return false
 	}
 
 	for _, p := range st.Purges {

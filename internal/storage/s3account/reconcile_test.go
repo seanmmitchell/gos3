@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"path/filepath"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -15,6 +16,7 @@ import (
 	"github.com/seanmmitchell/gos3/internal/s3client"
 	"github.com/seanmmitchell/gos3/internal/s3client/s3clienttest"
 	"github.com/seanmmitchell/gos3/internal/storage"
+	"github.com/seanmmitchell/gos3/internal/storage/multi"
 	"github.com/seanmmitchell/gos3/internal/storage/native"
 	"github.com/seanmmitchell/gos3/internal/storage/s3store"
 )
@@ -424,6 +426,49 @@ func TestFailedNativeDetachPreservesRecoverableRecord(t *testing.T) {
 		t.Fatal("release of pending record deleted the remote bucket")
 	}
 	noErr(t, "adopt released bucket", b.CreateBucket(ctx, "recover", storage.CreateBucketOptions{Target: nativeTarget("", true)}))
+}
+
+func TestInterruptedNativeDeletionReleasableAfterRouterRestart(t *testing.T) {
+	remote := s3clienttest.Start(t)
+	ctx := context.Background()
+	o := localOptions(t, remote, NewClaims(), t.TempDir())
+	var state *failingNativeState
+	h := testHooks()
+	h.openNative = func(opts native.Options) (NativeStore, error) {
+		state = &failingNativeState{StateStore: opts.State}
+		opts.State = state
+		return native.Open(opts)
+	}
+	b := openReadyWith(t, o, h)
+	noErr(t, "create", b.CreateBucket(ctx, "recover", storage.CreateBucketOptions{}))
+	path := filepath.Join(t.TempDir(), "placements.json")
+	openRouter := func(backing *Backend) *multi.Router {
+		t.Helper()
+		router, err := multi.Open(ctx, multi.Options{Backings: []multi.Backing{{Name: "remote", Backend: backing}}, StatePath: path})
+		noErr(t, "open router", err)
+		return router
+	}
+	router := openRouter(b)
+	state.fail.Store(true)
+	wantErr(t, "delete with failed local cleanup", router.DeleteBucket(ctx, "recover"), errCrash)
+	state.fail.Store(false)
+	noErr(t, "close router", router.Close())
+
+	b = openReady(t, o)
+	router = openRouter(b)
+	infos, err := router.ListBuckets(ctx)
+	noErr(t, "list buckets", err)
+	if len(infos) != 0 {
+		t.Fatalf("interrupted deletion became visible: %+v", infos)
+	}
+	_, err = router.GetBucket(ctx, "recover")
+	wantErr(t, "interrupted deletion unavailable", err, storage.ErrBucketUnavailable)
+	noErr(t, "release through router", router.ReleaseBucket(ctx, "recover"))
+	if !remoteHasBucket(t, remote, "recover") {
+		t.Fatal("router release deleted the remote bucket")
+	}
+	noErr(t, "adopt through router", router.CreateBucket(ctx, "recover", storage.CreateBucketOptions{Target: nativeTarget("", true)}))
+	noErr(t, "close recovered router", router.Close())
 }
 
 // TestReloadAfterHomeSession: when the home was reloaded (a new session),
