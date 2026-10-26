@@ -479,14 +479,20 @@ func (b *Backend) ReleaseBucket(ctx context.Context, name string) error {
 	}
 	b.mu.RLock()
 	var interrupted bool
+	var remote string
 	if e := b.reg.buckets[name]; e != nil {
 		interrupted = e.Kind == storage.BucketKindNative && e.Deleting
+		remote = e.Remote
 	}
 	b.mu.RUnlock()
 	if interrupted {
 		// Releasing a pending native deletion is an explicit way to
 		// recover its record without contacting a potentially reused name.
-		return b.dropBucket(context.WithoutCancel(ctx), name)
+		if err := b.dropBucket(context.WithoutCancel(ctx), name); err != nil {
+			return err
+		}
+		b.nat.UnbindBucket(name, remote)
+		return nil
 	}
 	t, _, err := b.lookupAny(ctx, name)
 	if err != nil {

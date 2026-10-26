@@ -448,3 +448,16 @@ func (s *Store) DetachBucket(ctx context.Context, bucket string, removeRemote bo
 	}
 	return errors.Join(errs...)
 }
+
+// UnbindBucket forgets only an in-memory binding after the account record
+// has been released. It never contacts the remote bucket or its objects.
+func (s *Store) UnbindBucket(bucket, remote string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.bound[strings.ToLower(remote)] != bucket {
+		return
+	}
+	delete(s.bound, strings.ToLower(remote))
+	delete(s.regions, remote)
+	delete(s.noTagging, remote)
+}

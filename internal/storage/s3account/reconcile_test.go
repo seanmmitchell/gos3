@@ -457,6 +457,8 @@ func TestInterruptedNativeDeletionReleasableImmediatelyAndAfterRouterRestart(t *
 	if !remoteHasBucket(t, remote, "immediate") {
 		t.Fatal("immediate release deleted the remote bucket")
 	}
+	noErr(t, "adopt under a different name", router.CreateBucket(ctx, "renamed", storage.CreateBucketOptions{Target: nativeTarget("immediate", true)}))
+	noErr(t, "release renamed bucket", router.ReleaseBucket(ctx, "renamed"))
 	state.fail.Store(true)
 	wantErr(t, "delete with failed local cleanup", router.DeleteBucket(ctx, "recover"), errCrash)
 	state.fail.Store(false)
@@ -477,6 +479,42 @@ func TestInterruptedNativeDeletionReleasableImmediatelyAndAfterRouterRestart(t *
 	}
 	noErr(t, "adopt through router", router.CreateBucket(ctx, "recover", storage.CreateBucketOptions{Target: nativeTarget("", true)}))
 	noErr(t, "close recovered router", router.Close())
+}
+
+func TestHomeReloadClearsCompletedNativeDeletion(t *testing.T) {
+	r := s3clienttest.Start(t)
+	r.CreateBucket(t, "home")
+	ctx := context.Background()
+	var fd *failingDeletes
+	h := testHooks()
+	h.wrapRecords = func(s s3store.AuxStore) s3store.AuxStore {
+		fd = &failingDeletes{AuxStore: s}
+		return fd
+	}
+	b := openReadyWith(t, homeOptions(t, r, NewClaims(), "home", ""), h)
+	noErr(t, "create native", b.CreateBucket(ctx, "gone", storage.CreateBucketOptions{Target: nativeTarget("", false)}))
+	key := bucketKey("gone")
+	fd.fail.Store(&key)
+	wantErr(t, "delete record during home outage", b.DeleteBucket(ctx, "gone"), storage.ErrBackingUnavailable)
+	b.mu.RLock()
+	e := b.reg.buckets["gone"]
+	completed := e != nil && e.Deleting && e.Detached
+	epoch := b.homeEpoch
+	b.mu.RUnlock()
+	if !completed {
+		t.Fatal("failed record deletion did not leave a completed tombstone")
+	}
+	b.reload(epoch + 1)
+	b.mu.RLock()
+	_, exists := b.reg.buckets["gone"]
+	b.mu.RUnlock()
+	if exists {
+		t.Fatal("home reload kept a completed native deletion")
+	}
+	if remoteHasBucket(t, r, "gone") {
+		t.Fatal("remote bucket was not deleted")
+	}
+	noErr(t, "reuse bucket name", b.CreateBucket(ctx, "gone", storage.CreateBucketOptions{Target: nativeTarget("", false)}))
 }
 
 // TestReloadAfterHomeSession: when the home was reloaded (a new session),
