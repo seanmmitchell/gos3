@@ -211,10 +211,14 @@ type Router struct {
 	probeNow chan *backing
 
 	saveMu sync.Mutex // serializes state file writes
-	// stateWriter is a test seam for failures after a durable deletion
-	// intent. Nil uses writeState. Replacements are atomic because purge
-	// workers can save in the background.
+	// stateWriter is a test seam for state save failures. Nil uses
+	// writeState. Replacements are atomic because purge workers and
+	// retrySave can save in the background.
 	stateWriter atomic.Pointer[stateWriter]
+	// saveRetrying is set while a retrySave loop waits for its next
+	// attempt. Guarded by saveRetryMu.
+	saveRetryMu  sync.Mutex
+	saveRetrying bool
 
 	keys keyLocks
 	jobs *workQueue
@@ -895,11 +899,50 @@ func (r *Router) save() error {
 }
 
 // saveLogged saves and logs a failure (for background changes that have
-// no caller to report to).
+// no caller to report to). A failed save is retried in the background
+// until one succeeds, so that a restart does not bring back the old
+// placements (after a failover, the failed primary's stale copy).
 func (r *Router) saveLogged(what string) {
 	if err := r.save(); err != nil {
-		r.log.Error("could not save the bucket placements", "after", what, "path", r.opts.StatePath, "err", err)
+		r.log.Error("could not save the bucket placements; retrying", "after", what, "path", r.opts.StatePath,
+			"retry_in", minBackoff, "err", err)
+		r.retrySave(minBackoff)
 	}
+}
+
+// retrySave saves the placements after the delay, and again with backoff
+// until a save succeeds. Every save writes the whole current state, so
+// one retry loop covers all earlier failures; it is started again by a
+// failure that happens while its own save runs.
+func (r *Router) retrySave(after time.Duration) {
+	r.saveRetryMu.Lock()
+	defer r.saveRetryMu.Unlock()
+	if r.saveRetrying || r.ctx.Err() != nil {
+		return
+	}
+	r.saveRetrying = true
+	r.wg.Add(1)
+	go func() {
+		defer r.wg.Done()
+		t := time.NewTimer(after)
+		defer t.Stop()
+		select {
+		case <-r.ctx.Done():
+			return
+		case <-t.C:
+		}
+		r.saveRetryMu.Lock()
+		r.saveRetrying = false
+		r.saveRetryMu.Unlock()
+		if err := r.save(); err != nil {
+			next := min(after*2, maxBackoff)
+			r.log.Error("could not save the bucket placements; retrying", "path", r.opts.StatePath,
+				"retry_in", next, "err", err)
+			r.retrySave(next)
+			return
+		}
+		r.log.Info("saved the bucket placements after an earlier failure", "path", r.opts.StatePath)
+	}()
 }
 
 func cmpString(a, b string) int {
