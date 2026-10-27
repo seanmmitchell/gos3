@@ -370,6 +370,11 @@ func (b *Backend) readRecords(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
+	removed, err := b.clearDetachedRecords(ctx, reg)
+	if err != nil {
+		return err
+	}
+	orphans = append(orphans, removed...)
 	b.logInvalidRecords(invalid)
 	b.install(reg, epoch)
 	for _, p := range orphans {
@@ -378,6 +383,31 @@ func (b *Backend) readRecords(ctx context.Context) error {
 		}
 	}
 	return nil
+}
+
+// clearDetachedRecords removes native records only after detaching has
+// completed. Pending deletions keep their binding for explicit recovery.
+// It is used on both initial load and home reload.
+func (b *Backend) clearDetachedRecords(ctx context.Context, reg *registry) ([]string, error) {
+	var orphans []string
+	for name, e := range reg.buckets {
+		if !e.Deleting {
+			continue
+		}
+		if !e.Detached {
+			b.log.Warn("s3account: native bucket deletion was interrupted; keeping its record unavailable for recovery",
+				"backing", b.name, "bucket", name)
+			continue
+		}
+		// Never retry the remote deletion after a restart: the globally
+		// unique name may already belong to another account.
+		if err := b.records.DeleteRecords(ctx, bucketKey(name)); err != nil {
+			return nil, fmt.Errorf("s3account %q: clear deletion intent for bucket %q: %w", b.name, name, err)
+		}
+		delete(reg.buckets, name)
+		orphans = append(orphans, configPrefix(name))
+	}
+	return orphans, nil
 }
 
 // logInvalidRecords logs the records decodeRegistry skipped.
@@ -511,13 +541,23 @@ func (b *Backend) reload(epoch uint64) {
 		b.log.Warn("s3account: re-reading the records after the home was reloaded failed; retrying", "backing", b.name, "err", err)
 		return
 	}
-	reg, _, invalid, err := decodeRegistry(recs)
+	reg, orphans, invalid, err := decodeRegistry(recs)
 	if err != nil {
 		b.log.Error("s3account: the records changed into ones this build cannot read", "backing", b.name, "err", err)
 		return
 	}
+	removed, err := b.clearDetachedRecords(b.ctx, reg)
+	if err != nil {
+		b.log.Warn("s3account: cleaning completed native deletions after a home reload failed; retrying", "backing", b.name, "err", err)
+		return
+	}
 	b.logInvalidRecords(invalid)
 	b.install(reg, epoch)
+	for _, p := range append(orphans, removed...) {
+		if err := b.records.DeleteRecords(b.ctx, p); err != nil {
+			b.log.Warn("s3account: delete orphaned configuration records", "backing", b.name, "prefix", p, "err", err)
+		}
+	}
 	if err := b.reconcileContainer(b.ctx, b.containerByID(homeID)); err != nil && b.ctx.Err() == nil {
 		b.log.Warn("s3account: reconciling the home failed", "backing", b.name, "err", err)
 	}

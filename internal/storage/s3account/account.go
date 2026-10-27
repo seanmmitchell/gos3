@@ -238,6 +238,7 @@ type NativeStore interface {
 	PutObjectLockConfig(ctx context.Context, bucket string, xml []byte) error
 	CheckEmpty(ctx context.Context, bucket string) error
 	DetachBucket(ctx context.Context, bucket string, removeRemote bool) error
+	UnbindBucket(bucket, remote string)
 	Close() error
 
 	objectStore

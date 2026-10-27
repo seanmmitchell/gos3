@@ -171,6 +171,9 @@ type Service struct {
 	loadedAt   time.Time               // last full read of the configs
 	cache      map[string]cachedSnapshots
 	stageLocks map[string]*sync.Mutex
+	// repoLocks keep repository maintenance from deleting data in use by
+	// a restore. All operations sharing a repository use the same lock.
+	repoLocks map[string]*repositoryGate
 
 	saveMu sync.Mutex // serializes writes of the state file
 
@@ -198,6 +201,7 @@ func New(opts Options) (*Service, error) {
 		dirty:        map[string]bool{},
 		cache:        map[string]cachedSnapshots{},
 		stageLocks:   map[string]*sync.Mutex{},
+		repoLocks:    map[string]*repositoryGate{},
 	}
 	if s.log == nil {
 		s.log = slog.Default()
@@ -279,6 +283,37 @@ func (s *Service) stageLock(dir string) *sync.Mutex {
 		s.stageLocks[dir] = l
 	}
 	return l
+}
+
+// repositoryLock coordinates restores with destructive maintenance of a
+// repository, including maintenance submitted outside the job workers.
+func (s *Service) repositoryLock(loc restic.Location) *repositoryGate {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	l := s.repoLocks[loc.Repository]
+	if l == nil {
+		l = &repositoryGate{}
+		s.repoLocks[loc.Repository] = l
+	}
+	return l
+}
+
+func (s *Service) forget(ctx context.Context, loc restic.Location, ids []string, guard func(restic.Snapshot) bool) error {
+	release, err := s.repositoryLock(loc).write(ctx)
+	if err != nil {
+		return err
+	}
+	defer release()
+	return s.rt.Forget(ctx, loc, ids, guard)
+}
+
+func (s *Service) prune(ctx context.Context, loc restic.Location, opts restic.PruneOptions) error {
+	release, err := s.repositoryLock(loc).write(ctx)
+	if err != nil {
+		return err
+	}
+	defer release()
+	return s.rt.Prune(ctx, loc, opts)
 }
 
 // ensureStageRoot returns the stage root, creating it (without a system

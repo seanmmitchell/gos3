@@ -27,7 +27,10 @@ func (r *Router) lookup(bucket string) (*bucketState, error) {
 	r.mu.RLock()
 	bs := r.buckets[bucket]
 	var err error
-	if bs == nil {
+	if r.deleting[bucket] {
+		bs = nil
+		err = fmt.Errorf("%w: %q is being deleted", storage.ErrBucketUnavailable, bucket)
+	} else if bs == nil {
 		err = r.unknownBucketLocked(bucket)
 	}
 	r.mu.RUnlock()
@@ -324,8 +327,10 @@ func (r *Router) ListBuckets(ctx context.Context) ([]storage.BucketInfo, error) 
 	}
 	r.mu.RLock()
 	states := make([]*bucketState, 0, len(r.buckets))
-	for _, bs := range r.buckets {
-		states = append(states, bs)
+	for name, bs := range r.buckets {
+		if !r.deleting[name] {
+			states = append(states, bs)
+		}
 	}
 	r.mu.RUnlock()
 	sort.Slice(states, func(i, j int) bool { return states[i].name < states[j].name })
@@ -641,13 +646,38 @@ func (r *Router) deleteBucket(ctx context.Context, name string) error {
 	r.mu.RLock()
 	prim := bs.members[bs.rec.primary()].backing
 	r.mu.RUnlock()
-	if err := prim.Backend.DeleteBucket(ctx, name); err != nil {
+	r.mu.Lock()
+	r.deleting[name] = true
+	r.mu.Unlock()
+	if err := r.save(); err != nil {
+		r.mu.Lock()
+		delete(r.deleting, name)
+		r.mu.Unlock()
+		return fmt.Errorf("persisting bucket deletion intent: %w", err)
+	}
+	if err := prim.Backend.DeleteBucket(ctx, name); err != nil && !errors.Is(err, storage.ErrBucketNotFound) {
+		if errors.Is(err, storage.ErrBucketNotEmpty) {
+			// The backend refused deletion before removing the bucket.
+			r.mu.Lock()
+			delete(r.deleting, name)
+			r.mu.Unlock()
+			if saveErr := r.save(); saveErr != nil {
+				r.mu.Lock()
+				r.deleting[name] = true
+				r.mu.Unlock()
+				return errors.Join(err, fmt.Errorf("clearing bucket deletion intent: %w", saveErr))
+			}
+			return err
+		}
+		// An error does not prove the remote deletion did not happen. Keep
+		// the durable intent so a restart can resolve the ambiguous result.
 		return r.observe(prim, err)
 	}
 	var cancel []*memberState
 	r.mu.Lock()
 	bs.removed = true
 	delete(r.buckets, name)
+	delete(r.deleting, name)
 	for bname, ms := range bs.members {
 		cancel = append(cancel, ms)
 		if bname != prim.Name {
@@ -659,7 +689,12 @@ func (r *Router) deleteBucket(ctx context.Context, name string) error {
 	for _, ms := range cancel {
 		r.cancelMember(ms)
 	}
-	r.saveLogged("deleting a bucket")
+	// The deletion intent was saved before touching the primary. Once the
+	// primary is gone, a failed final save cannot undo the deletion: keep
+	// cleaning up the replicas and let reconciliation finish after restart.
+	if err := r.save(); err != nil {
+		r.log.Error("could not save the completed bucket deletion", "bucket", name, "path", r.opts.StatePath, "err", err)
+	}
 	r.mu.RLock()
 	for bname := range bs.members {
 		r.startPurge(r.purges[purgeRecord{Bucket: name, Backing: bname}])

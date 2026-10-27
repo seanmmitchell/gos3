@@ -195,9 +195,10 @@ type Router struct {
 
 	// mu guards buckets, the rec, members and syncMode fields of every
 	// bucketState, and purges.
-	mu      sync.RWMutex
-	buckets map[string]*bucketState
-	purges  map[purgeRecord]*purgeJob
+	mu       sync.RWMutex
+	buckets  map[string]*bucketState
+	purges   map[purgeRecord]*purgeJob
+	deleting map[string]bool
 
 	// pendingAdopt names the backings whose buckets Open could not list:
 	// their buckets without a placement are adopted when the backing
@@ -210,6 +211,10 @@ type Router struct {
 	probeNow chan *backing
 
 	saveMu sync.Mutex // serializes state file writes
+	// stateWriter is a test seam for failures after a durable deletion
+	// intent. Nil uses writeState. Replacements are atomic because purge
+	// workers can save in the background.
+	stateWriter atomic.Pointer[stateWriter]
 
 	keys keyLocks
 	jobs *workQueue
@@ -226,6 +231,8 @@ type Router struct {
 	closeOnce sync.Once
 	closeErr  error
 }
+
+type stateWriter func(string, *stateFile) error
 
 // bucketState is the runtime state of one bucket.
 type bucketState struct {
@@ -299,6 +306,7 @@ func Open(ctx context.Context, opts Options) (_ *Router, err error) {
 		opts:         opts,
 		buckets:      map[string]*bucketState{},
 		purges:       map[purgeRecord]*purgeJob{},
+		deleting:     map[string]bool{},
 		pendingAdopt: map[string]bool{},
 		probeNow:     make(chan *backing, 16),
 	}
@@ -384,7 +392,10 @@ func Open(ctx context.Context, opts Options) (_ *Router, err error) {
 		r.healthLoop()
 	}()
 	r.mu.RLock()
-	for _, bs := range r.buckets {
+	for name, bs := range r.buckets {
+		if r.deleting[name] {
+			continue
+		}
 		for _, ms := range bs.members {
 			if ms.backing.Name != bs.rec.primary() {
 				r.kick(ms)
@@ -449,6 +460,40 @@ func (r *Router) listAll(ctx context.Context) (lists map[string][]storage.Bucket
 	return lists, unknown, nil
 }
 
+// retainsBucketForRecovery reports a hidden bucket record that an operator
+// can explicitly release without touching the remote bucket.
+func retainsBucketForRecovery(b *backing, name string) bool {
+	if b == nil {
+		return false
+	}
+	recovery, ok := b.Backend.(interface{ RetainsBucketForRecovery(string) bool })
+	return ok && recovery.RetainsBucketForRecovery(name)
+}
+
+type deletionPrimaryState uint8
+
+const (
+	deletionPrimaryUnknown deletionPrimaryState = iota
+	deletionPrimaryRetained
+	deletionPrimaryLive
+	deletionPrimaryAbsent
+)
+
+// classifyDeletionPrimary keeps a hidden recovery record distinct from a
+// listed bucket. Both startup and delayed adoption use the same decision.
+func classifyDeletionPrimary(b *backing, unknown, listed bool, name string) deletionPrimaryState {
+	switch {
+	case unknown:
+		return deletionPrimaryUnknown
+	case retainsBucketForRecovery(b, name):
+		return deletionPrimaryRetained
+	case listed:
+		return deletionPrimaryLive
+	default:
+		return deletionPrimaryAbsent
+	}
+}
+
 // reconcile turns the loaded state into the runtime state, checking it
 // against the buckets the backings hold. It returns the backings whose
 // buckets could not be listed ("unknown"): they are assumed to still hold
@@ -478,7 +523,10 @@ func (r *Router) reconcile(ctx context.Context, st *stateFile) ([]*backing, erro
 			return true
 		}
 		_, ok := present[backing][bucket]
-		return ok
+		if ok {
+			return true
+		}
+		return false
 	}
 
 	for _, p := range st.Purges {
@@ -496,6 +544,51 @@ func (r *Router) reconcile(ctx context.Context, st *stateFile) ([]*backing, erro
 	}
 
 	for name, rec := range st.Buckets {
+		primary := rec.primary()
+		_, listed := present[primary][name]
+		primaryState := classifyDeletionPrimary(r.topology.Load().backings[primary], isUnknown[primary], listed, name)
+		if st.Deleting[name] || primaryState == deletionPrimaryRetained {
+			if primaryState == deletionPrimaryUnknown || primaryState == deletionPrimaryRetained {
+				// Keep the intent hidden until the primary can be listed, but
+				// discard members whose backings cannot be used after recovery.
+				rec = rec.clone()
+				kept := rec.Members[:0]
+				for _, m := range rec.Members {
+					if r.topology.Load().backings[m.Backing] == nil {
+						r.log.Warn("bucket copy on a backing that is no longer configured is forgotten",
+							"bucket", name, "backing", m.Backing)
+						continue
+					}
+					if !slices.ContainsFunc(kept, func(k memberRecord) bool { return k.Backing == m.Backing }) {
+						kept = append(kept, m)
+					}
+				}
+				rec.Members = kept
+				if len(kept) == 1 {
+					rec.Mode = ModeSingle
+				}
+				if mv := rec.Move; mv != nil && (r.topology.Load().backings[mv.To] == nil || rec.member(mv.From) < 0 || rec.member(mv.To) >= 0) {
+					rec.Move = nil
+				}
+				r.deleting[name] = true
+				r.buckets[name] = r.newBucketState(name, rec)
+				continue
+			}
+			if primaryState == deletionPrimaryAbsent {
+				// The primary deletion completed. Purge every remaining copy;
+				// a replica must never become the new primary.
+				for _, m := range rec.Members {
+					if r.topology.Load().backings[m.Backing] != nil {
+						r.addPurgeLocked(name, m.Backing, m.Diverged)
+					}
+				}
+				if rec.Move != nil && r.topology.Load().backings[rec.Move.To] != nil {
+					r.addPurgeLocked(name, rec.Move.To, false)
+				}
+				continue
+			}
+			// A listed, live primary means deletion did not complete.
+		}
 		rec = rec.clone()
 		// Forget members on backings that are no longer configured.
 		var kept []memberRecord
@@ -656,18 +749,79 @@ func (r *Router) adoptPending(b *backing) {
 }
 
 // adoptListed ends the pending adoption of backing b (see pendingAdopt)
-// with infos, its buckets, and reports whether it adopted any (the caller
-// saves the placements then). The caller holds adminMu.
+// with infos, its buckets, and resolves deletion intents waiting for this
+// primary. It reports whether placements changed (the caller saves them).
+// The caller holds adminMu.
 func (r *Router) adoptListed(b *backing, infos []storage.BucketInfo) bool {
+	present := map[string]bool{}
+	for _, in := range infos {
+		present[in.Name] = true
+	}
+	var cancel, resume []*memberState
 	r.mu.Lock()
 	delete(r.pendingAdopt, b.Name)
+	changed := false
+	// A backing can acquire a tombstone while it could not be listed. Even
+	// without a saved router intent, discovering it must hide the placement.
+	for name, bs := range r.buckets {
+		if bs.rec.primary() != b.Name || r.deleting[name] || !retainsBucketForRecovery(b, name) {
+			continue
+		}
+		r.deleting[name] = true
+		changed = true
+		for backing, ms := range bs.members {
+			if backing != b.Name {
+				cancel = append(cancel, ms)
+			}
+		}
+	}
+	for name := range r.deleting {
+		bs := r.buckets[name]
+		if bs == nil || bs.rec.primary() != b.Name {
+			continue
+		}
+		if classifyDeletionPrimary(b, false, present[name], name) == deletionPrimaryRetained {
+			continue // keep the placement hidden and releasable
+		}
+		delete(r.deleting, name)
+		changed = true
+		if present[name] {
+			for backing, ms := range bs.members {
+				if backing != b.Name {
+					resume = append(resume, ms)
+				}
+			}
+			continue
+		}
+		bs.removed = true
+		delete(r.buckets, name)
+		for _, ms := range bs.members {
+			cancel = append(cancel, ms)
+		}
+		for _, m := range bs.rec.Members {
+			if r.topology.Load().backings[m.Backing] != nil {
+				r.addPurgeLocked(name, m.Backing, m.Diverged)
+				r.startPurge(r.purges[purgeRecord{Bucket: name, Backing: m.Backing}])
+			}
+		}
+		if mv := bs.rec.Move; mv != nil && r.topology.Load().backings[mv.To] != nil {
+			r.addPurgeLocked(name, mv.To, false)
+			r.startPurge(r.purges[purgeRecord{Bucket: name, Backing: mv.To}])
+		}
+	}
 	adopted := r.adoptLocked(b, infos)
 	r.mu.Unlock()
+	for _, ms := range cancel {
+		r.cancelMember(ms)
+	}
+	for _, ms := range resume {
+		r.kick(ms)
+	}
 	if adopted {
 		r.log.Info("adopted the buckets without a placement of a storage backing that could not be listed at startup",
 			"backing", b.Name)
 	}
-	return adopted
+	return adopted || changed
 }
 
 func memberNames(ms []memberRecord) []string {
@@ -711,10 +865,13 @@ func (r *Router) save() error {
 	}
 	r.saveMu.Lock()
 	defer r.saveMu.Unlock()
-	st := &stateFile{Version: stateVersion, Buckets: map[string]*placementRecord{}}
+	st := &stateFile{Version: stateVersion, Buckets: map[string]*placementRecord{}, Deleting: map[string]bool{}}
 	r.mu.RLock()
 	for name, bs := range r.buckets {
 		st.Buckets[name] = bs.rec
+	}
+	for name := range r.deleting {
+		st.Deleting[name] = true
 	}
 	for p, j := range r.purges {
 		st.Purges = append(st.Purges, p)
@@ -730,6 +887,9 @@ func (r *Router) save() error {
 			}
 			return cmpString(a.Backing, b.Backing)
 		})
+	}
+	if writer := r.stateWriter.Load(); writer != nil {
+		return (*writer)(r.opts.StatePath, st)
 	}
 	return writeState(r.opts.StatePath, st)
 }
@@ -908,7 +1068,10 @@ func (r *Router) probe(b *backing) {
 func (r *Router) onBackingDown(b *backing) {
 	var failover []*bucketState
 	r.mu.Lock()
-	for _, bs := range r.buckets {
+	for name, bs := range r.buckets {
+		if r.deleting[name] {
+			continue
+		}
 		ms := bs.members[b.Name]
 		if ms == nil || ms.backing != b {
 			continue
@@ -949,7 +1112,10 @@ func (r *Router) onBackingUp(b *backing) {
 	}
 	r.mu.RLock()
 	defer r.mu.RUnlock()
-	for _, bs := range r.buckets {
+	for name, bs := range r.buckets {
+		if r.deleting[name] {
+			continue
+		}
 		for _, ms := range bs.members {
 			if ms.backing.Name != bs.rec.primary() {
 				r.kick(ms)
