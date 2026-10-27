@@ -43,7 +43,7 @@ const run = useAsyncAction<[Job, JobAction | 'delete'], Job | null>(
     return requireAdmin().jobAction(job.id, action)
   },
   {
-    successMessage: (job, action) => `${jobKindMeta(job.kind).label} job ${JOB_ACTIONS[action].done}`,
+    successMessage: (job, action) => action === 'run' && job.kind === 'mirror' ? 'Mirror full comparison queued' : `${jobKindMeta(job.kind).label} job ${JOB_ACTIONS[action].done}`,
     errorTitle: 'Could not change the job'
   }
 )

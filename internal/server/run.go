@@ -73,6 +73,9 @@ func (s *Server) Serve(ctx context.Context, ln net.Listener) error {
 		s.log.Error("discovery: start failed", "err", err)
 	}
 	s.lifecycle.Start(s.lifeCtx)
+	if s.updates != nil {
+		go s.updates.Run(s.lifeCtx)
+	}
 
 	errc := make(chan error, 1)
 	go func() {

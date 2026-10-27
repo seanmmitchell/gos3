@@ -32,7 +32,9 @@ var errLockedConflict = errors.New("multi: a locked version conflicts with the p
 const walkBatchKeys = 256
 
 // syncMemberKey copies key from the bucket's primary to member ms, under
-// the key's lock. prog, when non-nil, counts the work.
+// the key's lock. prog, when non-nil, counts the work. A key copied
+// stops being skipped; an error wrapping copier.ErrTooManyVersions is
+// returned for the caller to skip the key (skipKey) and go on.
 func (r *Router) syncMemberKey(ctx context.Context, ms *memberState, key string, prog *Progress) error {
 	r.mu.RLock()
 	rec := ms.bucket.rec
@@ -50,6 +52,9 @@ func (r *Router) syncMemberKey(ctx context.Context, ms *memberState, key string,
 	unlock := r.keys.lock(ms.bucket.name, key)
 	defer unlock()
 	err := r.syncKey(ctx, src, ms.backing, ms.bucket.name, key, diverged, prog)
+	if err == nil {
+		ms.unskip(key)
+	}
 	if errors.Is(err, errRestoredLocked) {
 		r.restoredLocked(ms.bucket, key)
 	}
@@ -396,6 +401,27 @@ func (r *Router) fullSync(ctx context.Context, ms *memberState) error {
 		defer ms.mu.Unlock()
 		return ms.progress
 	}
+	// Keys with too long a history are skipped and the comparison goes on;
+	// skipped keys this comparison no longer meets are forgotten at its
+	// end (they are gone from both copies).
+	ms.mu.Lock()
+	stale := make(map[string]bool, len(ms.skipped))
+	for k := range ms.skipped {
+		stale[k] = true
+	}
+	ms.mu.Unlock()
+	syncOrSkip := func(k string, p *Progress) error {
+		err := r.syncMemberKey(ctx, ms, k, p)
+		if errors.Is(err, copier.ErrTooManyVersions) {
+			r.skipKey(ms, k, err)
+			delete(stale, k)
+			return nil
+		}
+		if err == nil {
+			delete(stale, k)
+		}
+		return err
+	}
 	// Every key of the source.
 	err = walkKeys(ctx, src.Backend, bs.name, func(keys []string) error {
 		for _, k := range keys {
@@ -403,7 +429,7 @@ func (r *Router) fullSync(ctx context.Context, ms *memberState) error {
 				return err
 			}
 			p := &Progress{}
-			if err := r.syncMemberKey(ctx, ms, k, p); err != nil {
+			if err := syncOrSkip(k, p); err != nil {
 				return err
 			}
 			r.addProgress(ms, prog(), p)
@@ -426,7 +452,7 @@ func (r *Router) fullSync(ctx context.Context, ms *memberState) error {
 			if !errors.Is(err, storage.ErrObjectNotFound) {
 				return r.observe(src, err)
 			}
-			if err := r.syncMemberKey(ctx, ms, k, nil); err != nil {
+			if err := syncOrSkip(k, nil); err != nil {
 				return err
 			}
 		}
@@ -435,6 +461,12 @@ func (r *Router) fullSync(ctx context.Context, ms *memberState) error {
 	if err != nil {
 		return r.walkErr(dst, err)
 	}
+	ms.mu.Lock()
+	for k := range stale {
+		delete(ms.skipped, k)
+	}
+	ms.nskipped.Store(int32(len(ms.skipped)))
+	ms.mu.Unlock()
 	return nil
 }
 

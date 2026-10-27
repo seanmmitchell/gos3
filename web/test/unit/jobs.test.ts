@@ -64,7 +64,7 @@ const job = (over: Partial<Job> = {}): Job => ({
   createdAt: '2026-10-15T10:00:00Z',
   spec: { kind: 'copy', source: { bucket: 'photos' }, target: { bucket: 'photos-bak' } },
   labels: { source: 'photos', target: 'photos-bak' },
-  status: { keysScanned: 10, keysCopied: 5, versionsCopied: 5, bytesCopied: 400, bytesDone: 500, keysDeleted: 0, conflicts: 0, totalKeys: 20, totalBytes: 1000, bytesPerSecond: 100, etaSeconds: 5 },
+  status: { totalsKnown: true, sourceKeysDone: 10, keysScanned: 10, keysCopied: 5, versionsCopied: 5, bytesCopied: 400, bytesDone: 500, keysDeleted: 0, conflicts: 0, totalKeys: 20, totalBytes: 1000, bytesPerSecond: 100, etaSeconds: 5 },
   ...over
 })
 
@@ -158,8 +158,8 @@ describe('job helpers', () => {
   it('computes byte progress from bytesDone / totalBytes, indeterminate without a total', () => {
     expect(jobProgress(job())).toEqual({ percent: 50, done: 500, total: 1000 })
     expect(jobProgress(job({ status: { bytesDone: 3, totalBytes: 0 } }))).toEqual({ percent: null, done: 3, total: 0 })
-    expect(jobProgress(job({ status: { bytesDone: 5000, totalBytes: 1000 } }))!.percent).toBe(100)
-    expect(jobProgress(job({ state: 'succeeded', status: { bytesDone: 10, totalBytes: 1000 } }))!.percent).toBe(100)
+    expect(jobProgress(job({ status: { totalsKnown: true, bytesDone: 5000, totalBytes: 1000 } }))!.percent).toBeNull()
+    expect(jobProgress(job({ state: 'succeeded', status: { passComplete: true, totalsKnown: true, bytesDone: 1000, totalBytes: 1000 } }))!.percent).toBe(100)
     expect(jobProgress(job({ status: null }))).toEqual({ percent: null, done: 0, total: 0 })
     expect(jobProgress(job({ kind: 'restic-snapshot' }))).toBeNull()
   })
@@ -186,8 +186,28 @@ describe('job helpers', () => {
     expect(jobTiming(job({ state: 'paused' }))).toBe('')
     const mirror = (status: Record<string, unknown>, over: Partial<Job> = {}) => job({ kind: 'mirror', state: 'waiting', status, ...over })
     expect(jobTiming(mirror({ pending: 1200, lagSeconds: 125 }))).toBe(`${(1200).toLocaleString()} pending · lag 2m 5s`)
-    expect(jobTiming(mirror({ pending: 0 }))).toBe('In sync')
+    expect(jobTiming(mirror({ pending: 0 }))).toBe('No full comparison reported')
     expect(jobTiming(job({ kind: 'restic-prune' }))).toBe('')
+  })
+
+  it('keeps lifetime writes out of pass progress and handles empty and zero-byte sources', () => {
+    expect(jobProgress(job({ status: { totalsKnown: true, bytesDone: 0, bytesCopied: 9000, totalBytes: 100 } }))).toEqual({ percent: 0, done: 0, total: 100 })
+    expect(jobProgress(job({ status: { totalsKnown: true, bytesDone: 0, sourceKeysDone: 1, totalKeys: 2 } }))!.percent).toBe(50)
+    expect(jobProgress(job({ status: { totalsKnown: true, bytesDone: 0, totalKeys: 0 } }))!.percent).toBeNull()
+    expect(jobProgress(job({ status: { totalsKnown: true, passComplete: true, bytesDone: 0, totalKeys: 0 } }))!.percent).toBe(100)
+    expect(jobProgress(job({ kind: 'mirror', phase: 'watching' }))!.percent).toBeNull()
+  })
+
+  it('qualifies mirror freshness and preserves current failures without treating historical samples as outstanding', () => {
+    const mirror = (status: Record<string, unknown>, over: Partial<Job> = {}) => job({ kind: 'mirror', state: 'waiting', phase: 'watching', status, ...over })
+    expect(jobTiming(mirror({ unresolved: 2 }))).toBe('2 unresolved keys')
+    expect(jobTiming(mirror({ conflicts: 3 }))).toBe('3 conflicts reported')
+    expect(jobTiming(mirror({ checkRequired: true }))).toBe('Full comparison required')
+    expect(jobTiming(mirror({}, { lastError: 'read failed' }))).toBe('Last run failed')
+    expect(jobTiming(mirror({}, { state: 'running' }))).toBe('Processing source changes')
+    expect(jobTiming(mirror({}, { state: 'running', phase: 'verifying' }))).toBe('Full comparison in progress')
+    const recovered = mirror({ unresolved: 0, conflicts: 1, errors: [{ key: 'x', error: 'old' }], lastPassAt: '2026-10-24T12:00:00Z' })
+    expect(jobTiming(recovered)).toBe('No known pending changes · last full comparison 2026-10-24T12:00:00Z')
   })
 
   it('offers the actions each state allows', () => {

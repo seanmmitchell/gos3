@@ -108,9 +108,16 @@ func MapKey(src, dst Endpoint, srcKey string) (string, bool) {
 //
 // A source key that maps to an empty target key or to one longer than
 // MaxKeyLen cannot be copied: the sync functions report it as a Conflict.
+//
+// Err is set (wrapping ErrTooManyVersions) when ZipWalk found more than
+// MaxKeyVersions entries of the key on either side. The walk skipped that
+// side's entries without keeping them, so Src or Dst is nil, and the walk
+// went on with the next key. The sync functions return Err without
+// changing anything; callers report the key as failed and continue.
 type KeyPair struct {
 	SrcKey, DstKey string
 	Src, Dst       []storage.ObjectInfo
+	Err            error
 }
 
 // Versions selects the versions a copy keeps.

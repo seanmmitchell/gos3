@@ -3,7 +3,11 @@ package copyjob
 import (
 	"context"
 	"errors"
+	"fmt"
+	"io"
+	"slices"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -96,21 +100,109 @@ func TestCopyJobPinsBucketIncarnations(t *testing.T) {
 	}
 }
 
-func TestFailedMirrorRechecksConflictsOnResume(t *testing.T) {
+// A key with more versions than copier.MaxKeyVersions fails alone: the
+// mirror copies every other key, reports that one in its errors and keeps
+// running (retrying it), instead of failing for good at that key.
+func TestMirrorSkipsKeyWithTooManyVersions(t *testing.T) {
 	router := openRouter(t, memBacking("a"))
+	createBucket(t, router, "src", storage.CreateBucketOptions{}, storage.VersioningEnabled)
+	createBucket(t, router, "dst", storage.CreateBucketOptions{}, storage.VersioningEnabled)
+	put(t, router, "src", "aaa-before", "a")
+	for range copier.MaxKeyVersions + 1 {
+		put(t, router, "src", "u/x", "x")
+	}
+	put(t, router, "src", "zzz-after", "z")
+	e := newEnv(t, router, "")
+	j := e.mustSubmit(map[string]any{"kind": KindMirror, "source": map[string]any{"bucket": "src"},
+		"target": map[string]any{"bucket": "dst"}})
+	j = e.waitJob(j.ID, "the mirror to watch with the hot key failed", func(j jobs.Job) bool {
+		if j.State == jobs.StateFailed {
+			t.Fatalf("mirror failed: %s", j.LastError)
+		}
+		if j.State != jobs.StateWaiting || j.Phase != phaseWatching || len(j.Status) == 0 {
+			return false
+		}
+		for _, ke := range statusOf(t, j).Errors {
+			if ke.Key == "u/x" && strings.Contains(ke.Error, "too many versions") {
+				return true
+			}
+		}
+		return false
+	})
+	if j.LastError != "" {
+		t.Fatalf("lastError %q", j.LastError)
+	}
+	if got := keys(t, router, "dst"); !slices.Equal(got, []string{"aaa-before", "zzz-after"}) {
+		t.Fatalf("target keys %v", got)
+	}
+}
+
+// A copy job's final pass fails while a key cannot be copied, so the job
+// is retried rather than reported as done; the other keys are copied.
+func TestCopySkipsKeyWithTooManyVersions(t *testing.T) {
+	router := openRouter(t, memBacking("a"))
+	createBucket(t, router, "src", storage.CreateBucketOptions{}, storage.VersioningEnabled)
+	put(t, router, "src", "aaa-before", "a")
+	for range copier.MaxKeyVersions + 1 {
+		put(t, router, "src", "u/x", "x")
+	}
+	put(t, router, "src", "zzz-after", "z")
+	e := newEnv(t, router, "")
+	j := e.mustSubmit(map[string]any{"kind": KindCopy, "source": map[string]any{"bucket": "src"},
+		"target": map[string]any{"bucket": "dst", "create": map[string]any{}}})
+	// Every other key is copied, then the job fails instead of retrying
+	// forever.
+	j = e.waitJob(j.ID, "the copy to fail after copying the other keys", func(j jobs.Job) bool {
+		if j.State == jobs.StateSucceeded {
+			t.Fatalf("copy succeeded without u/x")
+		}
+		return j.State == jobs.StateFailed
+	})
+	if !strings.Contains(j.LastError, "1 keys were not copied") || !strings.Contains(j.LastError, "too many versions") {
+		t.Fatalf("last error %q", j.LastError)
+	}
+	if got := keys(t, router, "dst"); !slices.Equal(got, []string{"aaa-before", "zzz-after"}) {
+		t.Fatalf("target keys %v", got)
+	}
+	found := false
+	for _, ke := range statusOf(t, j).Errors {
+		found = found || ke.Key == "u/x" && strings.Contains(ke.Error, "too many versions")
+	}
+	if !found {
+		t.Fatalf("errors %+v", statusOf(t, j).Errors)
+	}
+}
+
+// failingReads fails reads from the bucket "src" with an error that a
+// rerun would meet again while fail is set.
+type failingReads struct {
+	*memory.Backend
+	fail atomic.Bool
+}
+
+func (b *failingReads) OpenObject(ctx context.Context, bucket, key, versionID string) (storage.ObjectInfo, io.ReadSeekCloser, error) {
+	if b.fail.Load() && bucket == "src" {
+		return storage.ObjectInfo{}, nil, fmt.Errorf("injected: %w", storage.ErrBucketNotFound)
+	}
+	return b.Backend.OpenObject(ctx, bucket, key, versionID)
+}
+
+func TestFailedMirrorRechecksConflictsOnResume(t *testing.T) {
+	backend := &failingReads{Backend: memory.New()}
+	backend.fail.Store(true)
+	router := openRouter(t, multi.Backing{Name: "a", Kind: "memory", Backend: backend})
 	createBucket(t, router, "src", storage.CreateBucketOptions{}, storage.VersioningEnabled)
 	createBucket(t, router, "other", storage.CreateBucketOptions{}, storage.VersioningEnabled)
 	createBucket(t, router, "dst", storage.CreateBucketOptions{}, storage.VersioningEnabled)
-	for range copier.MaxKeyVersions + 1 {
-		put(t, router, "src", "hot", "x")
-	}
+	put(t, router, "src", "k", "x")
 	e := newEnv(t, router, "")
 	first := e.mustSubmit(map[string]any{"kind": KindMirror, "source": map[string]any{"bucket": "src"},
 		"target": map[string]any{"bucket": "dst"}})
 	failed := e.waitState(first.ID, jobs.StateFailed)
-	if !strings.Contains(failed.LastError, "too many versions") {
-		t.Fatalf("first failure: %s", failed.LastError)
+	if !strings.Contains(failed.LastError, "injected") || failed.Phase == phasePreparing {
+		t.Fatalf("first failure: %s in phase %s", failed.LastError, failed.Phase)
 	}
+	backend.fail.Store(false)
 	second := e.mustSubmit(map[string]any{"kind": KindMirror, "source": map[string]any{"bucket": "other"},
 		"target": map[string]any{"bucket": "dst"}})
 	e.waitIdle(second.ID)

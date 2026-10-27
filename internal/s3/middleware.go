@@ -236,6 +236,15 @@ func (s *Server) serve(w *responseWriter, r *http.Request, rc *reqContext) {
 		s.setAnonymousResourcePolicy(w, r, rc, settings)
 	}
 
+	switch op.Name {
+	case "ListObjects", "ListObjectsV2", "ListObjectVersions", "ListMultipartUploads":
+		// Before authorization: the policy must see the values the
+		// listing uses (N-02).
+		if err := validateListQuery(rc.query); err != nil {
+			s.writeError(w, r, rc, err)
+			return
+		}
+	}
 	if !op.AuthzByHandler {
 		if err := s.authorizeOp(r.Context(), r, rc); err != nil {
 			s.writeError(w, r, rc, err)

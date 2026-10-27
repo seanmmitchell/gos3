@@ -553,7 +553,8 @@ backing definitions on restart, like the runtime settings overlay.
       "pending": 0,            // changed keys not yet copied to this member
       "progress": { "keys": 120, "versions": 130, "bytes": 1048576 } | null, // running full copy
       "lastSyncAt": "…",       // last completed full copy (omitted when none)
-      "lastError": "" } ],
+      "lastError": "",
+      "skippedKeys": 0 } ],    // keys not copied: a copy holds more than 4,096 versions of them
   "move": { "from": "default", "to": "archive", "startedAt": "…",
             "phase": "copying" | "cutover",
             "target": { "kind": "wrapped", "container": "c-7f3a" } } | null } // target: when the move chose a container
@@ -562,8 +563,15 @@ backing definitions on restart, like the runtime settings overlay.
 Member states: `in-sync` (an active-active replica receiving every write
 synchronously, a replica with no pending changes, or the primary); `syncing`
 (initial or requested full copy running); `lagging` (changes are pending,
-copied in the background); `degraded` (copying failed; retried with
-back-off, see `lastError`); `offline` (the backing is unhealthy).
+copied in the background); `degraded` (copying failed and is retried with
+back-off, or `skippedKeys` keys could not be copied because a copy holds
+more than 4,096 versions of them; see `lastError`, which names one);
+`offline` (the backing is unhealthy). While `skippedKeys` is above 0, a
+replica does not become in-sync, an active-active replica does not take
+synchronous writes, a move does not complete, a graceful promote is
+refused (use `force`), and the replica neither serves reads nor takes over
+in an automatic failover, even if it was in sync before. Skipped keys are retried whenever they change, on
+every full copy and every few minutes.
 
 `BucketSummary` (`GET /buckets`, `GET /buckets/{name}`) also has
 `"placement": {"mode": "single", "primary": "default", "replicas": [], "moving": false}`.
@@ -667,7 +675,7 @@ the system directory; in memory without one) and report progress. See
 | GET | `/jobs?kind=&state=&bucket=` | ListJobs | `{"jobs": Job[]}`, newest first; `bucket` matches the source or target bucket |
 | POST | `/jobs` | CreateCopyJob on **both** `bucket/<source>` and `bucket/<target>` | body `CopyJobSpec` → 201 `Job`; with `"dryRun": true` → 200 `{"spec": CopyJobSpec, "warnings": ["…"]}` (validated and normalized, nothing created) |
 | GET | `/jobs/{id}` | GetJob on `bucket/<source>` and `bucket/<target>` | `Job` |
-| POST | `/jobs/{id}/pause` \| `/resume` \| `/cancel` \| `/run` | UpdateJob on `bucket/<source>` and `bucket/<target>` | `Job`. `run` starts a waiting job (a mirror pass, a retry) now; on a queued or running job it does nothing (a running mirror makes another pass right after this one), on a paused or finished job it is 409; `resume` also retries a failed job from its checkpoint |
+| POST | `/jobs/{id}/pause` \| `/resume` \| `/cancel` \| `/run` | UpdateJob on `bucket/<source>` and `bucket/<target>` | `Job`. `run` requests a full mirror reconciliation, including with no pending source changes; a running mirror runs again if needed to include the request. Other waiting jobs retry now. A queued job stays queued; paused or finished jobs return 409. The response acknowledges scheduling, not successful comparison. `resume` also retries a failed job from its checkpoint |
 | DELETE | `/jobs/{id}` | UpdateJob (as above) | 204; 409 unless the job is finished (succeeded, failed or canceled) |
 | GET | `/buckets/{name}/jobs` | GetJob on `bucket/<name>` | `{"jobs": Job[]}`: jobs whose source or target is the bucket (also after it was deleted), newest first, `kind` and `state` filters as for `/jobs`; only the jobs the caller may also get by ID (GetJob on their other bucket) |
 
@@ -738,6 +746,8 @@ state change the job's state does not allow; 404 for unknown jobs.
 
 // CopyStatus
 { "keysScanned": 0, "keysCopied": 0, "versionsCopied": 0, "bytesCopied": 0, "bytesDone": 0, "keysDeleted": 0,
+  "sourceKeysDone": 0, "passComplete": false, "totalsKnown": false,
+  "unresolved": 0, "checkRequired": true,
   "conflicts": 0, "conflictSamples": [ { "key": "k", "reason": "locked version" } ],
   "totalKeys": 0, "totalBytes": 0, "bytesPerSecond": 0, "etaSeconds": 0,
   "pending": 0, "lagSeconds": 0, "lastPassAt": "…", "nextPassAt": "…", "passes": 0,   // mirror
@@ -745,6 +755,26 @@ state change the job's state does not allow; 404 for unknown jobs.
   "mode": "identity" | "fingerprint",          // how keys are compared (see jobs.md)
   "warnings": [ "…" ] }                         // what the job skipped on purpose (e.g. a policy it cannot rewrite)
 ```
+
+Copy status separates lifetime writes (`keysCopied`, `versionsCopied`,
+`bytesCopied`, `keysDeleted`) from the current/last full pass
+(`keysScanned`, `sourceKeysDone`, `bytesDone`, `totalKeys`, `totalBytes`).
+Incremental runs do not add to pass progress. Use a ratio only when
+`totalsKnown` is true; zero-byte sources can use `sourceKeysDone/totalKeys`.
+`passComplete` says the comparison finished, including empty sources,
+not that all copies succeeded. Totals are remeasured for each full pass
+and finalized to the source keys/bytes examined when it completes.
+
+For mirrors, `pending` includes queued/in-flight source changes and
+`lagSeconds` their oldest age at the time of the API read. `unresolved`
+counts distinct keys with current errors/conflicts and survives restart;
+successful per-key work clears it. Historical `errors` and pass conflict
+samples do not imply current failure. `checkRequired` qualifies a pending
+or incomplete full comparison, including restart and manual-run requests.
+`lastPassAt` is completion time, not proof of current target agreement.
+Full passes reconcile according to the configured policy and backend
+comparison rules. External changes can remain unseen until the next full
+pass. The Jobs and bucket jobs endpoints use the same live assessment.
 
 ### Whole-bucket restic snapshots
 
@@ -829,6 +859,43 @@ ListJobs, GetJob and GetBucketSnapshots.
 | GET | `/discovery` | GetDiscovery | `{"enabled": bool, "config": discovery.Config, "self": Info, "peers": discovery.Peer[]}` |
 | POST | `/discovery/probe` | ProbeNetwork | body `{"url": "http://host:9000"}` → `discovery.Peer` (400 `InvalidRequest` ending in `address not allowed` when the target is, or resolves to, a cloud metadata, unspecified, multicast or broadcast address; 502 `ProbeFailed` on failure, with only a coarse reason: `unreachable`, `timed out`, `HTTP <status>` or `not a gos3 server`; 429 `TooManyRequests` while 4 probes are already running on the server; each probe is bounded by 10 s) |
 | POST | `/discovery/scan` | ScanNetwork | body `discovery.ScanRequest` → `discovery.ScanResult` (403 when `allowScan` is false; 400 when the targets expand to more than `maxScanHosts` hosts, or for more than 256 targets, more than 64 ports, a port outside 1–65535, a scheme other than http/https, a `timeout` outside 0–60 s or `concurrency` outside 0–1024; 429 `TooManyRequests` while 2 scans are already running on the server; the whole scan is bounded by 5 minutes) |
+
+## Cached release checks — `GET /_gos3/admin/v1/updates`
+
+Any authenticated identity may read this endpoint, including users without
+`admin:GetConfig` or `admin:UpdateConfig`. Reads never contact GitHub. Example:
+
+```json
+{
+  "supported": true,
+  "enabled": true,
+  "installedVersion": "v0.2.2",
+  "comparable": true,
+  "notifyFor": ["patch", "minor", "major"],
+  "lastCheck": "2026-10-25T12:00:00Z",
+  "lastSuccess": "2026-10-25T12:00:01Z",
+  "error": "",
+  "available": {
+    "version": "v0.2.3",
+    "type": "patch",
+    "url": "https://github.com/seanmmitchell/gos3/releases/tag/v0.2.3"
+  }
+}
+```
+
+Timestamps and `available` may be null. `supported: false` means this server
+has no enabled web UI and runs no release checker. A failed attempt sets
+`error` without discarding the last successful result. Disabled checking
+always returns `available: null`. Unknown/development installed versions have
+`comparable: false` and produce no notice.
+
+The runtime `GET/PUT /config` document includes
+`"updates": {"enabled": false, "notifyFor": ["patch", "minor", "major"]}`.
+Allowed notification types are unique `patch`, `minor`, `major`; `[]` means
+no notices. Invalid values return `400 InvalidSettings`. These settings persist
+and take effect without restart, overriding static configuration/environment.
+An older client's PUT that omits `updates` preserves the current values.
+Dismissal and skipped releases are browser-local choices, not API mutations.
 
 ## Public endpoints (no `/admin/v1` prefix; served by `internal/server`)
 

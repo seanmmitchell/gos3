@@ -75,6 +75,8 @@ const (
 	MinSnapshotSpoolBytes     = int64(64) << 20 // 64 MiB
 	DefaultRestoreSpoolBytes  = int64(1) << 30  // 1 GiB
 	MinRestoreSpoolBytes      = int64(64) << 20 // 64 MiB
+	DefaultMaxRestores        = 4
+	MaxResticRestores         = 64
 
 	// Replication modes (storage.replication.default_mode).
 	ReplicationSingle        = "single"
@@ -167,8 +169,9 @@ func Default() Config {
 			MinSize:          DefaultCompressionMinSize,
 			SkipContentTypes: slices.Clone(DefaultSkipContentTypes),
 		},
-		Jobs: JobsConfig{Workers: DefaultJobsWorkers},
-		Restic: ResticConfig{RestoreSpoolBytes: DefaultRestoreSpoolBytes, Snapshots: ResticSnapshotsConfig{
+		Updates: UpdatesConfig{NotifyFor: []string{"patch", "minor", "major"}},
+		Jobs:    JobsConfig{Workers: DefaultJobsWorkers},
+		Restic: ResticConfig{RestoreSpoolBytes: DefaultRestoreSpoolBytes, MaxRestores: DefaultMaxRestores, Snapshots: ResticSnapshotsConfig{
 			Workers:     DefaultSnapshotWorkers,
 			SpoolBytes:  DefaultSnapshotSpoolBytes,
 			Incremental: true,
@@ -272,6 +275,7 @@ var yamlSections = map[string]string{
 	"config.ReplicationConfig":     "storage.replication",
 	"config.AuthConfig":            "auth",
 	"config.UIConfig":              "ui",
+	"config.UpdatesConfig":         "updates",
 	"config.CORSConfig":            "cors",
 	"discovery.Config":             "discovery",
 	"config.LoggingConfig":         "logging",
@@ -367,6 +371,9 @@ func (c *Config) Normalize() {
 	}
 	if c.Restic.RestoreSpoolBytes == 0 {
 		c.Restic.RestoreSpoolBytes = DefaultRestoreSpoolBytes
+	}
+	if c.Restic.MaxRestores == 0 {
+		c.Restic.MaxRestores = DefaultMaxRestores
 	}
 	snap := &c.Restic.Snapshots
 	if snap.Workers == 0 {
@@ -484,6 +491,9 @@ func (c Config) validateJobs() error {
 	}
 	if n := c.Restic.RestoreSpoolBytes; n != 0 && n < MinRestoreSpoolBytes {
 		return fmt.Errorf("restic.restore_spool_bytes: must be at least %d bytes (64 MiB), got %d", MinRestoreSpoolBytes, n)
+	}
+	if n := c.Restic.MaxRestores; n != 0 && (n < 1 || n > MaxResticRestores) {
+		return fmt.Errorf("restic.max_restores: must be between 1 and %d, got %d", MaxResticRestores, n)
 	}
 	snap := c.Restic.Snapshots
 	if n := snap.Workers; n != 0 && (n < 1 || n > MaxJobsWorkers) {
@@ -661,6 +671,7 @@ func SettingsFrom(c Config) Settings {
 		Lifecycle:     LifecycleSettings{Enabled: c.Lifecycle.Enabled, IntervalSeconds: int64(interval / time.Second)},
 		MetricsPublic: c.Metrics.Public,
 		Compression:   comp,
+		Updates:       c.Updates,
 	}
 	return normalizeSettings(cloneSettings(s))
 }
@@ -675,6 +686,7 @@ func normalizeSettings(s Settings) Settings {
 		return v
 	}
 	s.Domains = nn(s.Domains)
+	s.Updates.NotifyFor = nn(s.Updates.NotifyFor)
 	s.CORS.AllowedOrigins = nn(s.CORS.AllowedOrigins)
 	s.CORS.AllowedHeaders = nn(s.CORS.AllowedHeaders)
 	s.CORS.ExposeHeaders = nn(s.CORS.ExposeHeaders)

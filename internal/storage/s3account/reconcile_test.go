@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"path/filepath"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -15,6 +16,8 @@ import (
 	"github.com/seanmmitchell/gos3/internal/s3client"
 	"github.com/seanmmitchell/gos3/internal/s3client/s3clienttest"
 	"github.com/seanmmitchell/gos3/internal/storage"
+	"github.com/seanmmitchell/gos3/internal/storage/multi"
+	"github.com/seanmmitchell/gos3/internal/storage/native"
 	"github.com/seanmmitchell/gos3/internal/storage/s3store"
 )
 
@@ -343,8 +346,8 @@ func TestMigrateGatewayHome(t *testing.T) {
 
 // TestNativeCrashPoints interrupts native bucket creations and deletions
 // between the remote change and the record: a creation leaves an unused
-// remote bucket (which can be adopted), a deletion a record that a second
-// delete removes.
+// remote bucket (which can be adopted), while a deletion leaves a
+// tombstone that is discarded on restart.
 func TestNativeCrashPoints(t *testing.T) {
 	r := s3clienttest.Start(t)
 	ctx := context.Background()
@@ -358,18 +361,292 @@ func TestNativeCrashPoints(t *testing.T) {
 	wantErr(t, "delete", b.DeleteBucket(ctx, "doomed"), errCrash)
 	crash.Store(nil)
 	noErr(t, "Close", b.Close())
+	// A different owner can acquire the globally reusable remote name
+	// before gos3 restarts. The tombstone must not expose or delete it.
+	r.CreateBucket(t, "doomed")
 
 	b = openReady(t, o)
 	kinds := bucketKinds(t, b)
-	if _, ok := kinds["limbo"]; ok || kinds["doomed"] != storage.BucketKindNative {
+	if _, ok := kinds["limbo"]; ok || len(kinds) != 0 {
 		t.Fatalf("buckets %v", kinds)
 	}
-	if !remoteHasBucket(t, r, "limbo") || remoteHasBucket(t, r, "doomed") {
+	if !remoteHasBucket(t, r, "limbo") || !remoteHasBucket(t, r, "doomed") {
 		t.Fatal("remote buckets not as expected")
 	}
-	noErr(t, "delete again", b.DeleteBucket(ctx, "doomed"))
+	wantErr(t, "deleted bucket stays gone", b.DeleteBucket(ctx, "doomed"), storage.ErrBucketNotFound)
 	wantErr(t, "create over the leftover", b.CreateBucket(ctx, "limbo", storage.CreateBucketOptions{}), storage.ErrRemoteBucketExists)
 	noErr(t, "adopt the leftover", b.CreateBucket(ctx, "limbo", storage.CreateBucketOptions{Target: nativeTarget("", true)}))
+}
+
+type failingNativeState struct {
+	native.StateStore
+	fail     atomic.Bool
+	failRead atomic.Bool
+}
+
+func (s *failingNativeState) Records(ctx context.Context) (map[string][]byte, error) {
+	if s.failRead.Load() {
+		return nil, errCrash
+	}
+	return s.StateStore.Records(ctx)
+}
+
+func (s *failingNativeState) DeleteRecords(ctx context.Context, prefix string) error {
+	if s.fail.Load() {
+		return errCrash
+	}
+	return s.StateStore.DeleteRecords(ctx, prefix)
+}
+
+func TestFailedNativeDetachPreservesRecoverableRecord(t *testing.T) {
+	r := s3clienttest.Start(t)
+	ctx := context.Background()
+	o := localOptions(t, r, NewClaims(), t.TempDir())
+	var state *failingNativeState
+	h := testHooks()
+	h.openNative = func(opts native.Options) (NativeStore, error) {
+		state = &failingNativeState{StateStore: opts.State}
+		opts.State = state
+		return native.Open(opts)
+	}
+	b := openReadyWith(t, o, h)
+	noErr(t, "create", b.CreateBucket(ctx, "recover", storage.CreateBucketOptions{}))
+	state.fail.Store(true)
+	wantErr(t, "delete with failed local cleanup", b.DeleteBucket(ctx, "recover"), errCrash)
+	if !remoteHasBucket(t, r, "recover") {
+		t.Fatal("failed cleanup deleted the remote bucket")
+	}
+	state.fail.Store(false)
+	noErr(t, "close", b.Close())
+
+	b = openReady(t, o)
+	b.mu.RLock()
+	e := b.reg.buckets["recover"]
+	pending := e != nil && e.Deleting && !e.Detached
+	b.mu.RUnlock()
+	if !pending {
+		t.Fatal("restart discarded the interrupted deletion record")
+	}
+	_, err := b.GetBucket(ctx, "recover")
+	wantErr(t, "pending bucket is unavailable", err, storage.ErrBucketUnavailable)
+	noErr(t, "release pending record", b.ReleaseBucket(ctx, "recover"))
+	if !remoteHasBucket(t, r, "recover") {
+		t.Fatal("release of pending record deleted the remote bucket")
+	}
+	noErr(t, "adopt released bucket", b.CreateBucket(ctx, "recover", storage.CreateBucketOptions{Target: nativeTarget("", true)}))
+}
+
+func TestInterruptedNativeDeletionReleasableImmediatelyAndAfterRouterRestart(t *testing.T) {
+	remote := s3clienttest.Start(t)
+	ctx := context.Background()
+	o := localOptions(t, remote, NewClaims(), t.TempDir())
+	var state *failingNativeState
+	h := testHooks()
+	h.openNative = func(opts native.Options) (NativeStore, error) {
+		state = &failingNativeState{StateStore: opts.State}
+		opts.State = state
+		return native.Open(opts)
+	}
+	b := openReadyWith(t, o, h)
+	noErr(t, "create immediate", b.CreateBucket(ctx, "immediate", storage.CreateBucketOptions{}))
+	noErr(t, "create", b.CreateBucket(ctx, "recover", storage.CreateBucketOptions{}))
+	path := filepath.Join(t.TempDir(), "placements.json")
+	openRouter := func(backing *Backend) *multi.Router {
+		t.Helper()
+		router, err := multi.Open(ctx, multi.Options{Backings: []multi.Backing{{Name: "remote", Backend: backing}}, StatePath: path})
+		noErr(t, "open router", err)
+		return router
+	}
+	router := openRouter(b)
+	state.fail.Store(true)
+	wantErr(t, "delete immediate with failed local cleanup", router.DeleteBucket(ctx, "immediate"), errCrash)
+	state.fail.Store(false)
+	noErr(t, "release before restart", router.ReleaseBucket(ctx, "immediate"))
+	if !remoteHasBucket(t, remote, "immediate") {
+		t.Fatal("immediate release deleted the remote bucket")
+	}
+	noErr(t, "adopt under a different name", router.CreateBucket(ctx, "renamed", storage.CreateBucketOptions{Target: nativeTarget("immediate", true)}))
+	noErr(t, "release renamed bucket", router.ReleaseBucket(ctx, "renamed"))
+	state.fail.Store(true)
+	wantErr(t, "delete with failed local cleanup", router.DeleteBucket(ctx, "recover"), errCrash)
+	state.fail.Store(false)
+	noErr(t, "close router", router.Close())
+
+	b = openReady(t, o)
+	router = openRouter(b)
+	infos, err := router.ListBuckets(ctx)
+	noErr(t, "list buckets", err)
+	if len(infos) != 0 {
+		t.Fatalf("interrupted deletion became visible: %+v", infos)
+	}
+	_, err = router.GetBucket(ctx, "recover")
+	wantErr(t, "interrupted deletion unavailable", err, storage.ErrBucketUnavailable)
+	noErr(t, "release through router", router.ReleaseBucket(ctx, "recover"))
+	if !remoteHasBucket(t, remote, "recover") {
+		t.Fatal("router release deleted the remote bucket")
+	}
+	noErr(t, "adopt through router", router.CreateBucket(ctx, "recover", storage.CreateBucketOptions{Target: nativeTarget("", true)}))
+	noErr(t, "close recovered router", router.Close())
+}
+
+func TestInterruptedNativeReleaseClearsDurableUploads(t *testing.T) {
+	remote := s3clienttest.Start(t)
+	proxy, requests := countingProxy(t, remote)
+	ctx := context.Background()
+	o := localOptions(t, remote, NewClaims(), t.TempDir())
+	o.Conn = proxyConn(t, proxy)
+	var state *failingNativeState
+	h := testHooks()
+	h.openNative = func(opts native.Options) (NativeStore, error) {
+		state = &failingNativeState{StateStore: opts.State}
+		opts.State = state
+		return native.Open(opts)
+	}
+	b := openReadyWith(t, o, h)
+	for _, name := range []string{"old", "neighbor"} {
+		noErr(t, "create "+name, b.CreateBucket(ctx, name, storage.CreateBucketOptions{}))
+	}
+	old, err := b.CreateMultipartUpload(ctx, "old", "key", storage.ObjectMeta{}, "")
+	noErr(t, "create old upload", err)
+	w, err := b.NewPartWriter(ctx, "old", "key", old.UploadID, 1)
+	noErr(t, "old part writer", err)
+	_, err = w.Write([]byte("old part"))
+	noErr(t, "write old part", err)
+	_, err = w.Commit(ctx, storage.PartMeta{})
+	noErr(t, "commit old part", err)
+	neighbor, err := b.CreateMultipartUpload(ctx, "neighbor", "keep", storage.ObjectMeta{}, "")
+	noErr(t, "create neighbor upload", err)
+	state.fail.Store(true)
+	wantErr(t, "delete with failed native cleanup", b.DeleteBucket(ctx, "old"), errCrash)
+	state.fail.Store(false)
+	state.failRead.Store(true)
+	wantErr(t, "release with failed state read", b.ReleaseBucket(ctx, "old"), errCrash)
+	state.failRead.Store(false)
+	state.fail.Store(true)
+	wantErr(t, "release with failed upload deletion", b.ReleaseBucket(ctx, "old"), errCrash)
+	state.fail.Store(false)
+	_, err = b.GetBucket(ctx, "old")
+	wantErr(t, "failed release kept tombstone", err, storage.ErrBucketUnavailable)
+	before := requests.Load()
+	noErr(t, "release after state recovery", b.ReleaseBucket(ctx, "old"))
+	if got := requests.Load() - before; got != 0 {
+		t.Fatalf("recovery release sent %d remote requests", got)
+	}
+	noErr(t, "rebind old name", b.CreateBucket(ctx, "old", storage.CreateBucketOptions{Target: nativeTarget("", true)}))
+	uploads, err := b.ListMultipartUploads(ctx, "old")
+	noErr(t, "list rebound uploads", err)
+	if len(uploads) != 0 {
+		t.Fatalf("old uploads returned after rebinding: %+v", uploads)
+	}
+	_, err = b.CompleteMultipartUpload(ctx, "old", "key", old.UploadID, []int{1}, storage.ObjectMeta{}, storage.CommitOptions{})
+	wantErr(t, "complete old upload", err, storage.ErrUploadNotFound)
+	uploads, err = b.ListMultipartUploads(ctx, "neighbor")
+	noErr(t, "list neighbor uploads", err)
+	if len(uploads) != 1 || uploads[0].UploadID != neighbor.UploadID {
+		t.Fatalf("neighbor uploads changed: %+v", uploads)
+	}
+	noErr(t, "close", b.Close())
+	b = openReadyWith(t, o, h)
+	uploads, err = b.ListMultipartUploads(ctx, "old")
+	noErr(t, "list uploads after restart", err)
+	if len(uploads) != 0 {
+		t.Fatalf("old uploads returned after restart: %+v", uploads)
+	}
+	noErr(t, "release rebound name", b.ReleaseBucket(ctx, "old"))
+	noErr(t, "adopt under different name", b.CreateBucket(ctx, "renamed", storage.CreateBucketOptions{Target: nativeTarget("old", true)}))
+	uploads, err = b.ListMultipartUploads(ctx, "renamed")
+	noErr(t, "list renamed uploads", err)
+	if len(uploads) != 0 {
+		t.Fatalf("old uploads returned under a different name: %+v", uploads)
+	}
+	noErr(t, "create restart bucket", b.CreateBucket(ctx, "restart", storage.CreateBucketOptions{}))
+	restarted, err := b.CreateMultipartUpload(ctx, "restart", "key", storage.ObjectMeta{}, "")
+	noErr(t, "create restart upload", err)
+	state.fail.Store(true)
+	wantErr(t, "interrupt restart deletion", b.DeleteBucket(ctx, "restart"), errCrash)
+	state.fail.Store(false)
+	noErr(t, "close before pending release", b.Close())
+	b = openReady(t, o)
+	_, err = b.GetBucket(ctx, "restart")
+	wantErr(t, "restarted tombstone stayed hidden", err, storage.ErrBucketUnavailable)
+	before = requests.Load()
+	noErr(t, "release after restart", b.ReleaseBucket(ctx, "restart"))
+	if got := requests.Load() - before; got != 0 {
+		t.Fatalf("release after restart sent %d remote requests", got)
+	}
+	noErr(t, "rebind after restart", b.CreateBucket(ctx, "restart", storage.CreateBucketOptions{Target: nativeTarget("", true)}))
+	uploads, err = b.ListMultipartUploads(ctx, "restart")
+	noErr(t, "list uploads after pending release", err)
+	if len(uploads) != 0 {
+		t.Fatalf("restarted upload returned after release: %+v", uploads)
+	}
+	_, err = b.CompleteMultipartUpload(ctx, "restart", "key", restarted.UploadID, []int{1}, storage.ObjectMeta{}, storage.CommitOptions{})
+	wantErr(t, "complete restarted upload", err, storage.ErrUploadNotFound)
+}
+
+func TestHomeReloadClearsCompletedNativeDeletion(t *testing.T) {
+	r := s3clienttest.Start(t)
+	r.CreateBucket(t, "home")
+	ctx := context.Background()
+	var fd *failingDeletes
+	h := testHooks()
+	h.wrapRecords = func(s s3store.AuxStore) s3store.AuxStore {
+		fd = &failingDeletes{AuxStore: s}
+		return fd
+	}
+	b := openReadyWith(t, homeOptions(t, r, NewClaims(), "home", ""), h)
+	noErr(t, "create native", b.CreateBucket(ctx, "gone", storage.CreateBucketOptions{Target: nativeTarget("", false)}))
+	key := bucketKey("gone")
+	fd.fail.Store(&key)
+	wantErr(t, "delete record during home outage", b.DeleteBucket(ctx, "gone"), storage.ErrBackingUnavailable)
+	b.mu.RLock()
+	e := b.reg.buckets["gone"]
+	completed := e != nil && e.Deleting && e.Detached
+	epoch := b.homeEpoch
+	b.mu.RUnlock()
+	if !completed {
+		t.Fatal("failed record deletion did not leave a completed tombstone")
+	}
+	b.reload(epoch + 1)
+	b.mu.RLock()
+	_, exists := b.reg.buckets["gone"]
+	b.mu.RUnlock()
+	if exists {
+		t.Fatal("home reload kept a completed native deletion")
+	}
+	if remoteHasBucket(t, r, "gone") {
+		t.Fatal("remote bucket was not deleted")
+	}
+	noErr(t, "reuse bucket name", b.CreateBucket(ctx, "gone", storage.CreateBucketOptions{Target: nativeTarget("", false)}))
+}
+
+func TestCompletedNativeDeletionReleasableWithoutRestart(t *testing.T) {
+	r := s3clienttest.Start(t)
+	ctx := context.Background()
+	var fd *failingDeletes
+	h := testHooks()
+	h.wrapRecords = func(s s3store.AuxStore) s3store.AuxStore {
+		fd = &failingDeletes{AuxStore: s}
+		return fd
+	}
+	b := openReadyWith(t, localOptions(t, r, NewClaims(), t.TempDir()), h)
+	noErr(t, "create", b.CreateBucket(ctx, "gone", storage.CreateBucketOptions{}))
+	path := filepath.Join(t.TempDir(), "placements.json")
+	router, err := multi.Open(ctx, multi.Options{Backings: []multi.Backing{{Name: "remote", Backend: b}}, StatePath: path})
+	noErr(t, "open router", err)
+	key := bucketKey("gone")
+	fd.fail.Store(&key)
+	wantErr(t, "delete record", router.DeleteBucket(ctx, "gone"), storage.ErrBackingUnavailable)
+	b.mu.RLock()
+	e := b.reg.buckets["gone"]
+	completed := e != nil && e.Deleting && e.Detached
+	b.mu.RUnlock()
+	if !completed {
+		t.Fatal("failed record deletion did not leave a completed tombstone")
+	}
+	noErr(t, "release completed deletion", router.ReleaseBucket(ctx, "gone"))
+	noErr(t, "reuse bucket name", router.CreateBucket(ctx, "gone", storage.CreateBucketOptions{}))
+	noErr(t, "close router", router.Close())
 }
 
 // TestReloadAfterHomeSession: when the home was reloaded (a new session),

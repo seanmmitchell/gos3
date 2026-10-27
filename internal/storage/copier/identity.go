@@ -39,11 +39,16 @@ import (
 //
 // Errors are those of the backends, wrapped, and the package's sentinels
 // for policies the target cannot satisfy. Changes made before an error
-// stay; running the key again continues from them.
+// stay; running the key again continues from them. A pair whose Err is
+// set is not synchronised: SyncKey returns Err (and so does
+// SyncKeyFingerprint).
 func SyncKey(ctx context.Context, src, dst Endpoint, p KeyPair, pol Policy) (Result, error) {
 	var res Result
 	if err := pol.Validate(); err != nil {
 		return res, err
+	}
+	if p.Err != nil {
+		return res, p.Err // the walk could not list the key
 	}
 	if c, bad := keyConflict(p); bad {
 		res.Conflicts = append(res.Conflicts, c)

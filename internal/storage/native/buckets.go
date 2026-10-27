@@ -423,6 +423,11 @@ func (s *Store) DetachBucket(ctx context.Context, bucket string, removeRemote bo
 	if err := s.dropBucketOverlays(ctx, bucket); err != nil {
 		errs = append(errs, err)
 	}
+	// Do not remove the remote bucket after local cleanup failed: the
+	// account layer retains the binding for explicit recovery.
+	if len(errs) > 0 {
+		return errors.Join(errs...)
+	}
 	if terr == nil {
 		if removeRemote {
 			err := s.call(ctx, t, func(c *s3client.Client) error { return c.DeleteBucket(ctx, t.b.Remote) })
@@ -442,4 +447,17 @@ func (s *Store) DetachBucket(ctx context.Context, bucket string, removeRemote bo
 		s.log.Warn("native: detach a bucket that cannot be resolved; its remote bucket is left alone", "backing", s.name, "bucket", bucket, "err", terr)
 	}
 	return errors.Join(errs...)
+}
+
+// UnbindBucket forgets only an in-memory binding after the account record
+// has been released. It never contacts the remote bucket or its objects.
+func (s *Store) UnbindBucket(bucket, remote string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.bound[strings.ToLower(remote)] != bucket {
+		return
+	}
+	delete(s.bound, strings.ToLower(remote))
+	delete(s.regions, remote)
+	delete(s.noTagging, remote)
 }

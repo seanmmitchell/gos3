@@ -325,6 +325,8 @@ export interface CompressionSettings {
 
 /** config.Settings — GET/PUT /config. PUT takes the full document. */
 export interface Settings {
+  /** Absent from older servers. */
+  updates?: UpdatesSettings
   name: string
   region: string
   publicUrl: string
@@ -338,6 +340,21 @@ export interface Settings {
   metricsPublic: boolean
   /** Absent from servers without compression support. */
   compression?: CompressionSettings
+}
+
+export type UpdateType = 'patch' | 'minor' | 'major'
+export interface UpdatesSettings {
+  enabled: boolean
+  notifyFor: UpdateType[]
+}
+export interface UpdateStatus extends UpdatesSettings {
+  supported: boolean
+  installedVersion: string
+  comparable: boolean
+  lastCheck: string | null
+  lastSuccess: string | null
+  error: string
+  available: { version: string, type: UpdateType, url: string } | null
 }
 
 // ---------------------------------------------------------------------------
@@ -711,7 +728,8 @@ export type PlacementRole = 'primary' | 'replica' | 'move-target'
  * - in-sync:  receives every write synchronously, has no pending changes, or is the primary
  * - syncing:  initial or requested full copy running
  * - lagging:  changes are pending, copied in the background
- * - degraded: copying failed; retried with back-off (see lastError)
+ * - degraded: copying failed; retried with back-off, or skippedKeys keys
+ *             could not be copied (see lastError)
  * - offline:  the backing is unhealthy
  */
 export type MemberState = 'in-sync' | 'syncing' | 'lagging' | 'degraded' | 'offline'
@@ -736,6 +754,8 @@ export interface PlacementMember {
   /** Last completed full copy (omitted when none). */
   lastSyncAt?: Timestamp
   lastError: string
+  /** Keys not copied because a copy holds more than 4,096 versions of them (absent on older servers). */
+  skippedKeys?: number
 }
 
 export type MovePhase = 'copying' | 'cutover'
@@ -1353,11 +1373,19 @@ export interface CopyJobDryRun {
 
 /** Progress of a copy or mirror job (Job.status). */
 export interface CopyStatus {
+  /** Progress describes one full comparison, independently of lifetime activity. */
+  passComplete?: boolean
+  totalsKnown?: boolean
+  sourceKeysDone?: number
+  /** Distinct keys with a currently unresolved error or conflict. */
+  unresolved?: number
+  /** A full comparison is pending or incomplete. */
+  checkRequired?: boolean
   keysScanned: number
   keysCopied: number
   versionsCopied: number
   bytesCopied: number
-  /** Bytes copied or found identical (progress against totalBytes). */
+  /** Source bytes examined in the full pass, including unsuccessful keys. */
   bytesDone: number
   keysDeleted: number
   conflicts: number

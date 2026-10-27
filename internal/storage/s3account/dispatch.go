@@ -68,6 +68,9 @@ func (b *Backend) lookupAny(ctx context.Context, bucket string) (t target, unusa
 	if e == nil {
 		return target{}, nil, fmt.Errorf("%w: %q", storage.ErrBucketNotFound, bucket)
 	}
+	if e.Deleting {
+		return target{}, nil, fmt.Errorf("%w: %q is being deleted", storage.ErrBucketUnavailable, bucket)
+	}
 	t = target{name: bucket, rec: e.bucketRecord}
 	if t.native() {
 		t.nat = b.nat
@@ -108,6 +111,9 @@ func (b *Backend) ListBuckets(ctx context.Context) ([]storage.BucketInfo, error)
 	targets := make([]target, 0, len(b.reg.buckets))
 	used := map[string]*container{}
 	for name, e := range b.reg.buckets {
+		if e.Deleting {
+			continue
+		}
 		t := target{name: name, rec: e.bucketRecord}
 		if !t.native() {
 			t.c = b.containers[e.Container]
@@ -149,6 +155,20 @@ func (b *Backend) ListBuckets(ctx context.Context) ([]storage.BucketInfo, error)
 	}
 	slices.SortFunc(out, func(a, c storage.BucketInfo) int { return strings.Compare(a.Name, c.Name) })
 	return out, nil
+}
+
+// RetainsBucketForRecovery reports a native deletion whose
+// placement must survive router reconciliation. The bucket remains hidden
+// from listings and unavailable for ordinary operations, but can be released
+// explicitly without contacting its remote name.
+func (b *Backend) RetainsBucketForRecovery(name string) bool {
+	b.mu.RLock()
+	defer b.mu.RUnlock()
+	if b.reg == nil {
+		return false
+	}
+	e := b.reg.buckets[name]
+	return e != nil && e.Kind == storage.BucketKindNative && e.Deleting
 }
 
 // validBucketName reports whether name can be a record key.
@@ -408,7 +428,20 @@ func (b *Backend) DeleteBucket(ctx context.Context, name string) error {
 		if err := t.nat.CheckEmpty(ctx, name); err != nil {
 			return err
 		}
+		// Save a tombstone before touching the remote bucket. A crash after
+		// remote deletion must not leave a live binding to this name.
+		deleting := t.rec
+		deleting.Deleting = true
+		if err := b.putBucket(context.WithoutCancel(ctx), name, deleting, nil); err != nil {
+			return err
+		}
 		if err := t.nat.DetachBucket(ctx, name, t.rec.Created); err != nil {
+			// Cleanup can already have removed local upload or overlay state.
+			// Keep the binding tombstoned for explicit recovery on restart.
+			return err
+		}
+		deleting.Detached = true
+		if err := b.putBucket(context.WithoutCancel(ctx), name, deleting, nil); err != nil {
 			return err
 		}
 		if err := b.step("delete-native:detached"); err != nil {
@@ -435,11 +468,41 @@ func (b *Backend) DeleteBucket(ctx context.Context, name string) error {
 
 // ReleaseBucket implements storage.BucketReleaser: a native bucket is
 // forgotten without touching its remote bucket or objects (its uploads in
-// progress are aborted); wrapped buckets cannot be released
+// progress are aborted). An interrupted native deletion can be released
+// without contacting the remote bucket. Wrapped buckets cannot be released
 // (storage.ErrNotSupported: their data would be orphaned).
 func (b *Backend) ReleaseBucket(ctx context.Context, name string) error {
 	b.adminMu.Lock()
 	defer b.adminMu.Unlock()
+	if err := b.serving(ctx); err != nil {
+		return err
+	}
+	b.mu.RLock()
+	var interrupted bool
+	var remote string
+	if e := b.reg.buckets[name]; e != nil {
+		interrupted = e.Kind == storage.BucketKindNative && e.Deleting
+		remote = e.Remote
+	}
+	b.mu.RUnlock()
+	if interrupted {
+		// Releasing a pending native deletion is an explicit way to
+		// recover its record without contacting a potentially reused name.
+		cleaner, ok := b.nat.(interface {
+			DiscardBucketLocalState(context.Context, string) error
+		})
+		if !ok {
+			return fmt.Errorf("s3account %q: native store cannot clear local state before releasing bucket %q: %w", b.name, name, storage.ErrNotSupported)
+		}
+		if err := cleaner.DiscardBucketLocalState(ctx, name); err != nil {
+			return err
+		}
+		if err := b.dropBucket(context.WithoutCancel(ctx), name); err != nil {
+			return err
+		}
+		b.nat.UnbindBucket(name, remote)
+		return nil
+	}
 	t, _, err := b.lookupAny(ctx, name)
 	if err != nil {
 		return err

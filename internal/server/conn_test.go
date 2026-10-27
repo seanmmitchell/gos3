@@ -1,13 +1,14 @@
 package server
 
 import (
-	"bufio"
 	"bytes"
 	"context"
 	"crypto/tls"
+	"fmt"
 	"io"
 	"net"
 	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
 	"time"
@@ -106,8 +107,42 @@ func TestHTTP2StalledStreamReleased(t *testing.T) {
 	}
 	s.writeIdle = 300 * time.Millisecond
 	srv := serve(t, s)
-	addr := strings.TrimPrefix(srv.url, "https://")
+	assertHTTP2StalledStreamReleased(t, strings.TrimPrefix(srv.url, "https://"), http2MaxStreams, 0)
+}
 
+// A body too large for net/http's response buffer must time out inside
+// Write too, not only during the final flush after the handler returns.
+func TestHTTP2StalledBodyWriteReleased(t *testing.T) {
+	for _, afterSuccess := range []bool{false, true} {
+		t.Run(fmt.Sprintf("afterSuccess=%t", afterSuccess), func(t *testing.T) {
+			s := &Server{writeIdle: 300 * time.Millisecond}
+			ts := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w, finish := s.guardWrites(w)
+				defer finish()
+				if afterSuccess {
+					if _, err := w.Write([]byte("a")); err != nil {
+						return
+					}
+					if err := http.NewResponseController(w).Flush(); err != nil {
+						return
+					}
+				}
+				_, _ = w.Write(make([]byte, 2*maxGuardedWrite))
+			}))
+			ts.EnableHTTP2 = true
+			ts.StartTLS()
+			defer ts.Close()
+			var window uint32
+			if afterSuccess {
+				window = 1 // the first successful flush exhausts the client's window
+			}
+			assertHTTP2StalledStreamReleased(t, strings.TrimPrefix(ts.URL, "https://"), 0, window)
+		})
+	}
+}
+
+func assertHTTP2StalledStreamReleased(t *testing.T, addr string, wantMaxStreams, initialWindow uint32) {
+	t.Helper()
 	conn, err := tls.Dial("tcp", addr, &tls.Config{InsecureSkipVerify: true, NextProtos: []string{"h2"}})
 	if err != nil {
 		t.Fatal(err)
@@ -118,7 +153,7 @@ func TestHTTP2StalledStreamReleased(t *testing.T) {
 		t.Fatal(err)
 	}
 	fr := http2.NewFramer(conn, conn)
-	if err := fr.WriteSettings(http2.Setting{ID: http2.SettingInitialWindowSize, Val: 0}); err != nil {
+	if err := fr.WriteSettings(http2.Setting{ID: http2.SettingInitialWindowSize, Val: initialWindow}); err != nil {
 		t.Fatal(err)
 	}
 	var hb bytes.Buffer
@@ -131,6 +166,7 @@ func TestHTTP2StalledStreamReleased(t *testing.T) {
 	}
 	start := time.Now()
 	maxStreams := uint32(0)
+	dataBytes := uint32(0)
 	for {
 		f, err := fr.ReadFrame()
 		if err != nil {
@@ -145,18 +181,22 @@ func TestHTTP2StalledStreamReleased(t *testing.T) {
 				_ = fr.WriteSettingsAck()
 			}
 		case *http2.DataFrame:
-			if len(f.Data()) > 0 {
-				t.Fatalf("DATA sent although the window is 0")
+			dataBytes += uint32(len(f.Data()))
+			if dataBytes > initialWindow {
+				t.Fatalf("received %d DATA bytes with a %d-byte window", dataBytes, initialWindow)
 			}
 		case *http2.RSTStreamFrame:
 			if f.StreamID != 1 {
 				continue
 			}
+			if dataBytes != initialWindow {
+				t.Errorf("received %d DATA bytes, want %d before the stall", dataBytes, initialWindow)
+			}
 			if d := time.Since(start); d > 10*time.Second {
 				t.Errorf("stream reset after %v", d)
 			}
-			if maxStreams != http2MaxStreams {
-				t.Errorf("SETTINGS_MAX_CONCURRENT_STREAMS = %d, want %d", maxStreams, http2MaxStreams)
+			if wantMaxStreams != 0 && maxStreams != wantMaxStreams {
+				t.Errorf("SETTINGS_MAX_CONCURRENT_STREAMS = %d, want %d", maxStreams, wantMaxStreams)
 			}
 			return
 		}
@@ -165,8 +205,10 @@ func TestHTTP2StalledStreamReleased(t *testing.T) {
 
 // TestMaxConnections: server.max_connections (opt-in) caps the open
 // connections without ever blocking Accept: an idle keep-alive connection
-// is closed to make room for a new one, and a new connection is refused at
-// once (not queued) when every connection is busy, so a client holding
+// is closed to make room for a new one, then a connection that has waited
+// longer than the grace period for its first request; a new connection is
+// refused at once (not queued) only when every connection is busy with a
+// request or still within its grace period, so a client holding
 // connections cannot make health probes hang.
 func TestMaxConnections(t *testing.T) {
 	cfg := testConfig()
@@ -195,17 +237,41 @@ func TestMaxConnections(t *testing.T) {
 	if lim == nil {
 		t.Fatal("no connection limiter")
 	}
-	waitConns := func(what string, open, idle int) {
+	setGrace := func(d time.Duration) {
+		lim.mu.Lock()
+		lim.grace = d
+		lim.mu.Unlock()
+	}
+	waitConns := func(what string, open, idle, pending int) {
 		t.Helper()
-		var o, i int
+		var o, i, p int
 		for deadline := time.Now().Add(5 * time.Second); ; time.Sleep(time.Millisecond) {
-			o, i = lim.conns()
-			if o == open && i == idle {
+			o, i, p = lim.conns()
+			if o == open && i == idle && p == pending {
 				return
 			}
 			if time.Now().After(deadline) {
-				t.Fatalf("%s: %d open, %d idle connections, want %d, %d", what, o, i, open, idle)
+				t.Fatalf("%s: %d open, %d idle, %d pending connections, want %d, %d, %d", what, o, i, p, open, idle, pending)
 			}
+		}
+	}
+	refused := func(what string) {
+		t.Helper()
+		start := time.Now()
+		if err := get(newClient()); err == nil {
+			t.Errorf("connection served while %s", what)
+		}
+		if d := time.Since(start); d > 2*time.Second {
+			t.Errorf("refusal took %v (accept must not block)", d)
+		}
+	}
+	closed := func(what string, c net.Conn) {
+		t.Helper()
+		_ = c.SetReadDeadline(time.Now().Add(5 * time.Second))
+		if _, err := c.Read(make([]byte, 1)); err == nil {
+			t.Errorf("%s: read data, want the connection closed", what)
+		} else if ne, ok := err.(net.Error); ok && ne.Timeout() {
+			t.Errorf("%s: still open", what)
 		}
 	}
 
@@ -213,7 +279,7 @@ func TestMaxConnections(t *testing.T) {
 	if err := get(newClient()); err != nil {
 		t.Fatal(err)
 	}
-	waitConns("the first connection never became idle", 1, 1)
+	waitConns("the first connection never became idle", 1, 1, 0)
 	start := time.Now()
 	if err := get(newClient()); err != nil {
 		t.Fatalf("new client while a connection is idle: %v", err)
@@ -221,35 +287,214 @@ func TestMaxConnections(t *testing.T) {
 	if d := time.Since(start); d > 2*time.Second {
 		t.Errorf("new client waited %v", d)
 	}
-	waitConns("the first connection was not closed, or the second one never became idle", 1, 1)
+	waitConns("the first connection was not closed, or the second one never became idle", 1, 1, 0)
 
-	// A busy connection (headers not yet sent) is not closed; the next one
-	// is refused at once.
+	// A connection that has not sent a whole request (half-sent headers)
+	// takes the idle one's place. Within the grace period it is kept and
+	// the next connection is refused at once; after it, the held
+	// connection gives way to a new client.
+	const grace = time.Second
+	setGrace(grace)
 	hold, err := net.Dial("tcp", addr)
 	if err != nil {
 		t.Fatal(err)
 	}
+	defer hold.Close()
+	held := time.Now()
 	if _, err := io.WriteString(hold, "GET /_gos3/health HTTP/1.1\r\n"); err != nil {
 		t.Fatal(err)
 	}
-	// The held connection took the idle one's place: the only open one is
-	// busy.
-	waitConns("the held connection was refused, or the idle one not closed", 1, 0)
-	start = time.Now()
-	if err := get(newClient()); err == nil {
-		t.Error("connection served while the only one is busy")
+	waitConns("the held connection was refused, or the idle one not closed", 1, 0, 1)
+	if time.Since(held) < grace {
+		refused("the only connection is within its grace period")
 	}
-	if d := time.Since(start); d > 2*time.Second {
-		t.Errorf("refusal took %v (accept must not block)", d)
+	waitFor(t, 5*time.Second, "the held connection to give way", func() bool { return get(newClient()) == nil })
+	if d := time.Since(held); d < grace {
+		t.Errorf("held connection closed after %v, before the %v grace period", d, grace)
 	}
-	if _, err := io.WriteString(hold, "Host: 127.0.0.1\r\nConnection: close\r\n\r\n"); err != nil {
-		t.Fatal(err)
+	closed("held connection past the grace period", hold)
+	waitConns("the held connection was not closed, or the new one never became idle", 1, 1, 0)
+}
+
+// TestConnLimiterKeepsActiveConnections: a connection with a request in
+// flight is never closed to make room, however old, and pending
+// connections are evicted only past the grace period, oldest first. This
+// drives the limiter directly: over HTTP, whether a request is still in
+// flight depends on the handler and on timing.
+func TestConnLimiterKeepsActiveConnections(t *testing.T) {
+	pipe := func() net.Conn {
+		c, peer := net.Pipe()
+		t.Cleanup(func() { _ = c.Close(); _ = peer.Close() })
+		return c
 	}
-	if resp, err := http.ReadResponse(bufio.NewReader(hold), nil); err != nil || resp.StatusCode != 200 {
-		t.Fatalf("held connection: %v", err)
+	isClosed := func(c net.Conn) bool {
+		_ = c.SetReadDeadline(time.Now().Add(10 * time.Millisecond))
+		_, err := c.Read(make([]byte, 1))
+		ne, timeout := err.(net.Error)
+		return err != nil && !(timeout && ne.Timeout())
 	}
-	hold.Close()
-	waitFor(t, 5*time.Second, "a free connection slot", func() bool { return get(newClient()) == nil })
+
+	l := newConnLimiter(2, func(string, ...any) {})
+	l.grace = time.Hour
+	active, older, newer := pipe(), pipe(), pipe()
+
+	// An old connection with a request in flight is never a victim.
+	l.connState(active, http.StateNew)
+	l.connState(active, http.StateActive)
+	l.connState(older, http.StateNew)
+	if l.admit() {
+		t.Fatal("admitted while the only other connection is pending within its grace period")
+	}
+	l.mu.Lock()
+	l.pending[older] = time.Now().Add(-2 * time.Hour)
+	l.mu.Unlock()
+	if !l.admit() {
+		t.Fatal("refused although a pending connection is past its grace period")
+	}
+	if !isClosed(older) || isClosed(active) {
+		t.Fatal("evicted the wrong connection: want the old pending one, never the active one")
+	}
+	l.connState(older, http.StateClosed)
+	l.connState(newer, http.StateNew)
+	l.mu.Lock()
+	l.pending[newer] = time.Now().Add(-2 * time.Hour)
+	l.grace = 0
+	l.mu.Unlock()
+	if open, idle, pending := l.conns(); open != 2 || idle != 0 || pending != 1 {
+		t.Fatalf("%d open, %d idle, %d pending, want 2, 0, 1", open, idle, pending)
+	}
+	l.connState(newer, http.StateActive)
+	if l.admit() {
+		t.Fatal("admitted by closing a connection with a request in flight")
+	}
+	if isClosed(active) || isClosed(newer) {
+		t.Fatal("closed a connection with a request in flight")
+	}
+}
+
+// addrConn is a net.Conn with a chosen remote address.
+type addrConn struct {
+	net.Conn
+	remote net.Addr
+}
+
+func (c addrConn) RemoteAddr() net.Addr { return c.remote }
+
+// TestConnLimiterEvictsBusiestAddressFirst: at the cap, a client that keeps
+// opening connections evicts its own pending connections before an older
+// one of a slow client elsewhere.
+func TestConnLimiterEvictsBusiestAddressFirst(t *testing.T) {
+	conn := func(ip string) net.Conn {
+		c, peer := net.Pipe()
+		t.Cleanup(func() { _ = c.Close(); _ = peer.Close() })
+		return addrConn{Conn: c, remote: &net.TCPAddr{IP: net.ParseIP(ip), Port: 40000}}
+	}
+	l := newConnLimiter(3, func(string, ...any) {})
+	l.grace = 0
+	// The flooding client uses two addresses of one IPv6 /64.
+	slow, flood1, flood2 := conn("192.0.2.1"), conn("2001:db8:1:2::7"), conn("2001:db8:1:2::8")
+	for i, c := range []net.Conn{slow, flood1, flood2} {
+		l.connState(c, http.StateNew)
+		l.pending[c] = time.Now().Add(time.Duration(i-10) * time.Second) // slow is the oldest
+	}
+	if !l.admit() {
+		t.Fatal("refused although pending connections are past the grace period")
+	}
+	l.mu.Lock()
+	_, slowKept := l.pending[slow]
+	_, flood1Kept := l.pending[flood1]
+	l.mu.Unlock()
+	if !slowKept || flood1Kept {
+		t.Fatal("want the flooding address's oldest pending connection evicted, not the slow client's")
+	}
+}
+
+// TestMaxConnectionsSilentClients: connections that never send a request
+// (or never finish their TLS handshake) count toward server.max_connections
+// until ReadHeaderTimeout. They used to be impossible to evict, so a client
+// holding max_connections silent sockets (reconnecting every
+// ReadHeaderTimeout) locked every other client out, health probes
+// included. Now the oldest one past the grace period gives way.
+func TestMaxConnectionsSilentClients(t *testing.T) {
+	for _, useTLS := range []bool{false, true} {
+		name := "http"
+		if useTLS {
+			name = "https"
+		}
+		t.Run(name, func(t *testing.T) {
+			const maxConns = 4
+			cfg := testConfig()
+			cfg.Server.MaxConnections = maxConns
+			if useTLS {
+				cfg.Server.TLSCert, cfg.Server.TLSKey = writeSelfSigned(t)
+			}
+			srv := start(t, cfg)
+			addr := srv.url[strings.Index(srv.url, "://")+3:]
+			lim := srv.limiter.Load()
+			if lim == nil {
+				t.Fatal("no connection limiter")
+			}
+			const grace = 100 * time.Millisecond
+			lim.mu.Lock()
+			lim.grace = grace
+			lim.mu.Unlock()
+
+			silent := make([]net.Conn, maxConns)
+			for i := range silent {
+				c, err := net.Dial("tcp", addr)
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer c.Close()
+				silent[i] = c
+			}
+			waitFor(t, 5*time.Second, "the silent connections to be counted", func() bool {
+				open, _, _ := lim.conns()
+				return open == maxConns
+			})
+			time.Sleep(2 * grace)
+
+			for i := range maxConns - 1 {
+				c := &http.Client{Timeout: 5 * time.Second, Transport: &http.Transport{
+					Proxy:           nil,
+					TLSClientConfig: &tls.Config{InsecureSkipVerify: true}, // self-signed test certificate
+				}}
+				resp, err := c.Get(srv.url + "/_gos3/health")
+				if err != nil {
+					t.Fatalf("health probe %d with %d silent connections open: %v", i, maxConns, err)
+				}
+				_, _ = io.Copy(io.Discard, resp.Body)
+				resp.Body.Close()
+				if resp.StatusCode != 200 {
+					t.Fatalf("health probe %d: %d", i, resp.StatusCode)
+				}
+				c.CloseIdleConnections()
+			}
+			// A silent connection made room for the first probe (which
+			// one is not checked: on Windows connections accepted within
+			// one clock tick are equally old). They are read concurrently:
+			// once a deadline has passed, Read reports a timeout even on a
+			// closed connection.
+			closedc := make(chan bool, len(silent))
+			for _, c := range silent {
+				go func() {
+					_ = c.SetReadDeadline(time.Now().Add(2 * time.Second))
+					_, err := c.Read(make([]byte, 1))
+					ne, ok := err.(net.Error)
+					closedc <- err != nil && (!ok || !ne.Timeout())
+				}()
+			}
+			evicted := 0
+			for range silent {
+				if <-closedc {
+					evicted++
+				}
+			}
+			if evicted == 0 || evicted == maxConns {
+				t.Errorf("%d of %d silent connections closed, want 1 to %d", evicted, maxConns, maxConns-1)
+			}
+		})
+	}
 }
 
 // TestReadyHidesBackendErrors: /_gos3/ready is anonymous: a failing
@@ -286,4 +531,62 @@ func TestReadyHidesBackendErrors(t *testing.T) {
 // signReq signs req with the root credentials.
 func signReq(req *http.Request) error {
 	return auth.SignRequest(req, rootCreds, "us-east-1", "s3", "", time.Now())
+}
+
+// Later restic windows can take longer to prepare than the write-idle
+// timeout. A healthy HTTP/2 client must be able to receive the next window
+// after either a successful Write or an explicit Flush.
+func TestHTTP2ResponsePreparationPause(t *testing.T) {
+	for _, flush := range []bool{false, true} {
+		t.Run(fmt.Sprintf("flush=%t", flush), func(t *testing.T) {
+			const idle = 300 * time.Millisecond
+			first := bytes.Repeat([]byte("a"), 128<<10)
+			if flush {
+				first = first[:64]
+			}
+			s := &Server{writeIdle: idle}
+			handlerErr := make(chan error, 1)
+			ts := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w, finish := s.guardWrites(w)
+				defer finish()
+				if _, err := w.Write(first); err != nil {
+					handlerErr <- err
+					return
+				}
+				if flush {
+					if err := http.NewResponseController(w).Flush(); err != nil {
+						handlerErr <- err
+						return
+					}
+				}
+				time.Sleep(3 * idle)
+				_, err := io.WriteString(w, "next window")
+				handlerErr <- err
+			}))
+			ts.EnableHTTP2 = true
+			ts.StartTLS()
+			defer ts.Close()
+			client := ts.Client()
+			client.Timeout = 5 * time.Second
+			resp, err := client.Get(ts.URL)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer resp.Body.Close()
+			if resp.ProtoMajor != 2 {
+				t.Fatalf("protocol = %s, want HTTP/2", resp.Proto)
+			}
+			got, err := io.ReadAll(resp.Body)
+			if err != nil {
+				t.Fatalf("download interrupted while preparing the next window: %v", err)
+			}
+			want := append(bytes.Clone(first), []byte("next window")...)
+			if !bytes.Equal(got, want) {
+				t.Fatalf("downloaded %d bytes, want %d", len(got), len(want))
+			}
+			if err := <-handlerErr; err != nil {
+				t.Fatalf("handler write: %v", err)
+			}
+		})
+	}
 }

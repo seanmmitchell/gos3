@@ -200,10 +200,21 @@ func (a *api) serveProxy(w http.ResponseWriter, r *http.Request) {
 		}
 		w.Header()[name] = values
 	}
+	// Without an upstream type net/http would sniff one from the body (e.g.
+	// application/pdf or text/html) after the checks below, and a browser may
+	// sniff an empty one. Never sniff, and download what cannot be classified.
+	// HEAD has no body to sniff, so its metadata keeps the upstream's (absent) type.
+	untyped := meta.Method != "HEAD" && strings.TrimSpace(strings.Join(w.Header().Values("Content-Type"), "")) == ""
+	if untyped {
+		w.Header().Set("Content-Type", "application/octet-stream")
+	}
 	// A PDF opened under the console origin must be downloaded. Browser PDF
 	// viewers do not reliably enforce the sandbox CSP used for other content.
-	if isRelayPDF(w.Header().Values("Content-Type")) {
+	pdf := isRelayPDF(w.Header().Values("Content-Type"))
+	if pdf {
 		w.Header().Set("Content-Type", "application/pdf")
+	}
+	if pdf || untyped {
 		w.Header().Set("Content-Disposition", relayAttachmentDisposition(w.Header().Get("Content-Disposition")))
 	}
 	// Expose all forwarded metadata, including provider-specific x-amz-meta-*
@@ -227,12 +238,21 @@ func (a *api) serveProxy(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+// isRelayPDF reports whether a browser might treat any of the Content-Type
+// values as a PDF. It deliberately errs towards true (unlike the S3 handler's
+// strict isPlainPDF, which decides what may skip the sandbox): browsers use
+// the last valid type of a repeated or comma-listed header and tolerate
+// malformed parameters, so every listed essence counts. Some PDF viewers
+// also claim the legacy aliases text/pdf and application/x-pdf.
 func isRelayPDF(values []string) bool {
-	if len(values) != 1 || strings.Contains(values[0], ",") {
-		return false
+	for _, piece := range strings.Split(strings.Join(values, ","), ",") {
+		essence, _, _ := strings.Cut(piece, ";")
+		switch strings.ToLower(strings.TrimSpace(essence)) {
+		case "application/pdf", "text/pdf", "application/x-pdf":
+			return true
+		}
 	}
-	mediaType, _, err := mime.ParseMediaType(values[0])
-	return err == nil && mediaType == "application/pdf"
+	return false
 }
 
 func relayAttachmentDisposition(disposition string) string {

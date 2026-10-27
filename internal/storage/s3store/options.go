@@ -67,6 +67,9 @@ type Options struct {
 	TempDir string
 	// MaxRestoreSpoolBytes caps encrypted per-object restic restores.
 	MaxRestoreSpoolBytes int64
+	// MaxRestores caps the per-object restic restores running at once
+	// (restic.Runtime.MaxRestores).
+	MaxRestores int
 	// LeaseInterval and LeaseTTL tune ownership fencing (0 = defaults).
 	LeaseInterval time.Duration
 	LeaseTTL      time.Duration

@@ -17,6 +17,31 @@ bucket and object features. It runs in two modes built from the same code in
 The UI works offline: fonts and icons are bundled, and it loads nothing from
 the internet.
 
+## Release notices
+
+On a UI-enabled gos3 server, open **Settings → Updates** to opt into daily
+release checks and choose patch, minor, and major notifications. Checking is
+off by default. The status panel shows the installed version, newest eligible
+release, last attempted/successful checks, and any error. Settings are saved
+server-wide and override the static configuration and environment.
+
+The small notice at the bottom right links to the release's GitHub notes;
+it never installs or downloads a release. **Dismiss** hides that version until
+the server's next check. **Skip this version** suppresses that exact release
+across visits and checks. A newer eligible version can notify again. Choices
+are stored per browser and gos3 server ID; they do not silence other users.
+Tabs share choices and coordinate display to avoid duplicate notices. On
+insecure HTTP origins without Web Locks, a notice is shown once per check.
+
+A standalone console reads the connected UI-enabled server's cached result.
+Browsers never query GitHub themselves. Authenticated users can receive notices
+without permission to edit server settings. Generic S3 connections, headless
+servers, and development/unknown builds do not show gos3 release notices.
+Network failures and rate limits appear only in settings; the previous
+successful result remains usable.
+
+![Updates settings](screenshots/updates/settings.png)
+
 ## What it does
 
 - **Dashboard** of all configured servers with status, version and usage.

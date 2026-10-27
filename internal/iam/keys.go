@@ -7,7 +7,13 @@ import (
 )
 
 const (
-	maxKeysPerUser    = 10
+	maxKeysPerUser = 10
+	// maxUsers and maxCustomPolicies bound the IAM state, which is held in
+	// memory, cloned by every mutation and rewritten to iam.json in full.
+	// At the caps the file stays well below maxStateWriteSize for typical
+	// documents; persist enforces that bound for the rest.
+	maxUsers          = 5000
+	maxCustomPolicies = 1000
 	maxPolicyNameLen  = 128
 	maxUserNameLen    = 64
 	maxDescriptionLen = 1024

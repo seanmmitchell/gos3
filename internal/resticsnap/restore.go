@@ -356,6 +356,11 @@ func (r *restoreRun) run(ctx context.Context) error {
 		return jobs.Permanent(fmt.Errorf("%w: bucket %q has no snapshot repository", restic.ErrSnapshotNotFound, spec.Bucket))
 	}
 	r.loc = loc
+	release, err := s.repositoryLock(loc).read(ctx)
+	if err != nil {
+		return err
+	}
+	defer release()
 	r.status.Repository, r.status.Snapshot = info.Repository, spec.Snapshot
 	if _, err := s.findSnapshot(ctx, loc, spec.Bucket, spec.Snapshot); err != nil {
 		return restoreFailure(err)

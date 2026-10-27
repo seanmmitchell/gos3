@@ -37,7 +37,7 @@ const job = (over: Partial<Job> = {}): Job => ({
   createdAt: '2026-10-15T10:00:00Z',
   spec: { kind: 'copy', source: { bucket: 'photos' }, target: { bucket: 'photos-bak' } },
   labels: { source: 'photos', target: 'photos-bak' },
-  status: { keysScanned: 10, keysCopied: 5, versionsCopied: 5, bytesCopied: 500, bytesDone: 500, keysDeleted: 0, conflicts: 0, totalKeys: 20, totalBytes: 1000, bytesPerSecond: 100, etaSeconds: 5 },
+  status: { totalsKnown: true, sourceKeysDone: 10, keysScanned: 10, keysCopied: 5, versionsCopied: 5, bytesCopied: 500, bytesDone: 500, keysDeleted: 0, conflicts: 0, totalKeys: 20, totalBytes: 1000, bytesPerSecond: 100, etaSeconds: 5 },
   ...over
 })
 
@@ -207,6 +207,24 @@ afterEach(() => {
 })
 
 describe('JobsTable', () => {
+  it('uses the same qualified pass and mirror assessment in full and compact views', async () => {
+    fakeServer({ admin: true, viewJobs: true })
+    await connect()
+    const mirror = job({ kind: 'mirror', state: 'waiting', phase: 'watching', status: { totalsKnown: true, passComplete: true, sourceKeysDone: 14, keysScanned: 14, totalKeys: 14, bytesDone: 666, totalBytes: 666, keysCopied: 17, bytesCopied: 867, unresolved: 2, pending: 1 } })
+    for (const compact of [false, true]) {
+      const { w } = await mountInApp(JobsTable, { jobs: [mirror], serverId: 'nas', compact })
+      expect(w.text()).toContain('Last full pass')
+      expect(w.text()).toContain('14 of 14 source keys examined')
+      expect(w.text()).toContain('Lifetime: 17 key writes')
+      expect(w.text()).toContain('1 pending · 2 unresolved keys')
+      expect(w.text()).not.toContain('17 of 14')
+      expect(w.text()).not.toContain('In sync')
+      w.unmount()
+      const recovered = await mountInApp(JobsTable, { jobs: [{ ...mirror, status: { ...mirror.status, pending: 0, unresolved: 0, lastPassAt: '2026-10-24T12:00:00Z' } }], serverId: 'nas', compact })
+      expect(recovered.w.text()).toContain('No known pending changes · last full comparison')
+      recovered.w.unmount()
+    }
+  })
   it('shows each job with its state, progress, error and the actions its state allows', async () => {
     fakeServer({ admin: true, viewJobs: true, manageJobs: true })
     await connect()

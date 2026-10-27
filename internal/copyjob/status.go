@@ -14,9 +14,19 @@ import (
 // API, Job.Status).
 //
 // KeysScanned, BytesDone, Conflicts and ConflictSamples describe the
-// current (or last) full pass and restart with each one; mirror runs that
-// copy changed keys add to them. The other counters cover the job's life.
+// current (or last) full pass and restart with each one. Incremental runs
+// only update lifetime activity and unresolved work.
 type Status struct {
+	// PassComplete and TotalsKnown qualify full-pass progress. Incremental
+	// work changes lifetime counters only; a comparison is not proof that
+	// all keys copied successfully.
+	PassComplete   bool  `json:"passComplete"`
+	TotalsKnown    bool  `json:"totalsKnown"`
+	SourceKeysDone int64 `json:"sourceKeysDone"`
+	// Unresolved counts distinct keys with an unresolved error or conflict.
+	// CheckRequired means a full comparison is pending or incomplete.
+	Unresolved    int64 `json:"unresolved"`
+	CheckRequired bool  `json:"checkRequired"`
 	// KeysScanned counts the keys compared; BytesDone the source bytes
 	// they hold (of the versions copied), for the progress against
 	// TotalBytes.
@@ -36,16 +46,16 @@ type Status struct {
 	// map); ConflictSamples are the last 20.
 	Conflicts       int64            `json:"conflicts"`
 	ConflictSamples []ConflictSample `json:"conflictSamples,omitempty"`
-	// TotalKeys and TotalBytes measure the source when the job started
-	// (the versions it copies).
+	// TotalKeys and TotalBytes measure the source at the start of this full
+	// pass (the versions it copies); TotalsKnown qualifies the estimate.
 	TotalKeys  int64 `json:"totalKeys"`
 	TotalBytes int64 `json:"totalBytes"`
 	// BytesPerSecond is the copy rate (exponentially weighted over a
 	// minute); ETASeconds the estimated time left in the current pass.
 	BytesPerSecond int64 `json:"bytesPerSecond"`
 	ETASeconds     int64 `json:"etaSeconds"`
-	// Mirror: Pending source keys changed and not yet copied (as of the
-	// job's last run) and LagSeconds the age of the oldest; LastPassAt and
+	// Mirror: Pending source keys queued or in flight (live in the admin
+	// API) and LagSeconds the age of the oldest; LastPassAt and
 	// NextPassAt the last and next full comparison; Passes the number of
 	// full passes done (a copy's too).
 	Pending    int64     `json:"pending"`
@@ -128,6 +138,8 @@ func (t *tracker) update(f func(*Status)) {
 func (t *tracker) startPass() {
 	t.update(func(st *Status) {
 		st.KeysScanned, st.BytesDone, st.Conflicts, st.ConflictSamples = 0, 0, 0, nil
+		st.SourceKeysDone, st.PassComplete = 0, false
+		st.TotalsKnown = false
 		st.ETASeconds = 0
 	})
 	t.mu.Lock()
@@ -137,7 +149,7 @@ func (t *tracker) startPass() {
 
 // record adds the outcome of synchronising pair p (as listed before the
 // sync) with result res.
-func (t *tracker) record(p copier.KeyPair, all bool, res copier.Result) {
+func (t *tracker) record(p copier.KeyPair, all bool, res copier.Result, full bool) {
 	var bytes int64
 	for _, v := range p.Src {
 		if !v.DeleteMarker {
@@ -150,8 +162,16 @@ func (t *tracker) record(p copier.KeyPair, all bool, res copier.Result) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	st := &t.st
-	st.KeysScanned++
-	st.BytesDone += bytes
+	if full {
+		st.KeysScanned++
+		st.BytesDone += bytes
+		if hasSource(p, all) {
+			st.SourceKeysDone++
+		}
+		if p.Err != nil || st.BytesDone > st.TotalBytes || st.SourceKeysDone > st.TotalKeys {
+			st.TotalsKnown = false
+		}
+	}
 	if res.VersionsCopied > 0 || res.MetaUpdated > 0 {
 		st.KeysCopied++
 	}
@@ -161,12 +181,16 @@ func (t *tracker) record(p copier.KeyPair, all bool, res copier.Result) {
 		st.KeysDeleted++
 	}
 	for _, c := range res.Conflicts {
-		st.Conflicts++
+		if full {
+			st.Conflicts++
+		}
 		reason := c.Reason
 		if c.VersionID != "" {
 			reason = "target version " + c.VersionID + ": " + reason
 		}
-		st.ConflictSamples = appendLast(st.ConflictSamples, ConflictSample{Key: c.Key, Reason: reason})
+		if full {
+			st.ConflictSamples = appendLast(st.ConflictSamples, ConflictSample{Key: c.Key, Reason: reason})
+		}
 	}
 }
 
@@ -201,7 +225,7 @@ func (t *tracker) tick(now time.Time) {
 	copyRate, doneRate := t.copyRate/t.weight, t.doneRate/t.weight
 	st.BytesPerSecond = int64(math.Round(copyRate))
 	st.ETASeconds = 0
-	if left := st.TotalBytes - st.BytesDone; left > 0 && doneRate > 0 {
+	if left := st.TotalBytes - st.BytesDone; st.TotalsKnown && left > 0 && doneRate > 0 {
 		st.ETASeconds = int64(math.Ceil(float64(left) / doneRate))
 	}
 }

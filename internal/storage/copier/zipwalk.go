@@ -1,6 +1,7 @@
 package copier
 
 import (
+	"cmp"
 	"context"
 	"errors"
 	"fmt"
@@ -13,7 +14,8 @@ import (
 // is suspended and its keys are paired, and roughly the number of entries
 // ZipWalk passes to its callback at once. Batches end at key boundaries,
 // so a key with more versions than this is still delivered whole, up to
-// MaxKeyVersions. A variable for tests.
+// MaxKeyVersions. A flagged key or pair with no retained entries counts as
+// one entry so error records also stay bounded. A variable for tests.
 var batchVersions = 1000
 
 // ZipWalk pairs the keys under src with those under dst, in ascending key
@@ -29,12 +31,17 @@ var batchVersions = 1000
 // interrupted walk with the SrcKey of the last pair it finished (target-only
 // keys have the source key they would map from).
 //
+// A key with more than MaxKeyVersions entries on either side does not stop
+// the walk: its pair comes with that side's entries left out and Err set
+// (see KeyPair), and the walk goes on with the next key.
+//
 // The two ranges must not overlap (the same bucket of the same backend with
 // one prefix starting with the other): copying into the walked source
 // would never end. Memory is bounded by two walk batches and
-// MaxKeyVersions entries per key. fn runs outside of both walks, so it may write to either backend;
-// it may keep the pairs. An error from fn stops the walk and is returned
-// as is; ZipWalk wraps walk errors with the side that failed.
+// MaxKeyVersions entries per key. fn runs outside of both walks, so it may
+// write to either backend; it may keep the pairs. An error from fn stops
+// the walk and is returned as is; ZipWalk wraps walk errors with the side
+// that failed.
 func ZipWalk(ctx context.Context, src, dst Endpoint, after string, versions bool, fn func([]KeyPair) error) error {
 	if fn == nil {
 		return errors.New("copier: nil ZipWalk callback")
@@ -42,8 +49,8 @@ func ZipWalk(ctx context.Context, src, dst Endpoint, after string, versions bool
 	if src.Backend == nil || dst.Backend == nil {
 		return errors.New("copier: endpoint without a backend")
 	}
-	sc := &cursor{ep: src, versions: versions}
-	dc := &cursor{ep: dst, versions: versions}
+	sc := &cursor{ep: src, side: "source", versions: versions}
+	dc := &cursor{ep: dst, side: "target", versions: versions}
 	switch {
 	case after == "" || after < src.Prefix:
 		// From the beginning.
@@ -79,14 +86,17 @@ func ZipWalk(ctx context.Context, src, dst Endpoint, after string, versions bool
 			sk, dk := sc.rel(), dc.rel()
 			switch {
 			case dc.empty() || !sc.empty() && sk < dk:
-				p = KeyPair{SrcKey: src.Prefix + sk, DstKey: dst.Prefix + sk, Src: sc.next()}
+				s := sc.next()
+				p = KeyPair{SrcKey: src.Prefix + sk, DstKey: dst.Prefix + sk, Src: s.entries, Err: s.err}
 			case sc.empty() || dk < sk:
-				p = KeyPair{SrcKey: src.Prefix + dk, DstKey: dst.Prefix + dk, Dst: dc.next()}
+				d := dc.next()
+				p = KeyPair{SrcKey: src.Prefix + dk, DstKey: dst.Prefix + dk, Dst: d.entries, Err: d.err}
 			default:
-				p = KeyPair{SrcKey: src.Prefix + sk, DstKey: dst.Prefix + dk, Src: sc.next(), Dst: dc.next()}
+				s, d := sc.next(), dc.next()
+				p = KeyPair{SrcKey: src.Prefix + sk, DstKey: dst.Prefix + dk, Src: s.entries, Dst: d.entries, Err: cmp.Or(s.err, d.err)}
 			}
 			batch = append(batch, p)
-			entries += len(p.Src) + len(p.Dst)
+			entries += max(1, len(p.Src)+len(p.Dst))
 			if entries >= batchVersions {
 				if err := fn(batch); err != nil {
 					return err
@@ -105,11 +115,21 @@ func ZipWalk(ctx context.Context, src, dst Endpoint, after string, versions bool
 // cursor reads one side of a ZipWalk in batches of whole keys.
 type cursor struct {
 	ep       Endpoint
+	side     string // "source" or "target", for errors
 	versions bool
 	after    string // the walk resumes strictly after this key ("" = start)
-	groups   [][]storage.ObjectInfo
+	groups   []group
 	head     int
 	done     bool // the walk has delivered every key
+}
+
+// group is one key's entries as a cursor read them. A key with more than
+// MaxKeyVersions entries keeps none, and err (wrapping ErrTooManyVersions)
+// says so.
+type group struct {
+	key     string
+	entries []storage.ObjectInfo
+	err     error
 }
 
 func (c *cursor) empty() bool { return c.head >= len(c.groups) }
@@ -120,41 +140,52 @@ func (c *cursor) rel() string {
 	if c.empty() {
 		return ""
 	}
-	return c.groups[c.head][0].Key[len(c.ep.Prefix):]
+	return c.groups[c.head].key[len(c.ep.Prefix):]
 }
 
-// next returns the next key's entries.
-func (c *cursor) next() []storage.ObjectInfo {
+// next returns the next key's group.
+func (c *cursor) next() group {
 	g := c.groups[c.head]
-	c.groups[c.head] = nil
+	c.groups[c.head] = group{}
 	c.head++
 	return g
 }
 
 // fill reads the next batch of keys once the buffer is used up. A batch
-// ends at the first key boundary after batchVersions entries.
+// ends at the first key boundary after batchVersions entries. A key found
+// to have more than MaxKeyVersions entries is drained: the entries held
+// are dropped, the rest are skipped as the walk passes them, and the group
+// is flagged. So one key never holds more than MaxKeyVersions entries in
+// memory, and the walk goes on with the next key.
 func (c *cursor) fill(ctx context.Context) error {
 	if !c.empty() || c.done {
 		return nil
 	}
 	var (
-		groups [][]storage.ObjectInfo
-		total  int
+		groups []group
+		total  int // entries held, plus one per flagged group
 		full   bool
 	)
 	collect := func(oi storage.ObjectInfo) error {
-		if n := len(groups); n == 0 || groups[n-1][0].Key != oi.Key {
+		if n := len(groups); n == 0 || groups[n-1].key != oi.Key {
 			if total >= batchVersions {
 				full = true
 				return storage.ErrStopWalk
 			}
-			groups = append(groups, nil)
+			groups = append(groups, group{key: oi.Key})
 		}
-		if len(groups[len(groups)-1]) >= MaxKeyVersions {
-			return fmt.Errorf("%w: %s/%s exceeds %d", ErrTooManyVersions, c.ep.Bucket, oi.Key, MaxKeyVersions)
+		g := &groups[len(groups)-1]
+		switch {
+		case g.err != nil:
+			// Draining a key with too many versions.
+		case len(g.entries) >= MaxKeyVersions:
+			g.err = fmt.Errorf("%w: %s/%s on the %s exceeds %d", ErrTooManyVersions, c.ep.Bucket, oi.Key, c.side, MaxKeyVersions)
+			total -= len(g.entries) - 1 // retain a charge for the group and its error
+			g.entries = nil
+		default:
+			g.entries = append(g.entries, oi)
+			total++
 		}
-		groups[len(groups)-1] = append(groups[len(groups)-1], oi)
-		total++
 		return nil
 	}
 	var err error
@@ -168,7 +199,7 @@ func (c *cursor) fill(ctx context.Context) error {
 	}
 	c.groups, c.head, c.done = groups, 0, !full
 	if n := len(groups); n > 0 {
-		c.after = groups[n-1][0].Key
+		c.after = groups[n-1].key
 	}
 	return nil
 }

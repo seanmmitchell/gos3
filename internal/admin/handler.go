@@ -186,6 +186,7 @@ func (a *api) routes() []route {
 		{"DELETE", "/whoami/keys/{accessKey}", "", service, a.deleteOwnKey}, // unless admin:DeleteOwnAccessKey is denied
 		// Server
 		{"GET", "/info", "ServerInfo", service, a.serverInfo},
+		{"GET", "/updates", "", service, a.updateStatus},
 		{"GET", "/stats", "GetStats", service, a.stats},
 		{"GET", "/config", "GetConfig", service, a.getConfig},
 		{"PUT", "/config", "UpdateConfig", service, a.putConfig},
@@ -250,7 +251,7 @@ func (a *api) routes() []route {
 		{"POST", "/jobs/{id}/pause", "UpdateJob", inHandler, a.updateJob("paused", pauseJob)},
 		{"POST", "/jobs/{id}/resume", "UpdateJob", inHandler, a.updateJob("resumed", resumeJob)},
 		{"POST", "/jobs/{id}/cancel", "UpdateJob", inHandler, a.updateJob("canceled", cancelJob)},
-		{"POST", "/jobs/{id}/run", "UpdateJob", inHandler, a.updateJob("run", runJob)},
+		{"POST", "/jobs/{id}/run", "UpdateJob", inHandler, a.updateJob("run", a.runJob)},
 		{"GET", "/buckets/{name}/jobs", "GetJob", bucket, a.listBucketJobs},
 		// Discovery
 		{"GET", "/discovery", "GetDiscovery", service, a.getDiscovery},

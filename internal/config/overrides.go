@@ -61,6 +61,8 @@ var settingFields = []settingField{
 	{"compression.level", func(s *Settings) any { return s.Compression.Level }},
 	{"compression.min_size", func(s *Settings) any { return s.Compression.MinSize }},
 	{"compression.skip_content_types", func(s *Settings) any { return s.Compression.SkipContentTypes }},
+	{"updates.enabled", func(s *Settings) any { return s.Updates.Enabled }},
+	{"updates.notify_for", func(s *Settings) any { return s.Updates.NotifyFor }},
 }
 
 // PersistedOverrides lists the runtime settings whose value in persisted
@@ -111,6 +113,7 @@ func formatSetting(v any) string {
 // the effective configuration once settings.json overrides it.
 func ApplySettings(c *Config, s Settings) {
 	s = cloneSettings(s)
+	c.Updates = s.Updates
 	c.Server.Name = s.Name
 	c.Server.Region = s.Region
 	c.Server.PublicURL = s.PublicURL

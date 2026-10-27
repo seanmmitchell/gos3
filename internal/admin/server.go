@@ -223,10 +223,11 @@ func (a *api) getConfig(rc *reqCtx) (int, any, error) {
 }
 
 func (a *api) putConfig(rc *reqCtx) (int, any, error) {
-	// A document without "compression" (from a client that predates it)
-	// keeps the current compression policy; fields it does send replace
-	// the current ones. Every other section must be complete.
-	in := config.Settings{Compression: a.d.Settings.Get().Compression}
+	// Clients predating compression or updates preserve those sections
+	// when omitted. Fields they send replace the current values; every
+	// other section must be complete.
+	current := a.d.Settings.Get()
+	in := config.Settings{Compression: current.Compression, Updates: current.Updates}
 	if err := rc.decodeBody(&in, false); err != nil {
 		var ae *apiError
 		if errors.As(err, &ae) && ae.Code == codeInvalidRequest && ae.Status == http.StatusBadRequest {
@@ -267,6 +268,7 @@ func normalizeSettings(s config.Settings) config.Settings {
 		return v
 	}
 	s.Domains = nn(s.Domains)
+	s.Updates.NotifyFor = nn(s.Updates.NotifyFor)
 	s.CORS.AllowedOrigins = nn(s.CORS.AllowedOrigins)
 	s.CORS.AllowedHeaders = nn(s.CORS.AllowedHeaders)
 	s.CORS.ExposeHeaders = nn(s.CORS.ExposeHeaders)

@@ -125,8 +125,10 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     needs: [version, build]
+    # actions: list this run's artifacts.
     permissions:
       contents: write
+      actions: read
       id-token: write
       attestations: write
     env:
@@ -134,16 +136,105 @@ jobs:
       GH_TOKEN: ${{ github.token }}
       GH_REPO: ${{ github.repository }}
     steps:
+      # Every job of this run can upload artifacts, including build.yml's
+      # test jobs, which run devDependencies and test-only modules. Only the
+      # binaries matrix's 12 bin-<os>-<arch>[-headless] names are accepted,
+      # each once, and they are then downloaded by immutable ID. Names are
+      # unique within a run: if another job took one of them first, the
+      # binaries upload failed and this job never runs; any other bin-* name
+      # fails here. (The artifacts API does not say which job uploaded an
+      # artifact, so the producer cannot be checked directly.)
+      - name: Only the expected binary artifacts
+        id: artifacts
+        # Plain bash 3 (no associative arrays), so the tests run it anywhere.
+        run: |
+          expected=() found=()
+          for os in linux darwin windows; do
+            for arch in amd64 arm64; do
+              for suffix in "" -headless; do
+                expected+=("bin-$os-$arch$suffix")
+                found+=("")
+              done
+            done
+          done
+          listing="$(gh api --paginate --jq '.artifacts[] | [.id, .name, .expired] | @tsv' \
+            "repos/$GH_REPO/actions/runs/$GITHUB_RUN_ID/artifacts?per_page=100")"
+          fail=0
+          while IFS=$'\t' read -r id name expired; do
+            [[ $name == bin-* ]] || continue
+            i=-1
+            for j in "${!expected[@]}"; do
+              if [ "${expected[$j]}" = "$name" ]; then i=$j; fi
+            done
+            if [ "$i" -lt 0 ]; then
+              echo "::error::Unexpected artifact $name ($id) in this run."
+              fail=1
+            elif [ -n "${found[$i]}" ]; then
+              echo "::error::Artifact $name appears more than once."
+              fail=1
+            elif [[ $expired != false || ! $id =~ ^[1-9][0-9]*$ ]]; then
+              echo "::error::Artifact $name ($id) is expired or has no valid ID."
+              fail=1
+            else
+              found[$i]=$id
+            fi
+          done <<<"$listing"
+          ids=()
+          for i in "${!expected[@]}"; do
+            if [ -z "${found[$i]}" ]; then
+              echo "::error::Artifact ${expected[$i]} is missing."
+              fail=1
+            else
+              ids+=("${found[$i]}")
+            fi
+          done
+          [ "$fail" = 0 ] || exit 1
+          (IFS=,; echo "ids=${ids[*]}") >> "$GITHUB_OUTPUT"
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
-          pattern: bin-*
+          artifact-ids: ${{ steps.artifacts.outputs.ids }}
           path: dist
           merge-multiple: true
-      - name: Checksums
+      # dist must hold exactly this version's 12 archives; only they are
+      # checksummed, attested and uploaded, by name.
+      - name: Verify and checksum the archives
+        id: archives
         working-directory: dist
         run: |
-          sha256sum gos3_* > checksums.txt
+          want=()
+          for os in linux darwin windows; do
+            ext=.tar.gz
+            if [ "$os" = windows ]; then ext=.zip; fi
+            for arch in amd64 arm64; do
+              for suffix in "" -headless; do
+                want+=("gos3_${TAG#v}_${os}_${arch}${suffix}${ext}")
+              done
+            done
+          done
+          if ! diff <(printf '%s\n' "${want[@]}" | LC_ALL=C sort) <(find . -mindepth 1 | sed 's|^\./||' | LC_ALL=C sort); then
+            echo "::error::dist does not hold exactly the 12 archives of $TAG."
+            exit 1
+          fi
+          for f in "${want[@]}"; do
+            if [ ! -f "$f" ] || [ -L "$f" ]; then
+              echo "::error::$f is not a regular file."
+              exit 1
+            fi
+          done
+          if command -v sha256sum >/dev/null; then
+            sha256sum -- "${want[@]}" > checksums.txt
+          else
+            shasum -a 256 -- "${want[@]}" > checksums.txt # macOS (tests)
+          fi
           cat checksums.txt
+          {
+            echo "subjects<<EOF"
+            printf 'dist/%s\n' "${want[@]}"
+            echo EOF
+            echo "assets<<EOF"
+            printf 'dist/%s\n' "${want[@]}" checksums.txt
+            echo EOF
+          } >> "$GITHUB_OUTPUT"
       # Verify with: gh attestation verify gos3_<version>_<os>_<arch>.tar.gz
       #   --repo <owner>/<repo> --source-ref refs/heads/main (docs/releasing.md)
       # gos3 is public; keep the visibility guard for private forks, as in
@@ -152,16 +243,22 @@ jobs:
         if: github.event.repository.visibility == 'public'
         uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
         with:
-          subject-path: dist/gos3_*
+          subject-path: ${{ steps.archives.outputs.subjects }}
       # Only a draft created by this run may be published. A pre-existing
       # draft may contain foreign notes or assets and is never reused.
       # Assets of a published release are never replaced (the version job
       # refuses to rebuild one; with release immutability on, GitHub refuses
       # too).
       - name: Create, upload and publish the release
+        env:
+          ASSETS: ${{ steps.archives.outputs.assets }}
         run: |
+          assets=()
+          while IFS= read -r a; do
+            if [ -n "$a" ]; then assets+=("$a"); fi
+          done <<<"$ASSETS"
           # Create fails if any release already exists, including a draft.
           # Never upload to or publish a release this run did not create.
           gh release create "$TAG" --verify-tag --draft --title "gos3 $TAG" --generate-notes
-          gh release upload "$TAG" dist/*
+          gh release upload "$TAG" "${assets[@]}"
           gh release edit "$TAG" --draft=false

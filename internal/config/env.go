@@ -26,6 +26,8 @@ type EnvVar struct {
 // syntax ("30s", "1h"); sizes accept unit suffixes ("5GiB", see ParseSize).
 var envVars = []EnvVar{
 	{EnvConfig, "", "path of the JSON or YAML config file", nil},
+	{"GOS3_UPDATES_ENABLED", "updates.enabled", "check published gos3 releases daily on UI-enabled servers (bool, default false)", boolean(func(c *Config) *bool { return &c.Updates.Enabled })},
+	{"GOS3_UPDATES_NOTIFY_FOR", "updates.notify_for", "release notice types, comma-separated patch,minor,major (empty = no notices)", list(func(c *Config) *[]string { return &c.Updates.NotifyFor })},
 	{"GOS3_ADMIN_ENABLED", "admin.enabled", "enable management API and saved UI settings (bool); false also disables UI", boolean(func(c *Config) *bool { return &c.Admin.Enabled })},
 	{"GOS3_ADDRESS", "server.address", "listen address, [host]:port", str(func(c *Config) *string { return &c.Server.Address })},
 	{"GOS3_NAME", "server.name", "server name (default: host name)", str(func(c *Config) *string { return &c.Server.Name })},
@@ -99,6 +101,7 @@ var envVars = []EnvVar{
 	{"GOS3_COMPRESSION_SKIP_CONTENT_TYPES", "compression.skip_content_types", "media types stored uncompressed (\"video/*\" wildcards), comma-separated", list(func(c *Config) *[]string { return &c.Compression.SkipContentTypes })},
 	{"GOS3_JOBS_WORKERS", "jobs.workers", "background jobs (copy, mirror, snapshots) running at once, 1-64", integer(func(c *Config) *int { return &c.Jobs.Workers })},
 	{"GOS3_RESTIC_RESTORE_SPOOL_BYTES", "restic.restore_spool_bytes", "encrypted temporary data reserved by concurrent object restores, bytes or 1GiB-style (at least 64MiB)", size(func(c *Config) *int64 { return &c.Restic.RestoreSpoolBytes })},
+	{"GOS3_RESTIC_MAX_RESTORES", "restic.max_restores", "per-object restic restores running at once, 1-64", integer(func(c *Config) *int { return &c.Restic.MaxRestores })},
 	{"GOS3_RESTIC_SNAPSHOTS_WORKERS", "restic.snapshots.workers", "whole-bucket snapshot, restore and prune jobs running restic at once, 1-64", integer(func(c *Config) *int { return &c.Restic.Snapshots.Workers })},
 	{"GOS3_RESTIC_SNAPSHOTS_STAGE_DIR", "restic.snapshots.stage_dir", "stage directory of snapshot runs (default: restic-stage in the system directory)", str(func(c *Config) *string { return &c.Restic.Snapshots.StageDir })},
 	{"GOS3_RESTIC_SNAPSHOTS_SPOOL_BYTES", "restic.snapshots.spool_bytes", "data a snapshot run stages before a partial snapshot, bytes or 8GiB-style (at least 64MiB)", size(func(c *Config) *int64 { return &c.Restic.Snapshots.SpoolBytes })},

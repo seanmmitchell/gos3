@@ -25,4 +25,9 @@ var (
 	// ErrInvalidKey is returned for malformed caller supplied access/secret
 	// keys or key status values. It matches ErrInvalidName.
 	ErrInvalidKey error = &wrappedError{msg: "iam: invalid access key, secret key or status", base: ErrInvalidName}
+	// ErrLimitExceeded is returned when a mutation would take the IAM state
+	// past one of its limits (maxUsers, maxCustomPolicies or
+	// maxStateWriteSize). It matches ErrTooManyKeys, the contract error
+	// for the per-user key limit, so callers map it the same way (400).
+	ErrLimitExceeded error = &wrappedError{msg: "iam: limit exceeded", base: ErrTooManyKeys}
 )

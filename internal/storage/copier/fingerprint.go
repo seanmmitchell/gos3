@@ -174,6 +174,9 @@ func SyncKeyFingerprint(ctx context.Context, src, dst Endpoint, p KeyPair, st Fi
 	if st == nil {
 		return res, errors.New("copier: nil fingerprint store")
 	}
+	if p.Err != nil {
+		return res, p.Err // the walk could not list the key
+	}
 	if c, bad := keyConflict(p); bad {
 		res.Conflicts = append(res.Conflicts, c)
 		return res, nil

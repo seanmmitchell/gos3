@@ -43,6 +43,9 @@ const stateVersion = 1
 type stateFile struct {
 	Version int                         `json:"version"`
 	Buckets map[string]*placementRecord `json:"buckets"`
+	// Deleting records a deletion intent before the primary is removed.
+	// Reconciliation must not promote a surviving replica of such a bucket.
+	Deleting map[string]bool `json:"deleting,omitempty"`
 	// Purges are copies of buckets on backings that no longer hold a
 	// member (removed replicas, the source of a finished move, the copies
 	// of a deleted bucket) and are still to be deleted.

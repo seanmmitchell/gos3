@@ -301,7 +301,7 @@ func (r *snapRun) run(ctx context.Context) (err error) {
 	if len(stale) > 0 {
 		// Left by an interrupted or failed run (one run per bucket at a
 		// time). They are never parents, whether forgetting them works.
-		if err := s.rt.Forget(ctx, r.loc, stale, snapshotGuard(r.bucket)); err != nil {
+		if err := s.forget(ctx, r.loc, stale, snapshotGuard(r.bucket)); err != nil {
 			if ctx.Err() != nil {
 				return err
 			}
@@ -940,7 +940,7 @@ const forgetTimeout = 2 * time.Minute
 func (r *snapRun) forgetDetached(ctx context.Context, id string, complete bool) error {
 	fctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), forgetTimeout)
 	defer cancel()
-	err := r.s.rt.Forget(fctx, r.loc, []string{id}, snapshotGuard(r.bucket))
+	err := r.s.forget(fctx, r.loc, []string{id}, snapshotGuard(r.bucket))
 	if err != nil {
 		r.warn("resticsnap: could not forget an unverified snapshot", "snapshot", id, "err", err)
 		if complete {
@@ -1081,7 +1081,7 @@ func (r *snapRun) cleanupPartials(ctx context.Context) {
 	}
 	fctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), forgetTimeout)
 	defer cancel()
-	if err := r.s.rt.Forget(fctx, r.loc, r.partials, snapshotGuard(r.bucket)); err != nil {
+	if err := r.s.forget(fctx, r.loc, r.partials, snapshotGuard(r.bucket)); err != nil {
 		r.warn("resticsnap: could not forget the partial snapshots of a failed run", "err", err)
 	}
 }
@@ -1132,7 +1132,7 @@ func (r *snapRun) finish(ctx context.Context) error {
 	if err := config.WriteFileAtomic(filepath.Join(r.stage, "stamp.json"), raw, 0o600); err != nil {
 		return fmt.Errorf("resticsnap: stamp the stage: %w", err)
 	}
-	if err := r.s.rt.Forget(ctx, r.loc, r.partials, snapshotGuard(r.bucket)); err != nil {
+	if err := r.s.forget(ctx, r.loc, r.partials, snapshotGuard(r.bucket)); err != nil {
 		if ctx.Err() != nil {
 			return err
 		}
@@ -1260,7 +1260,7 @@ func (r *snapRun) applyRetention(ctx context.Context) {
 	if len(ids) == 0 {
 		return
 	}
-	if err := r.s.rt.Forget(ctx, r.loc, ids, snapshotGuard(r.bucket)); err != nil {
+	if err := r.s.forget(ctx, r.loc, ids, snapshotGuard(r.bucket)); err != nil {
 		r.status.Warnings = append(r.status.Warnings, "retention: "+err.Error())
 		return
 	}
@@ -1296,7 +1296,7 @@ func (r *snapRun) maybePrune(ctx context.Context) {
 		return
 	}
 	r.h.SetPhase("pruning")
-	if err := r.s.rt.Prune(ctx, r.loc, restic.PruneOptions{RetryLock: pruneRetryLock}); err != nil {
+	if err := r.s.prune(ctx, r.loc, restic.PruneOptions{RetryLock: pruneRetryLock}); err != nil {
 		r.status.Warnings = append(r.status.Warnings, "prune: "+err.Error())
 		return
 	}

@@ -27,6 +27,7 @@ import (
 	"github.com/seanmmitchell/gos3/internal/metrics"
 	"github.com/seanmmitchell/gos3/internal/storage"
 	"github.com/seanmmitchell/gos3/internal/storage/restic"
+	"github.com/seanmmitchell/gos3/internal/updates"
 )
 
 // Prefix is the mount point of the admin API.
@@ -34,6 +35,8 @@ const Prefix = "/_gos3/admin/v1"
 
 // Deps are the admin API's dependencies.
 type Deps struct {
+	// Updates is available only on servers with the web UI enabled.
+	Updates   *updates.Service
 	Backend   storage.Backend
 	Verifier  *auth.Verifier
 	IAM       *iam.Manager

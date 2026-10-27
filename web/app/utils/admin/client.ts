@@ -61,7 +61,8 @@ import type {
   Stats,
   User,
   UserUpdate,
-  WhoAmI
+  WhoAmI,
+  UpdateStatus
 } from '~/types/admin'
 import { sha256Hex } from '../s3/hash'
 import { child, text, tryParseXml } from '../s3/xml'
@@ -402,6 +403,11 @@ export class AdminClient {
 
   getConfig(): Promise<Settings> {
     return this.request('GET', '/config')
+  }
+
+  /** Server-cached release information; no config permission required. */
+  getUpdates(): Promise<UpdateStatus> {
+    return this.request('GET', '/updates')
   }
 
   /** PUT the full settings document; returns the updated settings. */
