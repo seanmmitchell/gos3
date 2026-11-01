@@ -1124,8 +1124,8 @@ Supply-chain rules:
   support.
 - **Install scripts.** Only the packages listed in `onlyBuiltDependencies`
   may run install scripts.
-- **Scanning.** CI runs `govulncheck`. Run `pnpm audit` manually in `web/`
-  to check the web dependencies; CI does not currently run that command.
+- **Scanning.** CI runs `govulncheck` and `pnpm audit --audit-level high` in
+  `web/`. Run `pnpm audit` manually to review lower-severity npm findings.
 - **Release builds.** Releases are built without GitHub Actions caches (which
   any job on `dev` can write), the shipped UI is built without the test-only
   npm packages, and new archives and images built from the public gos3
