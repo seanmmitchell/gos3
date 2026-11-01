@@ -142,7 +142,12 @@ jobs:
       # Both builds above record the npm packages they ship in web/.notices.
       - name: THIRD_PARTY_NOTICES is up to date
         working-directory: .
-        run: go run ./internal/tools/notices -check
+        run: |
+          if ! go run ./internal/tools/notices -check; then
+            go run ./internal/tools/notices -o THIRD_PARTY_NOTICES.generated
+            diff -u THIRD_PARTY_NOTICES THIRD_PARTY_NOTICES.generated || true
+            exit 1
+          fi
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         id: embedded
         with:
