@@ -8,12 +8,37 @@
 # minimumReleaseAgeExclude below.
 minimumReleaseAge: 20160
 minimumReleaseAgeExclude:
-  # Security fixes younger than the cooldown, pinned below in overrides.
+  # Security fixes (and required transitives) younger than the cooldown.
   # Exact versions only, so no other release of these packages skips the
   # cooldown. Remove each entry once its version is older than 14 days
   # (shell-quote 1.11.0: 2026-10-13, source-map-js 1.2.2: 2026-10-14).
   - shell-quote@1.11.0
   - source-map-js@1.2.2
+  # Security releases; cooldown ends on 2026-11-03 and 2026-11-05.
+  - happy-dom@21.0.4
+  - serialize-javascript@7.1.3
+  # RSA signature verification fix; cooldown ends on 2026-11-10.
+  - node-forge@1.4.1
+  # Nuxt 4.6.3 security fixes; cooldown ends on 2026-11-10.
+  - nuxt@4.6.3
+  - impound@1.2.1
+  # 1.7.2 lacks publisher provenance; 1.7.3 restores trusted publishing.
+  - seroval@1.7.3
+  - vite@8.3.5
+  - nitropack@2.13.5
+  - postcss@8.5.31
+  - '@nuxt/devtools@3.4.4'
+  - '@nuxt/devtools-kit@3.4.4'
+  - '@nuxt/devtools-wizard@3.4.4'
+  - ignore@7.0.14
+  - pkg-types@2.4.0
+  - unrouting@0.3.1
+  - undici@8.12.3
+  - '@nuxt/kit@4.6.3'
+  - '@nuxt/schema@4.6.3'
+  - '@nuxt/vite-builder@4.6.3'
+  - '@nuxt/vite-server@4.6.3'
+  - '@nuxt/nitro-server@4.6.3'
 
 # Refuse a version published with weaker trust evidence (e.g. without the
 # provenance or trusted publisher of earlier releases): a typical sign of a
@@ -47,7 +72,24 @@ overrides:
   # GHSA-587h-7wmj-h5pm, GHSA-r825-w8mm-5pxw, GHSA-698v-4r3x-3vcv:
   # editor-launch fixes, published 2026-10-06 (past the 14-day cooldown).
   launch-editor: 2.14.2
-  vite: 8.3.3
+  vite: 8.3.5
+  # GHSA-xjj6-f33q-929c, GHSA-4qv8-2p9j-2685, GHSA-f72v-6w45-q472:
+  # fetch/EventSource DoS and SRI bypass (Nuxt tooling).
+  undici: 8.12.3
+  # Nuxt 4.6.3 also fixes GHSA-9v7c-q64q-vv33, GHSA-3xf4-9g3c-4h4w,
+  # GHSA-x287-wcfc-q46c and GHSA-648h-gw55-m2g7.
+  # Its serializer is pinned to the oldest compatible trusted release.
+  nuxt: 4.6.3
+  seroval: 1.7.3
+  # Nuxt accepts the previously locked, mature unstorage release.
+  unstorage: 1.17.5
+  # GHSA-834v-8h66-3h79: import-alias host code execution in the test DOM.
+  happy-dom: 21.0.4
+  # GHSA-m5mm-p8h7-m29v: unescaped closing script in function bodies.
+  serialize-javascript: 7.1.3
+  # GHSA-86w9-cpqp-85rv / GHSA-2g46-22mc-6gwp: nested DigestAlgorithm
+  # signature forgery, fixed upstream despite the older advisory metadata.
+  node-forge: 1.4.1
   # WebAssembly fallbacks, loaded only when the native binary is missing (a
   # platform without a prebuilt one). Removed to keep unused code out of the
   # dependency tree; every supported platform has the native package.
@@ -59,10 +101,7 @@ overrides:
 #   - braces 3.0.3 (GHSA-vfj7-8cjw-p6xm, stack exhaustion on nested brace
 #     patterns): only build-time globbing (micromatch via fast-glob/globby)
 #     sees it, with patterns from this repository's config.
-#   - node-forge 1.4.0 (GHSA-86w9-cpqp-85rv, RSA signature forgery): only
-#     listhen's self-signed certificate for `nuxt dev --https`; nothing
-#     verifies signatures with it.
-# Neither is part of the shipped UI (see THIRD_PARTY_NOTICES).
+# It is not part of the shipped UI (see THIRD_PARTY_NOTICES).
 
 # Only these packages may run install scripts (the only locked packages that
 # need one: esbuild checks its platform binary). Any other dependency with an
