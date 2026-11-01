@@ -81,6 +81,8 @@ overrides:
   # Its serializer is pinned to the oldest compatible trusted release.
   nuxt: 4.6.3
   seroval: 1.7.3
+  # Nuxt accepts the previously locked, mature unstorage release.
+  unstorage: 1.17.5
   # GHSA-834v-8h66-3h79: import-alias host code execution in the test DOM.
   happy-dom: 21.0.4
   # GHSA-m5mm-p8h7-m29v: unescaped closing script in function bodies.
