@@ -599,3 +599,99 @@ func TestLockedConflictNeverMarksMemberSynced(t *testing.T) {
 		t.Fatal("conflict not visible to operators")
 	}
 }
+
+func TestMoveKeepsSourceUntilPlacementIsSaved(t *testing.T) {
+	bk := memBackings(2)
+	statePath := filepath.Join(t.TempDir(), "placements.json")
+	r := openRouter(t, Options{Backings: bk, StatePath: statePath})
+	var failCutover atomic.Bool
+	var refused atomic.Int32
+	failCutover.Store(true)
+	writer := stateWriter(func(path string, st *stateFile) error {
+		if rec := st.Buckets["m"]; failCutover.Load() && rec != nil && rec.Move == nil && rec.primary() == "b" {
+			refused.Add(1)
+			return errors.New("injected cutover save failure")
+		}
+		return writeState(path, st)
+	})
+	r.stateWriter.Store(&writer)
+	ctx := context.Background()
+	if err := r.CreateBucket(ctx, "m", storage.CreateBucketOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	put(t, r, "m", "k", "data", storage.ObjectMeta{})
+	if _, err := r.Move(ctx, "m", "", "b", nil); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, "the cutover save to fail", func() bool { return refused.Load() > 0 })
+	waitFor(t, "the failed cutover to be undone", func() bool {
+		st, err := r.Placement("m")
+		return err == nil && st.Primary == "a" && st.Move != nil
+	})
+	if got := read(t, bk[0].Backend, "m", "k", ""); got != "data" {
+		t.Fatalf("source copy after the failed cutover = %q", got)
+	}
+	saved, err := loadState(statePath)
+	if err != nil || saved.Buckets["m"] == nil || saved.Buckets["m"].Move == nil || saved.Buckets["m"].primary() != "a" {
+		t.Fatalf("saved placement after the failed cutover = %+v, %v", saved, err)
+	}
+	put(t, r, "m", "k2", "after", storage.ObjectMeta{})
+
+	failCutover.Store(false)
+	waitFor(t, "the retried cutover", func() bool {
+		st, err := r.Placement("m")
+		return err == nil && st.Primary == "b" && st.Move == nil
+	})
+	waitFor(t, "the source copy to be deleted", func() bool {
+		_, err := bk[0].Backend.GetBucket(ctx, "m")
+		return errors.Is(err, storage.ErrBucketNotFound)
+	})
+	if got := read(t, r, "m", "k2", ""); got != "after" {
+		t.Fatalf("write during the failed cutover = %q", got)
+	}
+	saved, err = loadState(statePath)
+	if err != nil || saved.Buckets["m"] == nil || saved.Buckets["m"].Move != nil || saved.Buckets["m"].primary() != "b" {
+		t.Fatalf("saved placement after the move = %+v, %v", saved, err)
+	}
+}
+
+func TestFailoverPlacementSaveIsRetried(t *testing.T) {
+	fa := &faulty{Backend: memory.New()}
+	statePath := filepath.Join(t.TempDir(), "placements.json")
+	r := openRouter(t, Options{
+		Backings:      []Backing{{Name: "a", Backend: fa}, {Name: "b", Backend: memory.New()}},
+		NewBucketMode: ModeActivePassive, NewBucketReplicas: []string{"b"},
+		AutoFailover: true, StatePath: statePath,
+	})
+	var failSaves atomic.Bool
+	writer := stateWriter(func(path string, st *stateFile) error {
+		if failSaves.Load() {
+			return errors.New("injected save failure")
+		}
+		return writeState(path, st)
+	})
+	r.stateWriter.Store(&writer)
+	ctx := context.Background()
+	if err := r.CreateBucket(ctx, "ap", storage.CreateBucketOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	put(t, r, "ap", "k", "data", storage.ObjectMeta{})
+	waitState(t, r, "ap", StateInSync)
+
+	failSaves.Store(true)
+	fa.down.Store(true)
+	waitFor(t, "automatic failover", func() bool {
+		st, _ := r.Placement("ap")
+		return st.Primary == "b"
+	})
+	if saved, err := loadState(statePath); err != nil || saved.Buckets["ap"].primary() != "a" {
+		t.Fatalf("saved placement while saves fail = %+v, %v", saved, err)
+	}
+	// Nothing else saves the placements while the primary stays down: only
+	// the retry can persist the failover.
+	failSaves.Store(false)
+	waitFor(t, "the failover to be saved", func() bool {
+		saved, err := loadState(statePath)
+		return err == nil && saved.Buckets["ap"] != nil && saved.Buckets["ap"].primary() == "b"
+	})
+}

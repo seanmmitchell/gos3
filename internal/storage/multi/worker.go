@@ -563,6 +563,13 @@ func (r *Router) cutover(target *memberState) error {
 	wasPrimary := i == 0
 	diverged := next.Members[i].Diverged
 	source = bs.members[mv.From]
+	prev, prevSync := bs.rec, target.syncMode
+	pr := purgeRecord{Bucket: bs.name, Backing: mv.From}
+	prevPurge := r.purges[pr]
+	var prevDiverged bool
+	if prevPurge != nil {
+		prevDiverged = prevPurge.diverged
+	}
 	next.Members[i] = memberRecord{Backing: mv.To, Synced: true}
 	next.Move = nil
 	bs.rec = next
@@ -578,14 +585,34 @@ func (r *Router) cutover(target *memberState) error {
 	}
 	r.addPurgeLocked(bs.name, mv.From, diverged)
 	r.mu.Unlock()
+	// The source is deleted only once the new placement is durable: a
+	// restart with the old one would make the half-deleted source the
+	// move's source (or primary) again and remove from the target what it
+	// no longer has. With the gate still closed and the source untouched,
+	// a failed save is undone and the cutover retried.
+	if err := r.save(); err != nil {
+		r.mu.Lock()
+		bs.rec = prev
+		bs.movePh = phaseCopying
+		if source != nil {
+			bs.members[mv.From] = source
+		}
+		target.syncMode = prevSync
+		if prevPurge == nil {
+			delete(r.purges, pr)
+		} else {
+			prevPurge.diverged = prevDiverged
+		}
+		r.mu.Unlock()
+		return fmt.Errorf("saving the bucket placements after moving bucket %q: %w", bs.name, err)
+	}
 	if source != nil {
 		r.cancelMember(source)
 	}
 	r.log.Info("bucket move completed", "bucket", bs.name, "from", mv.From, "to", mv.To,
 		"took", time.Since(mv.StartedAt).Round(time.Second))
-	r.saveLogged("a bucket move")
 	r.mu.RLock()
-	r.startPurge(r.purges[purgeRecord{Bucket: bs.name, Backing: mv.From}])
+	r.startPurge(r.purges[pr])
 	r.mu.RUnlock()
 	return nil
 }
