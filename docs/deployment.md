@@ -12,8 +12,8 @@ do not form a distributed cluster or share a bucket namespace. Discovery and
 the web UI help you find and manage them. Do not put several independent
 gos3 servers behind one load balancer.
 
-For the current release, start with the [0.2.2 release overview](releases/0.2.2.md)
-and its [upgrade checklist](releases/0.2.2.md#upgrading-from-021).
+For the current release, start with the [0.3.1 release overview](releases/0.3.1.md)
+and its [upgrade checklist](releases/0.3.1.md#upgrading-from-030).
 
 - [Binary](#binary)
 - [Docker](#docker) and [Docker Compose](#docker-compose)
