@@ -1104,10 +1104,12 @@ Supply-chain rules:
   least 14 days old when chosen. The compatibility suite's Python packages,
   transitive ones included, are compiled with a 14-day cut-off into the
   hash-locked `test/compat/requirements.txt`. The only exceptions are
-  security fixes younger than the cooldown: the npm ones are listed in
-  `minimumReleaseAgeExclude` and pinned to the oldest fixed release in
-  `overrides` (currently `shell-quote` 1.11.0 and `source-map-js` 1.2.2),
-  and the Go ones are the oldest fixed release in `go.mod` (currently
+  security fixes younger than the cooldown: npm exceptions (including exact
+  transitive releases required by a security update) are listed in
+  `minimumReleaseAgeExclude` in `web/pnpm-workspace.yaml`. Security fixes are
+  pinned in `overrides`; the lockfile records the required transitive versions.
+  Prefer the oldest compatible fixed release that preserves publisher trust.
+  Go exceptions use the oldest fixed release in `go.mod` (currently
   `golang.org/x/net` v0.60.0).
 - **Small module graph.** `github.com/minio/minio-go/v7` (a test-only client)
   stays on v7.1.x: v7.2 and later declare their linter toolchain as module
@@ -1142,11 +1144,15 @@ Supply-chain rules:
   request. A shipped package without a license file needs its upstream text in
   `internal/tools/notices/fallback/`.
 
-Known open advisories, both without an upstream fix and both limited to Nuxt's
-build and development tooling: `node-forge` (Nitro's dev server, `listhen`)
-and `braces` (file globbing during builds, via `globby` → `micromatch`).
-Neither is part of the embedded UI, which is static files, nor of the
-standalone UI server bundle (`web/.output/server`).
+Known open advisory without an upstream fix: `braces` (file globbing during
+builds, via `globby` and `micromatch`). It is limited to Nuxt's build tooling
+and is not part of the embedded UI, which is static files, or the standalone
+UI server bundle (`web/.output/server`).
+
+The nested DigestAlgorithm signature forgery in `node-forge`
+(GHSA-86w9-cpqp-85rv / GHSA-2g46-22mc-6gwp) is fixed in 1.4.1, pinned in
+`web/pnpm-workspace.yaml`; the older advisory may still list no patched
+release. See the [upstream release notes](https://github.com/digitalbazaar/forge/blob/v1.4.1/CHANGELOG.md).
 
 ## Reporting vulnerabilities
 

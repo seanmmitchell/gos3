@@ -149,8 +149,8 @@ export default defineNuxtModule({
     addVitePlugin({
       name: 'gos3:third-party-notices',
       apply: 'build',
-      generateBundle(_opts, bundle) {
-        collectBundle(shipped, bundle as unknown as Record<string, ChunkLike>)
+      generateBundle(_opts: unknown, bundle: Record<string, ChunkLike>) {
+        collectBundle(shipped, bundle)
       }
     }, { server: false })
 
@@ -164,8 +164,8 @@ export default defineNuxtModule({
           const plugins = Array.isArray(config.plugins) ? config.plugins : config.plugins ? [config.plugins] : []
           plugins.push({
             name: 'gos3:third-party-notices',
-            generateBundle(_opts, bundle) {
-              collectBundle(shipped, bundle as unknown as Record<string, ChunkLike>)
+            generateBundle(_opts: unknown, bundle: Record<string, ChunkLike>) {
+              collectBundle(shipped, bundle)
             }
           })
           config.plugins = plugins
