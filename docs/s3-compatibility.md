@@ -94,7 +94,7 @@ web UI (see [backings.md](backings.md#choosing-the-backing-of-a-bucket)).
 | `?website` | 🟡 | Stored and returned only; there is no website endpoint. |
 | `?notification` | 🟡 | Stored and returned only; no events are delivered. |
 | `?logging` | 🟡 | Stored and returned only; no access logs are written to buckets (use the server access log). |
-| `?replication` | 🟡 | Stored and returned only; nothing is replicated. |
+| `?replication` | 🟡 | Enabled rules asynchronously copy versioned objects and delete markers to versioned gos3 buckets in the same namespace. Prefix and tag filters, rule priority, existing-version backfill, and local [replication roles](admin-api.md#replication-roles) are supported. Unsupported rule fields are rejected on PUT; older unsupported documents remain inactive until replaced. Source writes do not wait for the copy. Destination versions persist per-version completion; cluster mode also commits scan, retry, and backfill status through Raft. A late backfill that would make an older version the destination's latest remains pending rather than changing visible history. |
 | `?accelerate` | 🟡 | Stored and returned only. |
 | `?requestPayment` | 🟡 | `BucketOwner` only; `Requester` ❌. |
 | `?analytics`, `?inventory`, `?metrics`, `?intelligent-tiering`, `?torrent`, metadata tables, `?session` | ❌ | |
@@ -389,8 +389,9 @@ ListObjectsV2, ListParts and GetObjectAttributes.
   within the gos3 server, and conditional writes only as far as the remote
   service honours `If-None-Match` / `If-Match`. See
   [backings.md](backings.md#limits-of-native-buckets).
-- **No replication between gos3 servers.** Every server stores its own data.
-  Discovery only finds servers; it does not cluster them.
+- Discovery alone does not join servers. Standalone servers keep separate
+  namespaces; the opt-in [static cluster](cluster-import.md) replicates data
+  across configured voters and commits a shared namespace through Raft.
 - With slow CopyObject and CompleteMultipartUpload calls (over about 5 s),
   `x-amz-version-id` and `x-amz-expiration` are sent as HTTP trailers because
   the status line has already gone out. SDKs then do not report them.

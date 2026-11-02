@@ -41,6 +41,8 @@ import (
 	"github.com/seanmmitchell/gos3/internal/admin"
 	"github.com/seanmmitchell/gos3/internal/auth"
 	"github.com/seanmmitchell/gos3/internal/clientip"
+	"github.com/seanmmitchell/gos3/internal/cluster"
+	"github.com/seanmmitchell/gos3/internal/clusterjobs"
 	"github.com/seanmmitchell/gos3/internal/config"
 	"github.com/seanmmitchell/gos3/internal/copyjob"
 	"github.com/seanmmitchell/gos3/internal/discovery"
@@ -48,8 +50,10 @@ import (
 	"github.com/seanmmitchell/gos3/internal/jobs"
 	"github.com/seanmmitchell/gos3/internal/lifecycle"
 	"github.com/seanmmitchell/gos3/internal/metrics"
+	"github.com/seanmmitchell/gos3/internal/replication"
 	"github.com/seanmmitchell/gos3/internal/resticsnap"
 	"github.com/seanmmitchell/gos3/internal/s3"
+	"github.com/seanmmitchell/gos3/internal/s3client"
 	"github.com/seanmmitchell/gos3/internal/storage"
 	fsbackend "github.com/seanmmitchell/gos3/internal/storage/fs"
 	"github.com/seanmmitchell/gos3/internal/storage/memory"
@@ -82,9 +86,22 @@ const (
 type Option func(*options)
 
 type options struct {
-	uiFS       fs.FS
-	logControl *LogControl
-	version    string
+	uiFS              fs.FS
+	logControl        *LogControl
+	version           string
+	offlineInspection bool
+	peerListener      net.Listener
+	peerHandlerWrap   func(http.Handler) http.Handler
+}
+
+// WithOfflineInspection opens a stopped standalone server under its data
+// directory lock without resuming background copy and snapshot jobs.
+func WithOfflineInspection() Option { return func(o *options) { o.offlineInspection = true } }
+
+func withPeerListener(ln net.Listener) Option { return func(o *options) { o.peerListener = ln } }
+
+func withPeerHandler(wrap func(http.Handler) http.Handler) Option {
+	return func(o *options) { o.peerHandlerWrap = wrap }
 }
 
 // WithUIFS serves the web UI from fsys instead of the embedded build (tests,
@@ -109,31 +126,41 @@ type Server struct {
 	logControl *LogControl
 	version    string
 
-	backend     storage.Backend // the multi-backing router over backings
-	backings    []multi.Backing // opened backings (owned by backend once it is set)
-	backendName string
-	dataPath    string // absolute data directory ("" when system state is ephemeral)
-	systemDir   string
-	iam         *iam.Manager
-	verifier    *auth.Verifier
-	metrics     *metrics.Registry
-	settings    *config.Store
-	clientIP    clientip.Resolver // client address rules (server.trust_proxy_headers, server.trusted_proxies)
-	s3          http.Handler
-	admin       http.Handler
-	ui          http.Handler // nil when the UI is disabled
-	uiBuilt     bool
-	updates     *updates.Service
-	disc        *discovery.Service
-	lifecycle   *lifecycle.Worker
-	jobs        *jobs.Manager       // background jobs (jobs.go)
-	copyJobs    *copyjob.Service    // copy and mirror job runners
-	snapshots   *resticsnap.Service // whole-bucket restic snapshots
-	tlsConfig   *tls.Config
-	bodyIdle    time.Duration // idle read timeout of bodies sent to gos3 endpoints
-	writeIdle   time.Duration // idle write timeout of responses (see writeGuard)
-	hosts       *hostPolicy   // which Host headers name this server
-	dirLock     *os.File      // exclusive lock on <systemDir>/lock (nil when ephemeral)
+	backend         storage.Backend // the multi-backing router over backings
+	clusterNode     *cluster.Node
+	peerServer      *http.Server
+	peerListener    net.Listener
+	peerHandlerWrap func(http.Handler) http.Handler
+	peerDone        chan error
+	clusterDone     chan error
+	backings        []multi.Backing // opened backings (owned by backend once it is set)
+	backendName     string
+	dataPath        string // absolute data directory ("" when system state is ephemeral)
+	systemDir       string
+	iam             *iam.Manager
+	verifier        *auth.Verifier
+	metrics         *metrics.Registry
+	settings        *config.Store
+	clientIP        clientip.Resolver // client address rules (server.trust_proxy_headers, server.trusted_proxies)
+	s3              http.Handler
+	admin           http.Handler
+	ui              http.Handler // nil when the UI is disabled
+	uiBuilt         bool
+	updates         *updates.Service
+	disc            *discovery.Service
+	lifecycle       *lifecycle.Worker
+	replication     *replication.Worker
+	jobs            *jobs.Manager        // background jobs (jobs.go)
+	clusterJobs     *clusterjobs.Service // shared leader-run jobs
+	clusterCopyJobs *clusterjobs.CopyRunner
+	clusterJobsDone chan struct{}
+	copyJobs        *copyjob.Service    // copy and mirror job runners
+	snapshots       *resticsnap.Service // whole-bucket restic snapshots
+	tlsConfig       *tls.Config
+	bodyIdle        time.Duration // idle read timeout of bodies sent to gos3 endpoints
+	writeIdle       time.Duration // idle write timeout of responses (see writeGuard)
+	hosts           *hostPolicy   // which Host headers name this server
+	dirLock         *os.File      // exclusive lock on <systemDir>/lock (nil when ephemeral)
 
 	tempMu   sync.Mutex
 	tempTag  string   // server ID in temporary directory names ("" when unknown)
@@ -202,17 +229,19 @@ func New(cfg config.Config, logger *slog.Logger, opts ...Option) (_ *Server, err
 	}
 
 	s := &Server{
-		cfg:        cfg,
-		log:        logger,
-		logControl: o.logControl,
-		version:    o.version,
-		systemDir:  cfg.SystemDir(),
-		startedAt:  time.Now().UTC().Truncate(time.Second),
-		ready:      make(chan struct{}),
-		bodyIdle:   systemBodyIdleTimeout,
-		writeIdle:  responseWriteIdle,
-		hosts:      newHostPolicy(cfg),
-		claims:     s3account.NewClaims(),
+		cfg:             cfg,
+		log:             logger,
+		logControl:      o.logControl,
+		version:         o.version,
+		systemDir:       cfg.SystemDir(),
+		startedAt:       time.Now().UTC().Truncate(time.Second),
+		ready:           make(chan struct{}),
+		bodyIdle:        systemBodyIdleTimeout,
+		writeIdle:       responseWriteIdle,
+		hosts:           newHostPolicy(cfg),
+		claims:          s3account.NewClaims(),
+		peerListener:    o.peerListener,
+		peerHandlerWrap: o.peerHandlerWrap,
 	}
 	if s.clientIP, err = cfg.ClientIP(); err != nil {
 		return nil, fmt.Errorf("invalid configuration: %w", err)
@@ -264,8 +293,10 @@ func New(cfg config.Config, logger *slog.Logger, opts ...Option) (_ *Server, err
 		}
 		s.removeStaleTempDirs()
 	}
-	if err := s.openRouter(); err != nil {
-		return nil, err
+	if !cfg.Cluster.Enabled {
+		if err := s.openRouter(); err != nil {
+			return nil, err
+		}
 	}
 	if s.serverID, err = loadServerID(s.systemDir, logger); err != nil {
 		return nil, err
@@ -276,14 +307,24 @@ func New(cfg config.Config, logger *slog.Logger, opts ...Option) (_ *Server, err
 	}
 	s.cfg = cfg
 
-	if s.iam, err = iam.Open(iam.Options{
+	iamOptions := iam.Options{
 		Dir:           s.systemDir,
 		RootAccessKey: cfg.Auth.RootAccessKey,
 		RootSecretKey: cfg.Auth.RootSecretKey,
-	}); err != nil {
+	}
+	if cfg.Cluster.Enabled {
+		iamOptions.Dir = ""
+		iamOptions.SharedState = cluster.IAMStateStore{Node: s.clusterNode}
+	}
+	if s.iam, err = iam.Open(iamOptions); err != nil {
 		return nil, fmt.Errorf("opening IAM: %w", err)
 	}
-	if s.settings, err = cfg.LoadSettings(); err != nil {
+	if cfg.Cluster.Enabled {
+		s.settings, err = config.NewSharedStore(config.SettingsFrom(cfg), cluster.SettingsStateStore{Node: s.clusterNode})
+	} else {
+		s.settings, err = cfg.LoadSettings()
+	}
+	if err != nil {
 		return nil, err
 	}
 	st := s.settings.Get()
@@ -300,8 +341,18 @@ func New(cfg config.Config, logger *slog.Logger, opts ...Option) (_ *Server, err
 
 	// Background jobs need the router and the settings (region and
 	// compression policy of the copies); they resume at once.
-	if err := s.openJobs(); err != nil {
-		return nil, err
+	if !cfg.Cluster.Enabled && !o.offlineInspection {
+		if err := s.openJobs(); err != nil {
+			return nil, err
+		}
+	}
+	if cfg.Cluster.Enabled && !o.offlineInspection {
+		backend := s.backend.(*cluster.S3Backend)
+		s.clusterCopyJobs = &clusterjobs.CopyRunner{Backend: backend, IsLeader: backend.IsClusterLeader}
+		s.clusterJobs = clusterjobs.New(s.clusterNode, clusterjobs.Options{
+			Runners:  map[string]clusterjobs.Runner{copyjob.KindCopy: s.clusterCopyJobs},
+			IsLeader: backend.IsClusterLeader, Workers: cfg.Jobs.Workers,
+		})
 	}
 
 	s.verifier = auth.NewVerifier(s.iam, auth.Options{Region: st.Region, StrictRegion: cfg.Auth.StrictRegion})
@@ -328,21 +379,35 @@ func New(cfg config.Config, logger *slog.Logger, opts ...Option) (_ *Server, err
 		s.settings.Subscribe(func(_, next config.Settings) { s.updates.Configure(next.Updates) })
 	}
 	if cfg.Admin.Enabled {
+		var adminJobs admin.JobService
+		var adminCopyJobs admin.CopyJobService
+		if s.clusterJobs != nil {
+			adminJobs = s.clusterJobs
+			adminCopyJobs = s.clusterCopyJobs
+		} else if s.jobs != nil {
+			adminJobs = s.jobs
+			adminCopyJobs = s.copyJobs
+		}
+		var clusterStatus func(context.Context) cluster.Status
+		if s.clusterNode != nil {
+			clusterStatus = s.clusterNode.Status
+		}
 		s.admin = s.instrumentAdmin(admin.NewHandler(admin.Deps{
-			Backend:     s.backend,
-			Verifier:    s.verifier,
-			IAM:         s.iam,
-			Metrics:     s.metrics,
-			Settings:    s.settings,
-			Discovery:   s.disc,
-			Info:        s.Info,
-			BackendName: s.backendName,
-			DataPath:    s.dataPath,
-			Logger:      logger,
-			Jobs:        s.jobs,
-			CopyJobs:    s.copyJobs,
-			Snapshots:   s.snapshots,
-			Updates:     s.updates,
+			Backend:       s.backend,
+			Verifier:      s.verifier,
+			IAM:           s.iam,
+			Metrics:       s.metrics,
+			Settings:      s.settings,
+			Discovery:     s.disc,
+			Info:          s.Info,
+			ClusterStatus: clusterStatus,
+			BackendName:   s.backendName,
+			DataPath:      s.dataPath,
+			Logger:        logger,
+			Jobs:          adminJobs,
+			CopyJobs:      adminCopyJobs,
+			Snapshots:     s.snapshots,
+			Updates:       s.updates,
 
 			TrustProxyHeaders: s.clientIP,
 		}))
@@ -352,6 +417,7 @@ func New(cfg config.Config, logger *slog.Logger, opts ...Option) (_ *Server, err
 		Logger:   logger.With("component", "lifecycle"),
 	})
 	s.lifecycle.Reconfigure(time.Duration(st.Lifecycle.IntervalSeconds)*time.Second, st.Lifecycle.Enabled)
+	s.replication = replication.NewWorker(s.backend, s.iam, logger.With("component", "replication"))
 
 	if cfg.UI.Enabled {
 		fsys := o.uiFS
@@ -377,6 +443,43 @@ func New(cfg config.Config, logger *slog.Logger, opts ...Option) (_ *Server, err
 // openRouter then puts the router in front of them.
 func (s *Server) openBackend() error {
 	st := s.cfg.Storage
+	if s.cfg.Cluster.Enabled {
+		abs, err := filepath.Abs(st.Path)
+		if err != nil {
+			return fmt.Errorf("cluster data path: %w", err)
+		}
+		if err := s.checkClusterDataDir(); err != nil {
+			return err
+		}
+		stageMemory := s.cfg.Cluster.StageMemoryBytes
+		var node *cluster.Node
+		if st.Backend == config.BackendS3 {
+			remote, err := s3client.New(s3client.Config{
+				Endpoint: st.S3.Endpoint, Region: st.S3.Region,
+				AccessKey: st.S3.AccessKey, SecretKey: st.S3.SecretKey,
+				PathStyle: st.S3.PathStyle(),
+			})
+			if err != nil {
+				return fmt.Errorf("opening cluster S3 replica client: %w", err)
+			}
+			prefix := st.S3.HomePrefix + "_gos3-cluster/" + s.cfg.Cluster.ID + "/" + s.cfg.Cluster.NodeID + "/"
+			store, err := cluster.NewS3StageStore(remote, st.S3.HomeBucket, prefix, stageMemory)
+			if err != nil {
+				return fmt.Errorf("opening cluster S3 replica store: %w", err)
+			}
+			node, err = cluster.OpenNodeWithReplicaStore(s.cfg.Cluster, filepath.Join(s.systemDir, "cluster"), stageMemory, store)
+		} else {
+			node, err = cluster.OpenNode(s.cfg.Cluster, filepath.Join(s.systemDir, "cluster"), stageMemory)
+		}
+		if err != nil {
+			return fmt.Errorf("opening cluster node: %w", err)
+		}
+		s.clusterNode = node
+		s.backend = cluster.NewS3Backend(node)
+		s.backendName = "cluster"
+		s.dataPath = abs
+		return nil
+	}
 	switch st.Backend {
 	case config.BackendMemory, config.BackendS3:
 		// storage.path holds system state only.
@@ -616,12 +719,40 @@ func (s *Server) Close() error {
 		if err := s.closeJobs(); err != nil {
 			errs = append(errs, err)
 		}
+		if s.clusterJobsDone != nil {
+			<-s.clusterJobsDone
+		}
 		if s.lifecycle != nil {
 			s.lifecycle.Stop()
+		}
+		if s.replication != nil {
+			s.replication.Stop()
 		}
 		if s.backend != nil {
 			if err := s.backend.Close(); err != nil {
 				errs = append(errs, fmt.Errorf("closing storage: %w", err))
+			}
+		}
+		if s.peerServer != nil {
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			if err := s.peerServer.Shutdown(ctx); err != nil {
+				_ = s.peerServer.Close()
+			}
+			cancel()
+			if s.peerDone != nil {
+				<-s.peerDone
+			}
+		} else if s.peerListener != nil {
+			_ = s.peerListener.Close()
+		}
+		if s.clusterDone != nil {
+			if err := <-s.clusterDone; err != nil && !errors.Is(err, context.Canceled) {
+				errs = append(errs, fmt.Errorf("cluster consensus: %w", err))
+			}
+		}
+		if s.clusterNode != nil {
+			if err := s.clusterNode.Close(); err != nil {
+				errs = append(errs, fmt.Errorf("closing cluster node: %w", err))
 			}
 		}
 		for _, b := range s.backings { // opened, but the router never took them

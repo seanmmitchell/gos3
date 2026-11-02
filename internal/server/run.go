@@ -35,7 +35,11 @@ func (s *Server) Serve(ctx context.Context, ln net.Listener) error {
 	if !s.serving.CompareAndSwap(false, true) {
 		return errServing
 	}
+	defer ln.Close()
 	defer s.Close()
+	if err := s.startCluster(); err != nil {
+		return err
+	}
 
 	// Request contexts are not tied to ctx, so that cancelling ctx (SIGTERM)
 	// lets in-flight requests finish within the shutdown timeout.
@@ -75,6 +79,14 @@ func (s *Server) Serve(ctx context.Context, ln net.Listener) error {
 	s.lifecycle.Start(s.lifeCtx)
 	if s.updates != nil {
 		go s.updates.Run(s.lifeCtx)
+	}
+	s.replication.Start(s.lifeCtx)
+	if s.clusterJobs != nil {
+		s.clusterJobsDone = make(chan struct{})
+		go func() {
+			s.clusterJobs.Run(s.lifeCtx)
+			close(s.clusterJobsDone)
+		}()
 	}
 
 	errc := make(chan error, 1)

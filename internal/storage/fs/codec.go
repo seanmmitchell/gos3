@@ -65,6 +65,10 @@ const recordFormatVersionV2 byte = 4
 // Compression may be "" (an encrypted version stored uncompressed).
 const recordFormatVersionV3 byte = 5
 
+// V4 adds the internal replication origin after V3's encryption field.
+// Unlike V3, encryption may be empty. Only replicated versions use V4.
+const recordFormatVersionV4 byte = 6
+
 var errShortRecord = errors.New("truncated record")
 
 type encoder struct{ b []byte }
@@ -226,6 +230,9 @@ func encodeVersionRecord(r *versionRecord) []byte {
 	if m.Encryption != "" {
 		format = recordFormatVersionV3
 	}
+	if m.ReplicationOrigin != "" {
+		format = recordFormatVersionV4
+	}
 	e.b = append(e.b, format)
 	e.str(r.VersionID)
 	var flags byte
@@ -273,8 +280,11 @@ func encodeVersionRecord(r *versionRecord) []byte {
 		e.str(r.Compression)
 		e.varint(r.StoredSize)
 	}
-	if format == recordFormatVersionV3 {
+	if format >= recordFormatVersionV3 {
 		e.str(m.Encryption)
+	}
+	if format == recordFormatVersionV4 {
+		e.str(m.ReplicationOrigin)
 	}
 	return e.b
 }
@@ -283,7 +293,7 @@ func encodeVersionRecord(r *versionRecord) []byte {
 // encodeVersionRecord result; format is that format byte
 // (recordFormatVersionV1, V2 or V3).
 func decodeVersionRecord(data []byte, r *versionRecord, format byte) error {
-	if format != recordFormatVersionV1 && format != recordFormatVersionV2 && format != recordFormatVersionV3 {
+	if format != recordFormatVersionV1 && format != recordFormatVersionV2 && format != recordFormatVersionV3 && format != recordFormatVersionV4 {
 		*r = versionRecord{}
 		return fmt.Errorf("not a version record format: %d", format)
 	}
@@ -335,10 +345,20 @@ func decodeVersionRecord(data []byte, r *versionRecord, format byte) error {
 		}
 	}
 	m.Encryption = ""
-	if format == recordFormatVersionV3 {
+	if format >= recordFormatVersionV3 {
 		m.Encryption = d.str()
-		if m.Encryption != storage.EncryptionAES256 && m.Encryption != storage.EncryptionRestic {
+		if m.Encryption != "" && m.Encryption != storage.EncryptionAES256 && m.Encryption != storage.EncryptionRestic {
 			d.fail(errors.New("invalid encryption provider"))
+		}
+		if format == recordFormatVersionV3 && m.Encryption == "" {
+			d.fail(errors.New("invalid encryption provider"))
+		}
+	}
+	m.ReplicationOrigin = ""
+	if format == recordFormatVersionV4 {
+		m.ReplicationOrigin = d.str()
+		if m.ReplicationOrigin == "" {
+			d.fail(errors.New("empty replication origin"))
 		}
 	}
 	if d.err == nil && len(d.b) != 0 {

@@ -35,6 +35,12 @@ endpoint off (404).
 | `gos3_start_time_seconds` | gauge | | Start time (Unix seconds). |
 | `gos3_buckets` | gauge | | Number of buckets. |
 | `gos3_discovery_peers` | gauge | | Discovered peers (only while discovery is enabled). |
+| `gos3_cluster_available` | gauge | | 1 when a quorum-confirmed read succeeds, else 0 (cluster mode only). |
+| `gos3_cluster_leader` | gauge | | 1 when this node is the Raft leader (cluster mode only). |
+| `gos3_cluster_commit_index`, `gos3_cluster_applied_index`, `gos3_cluster_lag` | gauge | | Local Raft progress (cluster mode only). |
+| `gos3_cluster_replica_count`, `gos3_cluster_min_memory_acks`, `gos3_cluster_min_durable_acks` | gauge | | Configured placement and acknowledgment policy (cluster mode only). |
+| `gos3_cluster_last_write_memory_acks`, `gos3_cluster_last_write_durable_acks`, `gos3_cluster_last_write_committed` | gauge | | Distinct node acknowledgments and consensus result of the latest write coordinated by this node; reset on restart (cluster mode only). |
+| `gos3_cluster_last_repair_repaired`, `gos3_cluster_last_repair_failed` | gauge | | Copies restored by the most recent local placement scan and whether that scan failed; reset on restart (cluster mode only). |
 
 `op` is the S3 operation name (`GetObject`, `PutObject`,
 `CompleteMultipartUpload`, …), `Admin` for admin API requests,

@@ -490,18 +490,19 @@ archives and image. Branch rules, versioning and the release steps are in
 
 ## Limitations
 
-- **Independent servers.** Bucket replicas belong to the backings of one
-  gos3 server; there is no erasure coding or distributed cluster. Copy/mirror
-  jobs can reach another server through an S3 backing, but discovery does
-  not combine servers or their bucket namespaces. Use backups
-  (see [docs/operations.md](docs/operations.md#backups)) for durability.
+- **Standalone by default.** Discovery does not combine independent servers
+  or their bucket namespaces. An opt-in static cluster has a shared namespace
+  and configurable memory and durable acknowledgment thresholds; see
+  [cluster deployment and import](docs/cluster-import.md). There is no erasure
+  coding. Use backups (see [docs/operations.md](docs/operations.md#backups))
+  for recovery.
 - One account: IAM users share the bucket namespace, and there is no STS and
   no session tokens.
 - Not implemented: SigV2, SigV4A, SSE-C, ACL grants beyond canned ACLs,
   RestoreObject, SelectObjectContent, analytics, inventory and metrics
-  configurations. Lifecycle transitions, website, notification, logging and
-  replication configurations are stored but not acted on. Details are in
-  [docs/s3-compatibility.md](docs/s3-compatibility.md).
+  configurations. Lifecycle transitions, website, notification and logging
+  configurations are stored but not acted on. Supported S3 bucket replication
+  rules run asynchronously; see [docs/s3-compatibility.md](docs/s3-compatibility.md).
 - AWS KMS encryption is not implemented. Native AES256 and restic encrypt
   new objects when requested or enabled as the bucket default.
 - TLS certificates are loaded at startup; restart after renewal.

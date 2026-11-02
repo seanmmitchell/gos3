@@ -180,6 +180,8 @@ func (r *versionRecord) info(bucket, key string, latest bool) storage.ObjectInfo
 	if !r.DeleteMarker {
 		oi.ObjectMeta = r.Meta
 		oi.Compression, oi.StoredSize = r.Compression, r.StoredSize
+	} else {
+		oi.ReplicationOrigin = r.Meta.ReplicationOrigin
 	}
 	return oi
 }
@@ -266,7 +268,7 @@ func decodeRecord(data []byte, v any) error {
 		err = json.Unmarshal(data[1:], v)
 	case recordFormatGob:
 		err = gob.NewDecoder(bytes.NewReader(data[1:])).Decode(v)
-	case recordFormatVersionV1, recordFormatVersionV2, recordFormatVersionV3:
+	case recordFormatVersionV1, recordFormatVersionV2, recordFormatVersionV3, recordFormatVersionV4:
 		r, ok := v.(*versionRecord)
 		if !ok {
 			return fmt.Errorf("%w: version record format for %T", errCorrupt, v)
@@ -300,7 +302,7 @@ func recordIsUTF8(v any) bool {
 func metaIsUTF8(m *storage.ObjectMeta) bool {
 	for _, s := range []string{m.ETag, m.ContentType, m.ContentEncoding, m.ContentDisposition,
 		m.ContentLanguage, m.CacheControl, m.Expires, m.StorageClass, m.ACL, m.ChecksumType,
-		m.SSE, m.SSEKMSKeyID, m.RetentionMode, m.WebsiteRedirect} {
+		m.SSE, m.SSEKMSKeyID, m.RetentionMode, m.WebsiteRedirect, m.ReplicationOrigin} {
 		if !utf8.ValidString(s) {
 			return false
 		}

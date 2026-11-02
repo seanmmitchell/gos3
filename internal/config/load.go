@@ -141,6 +141,12 @@ func Default() Config {
 			ShutdownTimeout: DefaultShutdownTimeout,
 			MaxConnections:  DefaultMaxConnections,
 		},
+		Cluster: ClusterConfig{
+			ReplicaCount:     DefaultClusterCopies,
+			MinMemoryAcks:    DefaultClusterCopies,
+			MinDurableAcks:   DefaultClusterCopies,
+			StageMemoryBytes: DefaultClusterStageMemoryBytes,
+		},
 		Storage: StorageConfig{
 			Backend:   BackendFS,
 			Path:      DefaultDataPath,
@@ -295,7 +301,7 @@ func describeUnknownField(m string) string {
 		return fmt.Sprintf("unknown key %q in section %q", sub[1], sec)
 	}
 	if sub[2] == "config.Config" {
-		return fmt.Sprintf("unknown top-level key %q (expected server, storage, auth, ui, admin, cors, discovery, logging, lifecycle, metrics, compression, jobs or restic)", sub[1])
+		return fmt.Sprintf("unknown top-level key %q (expected server, cluster, storage, auth, ui, admin, cors, discovery, logging, lifecycle, metrics, compression, jobs or restic)", sub[1])
 	}
 	return fmt.Sprintf("unknown key %q", sub[1])
 }
@@ -304,6 +310,24 @@ func describeUnknownField(m string) string {
 // address, region and maximum object size when empty or zero), lower-cases
 // enumerations and trims list entries, dropping empty ones.
 func (c *Config) Normalize() {
+	if c.Cluster.ReplicaCount == 0 {
+		c.Cluster.ReplicaCount = DefaultClusterCopies
+	}
+	if c.Cluster.MinMemoryAcks == 0 {
+		c.Cluster.MinMemoryAcks = DefaultClusterCopies
+	}
+	if c.Cluster.MinDurableAcks == 0 {
+		c.Cluster.MinDurableAcks = DefaultClusterCopies
+	}
+	if c.Cluster.StageMemoryBytes == 0 {
+		c.Cluster.StageMemoryBytes = DefaultClusterStageMemoryBytes
+	}
+	c.Cluster.ID = strings.TrimSpace(c.Cluster.ID)
+	c.Cluster.NodeID = strings.TrimSpace(c.Cluster.NodeID)
+	for i := range c.Cluster.Peers {
+		c.Cluster.Peers[i].ID = strings.TrimSpace(c.Cluster.Peers[i].ID)
+		c.Cluster.Peers[i].URL = strings.TrimSpace(c.Cluster.Peers[i].URL)
+	}
 	if !c.Admin.Enabled {
 		c.UI.Enabled = false
 	}
@@ -402,6 +426,9 @@ func trimList(in []string) []string {
 // derived from it (ValidateSettings). Errors name the offending YAML key,
 // e.g. "server.address: ...".
 func (c Config) Validate() error {
+	if err := c.validateCluster(); err != nil {
+		return err
+	}
 	host, port, err := net.SplitHostPort(c.Server.Address)
 	if err != nil || strings.ContainsAny(host, "/ ") {
 		return fmt.Errorf("server.address: %q must be [host]:port (e.g. \":9000\")", c.Server.Address)
@@ -735,6 +762,7 @@ const RedactedValue = "<redacted>"
 // secret and encryption keys of s3 backings) replaced by "<redacted>", for
 // printing and logging.
 func (c Config) Redacted() Config {
+	c.Cluster.Peers = slices.Clone(c.Cluster.Peers)
 	if c.Auth.RootSecretKey != "" {
 		c.Auth.RootSecretKey = RedactedValue
 	}

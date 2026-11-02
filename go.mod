@@ -11,9 +11,11 @@ require (
 	github.com/miekg/dns v1.1.73
 	github.com/minio/minio-go/v7 v7.1.0
 	go.etcd.io/bbolt v1.5.0
+	go.etcd.io/raft/v3 v3.7.0
 	go.yaml.in/yaml/v3 v3.0.5
 	golang.org/x/net v0.60.0
 	golang.org/x/sys v0.48.0
+	google.golang.org/protobuf v1.36.11
 )
 
 require (

@@ -96,6 +96,11 @@ func TestActivePassiveReplicates(t *testing.T) {
 		t.Fatal(err)
 	}
 	put(t, r, "photos", "before", "existing data", storage.ObjectMeta{})
+	// A rule activation stamp is part of the bucket's backing state. A
+	// promoted replica must retain it so the S3 rule worker can resume.
+	if err := r.PutBucketConfig(ctx, "photos", storage.ConfigReplicationState, []byte(`{"hash":"test","activatedAt":"2026-01-01T00:00:00Z"}`)); err != nil {
+		t.Fatal(err)
+	}
 	st, err := r.SetReplication(ctx, "photos", ModeActivePassive, []string{"b"})
 	if err != nil {
 		t.Fatal(err)
@@ -106,7 +111,7 @@ func TestActivePassiveReplicates(t *testing.T) {
 	exercise(t, r, "photos")
 	waitState(t, r, "photos", StateInSync)
 	got := waitSame(t, "photos", bk[0].Backend, bk[1].Backend)
-	if !strings.Contains(got, "config policy=") || !strings.Contains(got, `versioning="Suspended"`) {
+	if !strings.Contains(got, "config policy=") || !strings.Contains(got, "config replication-state=") || !strings.Contains(got, `versioning="Suspended"`) {
 		t.Fatalf("replica is missing bucket settings:\n%s", got)
 	}
 	// Uploads are not copied.

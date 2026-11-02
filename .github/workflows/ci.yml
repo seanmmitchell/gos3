@@ -34,7 +34,7 @@ jobs:
           cache: true
       - name: gofmt
         run: |
-          unformatted="$(gofmt -l cmd internal test)"
+          unformatted="$(gofmt -l cmd internal test .github/scripts/filter_go_coverage.go)"
           if [ -n "$unformatted" ]; then
             echo "::error::gofmt needed:"; echo "$unformatted"; exit 1
           fi
@@ -47,14 +47,28 @@ jobs:
       # The real local and remote-S3 restic repository tests skip without
       # restic; install the pinned release the container images bundle.
       - uses: ./.github/actions/setup-restic
-      - name: Unit tests (race)
-        run: go test -race -count=1 ./cmd/... ./internal/...
+      - name: Unit and end-to-end tests (race, coverage)
+        run: |
+          set -o pipefail
+          go test -json -race -timeout=20m -count=1 -coverpkg=./cmd/...,./internal/... -coverprofile=go-coverage.out ./cmd/... ./internal/... ./test/e2e/... | tee go-tests.json
+          go run ./.github/scripts/filter_go_coverage.go go-coverage.out go-coverage-filtered.out
+          coverage="$(go tool cover -func=go-coverage-filtered.out | awk '/^total:/ { gsub(/%/, "", $3); print $3 }')"
+          echo "Go statement coverage: ${coverage}%"
+          awk -v coverage="$coverage" 'BEGIN { exit !(coverage >= 80) }'
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: always()
+        with:
+          name: go-coverage-linux
+          path: |
+            go-coverage.out
+            go-coverage-filtered.out
+            go-tests.json
+          if-no-files-found: ignore
+          retention-days: 7
       - name: Headless build and mode tests
         run: |
           go build -tags noui ./cmd/gos3
           go test -race -tags noui ./internal/config ./internal/webui ./internal/server ./cmd/gos3
-      - name: End-to-end tests (race)
-        run: go test -race -count=1 ./test/e2e/...
 
   go-platforms:
     # Release archives are published for macOS and Windows too, so the suites
@@ -62,7 +76,7 @@ jobs:
     # differ). Both jobs are required checks in .github/rulesets.
     name: Go tests (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 30
+    timeout-minutes: 45
     strategy:
       fail-fast: false
       matrix:
@@ -80,11 +94,26 @@ jobs:
       - uses: ./.github/actions/setup-restic
       # Durable filesystem suites perform thousands of disk flushes. On
       # Windows runners these can exceed Go's default 10-minute package
-      # timeout; keep all tests enabled within the 30-minute job budget.
-      - name: Unit tests
-        run: go test -timeout=20m -count=1 ./cmd/... ./internal/...
-      - name: End-to-end tests
-        run: go test -count=1 ./test/e2e/...
+      # timeout; keep all tests enabled within the 45-minute job budget.
+      - name: Unit and cluster integration tests (race)
+        shell: bash
+        run: |
+          set -o pipefail
+          go test -json -race -timeout=20m -count=1 ./cmd/... ./internal/... | tee go-platform-tests.json
+      - name: End-to-end tests (race)
+        shell: bash
+        run: |
+          set -o pipefail
+          go test -json -race -count=1 ./test/e2e/... | tee go-platform-e2e.json
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: always()
+        with:
+          name: go-test-logs-${{ matrix.os }}
+          path: |
+            go-platform-tests.json
+            go-platform-e2e.json
+          if-no-files-found: ignore
+          retention-days: 7
 
   web:
     name: Web UI (typecheck, test, build)
@@ -122,7 +151,14 @@ jobs:
       - name: Audit high-severity web dependencies
         run: pnpm audit --audit-level high
       - run: pnpm typecheck
-      - run: pnpm test
+      - run: pnpm test:coverage
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: always()
+        with:
+          name: ci-ui-coverage
+          path: web/coverage/
+          if-no-files-found: ignore
+          retention-days: 7
       - name: Standalone build
         run: |
           pnpm build
@@ -228,7 +264,7 @@ jobs:
           retention-days: 7
 
   compat:
-    name: Compatibility (boto3, AWS CLI)
+    name: Compatibility (boto3, AWS CLI, cluster)
     runs-on: ubuntu-latest
     timeout-minutes: 30
     env:
@@ -254,6 +290,12 @@ jobs:
           key: compat-venv-${{ runner.os }}-py${{ steps.python.outputs.python-version }}-${{ hashFiles('test/compat/requirements.txt') }}
       - name: Run test/compat/run.sh
         run: test/compat/run.sh
+      - name: Cluster boto3 compatibility
+        env:
+          GOS3_COMPAT_CLUSTER: "1"
+          GOS3_COMPAT_SKIP_BUILD: "1"
+          GOS3_COMPAT_SKIP_CLI: "1"
+        run: test/compat/run.sh test_cluster.py
 
   docker:
     name: Docker images

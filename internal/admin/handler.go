@@ -188,6 +188,7 @@ func (a *api) routes() []route {
 		{"GET", "/info", "ServerInfo", service, a.serverInfo},
 		{"GET", "/updates", "", service, a.updateStatus},
 		{"GET", "/stats", "GetStats", service, a.stats},
+		{"GET", "/cluster", "GetStats", service, a.clusterStatus},
 		{"GET", "/config", "GetConfig", service, a.getConfig},
 		{"PUT", "/config", "UpdateConfig", service, a.putConfig},
 		// Users & access keys
@@ -205,6 +206,11 @@ func (a *api) routes() []route {
 		{"PUT", "/policies/{name}", "PutPolicy", policy, a.putPolicy},
 		{"DELETE", "/policies/{name}", "DeletePolicy", policy, a.deletePolicy},
 		{"POST", "/authz/simulate", "SimulatePolicy", service, a.simulate},
+		// Limited IAM roles used only by S3 replication workers.
+		{"GET", "/replication-roles", "ListReplicationRoles", service, a.listReplicationRoles},
+		{"PUT", "/replication-roles/{name}", "PutReplicationRole", service, a.putReplicationRole},
+		{"GET", "/replication-roles/{name}", "GetReplicationRole", service, a.getReplicationRole},
+		{"DELETE", "/replication-roles/{name}", "DeleteReplicationRole", service, a.deleteReplicationRole},
 		// Buckets
 		{"GET", "/buckets", "ListBuckets", service, a.listBuckets},
 		{"GET", "/buckets/{name}", "GetBucket", bucket, a.getBucket},
@@ -391,6 +397,10 @@ func (a *api) endpoint(rt route) http.Handler {
 		res, err := a.d.Verifier.Authenticate(r)
 		if err != nil {
 			e := s3err.As(err)
+			if e.HTTPStatus == http.StatusServiceUnavailable {
+				writeError(w, errorf(http.StatusServiceUnavailable, codeInternalError, "%s", e.Message))
+				return
+			}
 			writeError(w, errorf(http.StatusUnauthorized, codeUnauthenticated, "%s: %s", e.Code, e.Message))
 			return
 		}
@@ -505,7 +515,11 @@ func (a *api) authorize(rc *reqCtx, action, resource string, extra map[string][]
 // any handler for actions beyond the route's own, e.g. when one request
 // body also does what another route gates separately.
 func (a *api) requireAction(rc *reqCtx, action, resource string, extra map[string][]string) error {
-	if !a.authorize(rc, action, resource, extra).Allowed {
+	decision := a.authorize(rc, action, resource, extra)
+	if decision.Unavailable {
+		return errorf(http.StatusServiceUnavailable, codeInternalError, "shared IAM unavailable")
+	}
+	if !decision.Allowed {
 		on := ""
 		if resource != "" {
 			on = " on " + resource
@@ -586,7 +600,7 @@ func (a *api) toAPIError(err error) *apiError {
 	case errors.Is(err, jobs.ErrClosed):
 		return errorf(http.StatusServiceUnavailable, codeInternalError, "%s", msg)
 	// iam (order matters: some errors wrap others)
-	case errors.Is(err, iam.ErrUserNotFound), errors.Is(err, iam.ErrKeyNotFound), errors.Is(err, iam.ErrPolicyNotFound):
+	case errors.Is(err, iam.ErrUserNotFound), errors.Is(err, iam.ErrKeyNotFound), errors.Is(err, iam.ErrPolicyNotFound), errors.Is(err, iam.ErrReplicationRoleNotFound):
 		return errorf(http.StatusNotFound, codeNotFound, "%s", msg)
 	case errors.Is(err, iam.ErrUserExists), errors.Is(err, iam.ErrPolicyInUse):
 		return errorf(http.StatusConflict, codeConflict, "%s", msg)
@@ -594,7 +608,7 @@ func (a *api) toAPIError(err error) *apiError {
 		return errorf(http.StatusBadRequest, codeInvalidName, "%s", msg)
 	case errors.Is(err, iam.ErrInvalidPolicy):
 		return errorf(http.StatusBadRequest, codeInvalidPolicy, "%s", msg)
-	case errors.Is(err, iam.ErrTooManyKeys), errors.Is(err, iam.ErrPolicyBuiltin), errors.Is(err, iam.ErrRootImmutable):
+	case errors.Is(err, iam.ErrTooManyKeys), errors.Is(err, iam.ErrPolicyBuiltin), errors.Is(err, iam.ErrRootImmutable), errors.Is(err, iam.ErrInvalidReplicationRole):
 		return errorf(http.StatusBadRequest, codeInvalidRequest, "%s", msg)
 	// storage
 	case errors.Is(err, storage.ErrBucketNotFound):
@@ -648,6 +662,8 @@ func (a *api) toAPIError(err error) *apiError {
 		return errorf(http.StatusBadRequest, codeInvalidRequest, "%s", msg)
 	case errors.Is(err, context.Canceled), errors.Is(err, context.DeadlineExceeded):
 		return errorf(http.StatusServiceUnavailable, codeInternalError, "request canceled or timed out: %s", msg)
+	case errors.Is(err, s3err.ErrServiceUnavailable):
+		return errorf(http.StatusServiceUnavailable, codeInternalError, "%s", msg)
 	}
 	var se *s3err.Error
 	if errors.As(err, &se) && se.HTTPStatus >= 400 && se.HTTPStatus < 500 {

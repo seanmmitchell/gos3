@@ -25,6 +25,7 @@ import (
 // Config is the full static configuration.
 type Config struct {
 	Server      ServerConfig      `yaml:"server"`
+	Cluster     ClusterConfig     `yaml:"cluster"`
 	Storage     StorageConfig     `yaml:"storage"`
 	Auth        AuthConfig        `yaml:"auth"`
 	UI          UIConfig          `yaml:"ui"`
@@ -331,13 +332,15 @@ type Store struct {
 	mu       sync.RWMutex
 	settings Settings
 	path     string // settings.json path ("" = not persisted)
+	shared   SettingsStateStore
+	initial  Settings
 	subs     []func(old, new Settings)
 }
 
 // NewStore returns a Store with initial settings, persisting to path ("" =
 // memory only).
 func NewStore(initial Settings, path string) *Store {
-	return &Store{settings: initial, path: path}
+	return &Store{settings: initial, initial: cloneSettings(initial), path: path}
 }
 
 // Get returns a copy of the current settings.
@@ -359,6 +362,9 @@ func (s *Store) Get() Settings {
 func (s *Store) Update(fn func(*Settings) error) (Settings, error) {
 	s.updateMu.Lock()
 	defer s.updateMu.Unlock()
+	if s.shared != nil {
+		return s.updateShared(fn)
+	}
 
 	s.mu.RLock()
 	old := cloneSettings(s.settings)

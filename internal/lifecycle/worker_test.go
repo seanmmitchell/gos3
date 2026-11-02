@@ -931,6 +931,42 @@ type countingBackend struct {
 	block  chan struct{} // when non-nil, ListBuckets waits on it
 }
 
+type leaderCountingBackend struct {
+	*countingBackend
+	leader atomic.Bool
+}
+
+func (b *leaderCountingBackend) IsClusterLeader() bool { return b.leader.Load() }
+
+func TestWorkerRunsOnlyOnClusterLeader(t *testing.T) {
+	backend := &leaderCountingBackend{countingBackend: &countingBackend{Backend: memory.New()}}
+	defer backend.Close()
+	worker := NewWorker(backend, Options{})
+	if stats, err := worker.RunOnce(context.Background()); err != nil || stats != (Stats{}) || backend.passes.Load() != 0 {
+		t.Fatalf("follower pass: %+v, %v, lists %d", stats, err, backend.passes.Load())
+	}
+	backend.leader.Store(true)
+	if _, err := worker.RunOnce(context.Background()); err != nil || backend.passes.Load() != 1 {
+		t.Fatalf("leader pass: %v, lists %d", err, backend.passes.Load())
+	}
+}
+
+func TestWorkerSchedulesPassAfterClusterElection(t *testing.T) {
+	backend := &leaderCountingBackend{countingBackend: &countingBackend{Backend: memory.New()}}
+	defer backend.Close()
+	worker := NewWorker(backend, Options{Interval: 20 * time.Millisecond})
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	worker.Start(ctx)
+	defer worker.Stop()
+	time.Sleep(60 * time.Millisecond)
+	if got := backend.passes.Load(); got != 0 {
+		t.Fatalf("follower ran %d passes", got)
+	}
+	backend.leader.Store(true)
+	waitFor(t, "leader lifecycle pass", func() bool { return backend.passes.Load() > 0 })
+}
+
 func (c *countingBackend) ListBuckets(ctx context.Context) ([]storage.BucketInfo, error) {
 	c.passes.Add(1)
 	if c.block != nil {

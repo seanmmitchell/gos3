@@ -73,6 +73,8 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 		err = cmdHealthcheck(ctx, rest, stdout, stderr)
 	case "restic":
 		err = cmdRestic(ctx, rest, stdout, stderr)
+	case "cluster":
+		err = cmdCluster(ctx, rest, stdout, stderr)
 	case "help", "-h", "--help":
 		usage(stdout)
 		return 0
@@ -112,6 +114,9 @@ Usage:
   gos3 restic env|exec|objects|recover [flags]
                                 a bucket's restic repositories: credentials, restic,
                                 archived objects (see "gos3 restic help")
+  gos3 cluster import export|seed [flags]
+  gos3 cluster migrate export [flags]
+                                migrate a stopped standalone server to a cluster
 
 Configuration: defaults < JSON/YAML file (--config or GOS3_CONFIG) < GOS3_*
 environment variables < flags. Root credentials are set only via the

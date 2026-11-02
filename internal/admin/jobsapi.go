@@ -2,6 +2,7 @@ package admin
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"net/http"
@@ -115,7 +116,11 @@ func (a *api) listJobs(rc *reqCtx) (int, any, error) {
 	if b := rc.r.URL.Query().Get("bucket"); b != "" {
 		f.Match = onBucket(b)
 	}
-	return http.StatusOK, a.newJobList(a.d.Jobs.List(f)), nil
+	js, err := listJobsConsistently(rc, a.d.Jobs, f)
+	if err != nil {
+		return 0, nil, err
+	}
+	return http.StatusOK, a.newJobList(js), nil
 }
 
 // listBucketJobs implements GET /buckets/{name}/jobs (admin:GetJob on the
@@ -151,7 +156,22 @@ func (a *api) listBucketJobs(rc *reqCtx) (int, any, error) {
 		}
 		return true
 	}
-	return http.StatusOK, a.newJobList(a.d.Jobs.List(f)), nil
+	js, err := listJobsConsistently(rc, a.d.Jobs, f)
+	if err != nil {
+		return 0, nil, err
+	}
+	return http.StatusOK, a.newJobList(js), nil
+}
+
+// Cluster job listings require a read barrier and can fail during a
+// partition. Standalone managers retain their existing in-memory List API.
+func listJobsConsistently(rc *reqCtx, service JobService, filter jobs.Filter) ([]jobs.Job, error) {
+	if shared, ok := service.(interface {
+		ListConsistent(context.Context, jobs.Filter) ([]jobs.Job, error)
+	}); ok {
+		return shared.ListConsistent(rc.ctx, filter)
+	}
+	return service.List(filter), nil
 }
 
 // copyJobHead is the part of a CopyJobSpec the API needs before handing
@@ -255,6 +275,12 @@ func (a *api) createJob(rc *reqCtx) (int, any, error) {
 // Authorize the effective backing before validation or submission. Pin
 // requests using target.create to the same boundary as placement changes.
 func (a *api) authorizeJobBacking(rc *reqCtx, spec json.RawMessage, backing string) (json.RawMessage, error) {
+	if a.d.ClusterStatus != nil {
+		if backing != "" {
+			return nil, badRequest("target.create.backing is node-specific and cannot be selected by a cluster job")
+		}
+		return spec, nil
+	}
 	if backing == "" {
 		r, err := a.router()
 		if err != nil {
@@ -401,7 +427,7 @@ func (a *api) getJob(rc *reqCtx) (int, any, error) {
 
 // updateJob returns the handler of POST /jobs/{id}/<op>: it applies op to
 // the authorized job and returns the job as it is then.
-func (a *api) updateJob(name string, op func(m *jobs.Manager, j jobs.Job) error) handlerFunc {
+func (a *api) updateJob(name string, op func(m JobService, j jobs.Job) error) handlerFunc {
 	return func(rc *reqCtx) (int, any, error) {
 		j, err := a.authorizedJob(rc)
 		if err != nil {
@@ -418,14 +444,14 @@ func (a *api) updateJob(name string, op func(m *jobs.Manager, j jobs.Job) error)
 	}
 }
 
-func pauseJob(m *jobs.Manager, j jobs.Job) error  { return m.Pause(j.ID) }
-func resumeJob(m *jobs.Manager, j jobs.Job) error { return m.Resume(j.ID) }
-func cancelJob(m *jobs.Manager, j jobs.Job) error { return m.Cancel(j.ID) }
+func pauseJob(m JobService, j jobs.Job) error  { return m.Pause(j.ID) }
+func resumeJob(m JobService, j jobs.Job) error { return m.Resume(j.ID) }
+func cancelJob(m JobService, j jobs.Job) error { return m.Cancel(j.ID) }
 
 // runJob requests a full mirror comparison or starts a pending retry.
 // A queued job stays queued; a running mirror runs again if needed to
 // include the comparison request. Paused and finished jobs are 409.
-func (a *api) runJob(m *jobs.Manager, j jobs.Job) error {
+func (a *api) runJob(m JobService, j jobs.Job) error {
 	switch {
 	case j.State == jobs.StatePaused:
 		return errorf(http.StatusConflict, codeConflict, "job %s is paused: resume it instead", j.ID)
@@ -435,8 +461,7 @@ func (a *api) runJob(m *jobs.Manager, j jobs.Job) error {
 	if requester, ok := a.d.CopyJobs.(interface{ RequestFullPass(jobs.Job) }); ok {
 		requester.RequestFullPass(j)
 	}
-	m.Kick(j.ID)
-	return nil
+	return m.RunNow(j.ID)
 }
 
 // deleteJob implements DELETE /jobs/{id}: removes a finished job (409

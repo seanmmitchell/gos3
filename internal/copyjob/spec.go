@@ -207,6 +207,21 @@ func decodeSpec(raw []byte) (Spec, error) {
 	return sp, nil
 }
 
+// NormalizeSpec performs the I/O-independent copy and mirror validation.
+// Cluster runners reuse the same request grammar and defaults, then check
+// bucket capabilities against their own storage backend.
+func NormalizeSpec(raw []byte, kind string) (Spec, error) {
+	sp, err := decodeSpec(raw)
+	if err != nil {
+		return Spec{}, err
+	}
+	if err := normalize(&sp, kind); err != nil {
+		return Spec{}, err
+	}
+	sp.BucketBindings = bucketBindings{}
+	return sp, nil
+}
+
 // normalize checks the parts of sp that need no I/O and fills in their
 // defaults. kind is the runner's kind ("" for a dry run: the spec's).
 // Versions and Create.ObjectLock depend on the buckets: check fills them in.
@@ -371,6 +386,11 @@ func validBucketName(name string) bool {
 	}
 	return true
 }
+
+// ValidBucketName applies the S3 bucket-name rules used by copy target
+// creation. Cluster copy jobs use the same validation before submitting a
+// bucket create through Raft.
+func ValidBucketName(name string) bool { return validBucketName(name) }
 
 // looksLikeIPv4 reports whether name has the form of an IPv4 address
 // (four dot-separated groups of 1-3 digits).

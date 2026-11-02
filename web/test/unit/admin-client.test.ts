@@ -79,6 +79,22 @@ describe('AdminClient', () => {
     expect(verifySigV4(c)).toBe(true)
   })
 
+  it('signs cluster status reads and reports quorum failures for retry', async () => {
+    let attempts = 0
+    const { admin, calls } = makeAdmin(() => ++attempts === 1
+      ? json({ error: { code: 'ServiceUnavailable', message: 'cluster quorum unavailable' } }, 503)
+      : json({ clusterId: 'c1', nodeId: 'node-a', leader: false, available: true, commitIndex: 9, appliedIndex: 9,
+        lag: 0, replicaCount: 2, minMemoryAcks: 2, minDurableAcks: 2, peers: [] }))
+    await expect(admin.clusterStatus()).rejects.toMatchObject({ code: 'ServiceUnavailable', status: 503 })
+    expect((await admin.clusterStatus()).minDurableAcks).toBe(2)
+    expect(calls).toHaveLength(2)
+    for (const call of calls) {
+      expect(call.method).toBe('GET')
+      expect(call.url).toBe('http://localhost:9000/_gos3/admin/v1/cluster')
+      expect(verifySigV4(call)).toBe(true)
+    }
+  })
+
   it('signs the SHA-256 of the exact body bytes sent', async () => {
     const { admin, calls } = makeAdmin(c => (c.method === 'DELETE' || c.method === 'PATCH' ? new Response(null, { status: 204 }) : json({ name: 'p', builtin: false, document: {} })))
     await admin.putPolicy('p', { document: { Version: '2012-10-17', Statement: [{ Effect: 'Allow', Action: ['s3:GetObject'], Resource: ['arn:aws:s3:::b/ünï ✓/*'] }] } })
