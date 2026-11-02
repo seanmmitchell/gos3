@@ -28,11 +28,13 @@ ENV PNPM_HOME=/pnpm \
     CI=true
 ENV PATH=$PNPM_HOME:$PATH
 WORKDIR /src/web
-# Dependencies first (cached until the lockfile changes). `pnpm fetch` only
-# needs the lockfile; the offline install below links from the store. Only
+# Dependencies first (cached until the lockfile or a patch changes). `pnpm
+# fetch` needs the lockfile and any patched dependency files; the offline
+# install below links from the store. Only
 # production dependencies are installed: `nuxt generate` needs none of the
 # devDependencies (test tools), so their code never runs in the image build.
 COPY web/package.json web/pnpm-lock.yaml web/pnpm-workspace.yaml ./
+COPY web/patches/ ./patches/
 # Install the project's pinned package manager directly for repeatable builds.
 RUN npm install --global --ignore-scripts "$(node -p "require('./package.json').packageManager")"
 RUN --mount=type=cache,id=gos3-pnpm,target=/pnpm/store \

@@ -39,6 +39,11 @@ minimumReleaseAgeExclude:
   - '@nuxt/vite-builder@4.6.3'
   - '@nuxt/vite-server@4.6.3'
   - '@nuxt/nitro-server@4.6.3'
+  # GHSA-3g3m-2fjr-6pw4 and GHSA-g3hv-75wg-m249; cooldown ends 2026-11-10.
+  - glob@14.0.2
+  - minimatch@11.0.1
+  - path-scurry@3.0.0
+  - '@isaacs/nonrecursive-glob-match@1.0.1'
 
 # Refuse a version published with weaker trust evidence (e.g. without the
 # provenance or trusted publisher of earlier releases): a typical sign of a
@@ -90,11 +95,24 @@ overrides:
   # GHSA-86w9-cpqp-85rv / GHSA-2g46-22mc-6gwp: nested DigestAlgorithm
   # signature forgery, fixed upstream despite the older advisory metadata.
   node-forge: 1.4.1
+  # GHSA-3g3m-2fjr-6pw4 and GHSA-g3hv-75wg-m249: fixed glob and matcher.
+  glob: 14.0.2
+  minimatch: 11.0.1
+  '@isaacs/nonrecursive-glob-match': 1.0.1
+  # GHSA-gcqx-w48m-w2h4 lists deepmerge >=4.2.0, but the same prototype-key
+  # behavior reproduces on 4.1.1. Rollup's node resolver is the only consumer.
+  # Use 4.1.1 with the local patch below until upstream publishes a fix.
+  '@rollup/plugin-node-resolve>deepmerge': 4.1.1
   # WebAssembly fallbacks, loaded only when the native binary is missing (a
   # platform without a prebuilt one). Removed to keep unused code out of the
   # dependency tree; every supported platform has the native package.
   '@tailwindcss/oxide-wasm32-wasi': '-'
   '@parcel/watcher-wasm': '-'
+
+# The upstream advisory has no patched release. Filter prototype-changing keys
+# in every entry point of the exact version used by Rollup's node resolver.
+patchedDependencies:
+  deepmerge@4.1.1: patches/deepmerge@4.1.1.patch
 
 # Known unpatched advisories, not overridden because no fixed release exists
 # (re-check and add an override once one does):
