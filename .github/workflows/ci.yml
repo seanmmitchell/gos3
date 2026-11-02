@@ -119,6 +119,8 @@ jobs:
           key: pnpm-${{ runner.os }}-${{ hashFiles('web/pnpm-lock.yaml') }}
           restore-keys: pnpm-${{ runner.os }}-
       - run: pnpm install --frozen-lockfile
+      - name: Audit high-severity web dependencies
+        run: pnpm audit --audit-level high
       - run: pnpm typecheck
       - run: pnpm test
       - name: Standalone build

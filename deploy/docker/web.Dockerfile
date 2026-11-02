@@ -31,6 +31,7 @@ ENV PNPM_HOME=/pnpm \
 ENV PATH=$PNPM_HOME:$PATH
 WORKDIR /src/web
 COPY web/package.json web/pnpm-lock.yaml web/pnpm-workspace.yaml ./
+COPY web/patches/ ./patches/
 # Install the project's pinned package manager directly for repeatable builds.
 RUN npm install --global --ignore-scripts "$(node -p "require('./package.json').packageManager")"
 RUN --mount=type=cache,id=gos3-pnpm,target=/pnpm/store \
