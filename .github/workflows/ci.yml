@@ -93,13 +93,25 @@ jobs:
       # and file locking differ).
       - uses: ./.github/actions/setup-restic
       # Durable filesystem suites perform thousands of disk flushes. On
-      # Windows runners these can exceed Go's default 10-minute package
-      # timeout; keep all tests enabled within the 60-minute job budget.
+      # Windows, run the cluster package after the other packages so their
+      # fsync workloads do not contend and trigger false admission timeouts.
       - name: Unit and cluster integration tests (race)
         shell: bash
         run: |
           set -o pipefail
-          go test -json -race -timeout=40m -count=1 ./cmd/... ./internal/... | tee go-platform-tests.json
+          if [[ "$RUNNER_OS" == Windows ]]; then
+            mapfile -t other_packages < <(go list ./cmd/... ./internal/... | grep -v '/internal/cluster$')
+            go test -json -race -timeout=20m -count=1 "${other_packages[@]}" | tee go-platform-tests.json
+            if go test -json -race -timeout=40m -count=1 ./internal/cluster > go-platform-cluster.json 2>&1; then
+              grep '"Action":"pass","Package":"github.com/seanmmitchell/gos3/internal/cluster"' go-platform-cluster.json | tail -n 1 || true
+            else
+              grep -E '"Action":"fail"|--- FAIL:|panic:|WARNING: DATA RACE' go-platform-cluster.json | tail -n 50 || true
+              tail -n 100 go-platform-cluster.json
+              exit 1
+            fi
+          else
+            go test -json -race -timeout=40m -count=1 ./cmd/... ./internal/... | tee go-platform-tests.json
+          fi
       - name: End-to-end tests (race)
         shell: bash
         run: |
@@ -111,6 +123,7 @@ jobs:
           name: go-test-logs-${{ matrix.os }}
           path: |
             go-platform-tests.json
+            go-platform-cluster.json
             go-platform-e2e.json
           if-no-files-found: ignore
           retention-days: 7
