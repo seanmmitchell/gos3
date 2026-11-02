@@ -356,7 +356,9 @@ func TestClusterServesTwoNodeS3AndFailsClosed(t *testing.T) {
 	if r := do(t, "GET", bURL+"/_gos3/metrics", nil, &rootCreds, nil); r.status != 200 || !strings.Contains(string(r.body), "gos3_cluster_min_durable_acks 2") || !strings.Contains(string(r.body), "gos3_cluster_available 1") || !strings.Contains(string(r.body), "gos3_cluster_last_repair_repaired ") {
 		t.Fatalf("cluster metrics: %d %s", r.status, r.body)
 	}
-	jobData, err := json.Marshal(jobs.Job{ID: "copy_queued", Kind: "copy", State: jobs.StateQueued,
+	// Persist a paused job so the leader's background runner cannot complete
+	// or fail it before both entry nodes have observed the shared state.
+	jobData, err := json.Marshal(jobs.Job{ID: "copy_queued", Kind: "copy", State: jobs.StatePaused,
 		Labels: map[string]string{"source": "photos", "target": "replica"}, CreatedAt: time.Now().UTC()})
 	if err != nil {
 		t.Fatal(err)
@@ -378,8 +380,8 @@ func TestClusterServesTwoNodeS3AndFailsClosed(t *testing.T) {
 	if r := do(t, "GET", bURL+"/_gos3/admin/v1/jobs", nil, &rootCreds, nil); r.status != 200 || !strings.Contains(string(r.body), `"copy_queued"`) || strings.Contains(string(r.body), "replication_test") {
 		t.Fatalf("shared job listing through b: %d %s", r.status, r.body)
 	}
-	if r := do(t, "POST", bURL+"/_gos3/admin/v1/jobs/copy_queued/pause", nil, &rootCreds, nil); r.status != 200 {
-		t.Fatalf("pause shared job through b: %d %s", r.status, r.body)
+	if r := do(t, "GET", bURL+"/_gos3/admin/v1/jobs/copy_queued", nil, &rootCreds, nil); r.status != 200 || !strings.Contains(string(r.body), `"state":"paused"`) {
+		t.Fatalf("paused job through b: %d %s", r.status, r.body)
 	}
 	if r := do(t, "GET", aURL+"/_gos3/admin/v1/jobs/copy_queued", nil, &rootCreds, nil); r.status != 200 || !strings.Contains(string(r.body), `"state":"paused"`) {
 		t.Fatalf("paused job through a: %d %s", r.status, r.body)
