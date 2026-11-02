@@ -95,8 +95,9 @@ func TestS3BackendTwoNodeVersionedWriteAndRead(t *testing.T) {
 	for name, node := range nodes {
 		ctx, cancel := context.WithCancel(context.Background())
 		cancels[name] = cancel
-		runners[name] = make(chan error, 1)
-		go func() { runners[name] <- node.Run(ctx) }()
+		result := make(chan error, 1)
+		runners[name] = result
+		go func() { result <- node.Run(ctx) }()
 	}
 	t.Cleanup(func() {
 		for _, cancel := range cancels {

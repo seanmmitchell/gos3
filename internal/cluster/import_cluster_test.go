@@ -109,8 +109,9 @@ func TestOfflineClusterMigrationAfterLiveCommit(t *testing.T) {
 	for name, node := range nodes {
 		runCtx, cancel := context.WithCancel(context.Background())
 		cancels[name] = cancel
-		done[name] = make(chan error, 1)
-		go func() { done[name] <- node.Run(runCtx) }()
+		result := make(chan error, 1)
+		done[name] = result
+		go func() { result <- node.Run(runCtx) }()
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()

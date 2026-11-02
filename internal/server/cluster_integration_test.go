@@ -298,8 +298,9 @@ func TestClusterServesTwoNodeS3AndFailsClosed(t *testing.T) {
 		}
 		ctx, cancel := context.WithCancel(context.Background())
 		cancels[name] = cancel
-		done[name] = make(chan error, 1)
-		go func() { done[name] <- srv.Serve(ctx, ln) }()
+		result := make(chan error, 1)
+		done[name] = result
+		go func() { result <- srv.Serve(ctx, ln) }()
 	}
 	stop := func(name string) {
 		t.Helper()
@@ -580,8 +581,9 @@ func TestClusterServesTwoNodeS3AndFailsClosed(t *testing.T) {
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	cancels["b"] = cancel
-	done["b"] = make(chan error, 1)
-	go func() { done["b"] <- restarted.Serve(ctx, publicListener) }()
+	result := make(chan error, 1)
+	done["b"] = result
+	go func() { result <- restarted.Serve(ctx, publicListener) }()
 	select {
 	case <-restarted.Ready():
 	case err := <-done["b"]:

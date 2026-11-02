@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -52,8 +53,9 @@ func TestTwoNodesAdmitMetadataOnlyWithBothDurableCopies(t *testing.T) {
 	for name, node := range nodes {
 		ctx, cancel := context.WithCancel(context.Background())
 		contexts[name] = cancel
-		done[name] = make(chan error, 1)
-		go func() { done[name] <- node.Run(ctx) }()
+		result := make(chan error, 1)
+		done[name] = result
+		go func() { result <- node.Run(ctx) }()
 	}
 	defer func() {
 		for name, cancel := range contexts {
@@ -253,13 +255,17 @@ func TestThreeNodesAdmitWithTwoCopiesAfterThirdFails(t *testing.T) {
 	ca, certs := peerTestCertificates(t, clusterID, "a", "b", "c")
 	names := []string{"a", "b", "c"}
 	nodes := map[string]*Node{}
+	slots := map[string]*atomic.Pointer[Node]{}
+	for _, name := range names {
+		slots[name] = new(atomic.Pointer[Node])
+	}
 	servers := map[string]*httptest.Server{}
 	dirs := map[string]string{}
 	configs := map[string]config.ClusterConfig{}
 	for _, name := range names {
 		name := name
 		servers[name] = httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			nodes[name].PeerHandler().ServeHTTP(w, r)
+			slots[name].Load().PeerHandler().ServeHTTP(w, r)
 		}))
 	}
 	peers := make([]config.ClusterPeer, 0, len(names))
@@ -275,6 +281,7 @@ func TestThreeNodesAdmitWithTwoCopiesAfterThirdFails(t *testing.T) {
 			t.Fatal(err)
 		}
 		nodes[name] = node
+		slots[name].Store(node)
 		servers[name].TLS = node.PeerTLSConfig()
 	}
 	for _, server := range servers {
@@ -286,8 +293,9 @@ func TestThreeNodesAdmitWithTwoCopiesAfterThirdFails(t *testing.T) {
 	for name, node := range nodes {
 		ctx, cancel := context.WithCancel(context.Background())
 		contexts[name] = cancel
-		done[name] = make(chan error, 1)
-		go func() { done[name] <- node.Run(ctx) }()
+		result := make(chan error, 1)
+		done[name] = result
+		go func() { result <- node.Run(ctx) }()
 	}
 	defer func() {
 		for name, cancel := range contexts {
@@ -496,9 +504,10 @@ func TestThreeNodesAdmitWithTwoCopiesAfterThirdFails(t *testing.T) {
 		t.Fatal(err)
 	}
 	nodes[failed] = restarted
+	slots[failed].Store(restarted)
 	name := failed
 	peerServer := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		nodes[name].PeerHandler().ServeHTTP(w, r)
+		slots[name].Load().PeerHandler().ServeHTTP(w, r)
 	}))
 	_ = peerServer.Listener.Close()
 	peerServer.Listener = listener
@@ -507,8 +516,9 @@ func TestThreeNodesAdmitWithTwoCopiesAfterThirdFails(t *testing.T) {
 	defer peerServer.Close()
 	restartCtx, restartCancel := context.WithCancel(context.Background())
 	contexts[failed] = restartCancel
-	done[failed] = make(chan error, 1)
-	go func() { done[failed] <- restarted.Run(restartCtx) }()
+	result := make(chan error, 1)
+	done[failed] = result
+	go func() { result <- restarted.Run(restartCtx) }()
 	repairDeadline := time.Now().Add(35 * time.Second)
 	for time.Now().Before(repairDeadline) {
 		local, readErr := restarted.stages.Read(context.Background(), firstVersion.VersionID)

@@ -60,8 +60,9 @@ func TestOfflineBundleSeedsTwoVotingNodes(t *testing.T) {
 	for name, node := range nodes {
 		ctx, cancel := context.WithCancel(context.Background())
 		contexts[name] = cancel
-		done[name] = make(chan error, 1)
-		go func() { done[name] <- node.Run(ctx) }()
+		result := make(chan error, 1)
+		done[name] = result
+		go func() { result <- node.Run(ctx) }()
 	}
 	defer func() {
 		for _, cancel := range contexts {
