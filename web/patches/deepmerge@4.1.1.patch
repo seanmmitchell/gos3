@@ -1,0 +1,45 @@
+diff --git a/dist/cjs.js b/dist/cjs.js
+index bc6f1e61aa2598173e9db553d4158d1d9e4b3bc3..aa6ebfcbf50f70c4e72b37a17a01c82dc59bf54e 100644
+--- a/dist/cjs.js
++++ b/dist/cjs.js
+@@ -58,7 +58,9 @@ function getEnumerableOwnPropertySymbols(target) {
+ }
+ 
+ function getKeys(target) {
+-	return Object.keys(target).concat(getEnumerableOwnPropertySymbols(target))
++	return Object.keys(target).filter(function(key) {
++		return key !== '__proto__' && key !== 'constructor' && key !== 'prototype'
++	}).concat(getEnumerableOwnPropertySymbols(target))
+ }
+ 
+ function mergeObject(target, source, options) {
+diff --git a/dist/umd.js b/dist/umd.js
+index 65be04fb6f80d44324483c505dfb140010688cb2..454cb359be4ea01f82b502fadd93fabb9c533f48 100644
+--- a/dist/umd.js
++++ b/dist/umd.js
+@@ -62,7 +62,9 @@
+ 	}
+ 
+ 	function getKeys(target) {
+-		return Object.keys(target).concat(getEnumerableOwnPropertySymbols(target))
++		return Object.keys(target).filter(function(key) {
++			return key !== '__proto__' && key !== 'constructor' && key !== 'prototype'
++		}).concat(getEnumerableOwnPropertySymbols(target))
+ 	}
+ 
+ 	function mergeObject(target, source, options) {
+diff --git a/index.js b/index.js
+index e3135d2f433101ef72d5c60d79da2b2fc2a115db..8a1353e2c208177aa9fc4f758f3c69454014ffce 100644
+--- a/index.js
++++ b/index.js
+@@ -33,7 +33,9 @@ function getEnumerableOwnPropertySymbols(target) {
+ }
+ 
+ function getKeys(target) {
+-	return Object.keys(target).concat(getEnumerableOwnPropertySymbols(target))
++	return Object.keys(target).filter(function(key) {
++		return key !== '__proto__' && key !== 'constructor' && key !== 'prototype'
++	}).concat(getEnumerableOwnPropertySymbols(target))
+ }
+ 
+ function mergeObject(target, source, options) {

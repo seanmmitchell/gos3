@@ -99,15 +99,20 @@ overrides:
   glob: 14.0.2
   minimatch: 11.0.1
   '@isaacs/nonrecursive-glob-match': 1.0.1
-  # GHSA-gcqx-w48m-w2h4 affects deepmerge >=4.2.0. Rollup's node resolver
-  # is its only consumer; use the last unaffected 4.1.x release until upstream
-  # publishes a fix. Validate this out-of-range override with web CI.
+  # GHSA-gcqx-w48m-w2h4 lists deepmerge >=4.2.0, but the same prototype-key
+  # behavior reproduces on 4.1.1. Rollup's node resolver is the only consumer.
+  # Use 4.1.1 with the local patch below until upstream publishes a fix.
   '@rollup/plugin-node-resolve>deepmerge': 4.1.1
   # WebAssembly fallbacks, loaded only when the native binary is missing (a
   # platform without a prebuilt one). Removed to keep unused code out of the
   # dependency tree; every supported platform has the native package.
   '@tailwindcss/oxide-wasm32-wasi': '-'
   '@parcel/watcher-wasm': '-'
+
+# The upstream advisory has no patched release. Filter prototype-changing keys
+# in every entry point of the exact version used by Rollup's node resolver.
+patchedDependencies:
+  deepmerge@4.1.1: patches/deepmerge@4.1.1.patch
 
 # Known unpatched advisories, not overridden because no fixed release exists
 # (re-check and add an override once one does):
