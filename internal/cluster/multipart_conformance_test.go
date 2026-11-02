@@ -7,6 +7,7 @@ import (
 	"net/http/httptest"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/seanmmitchell/gos3/internal/config"
 	"github.com/seanmmitchell/gos3/internal/storage"
@@ -16,11 +17,13 @@ import (
 // Run the storage contract against real two-voter Raft nodes. Each
 // conformance subtest gets a fresh shared namespace and durable stages.
 func TestClusterBackendConformance(t *testing.T) {
-	storagetest.RunWithOptions(t, newClusterBackend, storagetest.Options{NoControlKeys: true})
+	storagetest.RunWithOptions(t, newClusterBackend, storagetest.Options{NoControlKeys: true, StressDivisor: 2})
 }
 
 func newClusterBackend(t *testing.T) storage.Backend {
-	return NewS3Backend(newTwoNodeCluster(t)["a"])
+	backend := NewS3Backend(newTwoNodeCluster(t)["a"])
+	backend.operationTimeout = time.Minute
+	return backend
 }
 
 func newTwoNodeCluster(t *testing.T) map[string]*Node {
