@@ -26,6 +26,57 @@ func newClusterBackend(t *testing.T) storage.Backend {
 	return backend
 }
 
+func TestConditionalDeleteBindsCheckedNullVersion(t *testing.T) {
+	backend := NewS3Backend(newTwoNodeCluster(t)["a"])
+	ctx, cancel := context.WithTimeout(t.Context(), 30*time.Second)
+	defer cancel()
+	if err := backend.CreateBucket(ctx, "photos", storage.CreateBucketOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	if err := backend.SetBucketVersioning(ctx, "photos", storage.VersioningSuspended); err != nil {
+		t.Fatal(err)
+	}
+	old, err := NewObjectPutIntent("photos", "k", []byte("old"), storage.ObjectMeta{ETag: "old"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := backend.objects.PutVersion(ctx, old); err != nil {
+		t.Fatal(err)
+	}
+	marker, err := NewObjectPutIntent("photos", "k", nil, storage.ObjectMeta{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	marker.DeleteMarker = true
+	refused := errors.New("latest version changed")
+	inserted := false
+	marker.CheckLatest = func(info storage.ObjectInfo, found bool) error {
+		if !found {
+			return errors.New("latest version disappeared")
+		}
+		if info.ETag == "new" {
+			return refused
+		}
+		if !inserted {
+			inserted = true
+			next, err := NewObjectPutIntent("photos", "k", []byte("new"), storage.ObjectMeta{ETag: "new"})
+			if err != nil {
+				return err
+			}
+			_, err = backend.objects.PutVersion(ctx, next)
+			return err
+		}
+		return nil
+	}
+	if _, err := backend.objects.PutVersion(ctx, marker); !errors.Is(err, refused) {
+		t.Fatalf("stale conditional delete: got %v, want %v", err, refused)
+	}
+	latest, err := backend.GetObjectInfo(ctx, "photos", "k", "")
+	if err != nil || latest.DeleteMarker || latest.ETag != "new" {
+		t.Fatalf("concurrent replacement did not survive: %+v, %v", latest, err)
+	}
+}
+
 func newTwoNodeCluster(t *testing.T) map[string]*Node {
 	t.Helper()
 	const clusterID = "multipart-conformance"

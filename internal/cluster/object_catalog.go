@@ -180,6 +180,7 @@ func (c *ObjectCatalog) putVersion(ctx context.Context, intent ObjectPutIntent, 
 	}
 	priorVersion := string(latestRaw)
 	var current storage.ObjectInfo
+	var currentRaw []byte
 	if latestFound {
 		priorRecord, found, err := c.node.metadata.Get(MetadataVersions, versionObjectKey(intent.Bucket, intent.Key, priorVersion))
 		if err != nil {
@@ -188,6 +189,7 @@ func (c *ObjectCatalog) putVersion(ctx context.Context, intent ObjectPutIntent, 
 		if !found {
 			return storage.ObjectInfo{}, errors.New("cluster: latest object points to a missing version")
 		}
+		currentRaw = priorRecord
 		decoded, err := decodeObjectRecord(intent.Bucket, intent.Key, priorVersion, priorRecord)
 		if err != nil {
 			return storage.ObjectInfo{}, err
@@ -245,9 +247,16 @@ func (c *ObjectCatalog) putVersion(ctx context.Context, intent ObjectPutIntent, 
 	var newerRaw []byte
 	var newer objectRecord
 	if version == storage.NullVersionID || intent.VersionID != "" {
-		replacedRaw, found, err = c.node.GetMetadata(ctx, MetadataVersions, versionObjectKey(intent.Bucket, intent.Key, version))
-		if err != nil {
-			return storage.ObjectInfo{}, err
+		if latestFound && priorVersion == version {
+			// The latest version may be overwritten in place (notably the null
+			// version in suspended mode). Compare the exact bytes used by
+			// CheckLatest, even if another writer replaces them meanwhile.
+			replacedRaw, found = currentRaw, true
+		} else {
+			replacedRaw, found, err = c.node.GetMetadata(ctx, MetadataVersions, versionObjectKey(intent.Bucket, intent.Key, version))
+			if err != nil {
+				return storage.ObjectInfo{}, err
+			}
 		}
 		if found {
 			replaced, err = decodeObjectRecord(intent.Bucket, intent.Key, version, replacedRaw)
