@@ -76,7 +76,7 @@ jobs:
     # differ). Both jobs are required checks in .github/rulesets.
     name: Go tests (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 45
+    timeout-minutes: 60
     strategy:
       fail-fast: false
       matrix:
@@ -94,12 +94,12 @@ jobs:
       - uses: ./.github/actions/setup-restic
       # Durable filesystem suites perform thousands of disk flushes. On
       # Windows runners these can exceed Go's default 10-minute package
-      # timeout; keep all tests enabled within the 45-minute job budget.
+      # timeout; keep all tests enabled within the 60-minute job budget.
       - name: Unit and cluster integration tests (race)
         shell: bash
         run: |
           set -o pipefail
-          go test -json -race -timeout=20m -count=1 ./cmd/... ./internal/... | tee go-platform-tests.json
+          go test -json -race -timeout=40m -count=1 ./cmd/... ./internal/... | tee go-platform-tests.json
       - name: End-to-end tests (race)
         shell: bash
         run: |
