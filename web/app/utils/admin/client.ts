@@ -23,6 +23,7 @@ import type {
   BucketEncryptionProviderInput,
   BucketSnapshots,
   BucketSummary,
+  ClusterStatus,
   ContainerInfo,
   ContainerSpec,
   CopyJobDryRun,
@@ -399,6 +400,10 @@ export class AdminClient {
 
   stats(signal?: AbortSignal): Promise<Stats> {
     return this.request('GET', '/stats', { signal })
+  }
+
+  clusterStatus(signal?: AbortSignal): Promise<ClusterStatus> {
+    return this.request('GET', '/cluster', { signal })
   }
 
   getConfig(): Promise<Settings> {

@@ -1,6 +1,7 @@
 package iam
 
 import (
+	"context"
 	"slices"
 	"strconv"
 	"strings"
@@ -510,7 +511,7 @@ func limitDecision(where string) Decision {
 }
 
 // authorize implements Manager.Authorize.
-func (m *Manager) authorize(req AuthzRequest, shared *budget) Decision {
+func (m *Manager) authorize(ctx context.Context, req AuthzRequest, shared *budget) Decision {
 	id := req.Identity
 	if id.IsRoot && !id.IsAnonymous {
 		return Decision{Allowed: true, Reason: "root user"}
@@ -525,7 +526,10 @@ func (m *Manager) authorize(req AuthzRequest, shared *budget) Decision {
 	var policies []*NamedPolicy
 	principalKey := ""
 	if !id.IsAnonymous {
-		st := m.snapshot()
+		st, err := m.readSnapshot(ctx)
+		if err != nil {
+			return Decision{ExplicitDeny: true, Unavailable: true, Reason: "shared IAM unavailable"}
+		}
 		principalKey = usablePrincipalKey(st, id)
 		u := st.resolveUser(id)
 		if u != nil {

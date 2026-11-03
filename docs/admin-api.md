@@ -180,8 +180,18 @@ are backing names); don't put secrets in them.
 |---|---|---|---|
 | GET | `/info` | ServerInfo | `ServerInfo` |
 | GET | `/stats` | GetStats | `Stats` |
+| GET | `/cluster` | GetStats | Local cluster status; 404 in standalone mode |
 | GET | `/config` | GetConfig | `config.Settings` |
 | PUT | `/config` | UpdateConfig | body full `config.Settings` → updated `config.Settings` (400 `InvalidSettings` with message on validation failure) |
+
+`GET /cluster` reports the node ID, leader, quorum availability, committed and
+applied Raft indexes, peer replication lag when this node is leader, replica
+count, the configured memory and durable acknowledgment thresholds, and the
+latest write coordinated by this node (`lastWrite`): its distinct memory and
+durable counts, consensus result, and error if it failed. `lastWrite` is
+diagnostic memory state and resets on restart. Root
+credentials can read this endpoint even during a quorum outage; `available`
+then becomes `false` and `error` explains the failed read barrier.
 
 ```jsonc
 // ServerInfo = Info (see docs/discovery.md) plus:
@@ -290,6 +300,17 @@ environment and flags for these fields.
 | PUT | `/policies/{name}` | PutPolicy | body `{"description"?, "document": PolicyDocument}` → `iam.NamedPolicy` (creating a policy named `.` or `..` is 400 `InvalidName`) |
 | DELETE | `/policies/{name}` | DeletePolicy | 204 (409 if attached, 400 if builtin) |
 | POST | `/authz/simulate` | SimulatePolicy | body `{"user": "alice" \| "root" \| "" (anonymous), "action": "s3:GetObject", "bucket": "b", "key": "k", "resource"?: "arn:gos3:admin:::user/bob", "conditions"?: {"aws:SourceIp": "10.0.0.1" \| ["…"]}}` → `{"allowed": bool, "explicitDeny": bool, "reason": "…"}` (bucket policy and bucket ACL of `bucket` are included; 404 for an unknown user or bucket). `bucket`/`key` are for s3 actions, `resource` (empty = service level, or `arn:gos3:admin:::{user,policy,bucket,backing}/<name>`) for admin actions; mixing them is 400 |
+
+### Replication roles
+
+Replication roles have no access keys. A `?replication` configuration refers to one by `arn:aws:iam::000000000000:role/<name>`. Each grant names a source bucket, a destination bucket, an optional key prefix, and allowed actions. Supported actions are `s3:ReplicateObject`, `s3:ReplicateDelete`, `s3:ReplicateTags`, and `s3:ReplicateObjectLock`. gos3 checks the role when a rule is saved and checks each copy again when it runs.
+
+| Method | Path | Action | Response |
+|---|---|---|---|
+| GET | `/replication-roles` | ListReplicationRoles | `{"roles": iam.ReplicationRole[]}` |
+| GET | `/replication-roles/{name}` | GetReplicationRole | `iam.ReplicationRole` |
+| PUT | `/replication-roles/{name}` | PutReplicationRole | body `{"grants":[{"sourceBucket":"source","destinationBucket":"backup","prefix":"logs/","actions":["s3:ReplicateObject"]}]}` → `iam.ReplicationRole` |
+| DELETE | `/replication-roles/{name}` | DeleteReplicationRole | 204 |
 
 ### Buckets (management helpers; regular bucket ops use the S3 API)
 | Method | Path | Action | Response |
@@ -670,6 +691,20 @@ snapshots and restores (see below). Jobs survive restarts (`jobs.json` in
 the system directory; in memory without one) and report progress. See
 [jobs.md](jobs.md).
 
+In cluster mode, job records and state changes are committed through Raft
+before the admin API reports success. The leader executes copy jobs and a
+new leader retries an interrupted run from its persisted specification.
+Cluster copy jobs support the usual `options.configs` selection and require
+preserved encryption and compression. They copy supported configuration
+documents before objects, including mandatory ACL guards. Replication rules,
+their activation state, and restic snapshot schedules are excluded; cluster
+storage skips compression
+preferences and rejects selected source encryption settings that it cannot
+apply. They can create a new cluster target bucket, without selecting a
+node-specific backing or bucket kind. Mirror and restic snapshot runners
+remain unavailable in cluster mode; validation rejects those requests. Cluster
+job listings return 503 when a quorum read cannot complete.
+
 | Method | Path | Action | Response |
 |---|---|---|---|
 | GET | `/jobs?kind=&state=&bucket=` | ListJobs | `{"jobs": Job[]}`, newest first; `bucket` matches the source or target bucket |
@@ -688,7 +723,10 @@ than telling unknown IDs from other buckets' jobs. `POST /jobs` evaluates
 CreateCopyJob on both buckets before it validates anything else. When
 `target.create` is present, it also requires CreateCopyJob on
 `arn:gos3:admin:::backing/<backing>` (the effective default when omitted),
-including dry runs. The authorized backing is saved in the job spec so
+including dry runs. Cluster mode has no selectable backing for a copy target,
+so it checks only the source and target bucket grants and rejects an explicit
+`target.create.backing`. In standalone mode the authorized backing is saved
+in the job spec so
 changing the default later cannot redirect the job. Only
 kinds `copy` and `mirror` can be submitted (other kinds 400: restic jobs
 come from the snapshot endpoints). `dryRun` (matched like any member,

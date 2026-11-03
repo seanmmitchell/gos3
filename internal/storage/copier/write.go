@@ -326,7 +326,7 @@ func (w *writer) writeMarker(ctx context.Context, key string, v storage.ObjectIn
 		vw, err := w.importWriter(ctx, key, storage.WriteOptions{})
 		switch {
 		case err == nil:
-			out, err := vw.Commit(ctx, storage.ObjectInfo{VersionID: id, DeleteMarker: true, LastModified: v.LastModified})
+			out, err := vw.Commit(ctx, storage.ObjectInfo{ObjectMeta: storage.ObjectMeta{ReplicationOrigin: v.ReplicationOrigin}, VersionID: id, DeleteMarker: true, LastModified: v.LastModified})
 			if err != nil {
 				return Written{}, err
 			}

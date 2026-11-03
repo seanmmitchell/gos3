@@ -30,3 +30,15 @@ func lockSystemDir(systemDir string) (*os.File, error) {
 	}
 	return f, nil
 }
+
+// LockSystemDirForImport holds the same exclusive lock as a running server
+// while an offline importer initializes a new cluster node.
+func LockSystemDirForImport(systemDir string) (*os.File, error) {
+	if systemDir == "" {
+		return nil, errors.New("cluster import: a persistent system directory is required")
+	}
+	if err := os.MkdirAll(systemDir, 0o700); err != nil {
+		return nil, err
+	}
+	return lockSystemDir(systemDir)
+}

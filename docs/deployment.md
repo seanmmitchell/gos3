@@ -6,11 +6,11 @@ the embedded web UI.
 It needs a data directory and one TCP port (9000 by default). Discovery uses UDP multicast
 (`239.255.73.83:7373`, mDNS `224.0.0.251:5353`) when it is enabled.
 
-Every gos3 server is **independent**. A server can replicate buckets between
-its own storage backings and copy/mirror to other S3 endpoints, but servers
-do not form a distributed cluster or share a bucket namespace. Discovery and
-the web UI help you find and manage them. Do not put several independent
-gos3 servers behind one load balancer.
+Standalone mode is the default. Standalone servers have independent bucket
+namespaces even when discovery shows them together; do not put independent
+servers behind one load balancer. An opt-in static cluster can share one
+strongly consistent namespace across its voting nodes. See
+[cluster deployment and import](cluster-import.md) before configuring it.
 
 For the current release, start with the [0.3.1 release overview](releases/0.3.1.md)
 and its [upgrade checklist](releases/0.3.1.md#upgrading-from-030).

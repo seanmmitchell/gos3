@@ -107,8 +107,11 @@ const (
 	ConfigLogging           = "logging"      // BucketLoggingStatus XML
 	ConfigPublicAccessBlock = "public-access-block"
 	ConfigReplication       = "replication"
-	ConfigAccelerate        = "accelerate"
-	ConfigRequestPayment    = "request-payment"
+	// ConfigReplicationState records when the current replication rules were
+	// activated. The worker uses it to distinguish new writes from backfill.
+	ConfigReplicationState = "replication-state"
+	ConfigAccelerate       = "accelerate"
+	ConfigRequestPayment   = "request-payment"
 	// ConfigCompression is the gos3 bucket compression setting (JSON, see
 	// the admin API), not an S3 configuration.
 	ConfigCompression = "compression"
@@ -228,6 +231,9 @@ type ObjectMeta struct {
 	RetainUntil     time.Time // zero = none
 	LegalHold       bool
 	WebsiteRedirect string // x-amz-website-redirect-location
+	// ReplicationOrigin marks a version imported by bucket-rule replication.
+	// It is internal metadata and prevents a copied version from looping back.
+	ReplicationOrigin string
 	// MultipartRetentionSource is set only on an in-progress upload. "default"
 	// means its retention must be calculated when the version is published;
 	// "explicit" means the caller supplied the retention headers. It is

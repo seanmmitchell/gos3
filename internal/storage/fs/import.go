@@ -230,6 +230,8 @@ func (w *versionWriter) Commit(ctx context.Context, info storage.ObjectInfo) (st
 	if !info.DeleteMarker {
 		meta = cloneMeta(info.ObjectMeta)
 		meta.Encryption = w.encryption
+	} else {
+		meta.ReplicationOrigin = info.ReplicationOrigin
 	}
 	return w.b.commitObject(commitReq{
 		bucket:      w.bucket,

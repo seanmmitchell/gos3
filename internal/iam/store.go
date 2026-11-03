@@ -1,6 +1,7 @@
 package iam
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -39,9 +40,10 @@ var writeStateFile = writeFileAtomic
 
 // stateFile is the on-disk schema of iam.json.
 type stateFile struct {
-	Version  int           `json:"version"`
-	Users    []User        `json:"users"`    // keys include secrets
-	Policies []NamedPolicy `json:"policies"` // custom policies only
+	Version          int               `json:"version"`
+	Users            []User            `json:"users"`    // keys include secrets
+	Policies         []NamedPolicy     `json:"policies"` // custom policies only
+	ReplicationRoles []ReplicationRole `json:"replicationRoles,omitempty"`
 }
 
 // userRec is an immutable user record (copy-on-write).
@@ -72,7 +74,8 @@ type state struct {
 	// size is the length of the iam.json content this state was loaded
 	// from or written as; 0 when unknown (in-memory managers, a fresh
 	// clone). persist uses it to let an oversized state shrink.
-	size int
+	size  int
+	roles map[string]*ReplicationRole
 }
 
 func newState() *state {
@@ -80,6 +83,7 @@ func newState() *state {
 		users:    map[string]*userRec{},
 		keys:     map[string]*keyRec{},
 		policies: map[string]*NamedPolicy{},
+		roles:    map[string]*ReplicationRole{},
 	}
 }
 
@@ -88,6 +92,7 @@ func (s *state) clone() *state {
 		users:    cloneMap(s.users),
 		keys:     cloneMap(s.keys),
 		policies: cloneMap(s.policies),
+		roles:    cloneMap(s.roles),
 	}
 }
 
@@ -129,6 +134,9 @@ func open(opts Options) (*Manager, error) {
 	if (opts.RootAccessKey == "") != (opts.RootSecretKey == "") {
 		return nil, errors.New("iam: root access key and secret key must be set together")
 	}
+	if opts.SharedState != nil && opts.Dir != "" {
+		return nil, errors.New("iam: shared state and local directory are mutually exclusive")
+	}
 	m := &Manager{opts: opts, st: newState()}
 	if opts.Dir == "" {
 		return m, nil
@@ -152,6 +160,16 @@ func open(opts Options) (*Manager, error) {
 	m.st = st
 	m.warnAmbiguousNames()
 	return m, nil
+}
+
+// ValidateStateDocument checks a standalone IAM document before an offline
+// cluster import. The root access key must match the target cluster config.
+func ValidateStateDocument(data []byte, rootAccessKey string) error {
+	if len(data) == 0 {
+		return nil
+	}
+	_, err := decodeState(data, rootAccessKey)
+	return err
 }
 
 // warnAmbiguousNames logs the names in a loaded iam.json that break the
@@ -255,6 +273,16 @@ func decodeState(data []byte, rootKey string) (*state, error) {
 		}
 		st.users[u.Name] = rec
 	}
+	for i := range f.ReplicationRoles {
+		role := f.ReplicationRoles[i]
+		if err := validateReplicationRole(role); err != nil {
+			return nil, fmt.Errorf("replication role %q: %w", role.ARN, err)
+		}
+		if _, dup := st.roles[role.ARN]; dup {
+			return nil, fmt.Errorf("duplicate replication role %q", role.ARN)
+		}
+		st.roles[role.ARN] = cloneReplicationRole(role)
+	}
 	return st, nil
 }
 
@@ -281,6 +309,9 @@ func encodeState(st *state) ([]byte, error) {
 	}
 	for _, name := range slices.Sorted(maps.Keys(st.policies)) {
 		f.Policies = append(f.Policies, *st.policies[name])
+	}
+	for _, arn := range slices.Sorted(maps.Keys(st.roles)) {
+		f.ReplicationRoles = append(f.ReplicationRoles, *st.roles[arn])
 	}
 	return json.MarshalIndent(f, "", "  ")
 }
@@ -367,14 +398,48 @@ func syncDir(dir string) error {
 // mutate runs fn on a copy of the current state, persists the result and
 // publishes it. On any error the current state is left unchanged.
 //
-// Mutations are serialized by writeMu. Cloning, fn and persist (encoding,
-// write and fsync of iam.json) run without m.mu, so authentication and
-// authorization (snapshot) keep using the published state meanwhile;
-// m.mu is only held to swap in the new state. mutate is the only writer
-// of m.st after open, so reading m.st under writeMu alone is safe.
-func (m *Manager) mutate(fn func(st *state) error) error {
+// Mutations are serialized by writeMu. Local file persistence and shared
+// consensus writes run without m.mu so readers keep using the published
+// snapshot. m.mu is held only to publish the next snapshot.
+func (m *Manager) mutate(ctx context.Context, fn func(st *state) error) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	m.writeMu.Lock()
 	defer m.writeMu.Unlock()
+	if m.opts.SharedState != nil {
+		for range 32 {
+			old, found, err := m.opts.SharedState.Load(ctx)
+			if err != nil {
+				return err
+			}
+			current := newState()
+			if found {
+				current, err = decodeState(old, m.opts.RootAccessKey)
+				if err != nil {
+					return fmt.Errorf("iam: invalid shared state: %w", err)
+				}
+			}
+			next := current.clone()
+			if err := fn(next); err != nil {
+				return err
+			}
+			data, err := encodeState(next)
+			if err != nil {
+				return err
+			}
+			if err := m.opts.SharedState.CompareAndSwap(ctx, old, found, data); errors.Is(err, ErrStateConflict) {
+				continue
+			} else if err != nil {
+				return err
+			}
+			m.mu.Lock()
+			m.st = next
+			m.mu.Unlock()
+			return nil
+		}
+		return ErrStateConflict
+	}
 	cur := m.st
 	next := cur.clone()
 	if err := fn(next); err != nil {
@@ -394,6 +459,25 @@ func (m *Manager) snapshot() *state {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 	return m.st
+}
+
+// readSnapshot rechecks the consensus index before an IAM read. A follower
+// never authorizes from its last local cache after losing quorum.
+func (m *Manager) readSnapshot(ctx context.Context) (*state, error) {
+	if m.opts.SharedState == nil {
+		return m.snapshot(), nil
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	data, found, err := m.opts.SharedState.Load(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if !found {
+		return newState(), nil
+	}
+	return decodeState(data, m.opts.RootAccessKey)
 }
 
 func (m *Manager) now() time.Time {

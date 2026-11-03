@@ -97,6 +97,7 @@ func TestToAPIError(t *testing.T) {
 		{restic.ErrSnapshotNotFound, 404, codeNotFound},
 		{restic.ErrForgetRefused, 400, codeInvalidRequest},
 		{fmt.Errorf("restic missing: %w", storage.ErrEncryptionUnavailable), 503, codeInternalError},
+		{fmt.Errorf("shared state unavailable: %w", s3err.ErrServiceUnavailable), 503, codeInternalError},
 		{fmt.Errorf("no repository: %w", errors.ErrUnsupported), 400, codeInvalidRequest},
 		{errors.New("boom"), 500, codeInternalError},
 		{badRequest("x"), 400, codeInvalidRequest},

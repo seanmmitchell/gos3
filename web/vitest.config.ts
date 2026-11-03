@@ -1,6 +1,7 @@
 import { fileURLToPath } from 'node:url'
 import { defineVitestProject } from '@nuxt/test-utils/config'
 import { defineConfig } from 'vitest/config'
+import generatedCoverageExclusions from '../coverage.generated.json' with { type: 'json' }
 
 const alias = {
   '~~': fileURLToPath(new URL('./', import.meta.url)),
@@ -18,6 +19,14 @@ const alias = {
 //          happy-dom environment. Files: test/nuxt/**/*.test.ts.
 export default defineConfig({
   test: {
+    coverage: {
+      provider: 'v8',
+      include: ['app/**/*.{ts,vue}'],
+      // Explicit checked-in list; currently no generated application files.
+      exclude: generatedCoverageExclusions.web,
+      thresholds: { lines: 80 },
+      reporter: ['text-summary', 'json-summary']
+    },
     projects: [
       {
         resolve: { alias },

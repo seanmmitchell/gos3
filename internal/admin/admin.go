@@ -20,6 +20,7 @@ import (
 
 	"github.com/seanmmitchell/gos3/internal/auth"
 	"github.com/seanmmitchell/gos3/internal/clientip"
+	"github.com/seanmmitchell/gos3/internal/cluster"
 	"github.com/seanmmitchell/gos3/internal/config"
 	"github.com/seanmmitchell/gos3/internal/discovery"
 	"github.com/seanmmitchell/gos3/internal/iam"
@@ -45,6 +46,9 @@ type Deps struct {
 	Discovery *discovery.Service // may be nil when disabled
 	// Info returns this server's public identity document.
 	Info func() discovery.Info
+	// ClusterStatus reports the local node's quorum and replica progress.
+	// Nil in standalone mode.
+	ClusterStatus func(context.Context) cluster.Status
 	// BackendName is the kind of the default backing: "fs", "memory" or
 	// "s3". DataPath is the data directory: the fs backing's directory, or
 	// the directory holding only system state for memory and s3 ("" if
@@ -63,7 +67,7 @@ type Deps struct {
 	// Jobs runs the background jobs (copy and mirror jobs, restic
 	// snapshot, restore and prune jobs) listed and controlled by the /jobs
 	// endpoints. nil: those endpoints answer 404 ("not available").
-	Jobs *jobs.Manager
+	Jobs JobService
 	// CopyJobs validates copy and mirror job specs for POST /jobs with
 	// "dryRun" (*copyjob.Service). nil: dry runs answer 404; jobs are
 	// still submitted through Jobs.
@@ -73,6 +77,19 @@ type Deps struct {
 	// endpoints answer 404 and GET /buckets/{name}/restic reports no
 	// snapshot schedule.
 	Snapshots SnapshotService
+}
+
+// JobService is the admin view of a persistent job namespace. Cluster nodes
+// can serve it through Raft while standalone servers use jobs.Manager.
+type JobService interface {
+	Submit(context.Context, string, json.RawMessage, string) (jobs.Job, error)
+	Get(string) (jobs.Job, error)
+	List(jobs.Filter) []jobs.Job
+	Pause(string) error
+	Resume(string) error
+	Cancel(string) error
+	Delete(string) error
+	RunNow(string) error
 }
 
 // CopyJobService checks copy and mirror job specs without creating jobs

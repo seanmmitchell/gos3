@@ -10,6 +10,7 @@ import (
 	awss3 "github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/aws/aws-sdk-go-v2/service/s3/types"
 
+	"github.com/seanmmitchell/gos3/internal/iam"
 	"github.com/seanmmitchell/gos3/internal/storage"
 )
 
@@ -280,8 +281,25 @@ func TestBucketLoggingValidation(t *testing.T) {
 
 // --- Replication ---
 
+func bcReplicationReady(t *testing.T, e *testEnv, roleARN string) {
+	t.Helper()
+	e.createBucket("backup")
+	bcVersioned(t, e, "backup")
+	if err := e.iam.PutReplicationRole(bcCtx, iam.ReplicationRole{
+		ARN: roleARN,
+		Grants: []iam.ReplicationGrant{{
+			SourceBucket: "cfg", DestinationBucket: "backup",
+			Actions: []string{iam.ReplicateObjectAction, iam.ReplicateDeleteAction,
+				iam.ReplicateTagsAction, iam.ReplicateObjectLockAction},
+		}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestBucketReplicationSDK(t *testing.T) {
 	e := bcEnv(t)
+	bcReplicationReady(t, e, "arn:aws:iam::000000000000:role/replication")
 	c := e.client
 	_, err := c.GetBucketReplication(bcCtx, &awss3.GetBucketReplicationInput{Bucket: aws.String("cfg")})
 	bcSDKErr(t, err, "ReplicationConfigurationNotFoundError")
@@ -289,13 +307,11 @@ func TestBucketReplicationSDK(t *testing.T) {
 		{ID: aws.String("all"), Priority: aws.Int32(1), Status: types.ReplicationRuleStatusEnabled,
 			Filter:                  &types.ReplicationRuleFilter{Prefix: aws.String("")},
 			DeleteMarkerReplication: &types.DeleteMarkerReplication{Status: types.DeleteMarkerReplicationStatusDisabled},
-			Destination: &types.Destination{Bucket: aws.String("arn:aws:s3:::backup"), StorageClass: types.StorageClassStandardIa,
-				ReplicationTime: &types.ReplicationTime{Status: types.ReplicationTimeStatusEnabled, Time: &types.ReplicationTimeValue{Minutes: aws.Int32(15)}},
-				Metrics:         &types.Metrics{Status: types.MetricsStatusEnabled, EventThreshold: &types.ReplicationTimeValue{Minutes: aws.Int32(15)}}}},
+			Destination:             &types.Destination{Bucket: aws.String("arn:aws:s3:::backup")}},
 		{ID: aws.String("tagged"), Priority: aws.Int32(2), Status: types.ReplicationRuleStatusDisabled,
 			Filter: &types.ReplicationRuleFilter{And: &types.ReplicationRuleAndOperator{Prefix: aws.String("x/"),
 				Tags: []types.Tag{{Key: aws.String("a"), Value: aws.String("1")}, {Key: aws.String("b"), Value: aws.String("2")}}}},
-			DeleteMarkerReplication: &types.DeleteMarkerReplication{Status: types.DeleteMarkerReplicationStatusEnabled},
+			DeleteMarkerReplication: &types.DeleteMarkerReplication{Status: types.DeleteMarkerReplicationStatusDisabled},
 			Destination:             &types.Destination{Bucket: aws.String("arn:aws:s3:::backup")}},
 	}}
 	_, err = c.PutBucketReplication(bcCtx, &awss3.PutBucketReplicationInput{Bucket: aws.String("cfg"), ReplicationConfiguration: in})
@@ -314,7 +330,7 @@ func TestBucketReplicationSDK(t *testing.T) {
 	}
 	r0, r1 := rc.Rules[0], rc.Rules[1]
 	if aws.ToString(r0.ID) != "all" || aws.ToInt32(r0.Priority) != 1 || r0.Filter == nil || aws.ToString(r0.Filter.Prefix) != "" ||
-		r0.Destination.StorageClass != types.StorageClassStandardIa || aws.ToInt32(r0.Destination.ReplicationTime.Time.Minutes) != 15 ||
+		aws.ToString(r0.Destination.Bucket) != "arn:aws:s3:::backup" ||
 		r0.DeleteMarkerReplication.Status != types.DeleteMarkerReplicationStatusDisabled {
 		t.Fatalf("rule 0: %+v", r0)
 	}
@@ -335,9 +351,10 @@ func TestBucketReplicationSDK(t *testing.T) {
 
 func TestBucketReplicationValidation(t *testing.T) {
 	e := bcEnv(t)
+	bcReplicationReady(t, e, "arn:aws:iam::000000000000:role/r")
 	bcVersioned(t, e, "cfg")
 	doc := func(rules ...string) []byte {
-		return []byte("<ReplicationConfiguration><Role>arn:aws:iam::0:role/r</Role>" + strings.Join(rules, "") + "</ReplicationConfiguration>")
+		return []byte("<ReplicationConfiguration><Role>arn:aws:iam::000000000000:role/r</Role>" + strings.Join(rules, "") + "</ReplicationConfiguration>")
 	}
 	const dest = "<Destination><Bucket>arn:aws:s3:::backup</Bucket></Destination>"
 	rule := func(inner string) string { return "<Rule>" + inner + "</Rule>" }
@@ -354,20 +371,62 @@ func TestBucketReplicationValidation(t *testing.T) {
 		{"no destination", doc(rule("<Status>Enabled</Status>")), 400, "MalformedXML"},
 		{"bad arn", doc(rule("<Status>Enabled</Status><Destination><Bucket>backup</Bucket></Destination>")), 400, "InvalidArgument"},
 		{"bad bucket name", doc(rule("<Status>Enabled</Status><Destination><Bucket>arn:aws:s3:::Bad_Name</Bucket></Destination>")), 400, "InvalidArgument"},
-		{"bad storage class", doc(rule("<Status>Enabled</Status><Destination><Bucket>arn:aws:s3:::backup</Bucket><StorageClass>CHEAP</StorageClass></Destination>")), 400, "InvalidStorageClass"},
+		{"bad storage class", doc(rule("<Status>Enabled</Status><Destination><Bucket>arn:aws:s3:::backup</Bucket><StorageClass>CHEAP</StorageClass></Destination>")), 400, "InvalidArgument"},
+		{"unsupported storage class", doc(rule("<Status>Enabled</Status><Destination><Bucket>arn:aws:s3:::backup</Bucket><StorageClass>STANDARD_IA</StorageClass></Destination>")), 400, "InvalidArgument"},
+		{"unknown field", doc(rule("<Status>Enabled</Status><Foo/>" + dest)), 400, "InvalidArgument"},
+		{"tagged marker", doc(rule("<Status>Enabled</Status><Filter><Tag><Key>a</Key><Value>b</Value></Tag></Filter><DeleteMarkerReplication><Status>Enabled</Status></DeleteMarkerReplication>" + dest)), 400, "InvalidArgument"},
 		{"prefix and filter", doc(rule("<Status>Enabled</Status><Prefix/><Filter/>" + dest)), 400, "MalformedXML"},
 		{"filter two kinds", doc(rule("<Status>Enabled</Status><Filter><Prefix/><Tag><Key>a</Key><Value>b</Value></Tag></Filter>" + dest)), 400, "MalformedXML"},
 		{"filter bad tag", doc(rule("<Status>Enabled</Status><Filter><Tag><Key>aws:x</Key><Value>b</Value></Tag></Filter>" + dest)), 400, "InvalidTag"},
 		{"dup ids", doc(rule("<ID>a</ID><Status>Enabled</Status>"+dest), rule("<ID>a</ID><Status>Enabled</Status>"+dest)), 400, "InvalidArgument"},
 		{"dup priority", doc(rule("<Priority>1</Priority><Status>Enabled</Status><Filter/>"+dest), rule("<Priority>1</Priority><Status>Enabled</Status><Filter/>"+dest)), 400, "InvalidArgument"},
 		{"bad delete marker status", doc(rule("<Status>Enabled</Status><Filter/><DeleteMarkerReplication><Status>Yes</Status></DeleteMarkerReplication>" + dest)), 400, "MalformedXML"},
-		{"bad acl owner", doc(rule("<Status>Enabled</Status><Destination><Bucket>arn:aws:s3:::backup</Bucket><AccessControlTranslation><Owner>Me</Owner></AccessControlTranslation></Destination>")), 400, "MalformedXML"},
+		{"bad acl owner", doc(rule("<Status>Enabled</Status><Destination><Bucket>arn:aws:s3:::backup</Bucket><AccessControlTranslation><Owner>Me</Owner></AccessControlTranslation></Destination>")), 400, "InvalidArgument"},
 		{"long id", doc(rule("<ID>" + strings.Repeat("i", 256) + "</ID><Status>Enabled</Status>" + dest)), 400, "InvalidArgument"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			bcExpect(t, e.signed(http.MethodPut, "/cfg?replication", tc.body, nil), tc.status, tc.code)
 		})
 	}
+}
+
+func TestBucketReplicationRequiresLocalRoleAndVersionedDestination(t *testing.T) {
+	e := bcEnv(t)
+	bcVersioned(t, e, "cfg")
+	const role = "arn:aws:iam::000000000000:role/r"
+	config := func(destination, marker string) []byte {
+		return []byte("<ReplicationConfiguration><Role>" + role + "</Role><Rule><Status>Enabled</Status><Prefix>x/</Prefix><Destination><Bucket>arn:aws:s3:::" + destination + "</Bucket></Destination>" + marker + "</Rule></ReplicationConfiguration>")
+	}
+	put := func(body []byte, status int, code string) {
+		t.Helper()
+		bcExpect(t, e.signed(http.MethodPut, "/cfg?replication", body, nil), status, code)
+	}
+	put(config("backup", ""), 400, "InvalidArgument")
+	if err := e.iam.PutReplicationRole(bcCtx, iam.ReplicationRole{ARN: role, Grants: []iam.ReplicationGrant{{SourceBucket: "cfg", DestinationBucket: "backup", Prefix: "x/", Actions: []string{iam.ReplicateObjectAction}}}}); err != nil {
+		t.Fatal(err)
+	}
+	put(config("backup", ""), 400, "InvalidArgument")
+	e.createBucket("backup")
+	put(config("backup", ""), 400, "InvalidRequest")
+	bcVersioned(t, e, "backup")
+	put(config("cfg", ""), 400, "InvalidArgument")
+	put(config("backup", "<DeleteMarkerReplication><Status>Enabled</Status></DeleteMarkerReplication>"), 400, "InvalidArgument")
+	put(config("backup", ""), 200, "")
+}
+
+func TestBucketReplicationRequiresLockPreservingDestination(t *testing.T) {
+	e := bcEnv(t)
+	bcVersioned(t, e, "cfg")
+	bcReplicationReady(t, e, "arn:aws:iam::000000000000:role/r")
+	if err := e.backend.SetBucketObjectLock(bcCtx, "cfg", true); err != nil {
+		t.Fatal(err)
+	}
+	body := []byte(`<ReplicationConfiguration><Role>arn:aws:iam::000000000000:role/r</Role><Rule><Status>Enabled</Status><Prefix></Prefix><Destination><Bucket>arn:aws:s3:::backup</Bucket></Destination></Rule></ReplicationConfiguration>`)
+	bcExpect(t, e.signed(http.MethodPut, "/cfg?replication", body, nil), 400, "InvalidArgument")
+	if err := e.backend.SetBucketObjectLock(bcCtx, "backup", true); err != nil {
+		t.Fatal(err)
+	}
+	bcExpect(t, e.signed(http.MethodPut, "/cfg?replication", body, nil), 200, "")
 }
 
 // --- Accelerate ---

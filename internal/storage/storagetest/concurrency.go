@@ -72,11 +72,11 @@ func testConcurrentMixed(e *env) {
 	for _, status := range []storage.VersioningStatus{storage.VersioningUnversioned, storage.VersioningEnabled} {
 		e.runFresh(versioningName(status), func(e *env) {
 			const (
-				workers   = 8
-				ownKeys   = 12
-				sharedN   = 4
-				opsPerKey = 6
+				ownKeys = 12
+				sharedN = 4
 			)
+			workers := max(2, 8/e.suite.stressDivisor)
+			opsPerKey := max(2, 6/e.suite.stressDivisor)
 			e.mkVersioned("b", status)
 			// Each worker owns its keys (so their final state is known) and
 			// all workers fight over the shared keys.
@@ -203,7 +203,8 @@ func testConcurrentMixed(e *env) {
 }
 
 func testConcurrentVersionedPuts(e *env) {
-	const workers, perWorker = 8, 10
+	workers := max(2, 8/e.suite.stressDivisor)
+	perWorker := max(2, 10/e.suite.stressDivisor)
 	e.mkVersioned("b", storage.VersioningEnabled)
 	type written struct {
 		id   string

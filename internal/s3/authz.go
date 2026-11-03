@@ -199,6 +199,9 @@ func (s *Server) authorizeTarget(ctx context.Context, r *http.Request, rc *reqCo
 	}
 
 	dec := s.iam.Authorize(ctx, req)
+	if dec.Unavailable {
+		return s3err.ErrServiceUnavailable
+	}
 	if !dec.Allowed && !dec.ExplicitDeny && t.ObjectRead && t.Key != "" && !bz.aclsDisabled {
 		o := s.authzObject(ctx, rc, t.Bucket, t.Key, t.VersionID)
 		if o.err != nil {
@@ -208,6 +211,9 @@ func (s *Server) authorizeTarget(ctx context.Context, r *http.Request, rc *reqCo
 			if acl := effectiveACL(info.ACL, bz.pab); acl != "" {
 				req.ACL = acl
 				dec = s.iam.Authorize(ctx, req)
+				if dec.Unavailable {
+					return s3err.ErrServiceUnavailable
+				}
 			}
 		}
 	}

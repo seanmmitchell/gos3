@@ -44,6 +44,43 @@ export interface Info {
   startedAt: Timestamp
 }
 
+/** Authenticated GET /cluster status of one gos3 cluster node. */
+export interface ClusterStatus {
+  clusterId: string
+  nodeId: string
+  leaderId?: string
+  leader: boolean
+  available: boolean
+  error?: string
+  commitIndex: number
+  appliedIndex: number
+  lag: number
+  replicaCount: number
+  minMemoryAcks: number
+  minDurableAcks: number
+  lastWrite?: {
+    operationId?: string
+    memoryAcks: number
+    durableAcks: number
+    consensusCommitted: boolean
+    error?: string
+    updatedAt?: Timestamp
+  }
+  lastRepair?: {
+    repaired: number
+    error?: string
+    checkedAt?: Timestamp
+  }
+  peers: Array<{
+    id: string
+    local: boolean
+    leader: boolean
+    matchIndex?: number
+    lag?: number
+    progressKnown: boolean
+  }>
+}
+
 // ---------------------------------------------------------------------------
 // Identity
 // ---------------------------------------------------------------------------

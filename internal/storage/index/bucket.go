@@ -399,6 +399,8 @@ func (b *Bucket[P]) Import(key string, info storage.ObjectInfo, c Content[P]) (s
 	}
 	if !info.DeleteMarker {
 		v.Meta = CloneMeta(info.ObjectMeta)
+	} else {
+		v.Meta.ReplicationOrigin = info.ReplicationOrigin
 	}
 	v.Stamp, _ = b.stamp()
 	ch := Change[P]{Key: key, Added: v}

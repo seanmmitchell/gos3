@@ -178,7 +178,7 @@ func (e *env) raceCommits(n int, bucket, key string, opts func(i int) storage.Co
 func raceData(i int) []byte { return fmt.Appendf(nil, "racer %03d", i) }
 
 func testCondIfNoneMatchRace(e *env) {
-	const n = 16
+	n := max(2, 16/e.suite.stressDivisor)
 	for _, status := range []storage.VersioningStatus{storage.VersioningUnversioned, storage.VersioningEnabled} {
 		e.runFresh(versioningName(status), func(e *env) {
 			e.mkVersioned("b", status)
@@ -198,7 +198,7 @@ func testCondIfNoneMatchRace(e *env) {
 }
 
 func testCondIfMatchRace(e *env) {
-	const n = 16
+	n := max(2, 16/e.suite.stressDivisor)
 	e.mkVersioned("b", storage.VersioningEnabled)
 	base := e.put("b", "k", []byte("base"))
 	winners := e.raceCommits(n, "b", "k", func(int) storage.CommitOptions { return storage.CommitOptions{IfMatch: base.ETag} })

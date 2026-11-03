@@ -948,6 +948,9 @@ func (s *Server) authorizeObjectPublication(ctx context.Context, r *http.Request
 			BucketPolicy: policy, ACL: acl, Conditions: conditions,
 		})
 		rc.authzReason = decision.Reason
+		if decision.Unavailable {
+			return s3err.ErrServiceUnavailable
+		}
 		if !decision.Allowed {
 			return s3err.ErrAccessDenied
 		}
