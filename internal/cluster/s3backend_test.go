@@ -131,7 +131,9 @@ func TestS3BackendTwoNodeVersionedWriteAndRead(t *testing.T) {
 			Credentials:  credentials.NewStaticCredentialsProvider("ROOTTESTKEY", "root-test-secret-key", ""),
 			BaseEndpoint: aws.String(api.URL), UsePathStyle: true, HTTPClient: api.Client(), Retryer: aws.NopRetryer{}})
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	// This test performs many fsynced writes and a full replication backfill.
+	// Windows race runners can take longer than the ordinary request timeout.
+	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
 	defer cancel()
 	if err := backends["a"].CreateBucket(ctx, "locked", storage.CreateBucketOptions{ObjectLockEnabled: true}); err != nil {
 		t.Fatal(err)
