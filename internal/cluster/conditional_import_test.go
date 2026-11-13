@@ -9,10 +9,11 @@ import (
 )
 
 func TestConditionalImportCanReplaceHistoricalVersion(t *testing.T) {
-	nodes := newTwoNodeCluster(t)
-	ctx, cancel := context.WithTimeout(t.Context(), 15*time.Second)
+	ctx, cancel := context.WithTimeout(t.Context(), 2*time.Minute)
 	defer cancel()
-	b := NewS3Backend(nodes["a"])
+	// Use the conformance fixture's durable-write budget: this test commits
+	// several two-voter mutations and is not testing storage latency.
+	b := newClusterBackend(t).(*S3Backend)
 	if err := b.CreateBucket(ctx, "target", storage.CreateBucketOptions{}); err != nil {
 		t.Fatal(err)
 	}
