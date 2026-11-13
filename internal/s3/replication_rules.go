@@ -49,7 +49,7 @@ func (r ExecutableReplicationRule) Matches(key string, tags map[string]string, d
 		return false
 	}
 	for key, value := range r.Tags {
-		if tags[key] != value {
+		if actual, found := tags[key]; !found || actual != value {
 			return false
 		}
 	}

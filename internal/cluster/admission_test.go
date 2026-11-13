@@ -50,6 +50,10 @@ func (r failingReplica) Persist(ctx context.Context, id string) error {
 	return r.stage.Persist(ctx, id)
 }
 
+func (r failingReplica) Release(ctx context.Context, id string) error {
+	return r.stage.Release(ctx, id)
+}
+
 func TestAdmissionNeverPublishesBelowBothThresholds(t *testing.T) {
 	ctx := context.Background()
 	stores := make(map[string]*StageStore)
@@ -103,6 +107,8 @@ func TestAdmissionNeverPublishesBelowBothThresholds(t *testing.T) {
 }
 
 type stalledReplica struct{}
+
+func (stalledReplica) Release(context.Context, string) error { return nil }
 
 func (stalledReplica) Stage(ctx context.Context, _ string, _ []byte, _ [32]byte) error {
 	<-ctx.Done()

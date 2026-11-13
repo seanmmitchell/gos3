@@ -20,6 +20,10 @@ var ErrMetadataCondition = errors.New("cluster: metadata condition failed")
 
 var metadataOutcomes = []byte("outcomes")
 
+// Allow an exact-byte CAS of two maximum-size (1 MiB) records plus their
+// base64 encoding and envelope. Individual records retain their 1 MiB limit.
+const maxMetadataTransactionBytes = 3 << 20
+
 // MetadataCondition compares the exact current bytes of a shared record.
 // Exists=false requires absence; Exists=true also compares Value, including
 // an empty value. The checks and writes run in one bbolt transaction.
@@ -127,13 +131,16 @@ func EncodeMetadataTransaction(t MetadataTransaction) ([]byte, error) {
 	data, err := json.Marshal(struct {
 		Transaction MetadataTransaction `json:"transaction"`
 	}{Transaction: t})
-	if len(data) > 1<<20 {
+	if len(data) > maxMetadataTransactionBytes {
 		return nil, errInvalidMetadataCommand
 	}
 	return data, err
 }
 
 func decodeMetadataTransaction(data []byte) (MetadataTransaction, bool, error) {
+	if len(data) > maxMetadataTransactionBytes {
+		return MetadataTransaction{}, false, errInvalidMetadataCommand
+	}
 	var fields map[string]json.RawMessage
 	if err := json.Unmarshal(data, &fields); err != nil {
 		return MetadataTransaction{}, false, fmt.Errorf("%w: %v", errInvalidMetadataCommand, err)

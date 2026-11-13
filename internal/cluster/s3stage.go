@@ -65,22 +65,41 @@ func (s *S3StageStore) Stage(ctx context.Context, id string, payload []byte, dig
 		return errors.New("cluster: staged payload digest mismatch")
 	}
 	s.mu.Lock()
+	defer s.mu.Unlock()
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	now := time.Now()
+	s.used -= expireStages(s.memory, now)
 	if prior, ok := s.memory[id]; ok {
-		s.mu.Unlock()
 		if prior.digest != digest || !bytes.Equal(prior.data, payload) {
 			return errors.New("cluster: operation ID reused with different payload")
 		}
+		prior.expiresAt = now.Add(stageLeaseDuration)
+		s.memory[id] = prior
 		return nil
 	}
-	defer s.mu.Unlock()
 	// Memory acceptance remains available during an S3 outage. Persist
 	// resolves a prior durable copy or an operation-ID conflict by reading
 	// back the exact bytes after a conditional PUT.
 	if int64(len(payload)) > s.maxUsed-s.used {
 		return ErrStageFull
 	}
-	s.memory[id] = stagedPayload{digest: digest, data: bytes.Clone(payload)}
+	s.memory[id] = stagedPayload{digest: digest, data: bytes.Clone(payload), expiresAt: now.Add(stageLeaseDuration)}
 	s.used += int64(len(payload))
+	return nil
+}
+
+func (s *S3StageStore) Release(ctx context.Context, id string) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if staged, ok := s.memory[id]; ok {
+		delete(s.memory, id)
+		s.used -= int64(len(staged.data))
+	}
 	return nil
 }
 

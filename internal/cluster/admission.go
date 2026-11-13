@@ -7,7 +7,15 @@ import (
 	"errors"
 	"fmt"
 	"slices"
+	"sync"
+	"time"
 )
+
+// A stage lease outlives every admission that could count its memory ack.
+// Expiry also reclaims stages orphaned by a coordinator crash or lost cleanup.
+const maxAdmissionDuration = 5 * time.Minute
+const stageLeaseDuration = 2 * maxAdmissionDuration
+const replicaCleanupTimeout = 3 * time.Second
 
 // SelectReplicas uses rendezvous hashing to assign an object key to a stable
 // ordered set of voting nodes. Peer list order does not affect placement.
@@ -54,6 +62,8 @@ func SelectReplicas(clusterID, bucket, key string, peers []string, count int) ([
 type ReplicaStage interface {
 	Stage(context.Context, string, []byte, [32]byte) error
 	Persist(context.Context, string) error
+	// Release frees only volatile staging; it must never delete durable bytes.
+	Release(context.Context, string) error
 }
 
 // AdmitWrite stages the exact payload on selected distinct nodes, records
@@ -83,8 +93,23 @@ func admitWrite(ctx context.Context, operationID string, payload []byte, selecte
 		seen[id] = true
 	}
 	digest := sha256.Sum256(payload)
+	ctx, cancelAdmission := context.WithTimeout(ctx, maxAdmissionDuration)
+	defer cancelAdmission()
 	stageCtx, cancelStages := context.WithCancel(ctx)
-	defer cancelStages()
+	var workers sync.WaitGroup
+	defer func() {
+		cancelStages()
+		// Wait for cleanup on reachable replicas before a caller retries, but
+		// do not let an unreachable peer delay the acknowledgment indefinitely.
+		done := make(chan struct{})
+		go func() { workers.Wait(); close(done) }()
+		timer := time.NewTimer(replicaCleanupTimeout)
+		defer timer.Stop()
+		select {
+		case <-done:
+		case <-timer.C:
+		}
+	}()
 	type result struct {
 		id      string
 		durable bool
@@ -95,7 +120,18 @@ func admitWrite(ctx context.Context, operationID string, payload []byte, selecte
 	// a slower or failed third replica is still finishing.
 	results := make(chan result, 2*len(selected))
 	for _, id := range selected {
+		workers.Add(1)
 		go func(id string) {
+			defer workers.Done()
+			defer func() {
+				// Keep memory-only acknowledgments valid through publication,
+				// even if this replica's durable backing failed. Stage may have
+				// succeeded remotely even when its response was lost.
+				<-stageCtx.Done()
+				cleanup, cancel := context.WithTimeout(context.Background(), replicaCleanupTimeout)
+				defer cancel()
+				_ = nodes[id].Release(cleanup, operationID)
+			}()
 			if err := nodes[id].Stage(stageCtx, operationID, payload, digest); err != nil {
 				results <- result{id: id, err: err}
 				return

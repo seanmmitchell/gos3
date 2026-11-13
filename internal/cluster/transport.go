@@ -209,7 +209,7 @@ func (t *PeerTransport) Handler() http.Handler {
 			http.Error(w, "cluster import fingerprint mismatch", http.StatusConflict)
 			return
 		}
-		if r.URL.Path == "/stage" || r.URL.Path == "/persist" || r.URL.Path == "/payload" {
+		if r.URL.Path == "/stage" || r.URL.Path == "/persist" || r.URL.Path == "/payload" || r.URL.Path == "/release" {
 			t.handleStage(w, r)
 			return
 		}
@@ -261,6 +261,14 @@ func (t *PeerTransport) handleStage(w http.ResponseWriter, r *http.Request) {
 	id := r.Header.Get("X-Gos3-Operation-ID")
 	if id == "" || len(id) > 128 {
 		http.Error(w, "invalid operation ID", http.StatusBadRequest)
+		return
+	}
+	if r.URL.Path == "/release" {
+		if err := t.stage.Release(r.Context(), id); err != nil {
+			http.Error(w, "replica stage cleanup unavailable", http.StatusServiceUnavailable)
+			return
+		}
+		w.WriteHeader(http.StatusNoContent)
 		return
 	}
 	if r.URL.Path == "/payload" {
@@ -352,6 +360,10 @@ func (r remoteReplica) Stage(ctx context.Context, id string, data []byte, digest
 
 func (r remoteReplica) Persist(ctx context.Context, id string) error {
 	return r.request(ctx, "/persist", id, nil, nil)
+}
+
+func (r remoteReplica) Release(ctx context.Context, id string) error {
+	return r.request(ctx, "/release", id, nil, nil)
 }
 
 // ReadPayload fetches a durable replica over the mutually authenticated peer

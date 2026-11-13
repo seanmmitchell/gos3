@@ -67,7 +67,10 @@ func (n *Node) RepairLocalPlacements(ctx context.Context) (repaired int, err err
 			decoded, _ := hex.DecodeString(record.OperationID)
 			copy(id[:], decoded)
 			fetchCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
-			_, err = n.ReadVerifiedPayload(fetchCtx, id, record.Info.Bucket, record.Info.Key, expected, record.Info.Size)
+			payload, err := n.readVerifiedPayload(fetchCtx, id, record.Info.Bucket, record.Info.Key, expected, record.Info.Size, false)
+			if err == nil {
+				err = n.payloads.RepairCommitted(fetchCtx, record.OperationID, payload, expected)
+			}
 			cancel()
 			if err != nil {
 				return repaired, fmt.Errorf("cluster: repairing %s/%s@%s: %w", record.Info.Bucket, record.Info.Key, record.Info.VersionID, err)

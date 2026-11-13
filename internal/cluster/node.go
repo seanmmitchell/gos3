@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"path/filepath"
 	"sync"
+	"time"
 
 	"crypto/tls"
 
@@ -155,6 +156,10 @@ func (n *Node) HasMetadataPrefix(ctx context.Context, ns MetadataNamespace, pref
 // ReadVerifiedPayload uses a quorum read barrier, then checks each replica
 // against the committed digest before accepting or repairing a local copy.
 func (n *Node) ReadVerifiedPayload(ctx context.Context, id [16]byte, bucket, key string, expected [32]byte, size int64) ([]byte, error) {
+	return n.readVerifiedPayload(ctx, id, bucket, key, expected, size, true)
+}
+
+func (n *Node) readVerifiedPayload(ctx context.Context, id [16]byte, bucket, key string, expected [32]byte, size int64, repairLocal bool) ([]byte, error) {
 	if size < 0 {
 		return nil, errors.New("cluster: invalid committed payload size")
 	}
@@ -170,28 +175,50 @@ func (n *Node) ReadVerifiedPayload(ctx context.Context, id [16]byte, bucket, key
 		return nil, err
 	}
 	opID := hex.EncodeToString(id[:])
-	var failures []error
+	readCtx, cancelReads := context.WithCancel(ctx)
+	defer cancelReads()
+	type result struct {
+		peer    string
+		payload []byte
+		err     error
+	}
+	results := make(chan result, len(selected))
 	for _, peer := range selected {
-		payload, err := n.transport.ReadPayload(ctx, peer, opID)
-		if err != nil {
-			failures = append(failures, fmt.Errorf("%s: %w", peer, err))
+		go func() {
+			payload, err := n.transport.ReadPayload(readCtx, peer, opID)
+			if err == nil && (int64(len(payload)) != size || sha256.Sum256(payload) != expected) {
+				err = errors.New("replica payload differs from committed version")
+			}
+			results <- result{peer: peer, payload: payload, err: err}
+		}()
+	}
+	var failures []error
+	for range selected {
+		var r result
+		select {
+		case <-ctx.Done():
+			return nil, fmt.Errorf("%w for operation %s: %w", ErrVerifiedReplicaUnavailable, opID, ctx.Err())
+		case r = <-results:
+		}
+		if r.err != nil {
+			failures = append(failures, fmt.Errorf("%s: %w", r.peer, r.err))
 			continue
 		}
-		if int64(len(payload)) != size || sha256.Sum256(payload) != expected {
-			failures = append(failures, fmt.Errorf("%s: replica payload differs from committed version", peer))
-			continue
-		}
-		if peer != n.cfg.NodeID {
+		cancelReads()
+		if repairLocal && r.peer != n.cfg.NodeID {
 			for _, placement := range selected {
 				if placement == n.cfg.NodeID {
-					if err := n.payloads.RepairCommitted(ctx, opID, payload, expected); err != nil {
-						return nil, err
-					}
+					// A failed local backing must not hide a verified healthy
+					// peer copy. Bound opportunistic repair; the background scan
+					// retries it if the backing is still unavailable.
+					repairCtx, cancel := context.WithTimeout(ctx, 250*time.Millisecond)
+					_ = n.payloads.RepairCommitted(repairCtx, opID, r.payload, expected)
+					cancel()
 					break
 				}
 			}
 		}
-		return payload, nil
+		return r.payload, nil
 	}
 	return nil, fmt.Errorf("%w for operation %s: %w", ErrVerifiedReplicaUnavailable, opID, errors.Join(failures...))
 }

@@ -7,6 +7,30 @@ import (
 
 const replicationRole = "arn:aws:iam::000000000000:role/replication"
 
+func TestReplicationEmptyTagFilterRequiresKey(t *testing.T) {
+	raw := replicationDocument("<Rule><Status>Enabled</Status><Filter><Tag><Key>replicate</Key><Value></Value></Tag></Filter><Destination><Bucket>arn:aws:s3:::backup</Bucket></Destination></Rule>")
+	_, rules, err := CompileReplicationRules(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, tc := range []struct {
+		name string
+		tags map[string]string
+		want bool
+	}{
+		{"untagged", nil, false},
+		{"other key", map[string]string{"other": ""}, false},
+		{"different value", map[string]string{"replicate": "yes"}, false},
+		{"empty value", map[string]string{"replicate": ""}, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := rules[0].Matches("key", tc.tags, false); got != tc.want {
+				t.Fatalf("Matches() = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
 func replicationDocument(rules ...string) []byte {
 	return []byte("<ReplicationConfiguration><Role>" + replicationRole + "</Role>" + strings.Join(rules, "") + "</ReplicationConfiguration>")
 }

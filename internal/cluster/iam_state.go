@@ -1,9 +1,11 @@
 package cluster
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 
@@ -31,6 +33,14 @@ func (s IAMStateStore) CompareAndSwap(ctx context.Context, prior []byte, found b
 	if s.Node == nil || len(next) == 0 {
 		return errors.New("cluster: invalid IAM state write")
 	}
+	// Pretty-printing a compact imported document can exceed the record
+	// limit even when deleting a user. Store compact JSON so shrinking a
+	// valid imported IAM namespace always remains possible.
+	var compact bytes.Buffer
+	if err := json.Compact(&compact, next); err != nil {
+		return fmt.Errorf("cluster: invalid IAM document: %w", err)
+	}
+	next = compact.Bytes()
 	var id [16]byte
 	if _, err := rand.Read(id[:]); err != nil {
 		return err

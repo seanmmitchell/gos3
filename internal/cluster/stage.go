@@ -19,8 +19,20 @@ var stageBucket = []byte("payloads")
 var ErrStageFull = errors.New("cluster: replica memory staging limit reached")
 
 type stagedPayload struct {
-	digest [32]byte
-	data   []byte
+	digest    [32]byte
+	data      []byte
+	expiresAt time.Time
+}
+
+// expireStages runs under the store lock. Durable data is never expired.
+func expireStages(memory map[string]stagedPayload, now time.Time) (freed int64) {
+	for id, staged := range memory {
+		if !staged.expiresAt.After(now) {
+			delete(memory, id)
+			freed += int64(len(staged.data))
+		}
+	}
+	return freed
 }
 
 // StageStore keeps verified, complete payloads in memory before acknowledging
@@ -80,10 +92,17 @@ func (s *StageStore) Stage(ctx context.Context, operationID string, payload []by
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	now := time.Now()
+	s.used -= expireStages(s.memory, now)
 	if prior, ok := s.memory[operationID]; ok {
 		if prior.digest != digest || !bytes.Equal(prior.data, payload) {
 			return errors.New("cluster: operation ID reused with different payload")
 		}
+		prior.expiresAt = now.Add(stageLeaseDuration)
+		s.memory[operationID] = prior
 		return nil
 	}
 	var persisted []byte
@@ -104,8 +123,23 @@ func (s *StageStore) Stage(ctx context.Context, operationID string, payload []by
 	if int64(len(payload)) > s.maxUsed-s.used {
 		return ErrStageFull
 	}
-	s.memory[operationID] = stagedPayload{digest: digest, data: bytes.Clone(payload)}
+	s.memory[operationID] = stagedPayload{digest: digest, data: bytes.Clone(payload), expiresAt: now.Add(stageLeaseDuration)}
 	s.used += int64(len(payload))
+	return nil
+}
+
+// Release discards volatile bytes after admission finishes. Persisted copies
+// remain available for uncertain retries, committed reads and replica repair.
+func (s *StageStore) Release(ctx context.Context, operationID string) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if staged, ok := s.memory[operationID]; ok {
+		delete(s.memory, operationID)
+		s.used -= int64(len(staged.data))
+	}
 	return nil
 }
 
