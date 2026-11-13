@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -15,6 +16,19 @@ import (
 	"github.com/seanmmitchell/gos3/internal/jobs"
 	"github.com/seanmmitchell/gos3/internal/storage"
 )
+
+type unavailableSharedJobs struct{ JobService }
+
+func (unavailableSharedJobs) ListConsistent(context.Context, jobs.Filter) ([]jobs.Job, error) {
+	return nil, storage.ErrBackingUnavailable
+}
+
+func TestSharedJobListingPropagatesUnavailableRead(t *testing.T) {
+	_, err := listJobsConsistently(&reqCtx{ctx: context.Background()}, unavailableSharedJobs{}, jobs.Filter{})
+	if !errors.Is(err, storage.ErrBackingUnavailable) {
+		t.Fatalf("read barrier failure was hidden: %v", err)
+	}
+}
 
 // fakeCopyRunner is the runner of the "copy" and "mirror" kinds in the
 // admin tests. Validate decodes the spec strictly (so a "dryRun" left in

@@ -280,6 +280,25 @@ func npmEntries(webDir string) ([]entry, error) {
 			}
 		}
 	}
+	// Nitro includes unctx in the Linux standalone bundle, but its Windows
+	// build can omit it. Notices cover the union of release platforms while
+	// unctx is still in the web dependency graph.
+	lock, err := os.ReadFile(filepath.Join(filepath.Dir(webDir), "pnpm-lock.yaml"))
+	if err != nil && !errors.Is(err, fs.ErrNotExist) {
+		return nil, err
+	}
+	if _, ok := byName["unctx"]; !ok && bytes.Contains(lock, []byte("\n  unctx@")) {
+		body, err := fallbackFS.ReadFile("fallback/unctx.LICENSE")
+		if err != nil {
+			return nil, err
+		}
+		byName["unctx"] = &entry{
+			name:      "unctx",
+			license:   "MIT",
+			artifacts: []string{artifactGos3UI},
+			texts:     []text{{file: "LICENSE", body: normalize(string(body))}},
+		}
+	}
 	var entries []entry
 	for _, name := range sortedKeys(byName) {
 		e := byName[name]

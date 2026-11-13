@@ -25,8 +25,8 @@ var safeConfigs = []string{
 }
 
 // configKeys returns the configuration documents the job copies. Never
-// copied: replication (it names the source's destinations) and the restic
-// snapshot schedule (snapshots belong to the source), and for mirrors the
+// copied: replication and its activation state (they name the source's
+// destinations) and the restic snapshot schedule (snapshots belong to the source), and for mirrors the
 // lifecycle, whose expirations would be applied twice. The ACL guards
 // (storage.ACLGuardConfigs) are always considered: copied versions keep
 // their ACLs (see syncConfigs).
@@ -39,7 +39,7 @@ func configKeys(sp *Spec) []string {
 		keys = slices.Clone(storage.AllConfigKeys)
 	}
 	keys = slices.DeleteFunc(keys, func(k string) bool {
-		return k == storage.ConfigReplication || k == storage.ConfigResticSnapshots ||
+		return k == storage.ConfigReplication || k == storage.ConfigReplicationState || k == storage.ConfigResticSnapshots ||
 			k == storage.ConfigLifecycle && sp.mirror()
 	})
 	for _, k := range storage.ACLGuardConfigs {
@@ -49,6 +49,11 @@ func configKeys(sp *Spec) []string {
 	}
 	return keys
 }
+
+// ConfigKeys returns the configuration documents selected by a normalized
+// copy spec, including ACL guards and excluding replication and snapshot
+// schedules. Cluster copy runners share this selection with standalone jobs.
+func ConfigKeys(sp Spec) []string { return configKeys(&sp) }
 
 // selected reports whether the spec's "configs" option selects key (the
 // ACL guards are copied regardless when they guard, see storage.ACLGuard).
@@ -61,6 +66,10 @@ func selected(sp *Spec, key string) bool {
 	}
 	return false
 }
+
+// SelectedConfig reports whether configs safe/all explicitly selected key.
+// ACL guards may still be copied when this returns false.
+func SelectedConfig(sp Spec, key string) bool { return selected(&sp, key) }
 
 // syncConfigs copies the source's configuration documents to the target
 // (configKeys). A mirror also removes from the target the documents it
@@ -270,6 +279,10 @@ func rewritePolicy(data []byte, sp *Spec) ([]byte, string) {
 	}
 	return out, ""
 }
+
+// RewritePolicy maps the source bucket's policy to a copy target, refusing
+// statements that could grant more access after prefix mapping.
+func RewritePolicy(data []byte, sp Spec) ([]byte, string) { return rewritePolicy(data, &sp) }
 
 // rewriteScoped maps a policy's statements for a copy with prefixes (see
 // rewritePolicy) and returns those that remain.

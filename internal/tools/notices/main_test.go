@@ -114,6 +114,31 @@ func TestNpmEntriesMergesVersionsAndArtifacts(t *testing.T) {
 	}
 }
 
+func TestNpmEntriesIncludesLinuxNitroNoticeOnWindows(t *testing.T) {
+	root := t.TempDir()
+	webDir := filepath.Join(root, ".notices")
+	if err := os.Mkdir(webDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range []string{"embedded.json", "standalone.json"} {
+		if err := os.WriteFile(filepath.Join(webDir, name), []byte(manifestJSON(t)), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.WriteFile(filepath.Join(root, "pnpm-lock.yaml"), []byte("packages:\n  unctx@2.5.0:\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	entries, err := npmEntries(webDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 1 || entries[0].name != "unctx" ||
+		entries[0].license != "MIT" || strings.Join(entries[0].artifacts, ",") != "gos3-ui" ||
+		len(entries[0].texts) != 1 {
+		t.Fatalf("entries = %+v", entries)
+	}
+}
+
 func TestNpmEntriesRequiresLicenseText(t *testing.T) {
 	pkg := writeFiles(t, map[string]string{"package.json": `{"license":"MIT"}`})
 	web := writeFiles(t, map[string]string{

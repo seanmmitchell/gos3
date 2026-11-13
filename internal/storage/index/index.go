@@ -106,6 +106,8 @@ func (v *Version[P]) Info(bucket, key string, isLatest bool) storage.ObjectInfo 
 		if v.Compression != "" {
 			oi.Compression, oi.StoredSize = v.Compression, v.StoredSize
 		}
+	} else {
+		oi.ReplicationOrigin = v.Meta.ReplicationOrigin
 	}
 	return oi
 }

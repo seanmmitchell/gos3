@@ -198,7 +198,9 @@ type Decision struct {
 	Allowed bool
 	// ExplicitDeny is true when a Deny statement matched.
 	ExplicitDeny bool
-	Reason       string // short explanation for logs / admin UI
+	// Unavailable means shared IAM could not confirm its current state.
+	Unavailable bool
+	Reason      string // short explanation for logs / admin UI
 }
 
 // Options configures a Manager.
@@ -210,6 +212,21 @@ type Options struct {
 	RootSecretKey string
 	// Now overrides the clock (tests).
 	Now func() time.Time
+	// SharedState stores IAM in the cluster consensus namespace. Dir must be
+	// empty when it is set; every read is refreshed through a linearizable
+	// barrier, and mutations use compare-and-swap.
+	SharedState StateStore
+}
+
+// ErrStateConflict asks a shared IAM mutation to reread and retry after
+// another node committed a newer state.
+var ErrStateConflict = errors.New("iam: shared state changed")
+
+// StateStore is the small consensus-backed persistence contract for IAM.
+// Load must be linearizable. CompareAndSwap must commit before returning nil.
+type StateStore interface {
+	Load(context.Context) (data []byte, found bool, err error)
+	CompareAndSwap(context.Context, []byte, bool, []byte) error
 }
 
 // Manager is the IAM service. It implements auth.CredentialProvider.
@@ -255,9 +272,9 @@ func (m *Manager) Authorize(ctx context.Context, req AuthzRequest) Decision {
 	if shared, ok := ctx.Value(requestBudgetKey{}).(*requestBudget); ok {
 		shared.mu.Lock()
 		defer shared.mu.Unlock()
-		return m.authorize(req, shared.b)
+		return m.authorize(ctx, req, shared.b)
 	}
-	return m.authorize(req, nil)
+	return m.authorize(ctx, req, nil)
 }
 
 // ListUsers returns all users sorted by name (secrets are never included).

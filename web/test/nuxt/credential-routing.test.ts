@@ -79,6 +79,7 @@ describe('/connect: new server', () => {
     const prod = store.connections.find(c => c.id !== 'evil')!
     expect(prod).toMatchObject({ endpoint: 'http://10.9.9.1:9000', accessKeyId: 'ROOTKEY', secretAccessKey: 'ROOTSECRET', serverId: INFO.id })
     expect(hosts).not.toContain('evil.example:9000')
+    w.unmount()
   })
 
   it('points out a link prefill and requires confirming an unknown host (web-auth-4)', async () => {
@@ -106,6 +107,7 @@ describe('/connect: new server', () => {
     vm.model.endpoint = 'http://10.9.9.1:9000'
     await nextTick()
     expect(w.find('[data-testid="link-prefill"]').exists()).toBe(false)
+    w.unmount()
   })
 
   it('requires the tick and warns for an http link to a host configured over https', async () => {
@@ -121,6 +123,7 @@ describe('/connect: new server', () => {
     await nextTick()
     await vm.submit()
     expect(hosts).toHaveLength(0)
+    w.unmount()
   })
 
   it('does not ask to confirm a prefilled host that is already configured', async () => {
@@ -129,6 +132,7 @@ describe('/connect: new server', () => {
     const w = await mountSuspended(ConnectPage, { route: '/connect?new=1&endpoint=http://10.9.9.1:9000' })
     expect(w.find('[data-testid="link-prefill"]').text()).toContain('Check that it is the server you expect')
     expect(w.find('[data-testid="trust-prefill"]').exists()).toBe(false)
+    w.unmount()
   })
 })
 
@@ -152,7 +156,7 @@ describe('Add as server: reusing credentials for a discovered host (web-auth-2, 
     fakeProd()
     const store = useConnectionsStore()
     const from = store.add({ id: 'a', name: 'nas', endpoint: 'http://10.9.9.1:9000', accessKeyId: 'ROOTKEY', secretAccessKey: 'ROOTSECRET', kind: 'gos3' })
-    const { vm } = await open('http://10.0.0.66:9000', from)
+    const { w, vm } = await open('http://10.0.0.66:9000', from)
     const body = () => document.body.textContent ?? ''
     expect(body()).toContain('https://nas.lookalike.example') // advertised endpoint only as a hint
     expect(vm.reuseCredentials).toBe(false) // off by default
@@ -171,16 +175,18 @@ describe('Add as server: reusing credentials for a discovered host (web-auth-2, 
     await vm.save()
     expect(store.connections).toHaveLength(2)
     expect(store.connections[1]).toMatchObject({ endpoint: 'http://10.0.0.66:9000', accessKeyId: 'ROOTKEY', source: 'discovered' })
+    w.unmount()
   })
 
   it('needs no confirmation when the keys stay with their own host', async () => {
     fakeProd()
     const store = useConnectionsStore()
     const from = store.add({ id: 'a', name: 'nas', endpoint: 'http://10.9.9.1:9000', accessKeyId: 'AK', secretAccessKey: 'SK', kind: 'gos3' })
-    const { vm } = await open('http://10.9.9.1:9000', from)
+    const { w, vm } = await open('http://10.9.9.1:9000', from)
     vm.reuseCredentials = true
     await nextTick()
     expect(document.body.querySelector('[data-testid="reuse-warning"]')).toBeNull()
+    w.unmount()
   })
 })
 
@@ -188,18 +194,20 @@ describe('NewAccessKeyModal with a forged key-creation response (gap-1)', () => 
   it('offers no snippets or downloads for values with line breaks', async () => {
     const { default: NewAccessKeyModal } = await import('~/components/admin/NewAccessKeyModal.vue')
     const forged = { accessKey: 'GOS3X\n[default]\ncredential_process = sh -c evil', secretKey: 'abcdefghijklmnopqrstuvwxyz', status: 'Active' as const, createdAt: '2026-01-01T00:00:00Z' }
-    await mountSuspended(NewAccessKeyModal, { props: { open: true, accessKey: forged, user: 'alice', endpoint: 'http://10.9.9.1:9000', region: 'us-east-1' }, attachTo: document.body })
+    const w = await mountSuspended(NewAccessKeyModal, { props: { open: true, accessKey: forged, user: 'alice', endpoint: 'http://10.9.9.1:9000', region: 'us-east-1' }, attachTo: document.body })
     await vi.waitFor(() => expect(document.body.querySelector('[data-testid="snippet-problem"]')).toBeTruthy())
     expect(document.body.textContent).toContain('unexpected format')
     expect(document.body.textContent).not.toContain('AWS_SECRET_ACCESS_KEY')
     expect([...document.body.querySelectorAll('button')].some(b => b.textContent?.includes('Download'))).toBe(false)
+    w.unmount()
   })
 
   it('offers them for a normal key', async () => {
     const { default: NewAccessKeyModal } = await import('~/components/admin/NewAccessKeyModal.vue')
     const key = { accessKey: 'GOS3AKEXAMPLE', secretKey: 'abcdefghijklmnopqrstuvwxyz0123456789ABCD', status: 'Active' as const, createdAt: '2026-01-01T00:00:00Z' }
-    await mountSuspended(NewAccessKeyModal, { props: { open: true, accessKey: key, user: 'alice', endpoint: 'http://10.9.9.1:9000', region: 'us-east-1' }, attachTo: document.body })
+    const w = await mountSuspended(NewAccessKeyModal, { props: { open: true, accessKey: key, user: 'alice', endpoint: 'http://10.9.9.1:9000', region: 'us-east-1' }, attachTo: document.body })
     await vi.waitFor(() => expect(document.body.textContent).toContain('AWS_SECRET_ACCESS_KEY=abcdefghijklmnopqrstuvwxyz0123456789ABCD'))
     expect(document.body.querySelector('[data-testid="snippet-problem"]')).toBeNull()
+    w.unmount()
   })
 })

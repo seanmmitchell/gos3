@@ -7,6 +7,7 @@ import (
 	"slices"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/seanmmitchell/gos3/internal/storage"
 )
@@ -25,8 +26,49 @@ func optionalTests() []testCase {
 		{"UpdateObjectMetaIfRace", testUpdateObjectMetaIfRace},
 		{"ViewBucketConfig", testViewBucketConfig},
 		{"VersionImporter", testVersionImporter}, // importer.go
+		{"ConditionalVersionImporter", testConditionalVersionImporter},
 		{"Compression", testCompression},
 	}
+}
+
+func testConditionalVersionImporter(e *env) {
+	importer, ok := e.b.(storage.VersionImporter)
+	if !ok {
+		e.t.Skip("backend does not import versions")
+	}
+	e.mkVersioned("conditional-import", storage.VersioningEnabled)
+	w, err := importer.NewVersionWriter(e.ctx, "conditional-import", "key")
+	if err != nil {
+		e.t.Fatal(err)
+	}
+	defer w.Abort()
+	conditional, ok := w.(storage.ConditionalVersionWriter)
+	if !ok {
+		e.t.Skip("backend does not conditionally import versions")
+	}
+	if _, err := w.Write([]byte("older source")); err != nil {
+		e.t.Fatal(err)
+	}
+	// This client write completes after the import writer was opened.
+	latest := e.put("conditional-import", "key", []byte("newer client"))
+	called := false
+	_, err = conditional.CommitIf(e.ctx, storage.ObjectInfo{VersionID: "old-source", LastModified: latest.LastModified.Add(-time.Hour)}, func(current storage.ObjectInfo, found bool) error {
+		called = true
+		if !found || current.VersionID != latest.VersionID {
+			e.t.Errorf("precondition saw stale destination: %+v, found=%v", current, found)
+		}
+		return errCheckRefused
+	})
+	e.wantErr("conditional import refused", err, errCheckRefused)
+	if !called {
+		e.t.Fatal("import precondition did not run")
+	}
+	got, err := e.b.GetObjectInfo(e.ctx, "conditional-import", "key", "")
+	if err != nil || got.VersionID != latest.VersionID {
+		e.t.Fatalf("conditional import hid client write: %+v %v", got, err)
+	}
+	_, err = e.b.GetObjectInfo(e.ctx, "conditional-import", "key", "old-source")
+	e.wantErr("refused imported version is absent", err, storage.ErrVersionNotFound)
 }
 
 func (e *env) conditionalDeleter() storage.ConditionalDeleter {

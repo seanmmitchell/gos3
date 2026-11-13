@@ -25,6 +25,9 @@ func (s *Server) Info() discovery.Info {
 	base = strings.TrimSuffix(base, "/")
 
 	features := []string{"versioning", "object-lock", "multipart"}
+	if s.clusterNode != nil {
+		features = append(features, "cluster")
+	}
 	ep := discovery.Endpoints{
 		S3:  base,
 		All: all,

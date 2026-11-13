@@ -7,6 +7,7 @@
 *.test
 *.out
 coverage.*
+!coverage.generated.json
 
 # runtime data
 /data/
@@ -25,12 +26,14 @@ __pycache__/
 
 # web
 node_modules/
+.pnpm-store/
 web/.nuxt/
 web/.output/
 web/.data/
 web/dist
 web/test-results/
 web/playwright-report/
+web/coverage/
 .DS_Store
 *.log
 .env

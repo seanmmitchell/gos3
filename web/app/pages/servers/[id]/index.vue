@@ -25,6 +25,7 @@ const mode = computed(() => overviewMode(connection.value?.kind, capabilities.va
 const stats = ref<Stats | null>(null)
 const statsError = ref<unknown>(null)
 const statsLoading = ref(false)
+const cluster = useLoader(() => requireAdmin().clusterStatus(), { immediate: false })
 const lastUpdated = ref<number | null>(null)
 const paused = ref(false)
 let controller: AbortController | undefined
@@ -51,6 +52,7 @@ function tick() {
   if (paused.value || mode.value !== 'stats') return
   if (typeof document !== 'undefined' && document.visibilityState === 'hidden') return
   void loadStats()
+	if (serverInfo.value?.backend === 'cluster') void cluster.refresh()
   if (!serverInfo.value && capabilities.value.viewInfo) void refreshInfo()
 }
 onMounted(() => {
@@ -75,10 +77,15 @@ watch([mode, id], ([m]) => {
   else void buckets.refresh()
 }, { immediate: true })
 
+watch([mode, () => serverInfo.value?.backend], ([m, backend]) => {
+  if (m === 'stats' && backend === 'cluster') void cluster.refresh()
+}, { immediate: true })
+
 function refreshAll() {
   if (mode.value === 'stats') void loadStats()
   else void buckets.refresh()
   void refreshInfo()
+	if (serverInfo.value?.backend === 'cluster') void cluster.refresh()
 }
 
 // --- derived ----------------------------------------------------------------
@@ -243,6 +250,50 @@ const storageCards = computed(() => {
           </div>
         </div>
       </div>
+    </UCard>
+
+    <UCard v-if="mode === 'stats' && serverInfo?.backend === 'cluster'">
+      <template #header>
+        <div class="flex items-center justify-between gap-3">
+          <h2 class="font-semibold text-highlighted">Cluster</h2>
+          <UBadge
+            v-if="cluster.data.value"
+            :label="cluster.data.value.available ? 'Quorum available' : 'Quorum unavailable'"
+            :color="cluster.data.value.available ? 'success' : 'error'"
+            variant="subtle"
+          />
+        </div>
+      </template>
+      <CommonErrorAlert v-if="cluster.error.value" :error="cluster.error.value" title="Could not load cluster status" retryable @retry="cluster.refresh" />
+      <div v-if="cluster.data.value" class="space-y-4 text-sm">
+        <dl class="grid gap-x-5 gap-y-2 sm:grid-cols-[auto_1fr_auto_1fr]">
+          <dt class="text-muted">Cluster</dt><dd class="font-mono">{{ cluster.data.value.clusterId }}</dd>
+          <dt class="text-muted">Node</dt><dd class="font-mono">{{ cluster.data.value.nodeId }}</dd>
+          <dt class="text-muted">Leader</dt><dd class="font-mono">{{ cluster.data.value.leaderId || 'Unknown' }}</dd>
+          <dt class="text-muted">Raft lag</dt><dd>{{ formatNumber(cluster.data.value.lag) }} entries</dd>
+          <dt class="text-muted">Placement</dt><dd>{{ cluster.data.value.replicaCount }} replicas</dd>
+          <dt class="text-muted">Write policy</dt><dd>{{ cluster.data.value.minMemoryAcks }} memory · {{ cluster.data.value.minDurableAcks }} durable</dd>
+          <template v-if="cluster.data.value.lastWrite?.operationId">
+            <dt class="text-muted">Last write through node</dt><dd>{{ cluster.data.value.lastWrite.memoryAcks }}/{{ cluster.data.value.minMemoryAcks }} memory · {{ cluster.data.value.lastWrite.durableAcks }}/{{ cluster.data.value.minDurableAcks }} durable · {{ cluster.data.value.lastWrite.consensusCommitted ? 'consensus committed' : 'pending or failed' }}</dd>
+          </template>
+          <template v-if="cluster.data.value.lastRepair?.checkedAt">
+            <dt class="text-muted">Local replica repair</dt><dd>{{ cluster.data.value.lastRepair.repaired }} copies restored · <CommonRelativeTime :value="cluster.data.value.lastRepair.checkedAt" /></dd>
+          </template>
+        </dl>
+        <p v-if="cluster.data.value.error" class="text-error">{{ cluster.data.value.error }}</p>
+        <p v-if="cluster.data.value.lastWrite?.error" class="text-error">Last write through node: {{ cluster.data.value.lastWrite.error }}</p>
+        <p v-if="cluster.data.value.lastRepair?.error" class="text-error">Local replica repair: {{ cluster.data.value.lastRepair.error }}</p>
+        <div>
+          <h3 class="mb-2 font-medium text-highlighted">Peers</h3>
+          <ul class="space-y-1">
+            <li v-for="peer in cluster.data.value.peers" :key="peer.id" class="flex items-center justify-between gap-3 rounded-md border border-default px-3 py-2">
+              <span class="font-mono">{{ peer.id }}<span v-if="peer.local" class="ml-2 font-sans text-muted">this node</span><span v-if="peer.leader" class="ml-2 font-sans text-muted">leader</span></span>
+              <span class="text-muted">{{ peer.progressKnown ? `${formatNumber(peer.lag ?? 0)} entries behind` : 'Progress available on leader' }}</span>
+            </li>
+          </ul>
+        </div>
+      </div>
+      <USkeleton v-else-if="cluster.loading.value" class="h-24 w-full" />
     </UCard>
 
     <!-- Metrics dashboard -->

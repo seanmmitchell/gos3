@@ -8,16 +8,21 @@ package s3
 //     redirects;
 //   - notification: no events are delivered;
 //   - logging: no server access log objects are written;
-//   - replication: nothing is replicated;
 //   - accelerate: there is no accelerate endpoint;
 //   - request payment: only BucketOwner is supported.
+// Bucket replication rules below are executed by the asynchronous worker.
 
 import (
+	"bytes"
+	"context"
+	"encoding/json"
 	"encoding/xml"
+	"errors"
 	"net/http"
 	"strconv"
 	"strings"
 
+	"github.com/seanmmitchell/gos3/internal/iam"
 	"github.com/seanmmitchell/gos3/internal/s3err"
 	"github.com/seanmmitchell/gos3/internal/storage"
 )
@@ -796,21 +801,76 @@ func (s *Server) handleGetBucketReplication(w http.ResponseWriter, r *http.Reque
 	return writeXML(w, http.StatusOK, c)
 }
 
-// handlePutBucketReplication implements PutBucketReplication (see
-// replicationConfiguration.validate). Versioning must be Enabled on the
-// bucket (InvalidRequest). The configuration is stored only: gos3 does not
-// replicate objects.
+// handlePutBucketReplication stores only rules whose full XML can be
+// executed by the replication worker. Versioning must be Enabled on the
+// source bucket (InvalidRequest).
 func (s *Server) handlePutBucketReplication(w http.ResponseWriter, r *http.Request, rc *reqContext) error {
 	ctx := r.Context()
-	if _, err := s.bucketInfo(ctx, rc); err != nil {
+	sourceInfo, err := s.bucketInfo(ctx, rc)
+	if err != nil {
+		return err
+	}
+	raw, err := s.readConfigBody(r, rc, maxBucketConfigBody)
+	if err != nil {
 		return err
 	}
 	var c replicationConfiguration
-	if err := s.decodeConfigBody(r, rc, maxBucketConfigBody, &c); err != nil {
+	if err := decodeXML(raw, &c); err != nil {
 		return err
 	}
-	if err := c.validate(); err != nil {
+	role, rules, err := CompileReplicationRules(raw)
+	if err != nil {
 		return err
+	}
+	if s.iam == nil {
+		return replArgError("Role", "A local replication role is required.")
+	}
+	if _, err := s.iam.GetReplicationRole(ctx, role); err != nil {
+		if errors.Is(err, iam.ErrReplicationRoleNotFound) {
+			return replArgError("Role", "The local replication role does not exist.")
+		}
+		return err
+	}
+	for _, rule := range rules {
+		if rule.Destination == rc.bucket {
+			return replArgError("Destination", "The destination must differ from the source bucket.")
+		}
+		destination, err := s.backend.GetBucket(ctx, rule.Destination)
+		if errors.Is(err, storage.ErrBucketNotFound) {
+			return replArgError("Destination", "The destination bucket does not exist in this namespace.")
+		}
+		if err != nil {
+			return bucketError(err, rule.Destination)
+		}
+		if destination.Versioning != storage.VersioningEnabled {
+			return s3err.ErrInvalidRequest.WithMessage("Versioning must be 'Enabled' on the destination bucket")
+		}
+		caps, err := storage.CapsOf(ctx, s.backend, rule.Destination)
+		if err != nil {
+			return bucketError(err, rule.Destination)
+		}
+		if !caps.Import {
+			return replArgError("Destination", "The destination bucket cannot preserve imported versions.")
+		}
+		if !rule.Enabled {
+			continue
+		}
+		actions := []string{iam.ReplicateObjectAction}
+		if sourceInfo.ObjectLockEnabled {
+			if !destination.ObjectLockEnabled {
+				return replArgError("Destination", "The destination bucket must support object lock to preserve protected versions.")
+			}
+			actions = append(actions, iam.ReplicateObjectLockAction)
+		}
+		if len(rule.Tags) > 0 {
+			actions = append(actions, iam.ReplicateTagsAction)
+		}
+		if rule.DeleteMarkers {
+			actions = append(actions, iam.ReplicateDeleteAction)
+		}
+		if !s.iam.CanReplicate(ctx, role, rc.bucket, rule.Destination, rule.Prefix, actions...) {
+			return replArgError("Role", "The replication role does not permit this rule's destination, prefix, and actions.")
+		}
 	}
 	unlock := s.lockBucketState(rc.bucket)
 	defer unlock()
@@ -822,8 +882,42 @@ func (s *Server) handlePutBucketReplication(w http.ResponseWriter, r *http.Reque
 		return s3err.ErrInvalidRequest.WithMessage("Versioning must be 'Enabled' on the bucket to apply a replication configuration")
 	}
 	c.XMLNS = s3Namespace
-	if err := s.storeBucketConfig(ctx, rc, storage.ConfigReplication, c); err != nil {
+	canonical, err := xml.Marshal(c)
+	if err != nil {
 		return err
+	}
+	state, err := json.Marshal(ReplicationState{Hash: ReplicationRuleHash(canonical), ActivatedAt: s.now().UTC()})
+	if err != nil {
+		return err
+	}
+	if atomic, ok := s.backend.(interface {
+		PutReplicationConfiguration(context.Context, string, []byte, []byte) error
+	}); ok {
+		if err := atomic.PutReplicationConfiguration(ctx, rc.bucket, canonical, state); err != nil {
+			return bucketError(err, rc.bucket)
+		}
+		s.invalidateBucketConfig(rc.bucket)
+	} else {
+		previous, err := s.backend.GetBucketConfig(ctx, rc.bucket, storage.ConfigReplication)
+		if err != nil && !errors.Is(err, storage.ErrConfigNotFound) {
+			return bucketError(err, rc.bucket)
+		}
+		if bytes.Equal(previous, canonical) {
+			oldState, err := s.backend.GetBucketConfig(ctx, rc.bucket, storage.ConfigReplicationState)
+			if err != nil && !errors.Is(err, storage.ErrConfigNotFound) {
+				return bucketError(err, rc.bucket)
+			}
+			var activation ReplicationState
+			if json.Unmarshal(oldState, &activation) == nil && activation.Hash == ReplicationRuleHash(canonical) && !activation.ActivatedAt.IsZero() {
+				state = oldState
+			}
+		}
+		if err := s.backend.PutBucketConfig(ctx, rc.bucket, storage.ConfigReplicationState, state); err != nil {
+			return bucketError(err, rc.bucket)
+		}
+		if err := s.storeBucketConfig(ctx, rc, storage.ConfigReplication, c); err != nil {
+			return err
+		}
 	}
 	writeEmpty(w, http.StatusOK)
 	return nil
@@ -833,6 +927,16 @@ func (s *Server) handlePutBucketReplication(w http.ResponseWriter, r *http.Reque
 func (s *Server) handleDeleteBucketReplication(w http.ResponseWriter, r *http.Request, rc *reqContext) error {
 	unlock := s.lockBucketState(rc.bucket)
 	defer unlock()
+	if atomic, ok := s.backend.(interface {
+		DeleteReplicationConfiguration(context.Context, string) error
+	}); ok {
+		if err := atomic.DeleteReplicationConfiguration(r.Context(), rc.bucket); err != nil {
+			return bucketError(err, rc.bucket)
+		}
+		s.invalidateBucketConfig(rc.bucket)
+		writeEmpty(w, http.StatusNoContent)
+		return nil
+	}
 	return s.deleteBucketConfigResponse(w, r, rc, storage.ConfigReplication)
 }
 

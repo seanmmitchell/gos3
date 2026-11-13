@@ -189,6 +189,14 @@ type VersionWriter interface {
 	Abort() error
 }
 
+// ConditionalVersionWriter checks the latest version in the same atomic
+// publication that imports a version. The callback may run again on a retry;
+// it must not call the backend. found includes delete markers.
+type ConditionalVersionWriter interface {
+	VersionWriter
+	CommitIf(ctx context.Context, info ObjectInfo, check func(current ObjectInfo, found bool) error) (ObjectInfo, error)
+}
+
 // ValidImportedVersionID reports whether id may be passed to
 // VersionWriter.Commit: NullVersionID or 1-64 URL-safe characters.
 func ValidImportedVersionID(id string) bool {

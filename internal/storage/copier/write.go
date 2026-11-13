@@ -86,6 +86,19 @@ func WriteVersion(ctx context.Context, b storage.Backend, bucket, key string, v 
 	return w.write(ctx, key, v, MapVersionID(v.VersionID), body, mode)
 }
 
+// WriteVersionIf imports only when the destination precondition still holds
+// at publication. Unsupported conditional import fails closed.
+func WriteVersionIf(ctx context.Context, b storage.Backend, bucket, key string, v storage.ObjectInfo, body io.Reader, pol Policy, check func(storage.ObjectInfo, bool) error) (Written, error) {
+	if err := pol.Validate(); err != nil {
+		return Written{}, err
+	}
+	if check == nil {
+		return Written{}, errors.New("copier: nil import precondition")
+	}
+	w := &writer{b: b, bucket: bucket, pol: pol, checkImport: check}
+	return w.write(ctx, key, v, MapVersionID(v.VersionID), body, WriteImport)
+}
+
 // writer writes versions to one target bucket, caching what it learns of
 // the bucket for the duration of one sync.
 type writer struct {
@@ -94,7 +107,20 @@ type writer struct {
 	pol    Policy
 	info   *storage.BucketInfo
 	// prepared caches the outcome of PrepareEncryption per provider.
-	prepared map[string]error
+	prepared    map[string]error
+	checkImport func(storage.ObjectInfo, bool) error
+}
+
+func (w *writer) commitImport(ctx context.Context, vw storage.VersionWriter, info storage.ObjectInfo) (storage.ObjectInfo, error) {
+	if w.checkImport == nil {
+		return vw.Commit(ctx, info)
+	}
+	conditional, ok := vw.(storage.ConditionalVersionWriter)
+	if !ok {
+		_ = vw.Abort()
+		return storage.ObjectInfo{}, storage.ErrNotSupported
+	}
+	return conditional.CommitIf(ctx, info, w.checkImport)
 }
 
 // bucketInfo returns the target bucket's info (read once).
@@ -295,7 +321,7 @@ func (w *writer) write(ctx context.Context, key string, v storage.ObjectInfo, id
 				return Written{}, err
 			}
 			info := storage.ObjectInfo{ObjectMeta: meta, VersionID: id, LastModified: v.LastModified}
-			out, err := vw.Commit(ctx, info)
+			out, err := w.commitImport(ctx, vw, info)
 			if err != nil {
 				return Written{}, err
 			}
@@ -326,7 +352,7 @@ func (w *writer) writeMarker(ctx context.Context, key string, v storage.ObjectIn
 		vw, err := w.importWriter(ctx, key, storage.WriteOptions{})
 		switch {
 		case err == nil:
-			out, err := vw.Commit(ctx, storage.ObjectInfo{VersionID: id, DeleteMarker: true, LastModified: v.LastModified})
+			out, err := w.commitImport(ctx, vw, storage.ObjectInfo{ObjectMeta: storage.ObjectMeta{ReplicationOrigin: v.ReplicationOrigin}, VersionID: id, DeleteMarker: true, LastModified: v.LastModified})
 			if err != nil {
 				return Written{}, err
 			}

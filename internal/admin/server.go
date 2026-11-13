@@ -12,6 +12,7 @@ import (
 	"github.com/seanmmitchell/gos3/internal/config"
 	"github.com/seanmmitchell/gos3/internal/discovery"
 	"github.com/seanmmitchell/gos3/internal/metrics"
+	"github.com/seanmmitchell/gos3/internal/s3err"
 	"github.com/seanmmitchell/gos3/internal/storage"
 )
 
@@ -246,6 +247,10 @@ func (a *api) putConfig(rc *reqCtx) (int, any, error) {
 		return nil
 	})
 	if err != nil {
+		if errors.Is(err, s3err.ErrServiceUnavailable) || errors.Is(err, storage.ErrBackingUnavailable) ||
+			errors.Is(err, context.DeadlineExceeded) {
+			return 0, nil, a.toAPIError(err)
+		}
 		// The store validates and persists: file system failures are server
 		// errors, anything else is a rejected document.
 		var pe *fs.PathError

@@ -8,6 +8,7 @@ import (
 	"maps"
 	"slices"
 	"strings"
+	"time"
 
 	"github.com/seanmmitchell/gos3/internal/auth"
 	"github.com/seanmmitchell/gos3/internal/s3err"
@@ -28,7 +29,12 @@ func (m *Manager) lookupCredentials(accessKey string) (string, auth.Identity, er
 	if m.opts.RootAccessKey != "" && accessKey == m.opts.RootAccessKey {
 		return m.opts.RootSecretKey, auth.Identity{AccessKey: accessKey, User: auth.RootUser, IsRoot: true}, nil
 	}
-	st := m.snapshot()
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	st, err := m.readSnapshot(ctx)
+	if err != nil {
+		return "", auth.Identity{}, err
+	}
 	k := st.keys[accessKey]
 	if k == nil || k.Key.Status != KeyActive {
 		return "", auth.Identity{}, s3err.ErrInvalidAccessKeyID
@@ -73,7 +79,10 @@ func (m *Manager) listUsers(ctx context.Context) ([]User, error) {
 	if err := ctxErr(ctx); err != nil {
 		return nil, err
 	}
-	st := m.snapshot()
+	st, err := m.readSnapshot(ctx)
+	if err != nil {
+		return nil, err
+	}
 	out := make([]User, 0, len(st.users))
 	for _, name := range slices.Sorted(maps.Keys(st.users)) {
 		out = append(out, publicUser(st, st.users[name]))
@@ -85,7 +94,10 @@ func (m *Manager) getUser(ctx context.Context, name string) (User, error) {
 	if err := ctxErr(ctx); err != nil {
 		return User{}, err
 	}
-	st := m.snapshot()
+	st, err := m.readSnapshot(ctx)
+	if err != nil {
+		return User{}, err
+	}
 	u := st.users[name]
 	if u == nil {
 		return User{}, ErrUserNotFound
@@ -131,7 +143,7 @@ func (m *Manager) createUser(ctx context.Context, spec UserSpec) (User, error) {
 		return User{}, err
 	}
 	var out User
-	err := m.mutate(func(st *state) error {
+	err := m.mutate(ctx, func(st *state) error {
 		// A name taken by an access key (see keyIDConflict) is reported like
 		// an existing user, so the answer does not tell which one it is.
 		if st.users[spec.Name] != nil || st.keys[spec.Name] != nil || spec.Name == m.opts.RootAccessKey {
@@ -177,7 +189,7 @@ func (m *Manager) updateUser(ctx context.Context, name string, upd UserUpdate) (
 		}
 	}
 	var out User
-	err := m.mutate(func(st *state) error {
+	err := m.mutate(ctx, func(st *state) error {
 		old := st.users[name]
 		if old == nil {
 			return ErrUserNotFound
@@ -214,7 +226,7 @@ func (m *Manager) deleteUser(ctx context.Context, name string) error {
 	if strings.EqualFold(name, auth.RootUser) {
 		return ErrRootImmutable
 	}
-	return m.mutate(func(st *state) error {
+	return m.mutate(ctx, func(st *state) error {
 		u := st.users[name]
 		if u == nil {
 			return ErrUserNotFound
@@ -253,7 +265,7 @@ func (m *Manager) createAccessKey(ctx context.Context, user, description, access
 		}
 	}
 	var out AccessKey
-	err := m.mutate(func(st *state) error {
+	err := m.mutate(ctx, func(st *state) error {
 		old := st.users[user]
 		if old == nil {
 			return ErrUserNotFound
@@ -318,7 +330,7 @@ func (m *Manager) updateAccessKey(ctx context.Context, owner, accessKey, status 
 	if !ok {
 		return wrapf(ErrInvalidKey, fmt.Sprintf("status must be %s or %s", KeyActive, KeyInactive))
 	}
-	return m.mutate(func(st *state) error {
+	return m.mutate(ctx, func(st *state) error {
 		k := st.keys[accessKey]
 		if k == nil || (owner != "" && k.User != owner) {
 			return ErrKeyNotFound
@@ -334,7 +346,11 @@ func (m *Manager) accessKeyOwner(ctx context.Context, accessKey string) (string,
 	if err := ctxErr(ctx); err != nil {
 		return "", err
 	}
-	k := m.snapshot().keys[accessKey]
+	st, err := m.readSnapshot(ctx)
+	if err != nil {
+		return "", err
+	}
+	k := st.keys[accessKey]
 	if k == nil {
 		return "", ErrKeyNotFound
 	}
@@ -349,7 +365,7 @@ func (m *Manager) deleteAccessKey(ctx context.Context, owner, accessKey string) 
 	if m.opts.RootAccessKey != "" && accessKey == m.opts.RootAccessKey {
 		return ErrRootImmutable
 	}
-	return m.mutate(func(st *state) error {
+	return m.mutate(ctx, func(st *state) error {
 		k := st.keys[accessKey]
 		if k == nil || (owner != "" && k.User != owner) {
 			return ErrKeyNotFound
@@ -396,7 +412,10 @@ func (m *Manager) listPolicies(ctx context.Context) ([]NamedPolicy, error) {
 	if err := ctxErr(ctx); err != nil {
 		return nil, err
 	}
-	st := m.snapshot()
+	st, err := m.readSnapshot(ctx)
+	if err != nil {
+		return nil, err
+	}
 	out := make([]NamedPolicy, 0, len(builtinOrder)+len(st.policies))
 	for _, name := range builtinOrder {
 		out = append(out, copyPolicy(builtinPolicies[name]))
@@ -411,7 +430,11 @@ func (m *Manager) getPolicy(ctx context.Context, name string) (NamedPolicy, erro
 	if err := ctxErr(ctx); err != nil {
 		return NamedPolicy{}, err
 	}
-	p := m.snapshot().policy(name)
+	st, err := m.readSnapshot(ctx)
+	if err != nil {
+		return NamedPolicy{}, err
+	}
+	p := st.policy(name)
 	if p == nil {
 		return NamedPolicy{}, ErrPolicyNotFound
 	}
@@ -442,7 +465,7 @@ func (m *Manager) putPolicy(ctx context.Context, name, description string, doc P
 		return NamedPolicy{}, wrapf(ErrInvalidPolicy, fmt.Sprintf("Policy exceeds the maximum allowed document size of %d bytes.", MaxPolicySize))
 	}
 	var out NamedPolicy
-	err := m.mutate(func(st *state) error {
+	err := m.mutate(ctx, func(st *state) error {
 		now := m.now()
 		p := &NamedPolicy{Name: name, Description: description, Document: d, CreatedAt: now, UpdatedAt: now}
 		if old := st.policies[name]; old != nil {
@@ -467,7 +490,7 @@ func (m *Manager) deletePolicy(ctx context.Context, name string) error {
 	if _, ok := builtinPolicies[name]; ok {
 		return ErrPolicyBuiltin
 	}
-	return m.mutate(func(st *state) error {
+	return m.mutate(ctx, func(st *state) error {
 		if st.policies[name] == nil {
 			return ErrPolicyNotFound
 		}
@@ -496,7 +519,10 @@ func (m *Manager) effectivePolicies(ctx context.Context, id auth.Identity) ([]Na
 	case id.IsRoot:
 		return []NamedPolicy{copyPolicy(builtinPolicies[PolicyAdmin])}, nil
 	}
-	st := m.snapshot()
+	st, err := m.readSnapshot(ctx)
+	if err != nil {
+		return nil, err
+	}
 	u := st.resolveUser(id)
 	if u == nil {
 		return nil, ErrUserNotFound

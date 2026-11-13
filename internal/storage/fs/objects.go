@@ -43,7 +43,8 @@ type commitReq struct {
 	// imported, when set, stores the version under the identity it has on
 	// another backend (import.go) instead of assigning a new one; opts is
 	// then ignored.
-	imported *importedIdentity
+	imported    *importedIdentity
+	checkImport func(storage.ObjectInfo, bool) error
 }
 
 // commitObject publishes a new version in one write transaction, evaluating
@@ -78,6 +79,19 @@ func (b *Backend) commitObject(req commitReq) (storage.ObjectInfo, error) {
 			StoredSize:  req.storedSize,
 		}
 		if req.imported != nil {
+			if req.checkImport != nil {
+				latest, _, err := latestVersion(bb, req.key)
+				if err != nil {
+					return err
+				}
+				var current storage.ObjectInfo
+				if latest != nil {
+					current = latest.info(req.bucket, req.key, true)
+				}
+				if err := req.checkImport(current, latest != nil); err != nil {
+					return err
+				}
+			}
 			rec.VersionID = req.imported.versionID
 			rec.LastModified = req.imported.lastModified
 			rec.DeleteMarker = req.imported.deleteMarker

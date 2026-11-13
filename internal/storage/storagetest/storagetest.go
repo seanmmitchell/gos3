@@ -89,6 +89,11 @@ type Options struct {
 	// versions of keyMarker that are newer than the deleted one, as the
 	// storage.Backend contract allows; skipping a version still fails.
 	OpaqueVersionIDs bool
+	// StressDivisor reduces the number of concurrent writers and operations
+	// in the expensive race and mixed-operation cases. Zero means the full
+	// default load. Durable distributed backends can use 2 while retaining
+	// concurrent contention and all correctness assertions.
+	StressDivisor int
 }
 
 // suite is the configuration shared by all subtests of one run.
@@ -99,6 +104,7 @@ type suite struct {
 
 	noControlKeys    bool // Options.NoControlKeys
 	opaqueVersionIDs bool // Options.OpaqueVersionIDs
+	stressDivisor    int
 }
 
 // skipListed skips t when Options.Skip lists it.
@@ -121,6 +127,7 @@ func RunWithOptions(t *testing.T, newBackend Factory, opts Options) {
 		skip:             opts.Skip,
 		noControlKeys:    opts.NoControlKeys,
 		opaqueVersionIDs: opts.OpaqueVersionIDs,
+		stressDivisor:    max(1, opts.StressDivisor),
 	}
 	for _, g := range groups() {
 		t.Run(g.name, func(t *testing.T) {

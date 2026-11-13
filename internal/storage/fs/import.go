@@ -186,6 +186,10 @@ func (w *versionWriter) Write(p []byte) (int, error) {
 // Commit stores the written data as the newest version of the key with the
 // identity given by info (see storage.VersionWriter).
 func (w *versionWriter) Commit(ctx context.Context, info storage.ObjectInfo) (storage.ObjectInfo, error) {
+	return w.CommitIf(ctx, info, nil)
+}
+
+func (w *versionWriter) CommitIf(ctx context.Context, info storage.ObjectInfo, check func(storage.ObjectInfo, bool) error) (storage.ObjectInfo, error) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	if w.done {
@@ -230,8 +234,11 @@ func (w *versionWriter) Commit(ctx context.Context, info storage.ObjectInfo) (st
 	if !info.DeleteMarker {
 		meta = cloneMeta(info.ObjectMeta)
 		meta.Encryption = w.encryption
+	} else {
+		meta.ReplicationOrigin = info.ReplicationOrigin
 	}
 	return w.b.commitObject(commitReq{
+		checkImport: check,
 		bucket:      w.bucket,
 		bucketID:    w.bucketID,
 		key:         w.key,

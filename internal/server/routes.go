@@ -48,6 +48,16 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	w, finish := s.guardWrites(w)
 	defer finish()
 	r = withConnTLS(r)
+	if s.clusterNode != nil && r.URL.Path != HealthPath && r.URL.Path != "/minio/health/live" && r.URL.Path != admin.Prefix+"/cluster" {
+		ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
+		err := s.settings.Refresh(ctx)
+		cancel()
+		if err != nil {
+			s.log.Warn("cluster read barrier unavailable", "err", err)
+			s.writeClusterUnavailable(w, r)
+			return
+		}
+	}
 	st := s.settings.Get()
 	known := s.hosts.known(r.Host, &st)
 	if !known {
@@ -110,6 +120,18 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		r = r.WithContext(s3.WithUnknownHost(r.Context()))
 	}
 	s.s3.ServeHTTP(w, r)
+}
+
+func (s *Server) writeClusterUnavailable(w http.ResponseWriter, r *http.Request) {
+	if (r.URL.Path == "/_gos3" || strings.HasPrefix(r.URL.Path, SystemPrefix)) &&
+		!isVirtualHost(r.Host, s.settings.Get().Domains) {
+		writeJSONError(w, http.StatusServiceUnavailable, "ServiceUnavailable", "cluster consensus is unavailable")
+		return
+	}
+	w.Header().Set("Content-Type", "application/xml")
+	w.Header().Set("Retry-After", "1")
+	w.WriteHeader(http.StatusServiceUnavailable)
+	_, _ = io.WriteString(w, "<Error><Code>ServiceUnavailable</Code><Message>Cluster consensus is unavailable.</Message></Error>")
 }
 
 // serveSystem routes /_gos3/... paths.
@@ -267,6 +289,38 @@ func (s *Server) serveMetrics(w http.ResponseWriter, r *http.Request, st *config
 	}
 	if st.Discovery.Enabled {
 		extra["discovery_peers"] = float64(len(s.disc.Peers()))
+	}
+	if s.clusterNode != nil {
+		status := s.clusterNode.Status(ctx)
+		if status.Available {
+			extra["cluster_available"] = 1
+		} else {
+			extra["cluster_available"] = 0
+		}
+		if status.Leader {
+			extra["cluster_leader"] = 1
+		} else {
+			extra["cluster_leader"] = 0
+		}
+		extra["cluster_commit_index"] = float64(status.CommitIndex)
+		extra["cluster_applied_index"] = float64(status.AppliedIndex)
+		extra["cluster_lag"] = float64(status.Lag)
+		extra["cluster_replica_count"] = float64(status.ReplicaCount)
+		extra["cluster_min_memory_acks"] = float64(status.MinMemoryAcks)
+		extra["cluster_min_durable_acks"] = float64(status.MinDurableAcks)
+		extra["cluster_last_write_memory_acks"] = float64(status.LastWrite.MemoryAcks)
+		extra["cluster_last_write_durable_acks"] = float64(status.LastWrite.DurableAcks)
+		extra["cluster_last_repair_repaired"] = float64(status.LastRepair.Repaired)
+		if status.LastRepair.Error != "" {
+			extra["cluster_last_repair_failed"] = 1
+		} else {
+			extra["cluster_last_repair_failed"] = 0
+		}
+		if status.LastWrite.ConsensusCommitted {
+			extra["cluster_last_write_committed"] = 1
+		} else {
+			extra["cluster_last_write_committed"] = 0
+		}
 	}
 	var buf bytes.Buffer
 	if err := s.metrics.WritePrometheus(&buf, extra); err != nil {

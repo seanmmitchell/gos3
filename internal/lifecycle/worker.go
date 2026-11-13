@@ -194,6 +194,22 @@ func (w *Worker) loop(ctx context.Context, done chan struct{}) {
 	var last time.Time // end of the last scheduled pass (wall clock)
 	for {
 		interval, enabled := w.settings()
+		if enabled {
+			if leader, ok := w.backend.(interface{ IsClusterLeader() bool }); ok && !leader.IsClusterLeader() {
+				poll := min(interval, 5*time.Second)
+				timer := time.NewTimer(poll)
+				select {
+				case <-ctx.Done():
+				case <-w.wake:
+				case <-timer.C:
+				}
+				timer.Stop()
+				if ctx.Err() != nil {
+					return
+				}
+				continue
+			}
+		}
 		var (
 			timer *time.Timer
 			fire  <-chan time.Time
@@ -266,6 +282,9 @@ func (w *Worker) run(ctx context.Context, now time.Time) (Stats, error) {
 	var st Stats
 	if w.backend == nil {
 		return st, errors.New("lifecycle: no storage backend")
+	}
+	if leader, ok := w.backend.(interface{ IsClusterLeader() bool }); ok && !leader.IsClusterLeader() {
+		return st, nil
 	}
 	if err := ctx.Err(); err != nil {
 		return st, err
