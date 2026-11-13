@@ -145,12 +145,14 @@ func admitWrite(ctx context.Context, operationID string, payload []byte, selecte
 		}(id)
 	}
 	remaining := len(selected)
+	var failures []error
 	for remaining > 0 {
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
 		case r := <-results:
 			if r.err != nil {
+				failures = append(failures, fmt.Errorf("replica %s: %w", r.id, r.err))
 				remaining--
 				continue
 			}
@@ -172,7 +174,7 @@ func admitWrite(ctx context.Context, operationID string, payload []byte, selecte
 			}
 		}
 	}
-	return fmt.Errorf("operation %s: %w", operationID, acks.Require())
+	return fmt.Errorf("operation %s: %w", operationID, errors.Join(append([]error{acks.Require()}, failures...)...))
 }
 
 // AdmitProposal binds replica staging and the Raft command to the same

@@ -337,6 +337,9 @@ func (r remoteReplica) request(ctx context.Context, path, id string, data []byte
 		return err
 	}
 	req.Header.Set("X-Gos3-Operation-ID", id)
+	// These operations are idempotent under their operation ID. Let the
+	// transport replay them if a reused connection loses its response.
+	req.Header.Set("Idempotency-Key", id)
 	req.Header.Set("X-Gos3-Import-Fingerprint", r.importFingerprint)
 	if digest != nil {
 		req.Header.Set("X-Gos3-SHA256", hex.EncodeToString(digest[:]))

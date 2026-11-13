@@ -6,6 +6,7 @@ import (
 	"errors"
 	"path/filepath"
 	"slices"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -78,6 +79,8 @@ func TestAdmissionNeverPublishesBelowBothThresholds(t *testing.T) {
 	progress := func(m, d int) { memory, durable = m, d }
 	if err := admitWrite(ctx, "op-1", []byte("payload"), selected, policy, nodes, publish, progress); !errors.Is(err, ErrInsufficientAcks) {
 		t.Fatalf("expected durable threshold failure, got %v", err)
+	} else if !strings.Contains(err.Error(), "replica two: durable store unavailable") || !strings.Contains(err.Error(), "replica three: memory unavailable") {
+		t.Fatalf("admission discarded replica failures: %v", err)
 	}
 	if memory != 2 || durable != 1 {
 		t.Fatalf("failed write progress = %d memory, %d durable", memory, durable)
