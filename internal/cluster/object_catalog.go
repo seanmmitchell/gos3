@@ -315,11 +315,15 @@ func (c *ObjectCatalog) putVersion(ctx context.Context, intent ObjectPutIntent, 
 		if err != nil {
 			return storage.ObjectInfo{}, err
 		}
-		transaction.Conditions = append(transaction.Conditions, MetadataCondition{Namespace: MetadataVersions, Key: versionObjectKey(intent.Bucket, intent.Key, newer.Info.VersionID), Exists: true, Value: newerRaw})
+		expectedNewer := newerRaw
+		if intent.CheckLatest != nil && latestFound && newer.Info.VersionID == current.VersionID {
+			expectedNewer = currentRaw
+		}
+		transaction.Conditions = append(transaction.Conditions, MetadataCondition{Namespace: MetadataVersions, Key: versionObjectKey(intent.Bucket, intent.Key, newer.Info.VersionID), Exists: true, Value: expectedNewer})
 		transaction.Changes = append(transaction.Changes, MetadataCommand{Namespace: MetadataVersions, Key: versionObjectKey(intent.Bucket, intent.Key, newer.Info.VersionID), Value: updated})
 	}
 	transaction.Conditions = append(transaction.Conditions, intent.Conditions...)
-	if intent.CheckLatest != nil && latestFound && current.VersionID != version {
+	if intent.CheckLatest != nil && latestFound && current.VersionID != version && (newerRaw == nil || newer.Info.VersionID != current.VersionID) {
 		transaction.Conditions = append(transaction.Conditions, MetadataCondition{Namespace: MetadataVersions, Key: versionObjectKey(intent.Bucket, intent.Key, current.VersionID), Exists: true, Value: currentRaw})
 	}
 	transaction.PrefixDigests = append(transaction.PrefixDigests, intent.PrefixDigests...)
