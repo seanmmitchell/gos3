@@ -54,3 +54,34 @@ func TestClusterReplicationRulesAndActivationCommitTogether(t *testing.T) {
 		}
 	}
 }
+
+func TestIdenticalReplicationConfigAcrossVotersPreservesActivation(t *testing.T) {
+	nodes := newTwoNodeCluster(t)
+	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+	defer cancel()
+	a, b := NewS3Backend(nodes["a"]), NewS3Backend(nodes["b"])
+	if err := a.CreateBucket(ctx, "source", storage.CreateBucketOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	if err := a.SetBucketVersioning(ctx, "source", storage.VersioningEnabled); err != nil {
+		t.Fatal(err)
+	}
+	rules := []byte("identical rules")
+	first := []byte(`{"hash":"same","activatedAt":"2026-11-01T00:00:00Z"}`)
+	later := []byte(`{"hash":"same","activatedAt":"2026-11-02T00:00:00Z"}`)
+	if err := a.PutReplicationConfiguration(ctx, "source", rules, first); err != nil {
+		t.Fatal(err)
+	}
+	if err := b.PutReplicationConfiguration(ctx, "source", rules, later); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := a.GetBucketConfig(ctx, "source", storage.ConfigReplicationState); err != nil || !bytes.Equal(got, first) {
+		t.Fatalf("identical update reset activation: %s, %v", got, err)
+	}
+	if err := b.PutReplicationConfiguration(ctx, "source", []byte("changed rules"), later); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := a.GetBucketConfig(ctx, "source", storage.ConfigReplicationState); err != nil || !bytes.Equal(got, later) {
+		t.Fatalf("changed rules did not advance activation: %s, %v", got, err)
+	}
+}

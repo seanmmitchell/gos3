@@ -546,7 +546,7 @@ describe('ResticTab', () => {
     await connect()
     const { w } = await mountInApp(ResticTab, { bucket: 'photos' })
     await vi.waitFor(() => expect(w.find('[data-testid="snapshot-readonly"]').exists(), w.text()).toBe(true))
-    expect(w.find('[data-testid="recovery-denied"]').exists()).toBe(true)
+    await vi.waitFor(() => expect(w.find('[data-testid="recovery-denied"]').exists(), w.text()).toBe(true))
     expect(w.find('[data-testid="snapshot-form"]').exists()).toBe(false)
     expect(w.text()).not.toContain('Snapshot now')
     expect(w.text()).not.toContain('Reveal credentials')

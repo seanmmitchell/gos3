@@ -78,6 +78,21 @@ func (w *versionWriter) Commit(ctx context.Context, info storage.ObjectInfo) (st
 	})
 }
 
+func (w *versionWriter) CommitIf(ctx context.Context, info storage.ObjectInfo, check func(storage.ObjectInfo, bool) error) (storage.ObjectInfo, error) {
+	if check == nil {
+		return w.Commit(ctx, info)
+	}
+	conditional, ok := w.w.(storage.ConditionalVersionWriter)
+	if !ok {
+		_ = w.Abort()
+		return storage.ObjectInfo{}, storage.ErrNotSupported
+	}
+	cb := &cbTracker{}
+	return w.commit(ctx, cb, func() (storage.ObjectInfo, error) {
+		return conditional.CommitIf(ctx, info, func(current storage.ObjectInfo, found bool) error { return cb.note(check(current, found)) })
+	})
+}
+
 // errNoImportInto is the error for bucket, whose primary on backing b (a
 // bucket of kind) cannot receive imported versions; cause is the backing's
 // refusal, if any. It wraps errors.ErrUnsupported and

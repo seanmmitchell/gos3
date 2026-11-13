@@ -52,6 +52,10 @@ func TestOfflineClusterMigrationExportsVerifiedVoters(t *testing.T) {
 	if len(got.Buckets) != 1 || len(got.Buckets[0].Versions) != 2 {
 		t.Fatalf("migrated inventory: %+v", got.Buckets)
 	}
+	oldBuckets, err := source.ListBuckets(ctx)
+	if err != nil || got.Buckets[0].InstanceID != oldBuckets[0].InstanceID {
+		t.Fatalf("migration changed bucket identity: %v", err)
+	}
 	newCfg := config.ClusterConfig{Enabled: true, ID: "new-cluster", NodeID: "c",
 		Peers:        []config.ClusterPeer{{ID: "c", URL: "https://c.example:9443"}, {ID: "d", URL: "https://d.example:9443"}},
 		ReplicaCount: 2, MinMemoryAcks: 2, MinDurableAcks: 2, StageMemoryBytes: 1 << 20}

@@ -2,12 +2,48 @@ package cluster
 
 import (
 	"context"
+	"encoding/hex"
 	"errors"
 	"testing"
 	"time"
 
 	"github.com/seanmmitchell/gos3/internal/storage"
+	"go.etcd.io/bbolt"
 )
+
+func TestCopyJobCreatedBucketSurvivesLostMigrationOutcomes(t *testing.T) {
+	nodes := newTwoNodeCluster(t)
+	ctx, cancel := context.WithTimeout(t.Context(), 15*time.Second)
+	defer cancel()
+	b := NewS3Backend(nodes["a"])
+	created := time.Now().UTC()
+	opts := storage.CreateBucketOptions{Owner: "alice", Import: true}
+	first, err := b.CreateBucketForJob(ctx, "copy_migrated", created, "target", opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	id, err := hex.DecodeString(first.InstanceID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Migration restores the bucket and job records into a fresh Raft log,
+	// without the original operation outcomes.
+	for _, node := range nodes {
+		if err := node.ReadBarrier(ctx); err != nil {
+			t.Fatal(err)
+		}
+		if err := node.consensus.store.db.Update(func(tx *bbolt.Tx) error { return tx.Bucket(raftOpsBucket).Delete(id) }); err != nil {
+			t.Fatal(err)
+		}
+		if err := node.metadata.db.Update(func(tx *bbolt.Tx) error { return tx.Bucket(metadataOutcomes).Delete([]byte(first.InstanceID)) }); err != nil {
+			t.Fatal(err)
+		}
+	}
+	retried, err := NewS3Backend(nodes["b"]).CreateBucketForJob(ctx, "copy_migrated", created, "target", opts)
+	if err != nil || retried.InstanceID != first.InstanceID {
+		t.Fatalf("migrated job could not recognize its bucket: %+v %v", retried, err)
+	}
+}
 
 func TestCopyJobBucketCreateRetriesWithStableIdentity(t *testing.T) {
 	nodes := newTwoNodeCluster(t)

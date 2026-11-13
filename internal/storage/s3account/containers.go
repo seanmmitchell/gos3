@@ -323,6 +323,16 @@ func (w *versionWriter) Commit(ctx context.Context, info storage.ObjectInfo) (st
 	return out, w.c.classify(err)
 }
 
+func (w *versionWriter) CommitIf(ctx context.Context, info storage.ObjectInfo, check func(storage.ObjectInfo, bool) error) (storage.ObjectInfo, error) {
+	conditional, ok := w.VersionWriter.(storage.ConditionalVersionWriter)
+	if !ok {
+		_ = w.Abort()
+		return storage.ObjectInfo{}, storage.ErrNotSupported
+	}
+	out, err := conditional.CommitIf(ctx, info, check)
+	return out, w.c.classify(err)
+}
+
 // partWriter classifies the errors of a container's part writer.
 type partWriter struct {
 	storage.PartWriter

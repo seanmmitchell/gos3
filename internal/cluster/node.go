@@ -9,7 +9,6 @@ import (
 	"net/http"
 	"path/filepath"
 	"sync"
-	"time"
 
 	"crypto/tls"
 
@@ -37,6 +36,14 @@ type Node struct {
 	lastAck    AcknowledgmentStatus
 	repairMu   sync.Mutex
 	lastRepair ReplicaRepairStatus
+	repairs    chan payloadRepair
+}
+
+type payloadRepair struct {
+	id          [16]byte
+	bucket, key string
+	digest      [32]byte
+	size        int64
 }
 
 func OpenNode(cfg config.ClusterConfig, dir string, maxMemoryBytes int64) (*Node, error) {
@@ -77,7 +84,7 @@ func openNode(cfg config.ClusterConfig, dir string, maxMemoryBytes int64, store 
 		_ = store.Close()
 		return nil, err
 	}
-	node := &Node{cfg: cfg, metadata: metadata, stages: stage, payloads: store, stageMax: maxMemoryBytes}
+	node := &Node{cfg: cfg, metadata: metadata, stages: stage, payloads: store, stageMax: maxMemoryBytes, repairs: make(chan payloadRepair, 64)}
 	importFingerprint, _, err := metadata.Get(MetadataSettings, importFingerprintKey)
 	if err != nil {
 		_ = metadata.Close()
@@ -208,12 +215,13 @@ func (n *Node) readVerifiedPayload(ctx context.Context, id [16]byte, bucket, key
 		if repairLocal && r.peer != n.cfg.NodeID {
 			for _, placement := range selected {
 				if placement == n.cfg.NodeID {
-					// A failed local backing must not hide a verified healthy
-					// peer copy. Bound opportunistic repair; the background scan
-					// retries it if the backing is still unavailable.
-					repairCtx, cancel := context.WithTimeout(ctx, 250*time.Millisecond)
-					_ = n.payloads.RepairCommitted(repairCtx, opID, r.payload, expected)
-					cancel()
+					// Disk locks and fsync cannot be canceled by a context. Queue
+					// only the identity, never a payload or a goroutine per read.
+					// A full queue is safe: the periodic scan retries missed work.
+					select {
+					case n.repairs <- payloadRepair{id: id, bucket: bucket, key: key, digest: expected, size: size}:
+					default:
+					}
 					break
 				}
 			}

@@ -99,10 +99,14 @@ func ExportStandaloneBundle(ctx context.Context, backend ImportSource, settings 
 	}
 	for _, source := range inventory.Buckets {
 		var bucketID [16]byte
-		if _, err := rand.Read(bucketID[:]); err != nil {
-			return ImportBundle{}, err
+		instanceID := source.Info.InstanceID
+		if id, err := hex.DecodeString(instanceID); err != nil || len(id) != len(bucketID) {
+			if _, err := rand.Read(bucketID[:]); err != nil {
+				return ImportBundle{}, err
+			}
+			instanceID = hex.EncodeToString(bucketID[:])
 		}
-		bucket := ImportBundleBucket{Info: source.Info, InstanceID: hex.EncodeToString(bucketID[:]), Configs: source.Configs}
+		bucket := ImportBundleBucket{Info: source.Info, InstanceID: instanceID, Configs: source.Configs}
 		for _, version := range source.Versions {
 			if err := ctx.Err(); err != nil {
 				return ImportBundle{}, err

@@ -55,6 +55,15 @@ func (m *memoryCatalog) CompareAndSwap(_ context.Context, change cluster.JobMuta
 		m.conflicts--
 		return cluster.ErrJobRecordConflict
 	}
+	if change.CatalogDigest != "" {
+		var records []cluster.JobRecord
+		for id, value := range m.records {
+			records = append(records, cluster.JobRecord{ID: id, Data: value})
+		}
+		if cluster.JobCatalogDigest(records) != change.CatalogDigest {
+			return cluster.ErrJobRecordConflict
+		}
+	}
 	before, ok := m.records[change.ID]
 	if ok != change.Exists || !bytes.Equal(before, change.Expected) {
 		return cluster.ErrJobRecordConflict

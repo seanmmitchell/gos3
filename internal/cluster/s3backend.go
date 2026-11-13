@@ -6,6 +6,7 @@ import (
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -112,6 +113,17 @@ func (b *S3Backend) CreateBucketForJob(ctx context.Context, jobID string, create
 	digest := sha256.Sum256([]byte("cluster-copy-target\x00" + jobID))
 	var operationID [16]byte
 	copy(operationID[:], digest[:16])
+	// Offline migration preserves bucket identities but deliberately starts a
+	// new Raft log. Recognize the original job-created bucket without relying
+	// on the old log's operation outcome, and never adopt a replacement.
+	if existing, err := b.buckets.GetBucket(ctx, name); err == nil {
+		if existing.InstanceID == hex.EncodeToString(operationID[:]) && existing.CreatedAt.Equal(createdAt) {
+			return existing, nil
+		}
+		return storage.BucketInfo{}, storage.ErrBucketExists
+	} else if !errors.Is(err, storage.ErrBucketNotFound) {
+		return storage.BucketInfo{}, clusterBackendError(err)
+	}
 	intent := BucketCreateIntent{OperationID: operationID, CreatedAt: createdAt.UTC(), Name: name, Options: opts}
 	info, err := b.buckets.CreateBucket(ctx, intent)
 	return info, clusterBackendError(err)
@@ -219,13 +231,32 @@ func (b *S3Backend) DeleteReplicationConfiguration(ctx context.Context, bucket s
 func (b *S3Backend) changeReplicationConfiguration(ctx context.Context, bucket string, rules, state []byte, remove bool) error {
 	ctx, cancel := b.callContext(ctx)
 	defer cancel()
+	requestedState := bytes.Clone(state)
 	for {
+		state = requestedState
 		current, found, err := b.node.GetMetadata(ctx, MetadataBuckets, bucketKey(bucket))
 		if err != nil {
 			return clusterBackendError(err)
 		}
 		if !found {
 			return storage.ErrBucketNotFound
+		}
+		previousRules, rulesFound, err := b.node.metadata.Get(MetadataBuckets, bucketConfigKey(bucket, storage.ConfigReplication))
+		if err != nil {
+			return err
+		}
+		previousState, stateFound, err := b.node.metadata.Get(MetadataBuckets, bucketConfigKey(bucket, storage.ConfigReplicationState))
+		if err != nil {
+			return err
+		}
+		if !remove && bytes.Equal(previousRules, rules) {
+			var old, next struct {
+				Hash        string    `json:"hash"`
+				ActivatedAt time.Time `json:"activatedAt"`
+			}
+			if json.Unmarshal(previousState, &old) == nil && json.Unmarshal(state, &next) == nil && old.Hash == next.Hash && !old.ActivatedAt.IsZero() {
+				state = previousState
+			}
 		}
 		if !remove {
 			info, err := decodeBucketRecord(bucket, current)
@@ -241,7 +272,11 @@ func (b *S3Backend) changeReplicationConfiguration(ctx context.Context, bucket s
 			return err
 		}
 		transaction := MetadataTransaction{OperationID: hex.EncodeToString(id[:]),
-			Conditions: []MetadataCondition{{Namespace: MetadataBuckets, Key: bucketKey(bucket), Exists: true, Value: current}},
+			Conditions: []MetadataCondition{
+				{Namespace: MetadataBuckets, Key: bucketKey(bucket), Exists: true, Value: current},
+				{Namespace: MetadataBuckets, Key: bucketConfigKey(bucket, storage.ConfigReplication), Exists: rulesFound, Value: previousRules},
+				{Namespace: MetadataBuckets, Key: bucketConfigKey(bucket, storage.ConfigReplicationState), Exists: stateFound, Value: previousState},
+			},
 			Changes: []MetadataCommand{
 				{Namespace: MetadataBuckets, Key: bucketConfigKey(bucket, storage.ConfigReplication), Value: rules, Delete: remove},
 				{Namespace: MetadataBuckets, Key: bucketConfigKey(bucket, storage.ConfigReplicationState), Value: state, Delete: remove},
@@ -321,6 +356,10 @@ func (b *S3Backend) NewVersionWriter(ctx context.Context, bucket, key string) (s
 type clusterVersionWriter struct{ *clusterObjectWriter }
 
 func (w *clusterVersionWriter) Commit(ctx context.Context, info storage.ObjectInfo) (storage.ObjectInfo, error) {
+	return w.CommitIf(ctx, info, nil)
+}
+
+func (w *clusterVersionWriter) CommitIf(ctx context.Context, info storage.ObjectInfo, check func(storage.ObjectInfo, bool) error) (storage.ObjectInfo, error) {
 	ctx, cancel := w.backend.callContext(ctx)
 	defer cancel()
 	w.mu.Lock()
@@ -343,6 +382,7 @@ func (w *clusterVersionWriter) Commit(ctx context.Context, info storage.ObjectIn
 	intent.CreatedAt = info.LastModified.UTC()
 	intent.VersionID = info.VersionID
 	intent.DeleteMarker = info.DeleteMarker
+	intent.CheckLatest = check
 	stored, err := w.backend.objects.PutVersion(ctx, intent)
 	return stored, clusterBackendError(err)
 }

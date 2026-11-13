@@ -13,6 +13,7 @@ package s3
 // Bucket replication rules below are executed by the asynchronous worker.
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"encoding/xml"
@@ -897,6 +898,20 @@ func (s *Server) handlePutBucketReplication(w http.ResponseWriter, r *http.Reque
 		}
 		s.invalidateBucketConfig(rc.bucket)
 	} else {
+		previous, err := s.backend.GetBucketConfig(ctx, rc.bucket, storage.ConfigReplication)
+		if err != nil && !errors.Is(err, storage.ErrConfigNotFound) {
+			return bucketError(err, rc.bucket)
+		}
+		if bytes.Equal(previous, canonical) {
+			oldState, err := s.backend.GetBucketConfig(ctx, rc.bucket, storage.ConfigReplicationState)
+			if err != nil && !errors.Is(err, storage.ErrConfigNotFound) {
+				return bucketError(err, rc.bucket)
+			}
+			var activation ReplicationState
+			if json.Unmarshal(oldState, &activation) == nil && activation.Hash == ReplicationRuleHash(canonical) && !activation.ActivatedAt.IsZero() {
+				state = oldState
+			}
+		}
 		if err := s.backend.PutBucketConfig(ctx, rc.bucket, storage.ConfigReplicationState, state); err != nil {
 			return bucketError(err, rc.bucket)
 		}

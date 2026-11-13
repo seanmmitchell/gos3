@@ -40,7 +40,7 @@ v0.2.0 was built while the repository was private and has no GitHub
 attestations. Making the repository public does not add attestations to older
 artifacts; see [verification and its limits](releasing.md#verifying-a-release).
 
-To build from source you need Go 1.26.10 or newer (`go.mod` requires it, for
+To build from source you need Go 1.26.11 or newer (`go.mod` requires it, for
 the standard library's security fixes), Node.js 22 and pnpm (via corepack):
 
 ```sh
@@ -165,11 +165,9 @@ Notes:
   Dependabot proposes updates weekly (Go images without the 14-day
   cooldown, since Go point releases carry standard library security fixes).
   To build on another Node version, edit the tag and digest of its `FROM`
-  line together. Until a pinned base image ships Go 1.26.10, the Go build
-  stage installs the official Go 1.26.10 archives after verifying their
-  published per-architecture SHA-256 sums. `GOTOOLCHAIN=local` and a build
-  check ensure the installed Go is at least `go.mod`'s minimum. When raising
-  that minimum, update the Go archive version and checksums too.
+  line together. `GOTOOLCHAIN=local` and a build check ensure the pinned Go
+  image provides at least `go.mod`'s minimum. When raising that minimum,
+  update the Go image tag and digest too if the pinned image is older.
 
 The standalone web UI has its own image, `deploy/docker/web.Dockerfile`
 (`make docker-ui`); see [web-ui.md](web-ui.md#standalone-mode). Its local

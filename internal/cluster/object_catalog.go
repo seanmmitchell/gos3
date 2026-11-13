@@ -319,6 +319,9 @@ func (c *ObjectCatalog) putVersion(ctx context.Context, intent ObjectPutIntent, 
 		transaction.Changes = append(transaction.Changes, MetadataCommand{Namespace: MetadataVersions, Key: versionObjectKey(intent.Bucket, intent.Key, newer.Info.VersionID), Value: updated})
 	}
 	transaction.Conditions = append(transaction.Conditions, intent.Conditions...)
+	if intent.CheckLatest != nil && latestFound && current.VersionID != version {
+		transaction.Conditions = append(transaction.Conditions, MetadataCondition{Namespace: MetadataVersions, Key: versionObjectKey(intent.Bucket, intent.Key, current.VersionID), Exists: true, Value: currentRaw})
+	}
 	transaction.PrefixDigests = append(transaction.PrefixDigests, intent.PrefixDigests...)
 	transaction.Conditions = append(transaction.Conditions, configConditions...)
 	transaction.DeletePrefixes = append(transaction.DeletePrefixes, intent.DeletePrefixes...)

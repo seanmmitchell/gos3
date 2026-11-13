@@ -4,10 +4,12 @@ import (
 	"bytes"
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"slices"
 	"strings"
 )
 
@@ -27,11 +29,23 @@ type JobRecord struct {
 // JobMutation carries one stable operation ID across retries. A caller must
 // use the exact same Expected and Next bytes when retrying an uncertain write.
 type JobMutation struct {
-	OperationID [16]byte
-	ID          string
-	Expected    []byte
-	Exists      bool
-	Next        []byte // nil deletes the record
+	OperationID   [16]byte
+	ID            string
+	Expected      []byte
+	Exists        bool
+	Next          []byte // nil deletes the record
+	CatalogDigest string // optional complete job-catalog precondition
+}
+
+// JobCatalogDigest binds reservations to the same snapshot as their CAS.
+func JobCatalogDigest(records []JobRecord) string {
+	ordered := slices.Clone(records)
+	slices.SortFunc(ordered, func(a, b JobRecord) int { return strings.Compare(a.ID, b.ID) })
+	h := sha256.New()
+	for _, record := range ordered {
+		digestPrefixRecord(h, []byte(jobRecordKey(record.ID)), record.Data)
+	}
+	return hex.EncodeToString(h.Sum(nil))
 }
 
 func NewJobMutation(id string, expected []byte, exists bool, next []byte) (JobMutation, error) {
@@ -100,6 +114,9 @@ func (c *JobCatalog) CompareAndSwap(ctx context.Context, mutation JobMutation) e
 		OperationID: hex.EncodeToString(mutation.OperationID[:]),
 		Conditions:  []MetadataCondition{{Namespace: MetadataJobs, Key: key, Exists: mutation.Exists, Value: mutation.Expected}},
 		Changes:     []MetadataCommand{change},
+	}
+	if mutation.CatalogDigest != "" {
+		transaction.PrefixDigests = []MetadataPrefixDigest{{Namespace: MetadataJobs, Prefix: backgroundJobPrefix, SHA256: mutation.CatalogDigest}}
 	}
 	payload := mutation.Next
 	if payload == nil {

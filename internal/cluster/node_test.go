@@ -128,9 +128,7 @@ func TestTwoNodesAdmitMetadataOnlyWithBothDurableCopies(t *testing.T) {
 	if body, err := nodes[repairNode].ReadVerifiedPayload(ctx, id, "photos", "k", committedDigest, int64(len("complete object"))); err != nil || string(body) != "complete object" {
 		t.Fatalf("repair read: %q, %v", body, err)
 	}
-	if body, err := nodes[repairNode].stages.Read(ctx, opID); err != nil || string(body) != "complete object" {
-		t.Fatalf("repaired durable payload: %q, %v", body, err)
-	}
+	waitForRepairedPayload(t, nodes[repairNode], opID, "complete object")
 	// A record with a valid local checksum can still differ from the
 	// Raft-committed payload. Never return it or use it to repair peers.
 	selected, err := SelectReplicas(clusterID, "photos", "k", []string{"a", "b"}, 2)
@@ -148,9 +146,7 @@ func TestTwoNodesAdmitMetadataOnlyWithBothDurableCopies(t *testing.T) {
 	if body, err := nodes[selected[0]].ReadVerifiedPayload(ctx, id, "photos", "k", committedDigest, int64(len("complete object"))); err != nil || string(body) != "complete object" {
 		t.Fatalf("committed-digest read: %q, %v", body, err)
 	}
-	if body, err := nodes[selected[0]].stages.Read(ctx, opID); err != nil || string(body) != "complete object" {
-		t.Fatalf("committed-digest repair: %q, %v", body, err)
-	}
+	waitForRepairedPayload(t, nodes[selected[0]], opID, "complete object")
 	// A healthy quorum must not turn missing object bytes into a successful
 	// read. Restore the records after checking the retryable read failure.
 	for _, name := range selected {

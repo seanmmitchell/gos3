@@ -202,6 +202,7 @@ func (s *Service) change(id string, fn func(*jobs.Job) (bool, error)) error {
 		if err != nil {
 			return err
 		}
+		wasFinished := record.State.Finished()
 		write, err := fn(&record.Job)
 		if err != nil || !write {
 			return err
@@ -219,6 +220,16 @@ func (s *Service) change(id string, fn func(*jobs.Job) (bool, error)) error {
 		mutation, err := cluster.NewJobMutation(id, before, true, after)
 		if err != nil {
 			return err
+		}
+		if wasFinished && record.State == jobs.StateQueued {
+			records, err := s.catalog.List(ctx)
+			if err != nil {
+				return unavailable(err)
+			}
+			if err := checkCopyTargets(record.Job, records, false); err != nil {
+				return err
+			}
+			mutation.CatalogDigest = cluster.JobCatalogDigest(records)
 		}
 		err = s.catalog.CompareAndSwap(ctx, mutation)
 		if errors.Is(err, cluster.ErrJobRecordConflict) {

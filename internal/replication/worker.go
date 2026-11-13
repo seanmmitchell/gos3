@@ -318,6 +318,8 @@ func (w *Worker) copyVersion(ctx context.Context, role, source string, version s
 		return errors.New("destination object lock is not enabled")
 	}
 	var newerDestination bool
+	var latestDestination storage.ObjectInfo
+	var destinationFound bool
 	if err := w.backend.WalkVersions(ctx, rule.Destination, version.Key, "", "", func(existing storage.ObjectInfo) error {
 		if existing.Key != version.Key {
 			return storage.ErrStopWalk
@@ -325,6 +327,9 @@ func (w *Worker) copyVersion(ctx context.Context, role, source string, version s
 		if existing.LastModified.After(version.LastModified) {
 			newerDestination = true
 			return storage.ErrStopWalk
+		}
+		if existing.IsLatest {
+			latestDestination, destinationFound = existing, true
 		}
 		return nil
 	}); err != nil {
@@ -351,6 +356,11 @@ func (w *Worker) copyVersion(ctx context.Context, role, source string, version s
 	if !w.isActiveLeader() {
 		return errReplicationLeaderChanged
 	}
-	_, err = copier.WriteVersion(ctx, w.backend, rule.Destination, version.Key, version, body, copier.Policy{}, copier.WriteImport)
+	_, err = copier.WriteVersionIf(ctx, w.backend, rule.Destination, version.Key, version, body, copier.Policy{}, func(current storage.ObjectInfo, found bool) error {
+		if found != destinationFound || found && (!copier.SameVersion(current, latestDestination) || !copier.MetaEqual(current.ObjectMeta, latestDestination.ObjectMeta)) {
+			return storage.ErrPreconditionFailed
+		}
+		return nil
+	})
 	return err
 }

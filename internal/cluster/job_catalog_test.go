@@ -8,6 +8,36 @@ import (
 	"time"
 )
 
+func TestJobCatalogReservationSnapshotIsAtomicAcrossVoters(t *testing.T) {
+	nodes := newTwoNodeCluster(t)
+	ctx, cancel := context.WithTimeout(t.Context(), 15*time.Second)
+	defer cancel()
+	a, b := NewJobCatalog(nodes["a"]), NewJobCatalog(nodes["b"])
+	records, err := a.List(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	digest := JobCatalogDigest(records)
+	first, err := NewJobMutation("job_a", nil, false, []byte(`{"state":"queued"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := NewJobMutation("job_b", nil, false, []byte(`{"state":"queued"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	first.CatalogDigest, second.CatalogDigest = digest, digest
+	if err := a.CompareAndSwap(ctx, first); err != nil {
+		t.Fatal(err)
+	}
+	if err := b.CompareAndSwap(ctx, second); !errors.Is(err, ErrJobRecordConflict) {
+		t.Fatalf("stale reservation snapshot committed: %v", err)
+	}
+	if _, found, err := b.Get(ctx, "job_b"); err != nil || found {
+		t.Fatalf("rejected reservation created job: found=%v err=%v", found, err)
+	}
+}
+
 func TestJobCatalogSharesConditionalRecordsAcrossVoters(t *testing.T) {
 	nodes := newTwoNodeCluster(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)

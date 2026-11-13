@@ -68,14 +68,27 @@ func (s *Service) Submit(ctx context.Context, kind string, spec json.RawMessage,
 	if err != nil {
 		return jobs.Job{}, err
 	}
-	mutation, err := cluster.NewJobMutation(job.ID, nil, false, data)
-	if err != nil {
-		return jobs.Job{}, err
-	}
 	ctx, cancel := context.WithTimeout(ctx, operationTimeout)
 	defer cancel()
-	if err := s.catalog.CompareAndSwap(ctx, mutation); err != nil {
-		return jobs.Job{}, unavailable(err)
+	for {
+		records, err := s.catalog.List(ctx)
+		if err != nil {
+			return jobs.Job{}, unavailable(err)
+		}
+		if err := checkCopyTargets(job, records, false); err != nil {
+			return jobs.Job{}, err
+		}
+		mutation, err := cluster.NewJobMutation(job.ID, nil, false, data)
+		if err != nil {
+			return jobs.Job{}, err
+		}
+		mutation.CatalogDigest = cluster.JobCatalogDigest(records)
+		if err := s.catalog.CompareAndSwap(ctx, mutation); errors.Is(err, cluster.ErrJobRecordConflict) {
+			continue
+		} else if err != nil {
+			return jobs.Job{}, unavailable(err)
+		}
+		break
 	}
 	return job, nil
 }
@@ -244,6 +257,15 @@ func (s *Service) claim(ctx context.Context, id string) error {
 	if !eligible(record.Job, s.currentTime()) || !s.leader() {
 		return nil
 	}
+	records, err := s.catalog.List(ctx)
+	if err != nil {
+		return unavailable(err)
+	}
+	// Old/imported queues may contain overlaps accepted by an earlier
+	// version. Never execute their destructive copies concurrently.
+	if err := checkCopyTargets(record.Job, records, true); err != nil {
+		return cluster.ErrJobRecordConflict
+	}
 	record.RunID = strings.ToLower(rand.Text())
 	record.State = jobs.StateRunning
 	record.UpdatedAt = s.currentTime()
@@ -259,6 +281,7 @@ func (s *Service) claim(ctx context.Context, id string) error {
 	if err != nil {
 		return err
 	}
+	mutation.CatalogDigest = cluster.JobCatalogDigest(records)
 	if err := s.catalog.CompareAndSwap(ctx, mutation); err != nil {
 		if errors.Is(err, cluster.ErrJobRecordConflict) {
 			return err

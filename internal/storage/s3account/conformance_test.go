@@ -94,6 +94,7 @@ var nativeSkips = map[string]string{
 	// The backing implements these for its wrapped buckets; native buckets
 	// report them unavailable through BucketCaps (Import, Compression).
 	"Optional/VersionImporter":                        "native buckets cannot receive imported versions",
+	"Optional/ConditionalVersionImporter":             "native buckets cannot receive imported versions",
 	"Optional/Compression/RoundTrip":                  "native buckets store data as-is",
 	"Optional/Compression/Usage":                      "native buckets store data as-is",
 	"Optional/Compression/UpdateMetaKeepsCompression": "native buckets store data as-is",

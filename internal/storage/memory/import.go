@@ -82,6 +82,10 @@ func (w *versionWriter) Write(p []byte) (int, error) {
 // fresh stamp, so it sorts newest, but keeps info's version ID and
 // LastModified.
 func (w *versionWriter) Commit(ctx context.Context, info storage.ObjectInfo) (storage.ObjectInfo, error) {
+	return w.CommitIf(ctx, info, nil)
+}
+
+func (w *versionWriter) CommitIf(ctx context.Context, info storage.ObjectInfo, check func(storage.ObjectInfo, bool) error) (storage.ObjectInfo, error) {
 	w.mu.Lock()
 	if w.done {
 		w.mu.Unlock()
@@ -110,6 +114,16 @@ func (w *versionWriter) Commit(ctx context.Context, info storage.ObjectInfo) (st
 		return storage.ObjectInfo{}, err
 	}
 	defer w.bk.mu.Unlock()
+	if check != nil {
+		var current storage.ObjectInfo
+		v, found := w.bk.ix.Object(w.key)
+		if found {
+			current = v.Latest().Info(w.name, w.key, true)
+		}
+		if err := check(current, found); err != nil {
+			return storage.ObjectInfo{}, err
+		}
+	}
 	info.Encryption = w.encryption
 	out, _, err := w.bk.ix.Import(w.key, info, c)
 	return out, err

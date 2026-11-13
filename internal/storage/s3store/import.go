@@ -32,6 +32,10 @@ func (b *Backend) NewVersionWriterWith(ctx context.Context, bucket, key string, 
 // Commit stores the written data as the newest version of the key with the
 // identity given by info (see storage.VersionWriter).
 func (w *versionWriter) Commit(ctx context.Context, info storage.ObjectInfo) (storage.ObjectInfo, error) {
+	return w.CommitIf(ctx, info, nil)
+}
+
+func (w *versionWriter) CommitIf(ctx context.Context, info storage.ObjectInfo, check func(storage.ObjectInfo, bool) error) (storage.ObjectInfo, error) {
 	b, bk := w.b, w.bk
 	c, key, err := w.finish(ctx, func(size int64) error { return index.CheckImport(w.bucket, w.key, info, size) })
 	if err != nil {
@@ -47,6 +51,18 @@ func (w *versionWriter) Commit(ctx context.Context, info storage.ObjectInfo) (st
 	info.Encryption = w.encryption
 	if info.DeleteMarker {
 		info.Encryption = ""
+	}
+	if check != nil {
+		var current storage.ObjectInfo
+		v, found := bk.ix.Object(w.key)
+		if found {
+			current = v.Latest().Info(w.bucket, w.key, true)
+		}
+		if err := check(current, found); err != nil {
+			bk.mu.Unlock()
+			b.deleteLater(key)
+			return storage.ObjectInfo{}, err
+		}
 	}
 	out, ch, err := bk.ix.Import(w.key, info, c)
 	if err != nil {

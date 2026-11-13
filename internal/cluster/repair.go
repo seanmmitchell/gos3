@@ -8,7 +8,11 @@ import (
 	"errors"
 	"fmt"
 	"slices"
+	"strconv"
+	"strings"
 	"time"
+
+	"github.com/seanmmitchell/gos3/internal/storage"
 )
 
 const repairPageSize = 128
@@ -36,7 +40,7 @@ func (n *Node) RepairLocalPlacements(ctx context.Context) (repaired int, err err
 			return repaired, err
 		}
 		if len(page) == 0 {
-			return repaired, nil
+			break
 		}
 		for _, item := range page {
 			var raw objectRecord
@@ -79,9 +83,90 @@ func (n *Node) RepairLocalPlacements(ctx context.Context) (repaired int, err err
 		}
 		after = page[len(page)-1].Key
 		if len(page) < repairPageSize {
-			return repaired, nil
+			break
 		}
 	}
+	parts, err := n.repairMultipartParts(ctx, peerIDs)
+	return repaired + parts, err
+}
+
+func (n *Node) repairMultipartParts(ctx context.Context, peerIDs []string) (int, error) {
+	repaired, after := 0, ""
+	for {
+		if err := ctx.Err(); err != nil {
+			return repaired, err
+		}
+		page, err := n.metadata.ListPage(MetadataJobs, "part\x00", after, repairPageSize)
+		if err != nil {
+			return repaired, err
+		}
+		for _, item := range page {
+			pieces := strings.Split(item.Key, "\x00")
+			if len(pieces) != 4 {
+				return repaired, errors.New("cluster: invalid repair part key")
+			}
+			number, err := strconv.Atoi(pieces[3])
+			if err != nil || number < 1 || number > 10000 || item.Key != partKey(pieces[1], pieces[2], number) {
+				return repaired, errors.New("cluster: invalid repair part number")
+			}
+			part, err := decodeMultipartPart(item.Value, number)
+			if err != nil {
+				return repaired, err
+			}
+			raw, found, err := n.metadata.Get(MetadataJobs, uploadKey(pieces[1], pieces[2]))
+			if err != nil {
+				return repaired, err
+			}
+			if !found {
+				continue
+			} // Upload completed or was aborted during the scan.
+			var upload storage.UploadInfo
+			if err := json.Unmarshal(raw, &upload); err != nil || upload.Bucket != pieces[1] || upload.UploadID != pieces[2] || upload.Key == "" {
+				return repaired, errors.New("cluster: invalid multipart upload during repair")
+			}
+			placements, err := SelectReplicas(n.cfg.ID, upload.Bucket, upload.Key, peerIDs, n.cfg.ReplicaCount)
+			if err != nil {
+				return repaired, err
+			}
+			if !slices.Contains(placements, n.cfg.NodeID) {
+				continue
+			}
+			var id [16]byte
+			decoded, _ := hex.DecodeString(part.OperationID)
+			copy(id[:], decoded)
+			var digest [32]byte
+			decoded, _ = hex.DecodeString(part.Digest)
+			copy(digest[:], decoded)
+			changed, err := n.repairPayload(ctx, payloadRepair{id: id, bucket: upload.Bucket, key: upload.Key, digest: digest, size: part.Info.Size})
+			if err != nil {
+				return repaired, fmt.Errorf("cluster: repairing multipart %s: %w", item.Key, err)
+			}
+			if changed {
+				repaired++
+			}
+		}
+		if len(page) < repairPageSize {
+			return repaired, nil
+		}
+		after = page[len(page)-1].Key
+	}
+}
+
+func (n *Node) repairPayload(ctx context.Context, request payloadRepair) (bool, error) {
+	ctx, cancel := context.WithTimeout(ctx, 15*time.Second)
+	defer cancel()
+	id := hex.EncodeToString(request.id[:])
+	if local, err := n.payloads.Read(ctx, id); err == nil && int64(len(local)) == request.size && sha256.Sum256(local) == request.digest {
+		return false, nil
+	}
+	payload, err := n.readVerifiedPayload(ctx, request.id, request.bucket, request.key, request.digest, request.size, false)
+	if err != nil {
+		return false, err
+	}
+	if err := n.payloads.RepairCommitted(ctx, id, payload, request.digest); err != nil {
+		return false, err
+	}
+	return true, nil
 }
 
 func (n *Node) repairLoop(ctx context.Context) {
@@ -91,6 +176,13 @@ func (n *Node) repairLoop(ctx context.Context) {
 		select {
 		case <-ctx.Done():
 			return
+		case request := <-n.repairs:
+			changed, err := n.repairPayload(ctx, request)
+			count := 0
+			if changed {
+				count = 1
+			}
+			n.recordRepair(count, err)
 		case <-timer.C:
 			_, err := n.RepairLocalPlacements(ctx)
 			if err != nil {
