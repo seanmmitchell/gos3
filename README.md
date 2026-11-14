@@ -86,7 +86,7 @@ build provenance:
 checks that an attested archive was built by the Release workflow on `main`.
 The earlier v0.2.0 build has no GitHub attestations; see
 [verifying a release](docs/releasing.md#verifying-a-release).
-Or build it with Go 1.26.10 or newer, Node.js 22 and pnpm:
+Or build it with Go 1.26.11 or newer, Node.js 22 and pnpm:
 
 ```sh
 make build                      # web UI + bin/gos3 with the UI embedded
@@ -430,9 +430,9 @@ Report bugs and feature requests in the [issue tracker](https://github.com/seanm
 and submit pull requests against `dev`. Report vulnerabilities privately as
 described in [docs/security.md](docs/security.md#reporting-vulnerabilities).
 
-Requirements: Go 1.26.10 or newer, Node.js 22 with corepack (pnpm), and
+Requirements: Go 1.26.11 or newer, Node.js 22 with corepack (pnpm), and
 optionally Docker and Python 3 (for the compatibility suite). `go.mod`
-requires Go 1.26.10 (`go 1.26.10`, a supported release with current security
+requires Go 1.26.11 (`go 1.26.11`, a supported release with current security
 fixes for the standard library gos3 links); with the default
 `GOTOOLCHAIN=auto` an older go command downloads it, and with
 `GOTOOLCHAIN=local` it refuses to build.
