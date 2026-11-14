@@ -210,7 +210,7 @@ const SOURCE_BADGES: Partial<Record<ConnectionSource, SourceBadge>> = {
                 </UTooltip>
               </p>
               <p v-if="store.statusOf(row.original.id).info?.version" class="text-xs text-muted">
-                v{{ store.statusOf(row.original.id).info?.version }}
+                {{ store.statusOf(row.original.id).info?.version }}
               </p>
             </div>
           </div>
