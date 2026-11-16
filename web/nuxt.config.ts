@@ -157,6 +157,8 @@ export default defineNuxtConfig({
   },
 
   nitro: {
+    // Keep server output unminified; the optional Terser worker is omitted.
+    minify: false,
     // `nuxt build` → standalone Node server. `nuxt generate` overrides the
     // preset with its static output automatically.
     preset: process.env.NITRO_PRESET || 'node-server',

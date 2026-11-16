@@ -103,6 +103,9 @@ overrides:
   # behavior reproduces on 4.1.1. Rollup's node resolver is the only consumer.
   # Use 4.1.1 with the local patch below until upstream publishes a fix.
   '@rollup/plugin-node-resolve>deepmerge': 4.1.1
+  # Server minification is disabled in nuxt.config.ts. Remove the unused
+  # Terser worker, which evaluates serialized build options.
+  '@rollup/plugin-terser': '-'
   # WebAssembly fallbacks, loaded only when the native binary is missing (a
   # platform without a prebuilt one). Removed to keep unused code out of the
   # dependency tree; every supported platform has the native package.
