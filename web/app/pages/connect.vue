@@ -227,7 +227,7 @@ const others = computed(() => store.sorted.filter(c => c.id !== target.value?.id
           <p v-if="mode === 'signin'" class="flex flex-wrap items-center gap-x-2 gap-y-1 text-sm text-muted">
             <code class="truncate font-mono text-xs">{{ target!.endpoint }}</code>
             <UBadge :label="target!.kind === 'gos3' ? 'gos3' : 'S3'" :color="target!.kind === 'gos3' ? 'primary' : 'neutral'" variant="outline" size="sm" />
-            <span v-if="status?.info" class="text-xs">v{{ status.info.version }}</span>
+            <span v-if="status?.info" class="text-xs">{{ status.info.version }}</span>
             <CommonStatusDot v-if="status && status.state !== 'unknown'" :state="status.state" show-label size="xs" />
           </p>
           <p v-else class="text-sm text-muted">
