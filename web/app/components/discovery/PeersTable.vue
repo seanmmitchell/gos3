@@ -50,7 +50,7 @@ const columns: TableColumn<Peer>[] = [
         <p class="font-mono text-xs text-muted">
           {{ row.original.id }}
           <template v-if="row.original.version">
-            · v{{ row.original.version }}
+            · {{ row.original.version }}
           </template>
           <template v-if="row.original.region">
             · {{ row.original.region }}
