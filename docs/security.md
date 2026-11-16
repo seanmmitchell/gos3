@@ -1150,9 +1150,10 @@ and is not part of the embedded UI, which is static files, or the standalone
 UI server bundle (`web/.output/server`).
 
 The nested DigestAlgorithm signature forgery in `node-forge`
-(GHSA-86w9-cpqp-85rv / GHSA-2g46-22mc-6gwp) is fixed in 1.4.1, pinned in
-`web/pnpm-workspace.yaml`; the older advisory may still list no patched
-release. See the [upstream release notes](https://github.com/digitalbazaar/forge/blob/v1.4.1/CHANGELOG.md).
+(GHSA-86w9-cpqp-85rv / GHSA-2g46-22mc-6gwp) is fixed in 1.4.1 and later.
+Version 1.4.3 is pinned in `web/pnpm-workspace.yaml` to also fix HTTP
+header ReDoS, TLS client crashes, and small-order Ed25519 key verification.
+The older advisory may still list no patched release. See the [upstream release notes](https://github.com/digitalbazaar/forge/blob/v1.4.1/CHANGELOG.md).
 
 ## Reporting vulnerabilities
 
