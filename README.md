@@ -11,11 +11,10 @@ gos3 is public on [GitHub](https://github.com/seanmmitchell/gos3) under the
 Run `gos3 serve`, point the AWS CLI, an SDK, `mc` or rclone at it, and open
 `http://localhost:9000/_gos3/ui/`.
 
-**v0.3.1** fixes a bucket-move failure that could delete data before the new
-placement was saved, and updates web dependencies to address reported security
-alerts. Start with the [0.3.1 release overview](docs/releases/0.3.1.md) for
-downloads, upgrade steps and limitations. [v0.2.0](docs/releases/0.2.0.md)
-introduced the full feature set.
+**v0.3.2** fixes console server-version labels and updates Go, Nuxt and
+node-forge for security fixes. Start with the
+[0.3.2 release overview](docs/releases/0.3.2.md) for downloads, upgrade steps
+and limitations. [v0.2.0](docs/releases/0.2.0.md) introduced the full feature set.
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="docs/screenshots/dashboard-dark.png">
@@ -78,7 +77,7 @@ introduced the full feature set.
 
 ### Binary
 
-Download an archive from [v0.3.1](https://github.com/seanmmitchell/gos3/releases/tag/v0.3.1)
+Download an archive from [v0.3.2](https://github.com/seanmmitchell/gos3/releases/tag/v0.3.2)
 (Linux, macOS, Windows; amd64 and arm64). Check the archive against the release's
 `checksums.txt`. Releases built after gos3 became public also carry signed
 build provenance:
@@ -107,9 +106,9 @@ bin/gos3 serve --data ./data
 ### Docker
 
 ```sh
-(umask 077; docker run --rm ghcr.io/seanmmitchell/gos3:0.3.1 keygen > gos3.env)  # private root keys
+(umask 077; docker run --rm ghcr.io/seanmmitchell/gos3:0.3.2 keygen > gos3.env)  # private root keys
 docker run -d --name gos3 -p 127.0.0.1:9000:9000 -v gos3-data:/data --env-file gos3.env \
-  ghcr.io/seanmmitchell/gos3:0.3.1
+  ghcr.io/seanmmitchell/gos3:0.3.2
 ```
 
 This publishes the port on this machine only; use `-p 9000:9000` to serve
@@ -407,7 +406,7 @@ More in [docs/security.md](docs/security.md).
 
 | | |
 |---|---|
-| [docs/releases/0.3.1.md](docs/releases/0.3.1.md) | current release: fixes, downloads, upgrade notes and limitations |
+| [docs/releases/0.3.2.md](docs/releases/0.3.2.md) | current release: fixes, downloads, upgrade notes and limitations |
 | [docs/releases/0.2.0.md](docs/releases/0.2.0.md) | first full release and upgrade notes from 0.1.0 |
 | [docs/configuration.md](docs/configuration.md) | every YAML key, environment variable and flag |
 | [docs/deployment.md](docs/deployment.md) | Docker, Compose, systemd, Kubernetes, reverse proxies, TLS |
